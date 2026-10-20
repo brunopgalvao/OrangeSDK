@@ -241,10 +241,8 @@ fn check(program: &Program) -> Result<(), CompileError> {
 fn compile(program: &Program, options: Options) -> Result<(Code, exec::ExecMem), CompileError> {
     let hosts = &arch::HOST_REGS[..options.host_registers.min(arch::HOST_REGS.len())];
     let map = regmap::RegMap::choose(program, hosts);
-    let code = code::drive(arch::Native::new(map), program);
-    if code.bytes.len() > options.code_limit.min(arch::CODE_LIMIT) {
-        return Err(CompileError::TooLarge);
-    }
+    let limit = options.code_limit.min(arch::CODE_LIMIT);
+    let code = code::drive(arch::Native::new(map), program, limit).ok_or(CompileError::TooLarge)?;
     let exec = exec::ExecMem::new(&code.bytes)?;
     Ok((code, exec))
 }

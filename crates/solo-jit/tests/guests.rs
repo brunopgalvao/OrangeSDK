@@ -165,8 +165,19 @@ fn genesis() -> Genesis {
     }
 }
 
-/// Everything a kernel call sequence leaves behind.
-type Trace = (Vec<CallResult>, Option<([u8; 32], u32, usize)>, [u8; 32]);
+/// What one kernel call leaves behind: its result, where it ended, the
+/// executor's logs and metrics so far, and the state commitment.
+type Step = (
+    CallResult,
+    Option<([u8; 32], u32, usize)>,
+    Vec<(u32, Vec<u8>)>,
+    Vec<(String, i64, u32)>,
+    [u8; 32],
+);
+
+/// Everything a kernel call sequence leaves behind, call by call, and
+/// whether the kernel ran as native code.
+type Trace = (Vec<Step>, Option<bool>);
 
 /// Runs a fixed sequence of kernel entrypoints on `backend`.
 fn kernel_trace(module: &[u8], backend: Backend) -> Trace {
@@ -220,9 +231,9 @@ fn kernel_trace(module: &[u8], backend: Backend) -> Trace {
             5_000,
         ),
     ];
-    let mut results = Vec::new();
+    let mut steps = Vec::new();
     for (export, input, gas) in calls {
-        results.push(exec.call_export(
+        let result = exec.call_export(
             &kernel,
             export,
             [0; 32],
@@ -230,24 +241,32 @@ fn kernel_trace(module: &[u8], backend: Backend) -> Trace {
             gas,
             Capability::Privileged,
             Flags::default(),
+        );
+        steps.push((
+            result,
+            exec.last_position(),
+            exec.logs().to_vec(),
+            exec.metrics().to_vec(),
+            solo_node::extension::commitment(exec.state()),
         ));
     }
-    (
-        results,
-        exec.last_position(),
-        solo_node::extension::commitment(exec.state()),
-    )
+    (steps, exec.runs_natively(&kernel))
 }
 
 #[test]
 fn kernel_entrypoints_agree_on_both_backends() {
     let module = recompile(&Input::load(KERNEL).unwrap(), &Options::default()).unwrap();
-    let interpreted = kernel_trace(&module, Backend::Interpreter);
-    let statuses: Vec<Termination> = interpreted.0.iter().map(|r| r.status).collect();
+    let (interpreted, ran_natively) = kernel_trace(&module, Backend::Interpreter);
+    assert_eq!(ran_natively, None);
+    let statuses: Vec<Termination> = interpreted.iter().map(|s| s.0.status).collect();
     assert_eq!(&statuses[..6], &[Termination::Halt; 6]);
     assert_eq!(statuses[6], Termination::OutOfGas);
-    assert!(interpreted.0[0].gas_used > 1_000, "{:?}", interpreted.0[0]);
-    assert_eq!(kernel_trace(&module, Backend::Native), interpreted);
+    assert!(interpreted[0].0.gas_used > 1_000, "{:?}", interpreted[0].0);
+    let (native, ran_natively) = kernel_trace(&module, Backend::Native);
+    // The kernel must really have run as native code; a silent fallback
+    // would compare the interpreter with itself.
+    assert_eq!(ran_natively, Some(true));
+    assert_eq!(native, interpreted);
 }
 
 /// Wall-clock time of the kernel sequence on each backend; ignored by

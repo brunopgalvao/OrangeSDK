@@ -72,8 +72,10 @@ pub(crate) trait Emitter {
 }
 
 /// Lowers every block of `program` in layout order. Costs must already be
-/// known to fit (see `check` in the crate root).
-pub(crate) fn drive(mut e: impl Emitter, program: &Program) -> Code {
+/// known to fit (see `check` in the crate root). Stops with `None` as soon
+/// as the code passes `limit` bytes, so an oversized program costs at most
+/// `limit` plus one block of work and memory before it is rejected.
+pub(crate) fn drive(mut e: impl Emitter, program: &Program, limit: usize) -> Option<Code> {
     let n = program.module.blocks.len();
     let mut blocks = Vec::with_capacity(n);
     let mut exits = Vec::new();
@@ -107,12 +109,15 @@ pub(crate) fn drive(mut e: impl Emitter, program: &Program) -> Code {
                 }
             }
         }
+        if e.here() as usize > limit {
+            return None;
+        }
     }
     let bytes = e.finish(&blocks);
-    Code {
+    Some(Code {
         bytes,
         blocks,
         exits,
         sites,
-    }
+    })
 }

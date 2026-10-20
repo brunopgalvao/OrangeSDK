@@ -1068,6 +1068,10 @@ fn native_backend_matches_the_interpreter() {
         ro.extend_from_slice(&[0x42, 0xFF]);
         let mut results = vec![run(&mut exec, &hello, b"", 1_000_000)];
         let mut positions = vec![exec.last_position()];
+        // Native code really ran wherever the target has a backend; a
+        // silent fallback would compare the interpreter with itself.
+        let expected = (backend == Backend::Native).then_some(solo_jit::SUPPORTED);
+        assert_eq!(exec.runs_natively(&keccak256(&hello)), expected);
         // A nested call that commits, one whose callee traps, and a run out of gas.
         for (code, gas) in [
             (module(&imports(), &caller(50_000, 0, 64), &ro), 200_000),
@@ -1089,4 +1093,56 @@ fn native_backend_matches_the_interpreter() {
     assert_eq!(interpreted.0[3].status, Termination::OutOfGas);
     assert_eq!(run_all(Backend::Native), interpreted);
     assert_eq!(Backend::default(), Backend::Interpreter);
+}
+
+#[test]
+fn native_compile_outcomes_are_cached_and_bounded() {
+    use crate::executor::{Backend, NATIVE_CODE_BUDGET, NativeStats};
+    let hello = module(&imports(), &[li(Reg::A0, 7), Instruction::Halt], &[]);
+    let callee = callee();
+    let mut reference = executor();
+    let expected = run(&mut reference, &hello, b"", 10_000);
+
+    let mut exec = executor();
+    exec.set_backend(Backend::Native);
+    assert_eq!(exec.native_stats(), NativeStats::default());
+    let hash = load(&mut exec, &hello, Capability::Sandboxed);
+    assert_eq!(exec.runs_natively(&hash), None);
+    // No budget left: the program runs on the interpreter, and the failed
+    // compile is remembered rather than repeated on every call.
+    exec.set_native_code_budget(0);
+    for _ in 0..3 {
+        assert_eq!(run(&mut exec, &hello, b"", 10_000), expected);
+    }
+    assert_eq!(exec.runs_natively(&hash), Some(false));
+    assert_eq!(
+        exec.native_stats(),
+        NativeStats {
+            attempts: 1,
+            compiled: 0,
+            code_bytes: 0
+        }
+    );
+    // With room, another program compiles once and stays within budget;
+    // the earlier failure stays cached.
+    exec.set_native_code_budget(NATIVE_CODE_BUDGET);
+    let callee_hash = load(&mut exec, &callee, Capability::Sandboxed);
+    for _ in 0..2 {
+        exec.call(
+            &callee_hash,
+            NS,
+            &[1],
+            100_000,
+            Capability::Sandboxed,
+            Flags::default(),
+        );
+    }
+    let stats = exec.native_stats();
+    assert_eq!(stats.attempts, 2);
+    assert_eq!(stats.compiled, usize::from(solo_jit::SUPPORTED));
+    assert_eq!(stats.code_bytes > 0, solo_jit::SUPPORTED);
+    assert!(stats.code_bytes <= NATIVE_CODE_BUDGET);
+    assert_eq!(exec.runs_natively(&callee_hash), Some(solo_jit::SUPPORTED));
+    assert_eq!(exec.runs_natively(&hash), Some(false));
+    assert!(!format!("{stats:?}").is_empty());
 }

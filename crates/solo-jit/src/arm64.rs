@@ -8,8 +8,9 @@
 //! | `x27` | the gas counter |
 //! | `x9`–`x11` | scratch: effective address, host address, temporaries |
 //! | `x30` | link register for calls into the runtime |
+//! | `x29` | frame pointer: the entry trampoline's frame record, never a guest value |
 //! | `x18` | untouched (reserved by the platform) |
-//! | the other 24 | guest registers, most used first ([`HOST_REGS`]) |
+//! | the other 23 | guest registers, most used first ([`HOST_REGS`]) |
 //!
 //! Native code never calls Rust. Every exit stores the guest state back into
 //! the context and returns from the entry trampoline, so host calls, nested
@@ -30,9 +31,12 @@ use crate::ctx::{self, EXIT_FAULT, EXIT_HALT, EXIT_INVALID_JUMP, EXIT_OUT_OF_GAS
 use crate::ctx::{EXIT_TRAP, HEAP, RO, RW, STACK};
 use crate::regmap::RegMap;
 
-/// Host registers given to guest registers, in order of preference.
-pub(crate) const HOST_REGS: [u8; 24] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 29,
+/// Host registers given to guest registers, in order of preference. `x29`
+/// is left out: the platform ABI requires it to address a valid frame record
+/// at every instruction, so frame-pointer unwinders (sampling profilers,
+/// crash handlers) can walk through native code.
+pub(crate) const HOST_REGS: [u8; 23] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26,
 ];
 
 /// Largest code size the encodings reach: direct branches and calls span
@@ -244,10 +248,12 @@ impl Arm64 {
         self.emit(0x5400_0000 | (words as u32 & 0x7_FFFF) << 5 | cond);
     }
 
-    /// Saves the callee-saved registers, loads the guest state and jumps to
-    /// the address in `x1`. Called as [`Entry`] with the context in `x0`.
+    /// Saves the callee-saved registers, points `x29` at the new frame
+    /// record, loads the guest state and jumps to the address in `x1`.
+    /// Called as [`Entry`] with the context in `x0`.
     fn entry(&mut self) {
         self.pair(0xA980_0000, 29, LR, -12);
+        self.emit(0x9100_03FD); // mov x29, sp
         for (i, r) in [19u8, 21, 23, 25, 27].into_iter().enumerate() {
             self.pair(0xA900_0000, r, r + 1, 2 + 2 * i as i32);
         }
@@ -755,6 +761,19 @@ mod tests {
             .chunks(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
+    }
+
+    #[test]
+    fn the_frame_pointer_always_addresses_a_frame_record() {
+        // Platform ABI: x29 must name a valid frame record at every
+        // instruction, so it is never a guest register, and the trampoline
+        // points it at the record it pushes before running guest code.
+        assert!(!HOST_REGS.contains(&29));
+        assert!(!HOST_REGS.contains(&18));
+        let mut all = words(Arm64::entry);
+        all.truncate(2);
+        // stp x29, x30, [sp, #-96]!; mov x29, sp
+        assert_eq!(all, [0xA9BA_7BFD, 0x9100_03FD]);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use solo_jit::Compiled;
+use solo_jit::{Compiled, Options};
 use solo_vm::host::{Capability, Host, HostContext};
 use solo_vm::interp::{Instance, InstanceError};
 use solo_vm::module::Program;
@@ -113,7 +113,25 @@ pub struct Executor<S: Storage> {
     extension: Option<Box<dyn Extension<S>>>,
     last_position: Option<([u8; 32], u32, usize)>,
     backend: Backend,
-    native: HashMap<[u8; 32], Arc<Compiled>>,
+    /// The outcome of the one compile attempt per code hash: native code, or
+    /// `None` when compilation failed and the interpreter runs it.
+    native: HashMap<[u8; 32], Option<Arc<Compiled>>>,
+    native_stats: NativeStats,
+    native_budget: usize,
+}
+
+/// Default bound on the native code an executor keeps, in bytes.
+pub const NATIVE_CODE_BUDGET: usize = 256 << 20;
+
+/// What the native backend has done so far.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeStats {
+    /// Compile attempts: at most one per code hash, failures included.
+    pub attempts: usize,
+    /// Attempts that produced native code.
+    pub compiled: usize,
+    /// Bytes of native code held, never more than the budget.
+    pub code_bytes: usize,
 }
 
 /// Which backend runs instances. Results are identical (spec 07 §4); only
@@ -123,8 +141,10 @@ pub enum Backend {
     /// The reference interpreter.
     #[default]
     Interpreter,
-    /// Native code from `solo-jit`, compiled once per code hash. Falls back
-    /// to the interpreter on targets without a native backend.
+    /// Native code from `solo-jit`, compiled at most once per code hash.
+    /// The interpreter runs a program instead when the target has no native
+    /// backend, the program does not compile, or its code would take the
+    /// executor past its native code budget; that outcome is cached too.
     Native,
 }
 
@@ -145,6 +165,8 @@ impl<S: Storage> Executor<S> {
             last_position: None,
             backend: Backend::Interpreter,
             native: HashMap::new(),
+            native_stats: NativeStats::default(),
+            native_budget: NATIVE_CODE_BUDGET,
         }
     }
 
@@ -203,15 +225,47 @@ impl<S: Storage> Executor<S> {
         self.backend = backend;
     }
 
-    /// Native code for a cached program, compiled on first use; `None` where
-    /// the target has no native backend.
+    /// Bounds the native code this executor keeps (default
+    /// [`NATIVE_CODE_BUDGET`]). Programs whose code would not fit run on the
+    /// interpreter; code already compiled stays.
+    pub fn set_native_code_budget(&mut self, bytes: usize) {
+        self.native_budget = bytes;
+    }
+
+    /// Native backend counters.
+    #[must_use]
+    pub fn native_stats(&self) -> NativeStats {
+        self.native_stats
+    }
+
+    /// Whether the program `hash` runs natively: `None` before its first
+    /// call under [`Backend::Native`], then the cached outcome.
+    #[must_use]
+    pub fn runs_natively(&self, hash: &[u8; 32]) -> Option<bool> {
+        self.native.get(hash).map(Option::is_some)
+    }
+
+    /// Native code for a cached program, compiled on first use; `None` when
+    /// the interpreter must run it. Each hash is attempted once, so a
+    /// program that fails to compile never pays for code generation again.
     fn native_code(&mut self, hash: &[u8; 32], program: &Program) -> Option<Arc<Compiled>> {
         if let Some(code) = self.native.get(hash) {
-            return Some(Arc::clone(code));
+            return code.clone();
         }
-        let code = Arc::new(Compiled::new(program).ok()?);
-        self.native.insert(*hash, Arc::clone(&code));
-        Some(code)
+        let options = Options {
+            code_limit: self
+                .native_budget
+                .saturating_sub(self.native_stats.code_bytes),
+            ..Options::default()
+        };
+        let code = Compiled::with_options(program, options).ok().map(Arc::new);
+        self.native_stats.attempts += 1;
+        if let Some(code) = &code {
+            self.native_stats.compiled += 1;
+            self.native_stats.code_bytes += code.code_size();
+        }
+        self.native.insert(*hash, code.clone());
+        code
     }
 
     /// Lowers the nesting limit; for tests and constrained hosts.

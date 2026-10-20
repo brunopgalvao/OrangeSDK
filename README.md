@@ -43,7 +43,7 @@ cargo llvm-cov --workspace --fail-under-lines 100
 
 ## Native backend
 
-`solo-jit` translates a validated program to native code once and runs it in-process. It is bit-exact with the reference interpreter, which stays the oracle: same registers, memory, gas (including the exact out-of-gas point), termination status and program position. Host calls, `sbrk`, `memcopy` and `memfill` return to Rust and are performed exactly as the interpreter performs them, so a host implements the same `Host` trait for both. The executor picks a backend with `Executor::set_backend(Backend::Native)`; on targets without a backend it falls back to the interpreter.
+`solo-jit` translates a validated program to native code once and runs it in-process. It is bit-exact with the reference interpreter, which stays the oracle: same registers, memory, gas (including the exact out-of-gas point), termination status and program position. Host calls, `sbrk`, `memcopy` and `memfill` return to Rust and are performed exactly as the interpreter performs them, so a host implements the same `Host` trait for both. The executor picks a backend with `Executor::set_backend(Backend::Native)`. It compiles each code hash at most once and caches the outcome, failures included, and it keeps at most `NATIVE_CODE_BUDGET` bytes of native code (adjustable with `set_native_code_budget`). A program that has no native backend on this target, does not compile, or would not fit in the budget runs on the interpreter.
 
 Every change runs the differential suite of spec 07 §4.1: generated modules, per-instruction edge tables, the `hello` guest and the kernel's entrypoints, each on both backends. Timings, in release mode:
 
