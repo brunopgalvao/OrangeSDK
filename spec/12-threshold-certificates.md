@@ -171,7 +171,7 @@ A verifier contract for version 1 holds as constants the chain id, `PK` in EIP-2
 4. calls `BLS12_MAP_FP_TO_G1` (`0x10`) on `u_0` and on `u_1` and `BLS12_G1ADD` (`0x0b`) on the two results, giving `H(message, DST_SIG)` (the map precompile clears the cofactor, and cofactor clearing is linear, so map–map–add equals `hash_to_curve`);
 5. calls `BLS12_PAIRING_CHECK` (`0x0f`) on `signature ‖ (−g2) ‖ H ‖ PK` (768 bytes) and accepts exactly when it returns 32 bytes ending in `0x01`. The precompile checks that the signature is on the curve and in the subgroup.
 
-The BLS precompiles cost 114 275 gas; SHA-256 adds 516 and MODEXP 2 × 200 (2 × 500 once EIP-7883 is active). The reference contract of Appendix A spends 152 755 gas per `verify` call on a Prague EVM, most of the difference being unoptimised memory copying. ADR 0013 makes the verifier immutable per certificate version.
+The BLS precompiles cost 114 275 gas; SHA-256 adds 516 and MODEXP 2 × 200 (2 × 500 once EIP-7883 is active). The reference contract of Appendix A spends 126 705 gas of execution per `verify` call on an Osaka EVM (spec 17 §8). ADR 0013 makes the verifier immutable per certificate version. Spec 17 builds the light client on it: a certificate signs a proposal hash, and the proposal's anchor carries the state root the certificate vouches for (17 §4).
 
 ## 9. Worked examples
 
@@ -244,75 +244,4 @@ The implementation also passes the RFC 9380 vectors of Appendices J.9.1 (`BLS123
 
 ## Appendix A. Reference verifier (informative)
 
-The contract below follows §8. It was compiled with solc 0.8.28 and run on a Prague EVM against the example of §9.1: `verify(1, 0xabab…ab, signature)` returns true for 152 755 gas, and false for another height, block or chain id.
-
-```solidity
-// SPDX-License-Identifier: Apache-2.0
-pragma solidity ^0.8.28;
-
-contract SoloFinalityVerifierV1 {
-    uint64 public immutable chainId;
-    bytes32 private immutable k0; bytes32 private immutable k1; bytes32 private immutable k2; bytes32 private immutable k3;
-    bytes32 private immutable k4; bytes32 private immutable k5; bytes32 private immutable k6; bytes32 private immutable k7;
-
-    bytes private constant DST = "SOLO-V01-CS01-with-BLS12381G1_XMD:SHA-256_SSWU_RO_";
-    bytes private constant P =
-        hex"1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab";
-    bytes private constant NEG_G2 = hex"…"; // −g2 in EIP-2537 encoding, §9.1
-
-    constructor(uint64 chainId_, bytes memory groupKey) {
-        require(groupKey.length == 256, "key");
-        chainId = chainId_;
-        bytes32[8] memory w;
-        for (uint256 i = 0; i < 8; i++) {
-            bytes32 word;
-            assembly { word := mload(add(add(groupKey, 32), mul(i, 32))) }
-            w[i] = word;
-        }
-        (k0, k1, k2, k3, k4, k5, k6, k7) = (w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-    }
-
-    function verify(uint64 height, bytes32 blockHash, bytes calldata signature) external view returns (bool) {
-        require(signature.length == 128, "signature");
-        bytes memory message = abi.encodePacked(bytes13("SOLO-FINALITY"), uint8(1), chainId, height, blockHash);
-        bytes memory h = hashToG1(message);
-        bytes memory input = abi.encodePacked(signature, NEG_G2, h, k0, k1, k2, k3, k4, k5, k6, k7);
-        (bool ok, bytes memory out) = address(0x0f).staticcall(input);
-        return ok && out.length == 32 && uint256(bytes32(out)) == 1;
-    }
-
-    function hashToG1(bytes memory message) internal view returns (bytes memory) {
-        bytes memory uniform = expandMessageXmd(message);
-        bytes memory u0 = new bytes(64);
-        bytes memory u1 = new bytes(64);
-        for (uint256 i = 0; i < 64; i++) {
-            u0[i] = uniform[i];
-            u1[i] = uniform[64 + i];
-        }
-        (bool ok0, bytes memory q0) = address(0x10).staticcall(reduce(u0));
-        (bool ok1, bytes memory q1) = address(0x10).staticcall(reduce(u1));
-        require(ok0 && ok1, "map");
-        (bool ok, bytes memory h) = address(0x0b).staticcall(abi.encodePacked(q0, q1));
-        require(ok, "add");
-        return h;
-    }
-
-    function expandMessageXmd(bytes memory message) internal pure returns (bytes memory out) {
-        bytes memory dstPrime = abi.encodePacked(DST, uint8(DST.length));
-        bytes32 b0 = sha256(abi.encodePacked(new bytes(64), message, uint16(128), uint8(0), dstPrime));
-        bytes32 bi = sha256(abi.encodePacked(b0, uint8(1), dstPrime));
-        out = abi.encodePacked(bi);
-        for (uint8 i = 2; i <= 4; i++) {
-            bi = sha256(abi.encodePacked(b0 ^ bi, i, dstPrime));
-            out = abi.encodePacked(out, bi);
-        }
-    }
-
-    function reduce(bytes memory x) internal view returns (bytes memory) {
-        bytes memory input = abi.encodePacked(uint256(64), uint256(1), uint256(48), x, uint8(1), P);
-        (bool ok, bytes memory r) = address(0x05).staticcall(input);
-        require(ok && r.length == 48, "modexp");
-        return abi.encodePacked(bytes16(0), r);
-    }
-}
-```
+The reference verifier is `contracts/SoloFinalityVerifierV1.sol`, compiled by `tools/build-contracts.sh` with solc 0.8.28 (spec 17 §9). It follows §8 step by step: the constructor takes the chain id and `PK` in EIP-2537 encoding, checks the key with `BLS12_G2MSM` and keeps it in eight immutable words; `verify(height, blockHash, signature)` builds `message` with `abi.encodePacked`, expands it with five SHA-256 calls into four words, reduces each 64-byte half with MODEXP, maps both with `BLS12_MAP_FP_TO_G1`, adds them with `BLS12_G1ADD` and runs `BLS12_PAIRING_CHECK` on `signature ‖ −g2 ‖ H ‖ PK`. `crates/solo-bridge/tests/contracts.rs` runs it on revm at Osaka against the example of §9.1: `verify(1, 0xabab…ab, signature)` returns true for 126 705 gas of execution, and false for another height, block or chain id, a signature by another key, or a signature off the curve; a signature that is not 128 bytes reverts. An earlier draft of this appendix copied the halves of `uniform` byte by byte and spent 152 755 gas on a Prague EVM.
