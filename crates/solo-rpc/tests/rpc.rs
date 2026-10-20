@@ -310,7 +310,7 @@ fn rejections_carry_reasons() {
     let bob = Wallet::new(2);
     let poor = Wallet::new(3);
     let mut rpc = rpc(&alice);
-    let cases: [(Vec<u8>, &str); 6] = [
+    let cases: [(Vec<u8>, &str); 7] = [
         (alice.transfer(1, bob.address, ETHER, 21_000), "nonce"),
         (
             poor.transfer(0, bob.address, ETHER, 21_000),
@@ -324,11 +324,14 @@ fn rejections_carry_reasons() {
             alice.transfer_on(0, bob.address, ETHER, 21_000, CHAIN_ID + 1, &[]),
             "wrong chain",
         ),
+        // Calldata is executed now, so 21 000 gas no longer covers a transfer that carries it.
         (
             alice.transfer_on(0, bob.address, ETHER, 21_000, CHAIN_ID, &[1]),
-            "not supported",
+            "intrinsic gas",
         ),
-        (b"garbage".to_vec(), "malformed"),
+        // A first byte below 0x80 is a typed envelope; 'g' is no type the kernel executes.
+        (b"garbage".to_vec(), "not supported"),
+        (vec![0xC0], "malformed"),
     ];
     for (raw, text) in cases {
         let (code, message) =
