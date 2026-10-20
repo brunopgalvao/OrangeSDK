@@ -39,7 +39,7 @@ Names follow EIP-2159 where it defines a metric (`ethereum_*`); every other name
 | `ethereum_peer_count` | gauge | — | Peers that completed the handshake (09 §3) (EIP-2159). Absent on a node without a peer-to-peer transport. |
 | `solo_chain_finalized_height` | gauge | — | The last height this node finalized. |
 | `solo_chain_head_age_seconds` | gauge | — | Seconds since the head last advanced, or since the node opened if it has executed no block. Computed at scrape time. |
-| `solo_chain_id` | gauge | — | The chain id the kernel reports. Absent while the kernel cannot answer. |
+| `solo_chain_id` | gauge | — | The chain id the kernel reports, refreshed at scrape time. Absent until the kernel has answered once. |
 | `solo_blocks_executed_total` | counter | — | Blocks this node executed (`ExecuteBlock` applied). |
 | `solo_blocks_finalized_total` | counter | — | Blocks this node finalized (`FinalizeBlock` applied). |
 | `solo_block_transactions_total` | counter | — | Transactions in executed blocks, from each `ExecuteSummary.tx_count`. |
