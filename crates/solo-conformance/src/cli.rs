@@ -37,7 +37,8 @@ pub fn fixture_files(path: &Path) -> Result<Vec<PathBuf>, String> {
 
 /// Runs the command with `args` (without the program name), writing the
 /// report to `out`. Returns the exit code: 0 when every case passed or
-/// failed as listed, 1 otherwise, 2 for a usage or input error.
+/// failed as listed and, under `--native` or `--both`, the guest ran as
+/// native code; 1 otherwise; 2 for a usage or input error.
 pub fn main(args: &[String], out: &mut String) -> i32 {
     match run(args, out) {
         Ok(true) => 0,
@@ -84,5 +85,18 @@ fn run(args: &[String], out: &mut String) -> Result<bool, String> {
         .collect::<Result<Vec<_>, _>>()?;
     let report = suite::run(&cases, &mut runners, &expected);
     let _ = write!(out, "{report}");
-    Ok(report.ok(true))
+    // The executor falls back to the interpreter when the native backend
+    // cannot compile the guest; a run that asked for native code and got
+    // none has compared nothing against the interpreter.
+    let native = runners
+        .iter()
+        .filter(|r| r.backend() == Backend::Native)
+        .all(|r| r.runs_natively() == Some(true));
+    if !native {
+        let _ = writeln!(
+            out,
+            "the native backend did not run the guest as native code"
+        );
+    }
+    Ok(report.ok(true) && native)
 }

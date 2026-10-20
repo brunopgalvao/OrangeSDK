@@ -23,6 +23,7 @@ mod state;
 #[path = "../../kernel/src/tx.rs"]
 mod tx;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use solo_abi::chain::{GenesisParams, call_status};
@@ -74,6 +75,67 @@ solo_guest::solo_export!(conformance_run, |input: &[u8]| -> Vec<u8> {
         Err(_) => solo_guest::trap(),
     }
 });
+
+/// The address of a heap block, opaque to the optimizer so that it can
+/// neither elide the allocation nor fold comparisons between blocks.
+fn address<T: ?Sized>(block: &T) -> usize {
+    core::hint::black_box(core::ptr::from_ref(block).cast::<u8>()) as usize
+}
+
+/// A block whose alignment is larger than a page.
+#[repr(C, align(8192))]
+struct PageAligned([u8; 16]);
+
+/// Checks the guest runtime's allocator (`solo_guest::heap::Pool`) from the
+/// inside, one byte per property, 1 when it holds, in this order:
+///
+/// 0. a freed block is the next one handed out in its size class;
+/// 1. a freed block of a large class (1 MiB) is handed out again too;
+/// 2. growing a block within its class keeps it in place;
+/// 3. growing it past its class moves it, keeps its contents and frees the
+///    old block for the next allocation of that class;
+/// 4. blocks aligned above a page come out aligned, every time.
+///
+/// Nothing else allocates between the steps, so each comparison is exact.
+fn heap_check() -> Vec<u8> {
+    let small = Box::new([7u8; 100]);
+    let freed = address(&*small);
+    drop(small);
+    let again = Box::new([9u8; 120]);
+    let reuse = address(&*again) == freed;
+    drop(again);
+
+    let large = alloc::vec![1u8; 1 << 20];
+    let freed = address(&*large);
+    drop(large);
+    let again = alloc::vec![2u8; (1 << 20) - 100];
+    let reuse_large = address(&*again) == freed;
+    drop(again);
+
+    let mut grown: Vec<u8> = Vec::with_capacity(40);
+    grown.extend_from_slice(b"solo");
+    let first = address(grown.as_slice());
+    grown.reserve_exact(56);
+    let in_place = address(grown.as_slice()) == first && grown.capacity() >= 60;
+    grown.reserve_exact(200);
+    let moved = address(grown.as_slice()) != first && grown == b"solo";
+    let next = Box::new([3u8; 64]);
+    let moved = moved && address(&*next) == first;
+    drop(next);
+    drop(grown);
+
+    let one = Box::new(PageAligned([0; 16]));
+    let two = Box::new(PageAligned([1; 16]));
+    let aligned = address(&*one) % 8192 == 0 && address(&*two) % 8192 == 0;
+    drop(one);
+    let three = Box::new(PageAligned([2; 16]));
+    let aligned = aligned && address(&*three) % 8192 == 0 && two.0[0] == 1 && three.0[0] == 2;
+    drop((two, three));
+
+    [reuse, reuse_large, in_place, moved, aligned].into_iter().map(u8::from).collect()
+}
+
+solo_guest::solo_export!(heap_check, |_input: &[u8]| -> Vec<u8> { heap_check() });
 
 // The VM starts at an export; `main` exists only so the linker is satisfied.
 solo_guest::solo_main!(unused_main);

@@ -21,6 +21,12 @@ pub struct Executed {
     pub outcome: Outcome,
     /// The state left in storage.
     pub post: State,
+    /// Addresses with storage slots but no account, in order. Ethereum has
+    /// no such thing, and the state root cannot show it (an account's slots
+    /// are reached only through the account), but Solo's own commitment
+    /// (spec 10) covers them and they would reappear under a new account at
+    /// the address, so any is a failure of its own.
+    pub orphans: Vec<[u8; 20]>,
 }
 
 /// The conformance guest loaded into an executor.
@@ -42,9 +48,24 @@ impl Runner {
     /// When the ELF loads but does not recompile (floating point, an
     /// unsupported relocation): guests are built for the recompiler.
     pub fn new(elf: &[u8], backend: Backend) -> Result<Runner, String> {
+        Runner::with_options(elf, backend, &solo_recompile::Options::default())
+    }
+
+    /// [`Runner::new`] with recompiler options other than the defaults the
+    /// node uses: a smaller `heap_max`, to measure what a case keeps live.
+    ///
+    /// # Errors
+    /// As [`Runner::new`].
+    ///
+    /// # Panics
+    /// As [`Runner::new`].
+    pub fn with_options(
+        elf: &[u8],
+        backend: Backend,
+        options: &solo_recompile::Options,
+    ) -> Result<Runner, String> {
         let input = solo_recompile::Input::load(elf).map_err(|e| format!("guest ELF: {e:?}"))?;
-        let module = solo_recompile::recompile(&input, &solo_recompile::Options::default())
-            .expect("the guest recompiles");
+        let module = solo_recompile::recompile(&input, options).expect("the guest recompiles");
         let mut exec = Executor::new(ModuleCache::default(), MemStorage::default());
         exec.set_backend(backend);
         let guest = exec
@@ -80,12 +101,47 @@ impl Runner {
     /// storage that is not in the kernel's layout: both would be bugs in the
     /// guest, not results to compare.
     pub fn run(&mut self, case: &Case) -> Result<Executed, Termination> {
-        *self.exec.state_mut() = Overlay::new(MemStorage::default());
+        self.run_on(case, MemStorage::default())
+    }
+
+    /// Runs `case` on `storage` rather than empty storage: state written in
+    /// the kernel's layout before genesis allocation, for cases whose
+    /// pre-state is too large to pass as allocations (many accounts sharing
+    /// one code), or that is not one genesis could create.
+    ///
+    /// # Errors
+    /// As [`Runner::run`].
+    ///
+    /// # Panics
+    /// As [`Runner::run`].
+    pub fn run_on(&mut self, case: &Case, storage: MemStorage) -> Result<Executed, Termination> {
+        let output = self.call(EXPORT, &case.to_bytes(), storage)?;
+        let outcome = Outcome::from_bytes(&output).expect("the guest encodes an Outcome");
+        let (post, orphans) = self.post_state();
+        Ok(Executed {
+            outcome,
+            post,
+            orphans,
+        })
+    }
+
+    /// Calls `export` of the guest with `input` on `storage` and returns its
+    /// output.
+    ///
+    /// # Errors
+    /// How the guest ended when it did not halt.
+    pub fn call(
+        &mut self,
+        export: &str,
+        input: &[u8],
+        storage: MemStorage,
+    ) -> Result<Vec<u8>, Termination> {
+        *self.exec.state_mut() = Overlay::new(storage);
         let result = self.exec.call_export(
             &self.guest,
-            EXPORT,
+            export,
             [0; 32],
-            &case.to_bytes(),
+            input,
             CASE_GAS,
             Capability::Privileged,
             Flags::default(),
@@ -93,15 +149,12 @@ impl Runner {
         if result.status != Termination::Halt {
             return Err(result.status);
         }
-        let outcome = Outcome::from_bytes(&result.output).expect("the guest encodes an Outcome");
-        Ok(Executed {
-            outcome,
-            post: self.post_state(),
-        })
+        Ok(result.output)
     }
 
-    /// The accounts in storage, in the kernel's layout (`solo_abi::chain::keys`).
-    fn post_state(&self) -> State {
+    /// The accounts in storage, in the kernel's layout (`solo_abi::chain::keys`),
+    /// and the addresses that have slots but no account.
+    fn post_state(&self) -> (State, Vec<[u8; 20]>) {
         let storage = self.exec.state();
         let mut state = State::new();
         for (key, value) in storage.scan(keys::ACCOUNT) {
@@ -141,6 +194,17 @@ impl Runner {
                 },
             );
         }
-        state
+        let mut orphans: Vec<[u8; 20]> = storage
+            .scan(keys::SLOT)
+            .into_iter()
+            .map(|(key, _)| {
+                key[keys::SLOT.len()..keys::SLOT.len() + 20]
+                    .try_into()
+                    .expect("slot keys start with an address")
+            })
+            .filter(|address| !state.contains_key(address))
+            .collect();
+        orphans.dedup();
+        (state, orphans)
     }
 }

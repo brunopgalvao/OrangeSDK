@@ -7,8 +7,12 @@
 //! bounded by what is live at once (at most twice it, per class) rather than
 //! by everything ever allocated. That matters to the kernel: the EVM drops
 //! call inputs, return data and call frames as fast as gas lets it create
-//! them, and a heap that never took memory back would run out within one
-//! transaction (`crates/solo-conformance/tests/heap.rs`).
+//! them. A transaction looping over the identity precompile finishes in a
+//! 16 MiB heap with this allocator; one that never took memory back needs
+//! more than 128 MiB for it (`crates/solo-conformance/tests/heap.rs`, which
+//! also checks the rules above from inside the guest). The price is the
+//! rounding: a block takes up to twice its size, and a class's blocks stay in
+//! that class for the instance's life, so a 24 KiB code copy holds 32 KiB.
 //!
 //! An allocation the heap cannot satisfy returns null, which `alloc` turns
 //! into a handled allocation error: the instance traps.

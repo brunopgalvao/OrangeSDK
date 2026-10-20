@@ -31,6 +31,12 @@ pub fn check(case: &TestCase, executed: &Result<Executed, Termination>) -> Resul
         }
         _ => {}
     }
+    if let Some(address) = executed.orphans.first() {
+        return Err(format!(
+            "storage slots remain under 0x{}, which has no account",
+            hex(address)
+        ));
+    }
     let root = state_root(&executed.post);
     if root != case.expected.state_root {
         let detail = case.expected.state.as_ref().map_or_else(

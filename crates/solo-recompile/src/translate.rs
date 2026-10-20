@@ -26,10 +26,11 @@ pub struct Options {
 }
 
 /// Default maximum heap: 1 GiB (spec 03 §8 rule 10). Kernels are recompiled
-/// with the defaults, and one Osaka transaction (2^24 gas, EIP-7825) can keep
-/// close to 200 MiB live in the EVM; the heaviest execution-spec state test
-/// needs 192 MiB (spec 07 §4.2). The heap grows only as `sbrk` asks, at
-/// 256 gas a page, so the bound costs nothing until it is used.
+/// with the defaults. The heaviest Osaka transaction known (2^24 gas,
+/// EIP-7825) needs between 256 and 320 MiB of guest heap, and a full block of
+/// the reference kernel about 600 MiB at that rate (spec 07 §4.2). The heap
+/// grows only as `sbrk` asks, at 256 gas a page, so the bound costs nothing
+/// until it is used.
 pub const HEAP_MAX: u32 = 1 << 30;
 
 impl Default for Options {

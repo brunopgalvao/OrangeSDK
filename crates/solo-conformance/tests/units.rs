@@ -386,3 +386,43 @@ fn outcome_records_are_what_the_guest_returns() {
     );
     assert!(run.outcome.gas_used > 21_000);
 }
+
+/// Slots under an address with no account are invisible to Ethereum's state
+/// root, so they are reported on their own: a commit that removed an account
+/// but kept its storage would otherwise pass. Slots under an account that
+/// exists are its storage, not orphans.
+#[test]
+fn storage_without_an_account_fails_the_case() {
+    use solo_abi::chain::keys;
+    use solo_host::{MemStorage, Storage};
+    let case = base();
+    let owner = *case.pre.keys().next().unwrap();
+    let orphan = [0x0Fu8; 20];
+    let slot = |address: &[u8; 20], index: u8| {
+        let mut key = [keys::SLOT, &address[..]].concat();
+        key.extend_from_slice(&[index; 32]);
+        key
+    };
+    let mut storage = MemStorage::default();
+    storage.set(&slot(&orphan, 1), &[1; 32]);
+    storage.set(&slot(&orphan, 2), &[2; 32]);
+    storage.set(&slot(&owner, 3), &[3; 32]);
+    let mut runner = Runner::new(GUEST, Backend::Interpreter).unwrap();
+    let executed = runner.run_on(&case.to_case().unwrap(), storage).unwrap();
+    assert_eq!(executed.orphans, vec![orphan]);
+    assert_eq!(executed.post[&owner].storage[&[3; 32]], [3; 32]);
+    assert_eq!(
+        check(&case, &Ok(executed)).unwrap_err(),
+        format!(
+            "storage slots remain under 0x{}, which has no account",
+            hex(&orphan)
+        )
+    );
+    // The same case on empty storage leaves none.
+    assert!(executed_orphans_empty(&case));
+}
+
+fn executed_orphans_empty(case: &TestCase) -> bool {
+    let executed = executed(case);
+    executed.orphans.is_empty() && check(case, &Ok(executed)).is_ok()
+}

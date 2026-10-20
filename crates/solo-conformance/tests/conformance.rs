@@ -80,6 +80,7 @@ fn command_runs_a_directory_on_both_backends() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{stdout}");
     assert!(stdout.contains("istanbul/eip1344_chainid"), "{stdout}");
+    assert!(!stdout.contains("native code"), "{stdout}");
     // Prefix and type entries need not excuse anything in a partial run.
     let total = stdout.lines().find(|l| l.starts_with("total")).unwrap();
     assert_eq!(
@@ -101,6 +102,29 @@ fn command_reports_failures() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "{stdout}");
     assert!(stdout.contains("FAIL tests/istanbul/eip1344_chainid/test_chainid.py::test_chainid[fork_Osaka-typed_transaction_3-state_test]: the transaction was refused"), "{stdout}");
+}
+
+/// A run that asked for the native backend fails unless the guest really ran
+/// as native code: the executor would otherwise fall back to the interpreter
+/// and compare it with itself. With no case to run, nothing ran natively.
+#[test]
+fn command_fails_when_the_native_backend_ran_nothing() {
+    let empty = scratch("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    for backends in ["--native", "--both"] {
+        let out = bin()
+            .args([backends, empty.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains("the native backend did not run the guest as native code"),
+            "{stdout}"
+        );
+    }
+    let out = bin().arg(empty.to_str().unwrap()).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
 }
 
 #[test]
