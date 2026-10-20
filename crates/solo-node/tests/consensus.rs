@@ -55,6 +55,7 @@ fn genesis(keys: &[SigningKey], funded: [u8; 20]) -> Genesis {
             address: funded,
             balance: 100 * ETHER,
         }]),
+        ..GenesisParams::default()
     };
     Genesis {
         chain_id: CHAIN_ID,

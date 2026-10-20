@@ -8,6 +8,7 @@ extern crate alloc;
 
 mod driver;
 mod evm;
+mod governance;
 mod persist;
 mod state;
 mod stf;
@@ -42,9 +43,12 @@ solo_guest::solo_export!(kernel_driver_state, |_input: &[u8]| -> Vec<u8> {
 
 solo_guest::solo_export!(kernel_migrate, |input: &[u8]| -> Vec<u8> {
     let args: MigrateArgs = decode_or_trap(input);
+    governance::migrate(&args);
     driver::migrate(&args);
     Vec::new()
 });
+
+solo_guest::solo_export!(kernel_version, |_input: &[u8]| -> Vec<u8> { governance::KERNEL_VERSION.to_bytes() });
 
 solo_guest::solo_export!(kernel_stf_validate_tx, |input: &[u8]| -> Vec<u8> {
     let args: ValidateArgs = decode_or_trap(input);

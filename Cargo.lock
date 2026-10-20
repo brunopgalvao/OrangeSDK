@@ -542,6 +542,7 @@ dependencies = [
  "solo-host",
  "solo-recompile",
  "solo-rlp",
+ "solo-upgrade",
  "solo-vm",
 ]
 
@@ -572,6 +573,15 @@ dependencies = [
  "solo-node",
  "solo-recompile",
  "solo-rlp",
+]
+
+[[package]]
+name = "solo-upgrade"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+ "solo-abi",
+ "tiny-keccak",
 ]
 
 [[package]]

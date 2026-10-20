@@ -100,6 +100,7 @@ fn genesis(alice: &Wallet) -> Genesis {
             address: alice.address,
             balance: 100 * ETHER,
         }]),
+        ..GenesisParams::default()
     };
     Genesis {
         chain_id: CHAIN_ID,
@@ -267,6 +268,7 @@ fn transfers_make_blocks() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn rejections() {
     let alice = Wallet::new(1);
     let bob = Wallet::new(2);
@@ -359,6 +361,7 @@ fn rejections() {
                     address: whale.address,
                     balance: ETHER + 21_000 * gp,
                 }]),
+                ..GenesisParams::default()
             };
             g.params = params.to_bytes();
             g

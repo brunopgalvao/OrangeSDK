@@ -102,6 +102,7 @@ pub fn genesis(alice: &Wallet) -> Genesis {
             address: alice.address,
             balance: 100 * ETHER,
         }]),
+        ..GenesisParams::default()
     };
     Genesis {
         chain_id: CHAIN_ID,

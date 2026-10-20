@@ -58,6 +58,23 @@ record! {
         max_txs: u32,
         /// Initial balances.
         allocations: Seq<Allocation>,
+        /// Governed kernel upgrades and host feature gates (spec 13).
+        upgrades: UpgradeParams,
+    }
+}
+
+record! {
+    /// Genesis parameters of governed kernel upgrades and host feature gates
+    /// (spec 13), carried in `GenesisParams::upgrades`.
+    UpgradeParams {
+        /// The account allowed to stage, propose and cancel kernel upgrades;
+        /// zero disables kernel upgrades.
+        governance: Address,
+        /// Fewest blocks between the block that proposes an upgrade and its
+        /// activation height; a proposal is always at least one block ahead.
+        min_delay: u64,
+        /// Blocks per feature-gate epoch; zero disables feature-gate signalling.
+        epoch_blocks: u64,
     }
 }
 
@@ -237,6 +254,10 @@ pub mod reason {
     pub const GAS_LIMIT_TOO_HIGH: u32 = 9;
     /// Contract initcode above the EIP-3860 limit.
     pub const INITCODE_TOO_LARGE: u32 = 10;
+    /// A transaction to the upgrade system address that cannot run: value
+    /// attached, calldata that is not an action, or a sender the action does
+    /// not authorize (spec 13 §2).
+    pub const SYSTEM_ACTION: u32 = 11;
 }
 
 /// Storage key prefixes of the reference kernel.
@@ -588,6 +609,11 @@ mod tests {
                 address: [1; 20],
                 balance: 7,
             }]),
+            upgrades: UpgradeParams {
+                governance: [2; 20],
+                min_delay: 10,
+                epoch_blocks: 100,
+            },
         });
         roundtrip(&BlockHeader {
             height: 1,
@@ -649,7 +675,7 @@ mod tests {
         });
         assert_eq!(TRANSFER_GAS, 21_000);
         assert_eq!(query::ACCOUNT, "account");
-        assert_eq!(reason::BAD_NONCE, 4);
+        assert_eq!((reason::BAD_NONCE, reason::SYSTEM_ACTION), (4, 11));
         assert_eq!(keys::ACCOUNT, b"acct/");
         assert!(alloc::format!("{:?}", Account::default()).contains("Account"));
         for name in [
