@@ -10,6 +10,7 @@ rust-version.workspace = true
 solo-abi = { path = "../solo-abi" }
 solo-eth = { path = "../solo-eth" }
 solo-host = { path = "../solo-host" }
+solo-metrics = { path = "../solo-metrics" }
 solo-node = { path = "../solo-node" }
 solo-rlp = { path = "../solo-rlp" }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }

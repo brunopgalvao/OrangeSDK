@@ -130,7 +130,7 @@ Network functions are *effects* in the driver model (06): they enqueue; nothing 
 | `log_emit` | `a0` level, `a1` msg, `a2` len | `a0` = 0 | Sandboxed | 10 + 1 per 32 bytes |
 | `metric_emit` | `a0` name, `a1` name_len, `a2` value (i64), `a3` kind | `a0` = 0 | Sandboxed | 10 |
 
-Both are ignored by consensus. A host MAY drop them under load. They are charged so that a contract cannot use them as free work.
+Both are ignored by consensus. A host MAY drop them under load. They are charged so that a contract cannot use them as free work. The meaning of `kind` and of `level`, and how a node exports what it records, are in 11 §4–§5.
 
 ## 5. Determinism requirements on the host
 

@@ -274,8 +274,13 @@ pub fn dispatch<S: Storage>(
             let name = read(ctx, a0, a1)?;
             #[allow(clippy::cast_possible_wrap)]
             let value = ctx.arg(Reg::A2) as i64;
-            host.metrics
-                .push((String::from_utf8_lossy(&name).into_owned(), value, a3));
+            let capability = host.frame().capability;
+            host.metrics.push((
+                String::from_utf8_lossy(&name).into_owned(),
+                value,
+                a3,
+                capability,
+            ));
             ctx.set(Reg::A0, 0);
         }
         _ => return Err(Termination::HostError(HostStatus::Unavailable.code())),

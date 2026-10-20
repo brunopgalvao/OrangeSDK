@@ -17,3 +17,5 @@ pub mod methods;
 pub mod views;
 
 pub use methods::{Rpc, RpcError};
+
+pub mod telemetry;

@@ -172,7 +172,7 @@ type Step = (
     CallResult,
     Option<([u8; 32], u32, usize)>,
     Vec<(u32, Vec<u8>)>,
-    Vec<(String, i64, u32)>,
+    Vec<(String, i64, u32, Capability)>,
     [u8; 32],
 );
 

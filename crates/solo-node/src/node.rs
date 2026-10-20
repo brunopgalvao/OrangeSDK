@@ -162,6 +162,8 @@ pub struct Node {
     committed: BTreeMap<u64, solo_trie::Trie>,
     /// How many executed blocks' tries to keep; see [`PROOF_HISTORY`].
     pub proof_history: usize,
+    /// Telemetry (spec 11); consensus-ignored.
+    pub(crate) telemetry: solo_metrics::NodeMetrics,
 }
 
 impl Node {
@@ -214,6 +216,7 @@ impl Node {
             tx_gossip: Vec::new(),
             committed: BTreeMap::new(),
             proof_history: PROOF_HISTORY,
+            telemetry: solo_metrics::NodeMetrics::new(),
         };
         node.call_unit(exports::INIT, &genesis.to_bytes())?;
         node.kernel_gas = config.kernel_gas;
@@ -232,6 +235,7 @@ impl Node {
     ) -> Result<CallResult, NodeError> {
         let kernel = self.kernel;
         self.services.borrow_mut().commitments.clear();
+        let started = std::time::Instant::now();
         let r = self.exec.call_export(
             &kernel,
             export,
@@ -241,6 +245,7 @@ impl Node {
             Capability::Privileged,
             Flags::default(),
         );
+        crate::telemetry::record_call(&mut self.telemetry, &mut self.exec, export, started, &r);
         if r.status == Termination::Halt {
             Ok(r)
         } else {
@@ -399,6 +404,7 @@ impl Node {
                 .to_bytes();
                 self.call_unit(exports::FINALIZE_BLOCK, &args)?;
                 self.finalized.push(height);
+                self.telemetry.block_finalized(height);
                 None
             }
             Effect::PersistState { state } => {
@@ -426,6 +432,7 @@ impl Node {
                 None
             }
             Effect::Metric { name, value } => {
+                self.telemetry.driver_metric(&name, value);
                 self.metrics.push((name, value));
                 None
             }
@@ -515,6 +522,9 @@ impl Node {
         let block_hash = keccak256(&stored.to_bytes());
         self.mempool.retain(|p| !carried.contains(&p.hash));
         self.executed.push((height, block_hash));
+        let summary = &result.summary;
+        self.telemetry
+            .block_executed(height, summary.tx_count, summary.gas_used);
         Ok(Input::BlockExecuted {
             height,
             block_hash,

@@ -881,7 +881,10 @@ fn logs_metrics_and_call_errors() {
     let r = run(&mut exec, &module(&imports(), &body, b"hello"), b"", 10_000);
     assert_eq!(r.status, Termination::Halt);
     assert_eq!(exec.logs(), &[(3, b"hello".to_vec())]);
-    assert_eq!(exec.metrics(), &[("hello".to_owned(), -7, 1)]);
+    let emitted = [("hello".to_owned(), -7, 1, Capability::Sandboxed)];
+    assert_eq!(exec.metrics(), &emitted);
+    assert_eq!(exec.take_metrics(), emitted.to_vec());
+    assert!(exec.metrics().is_empty());
     // Unknown hash, unknown export, bad gas limit.
     let fail = |r: CallResult, s: HostStatus| {
         assert_eq!(r.status, Termination::HostError(s.code()));

@@ -825,6 +825,7 @@ dependencies = [
  "serde_json",
  "solo-abi",
  "solo-host",
+ "solo-metrics",
  "solo-node",
  "solo-recompile",
  "solo-rpc",
@@ -872,6 +873,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "solo-metrics"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+ "serde_json",
+]
+
+[[package]]
 name = "solo-node"
 version = "0.0.1"
 dependencies = [
@@ -879,6 +888,7 @@ dependencies = [
  "p256",
  "solo-abi",
  "solo-host",
+ "solo-metrics",
  "solo-recompile",
  "solo-rlp",
  "solo-trie",
@@ -910,6 +920,7 @@ dependencies = [
  "solo-abi",
  "solo-eth",
  "solo-host",
+ "solo-metrics",
  "solo-node",
  "solo-recompile",
  "solo-rlp",
