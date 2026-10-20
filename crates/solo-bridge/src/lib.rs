@@ -65,18 +65,6 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<NodeError> for Error {
-    fn from(e: NodeError) -> Error {
-        Error::Node(e)
-    }
-}
-
-impl From<solo_bls::Error> for Error {
-    fn from(e: solo_bls::Error) -> Error {
-        Error::Bls(e)
-    }
-}
-
 fn le64(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or_default())
 }
@@ -107,7 +95,8 @@ impl Submission {
     /// [`Error::ProposalMismatch`] for a proposal it does not certify,
     /// [`Error::NoAnchor`] for one without an anchor.
     pub fn new(proof: &FinalityProof) -> Result<Submission, Error> {
-        let certificate = solo_bls::Certificate::from_bytes(&proof.certificate)?;
+        let certificate =
+            solo_bls::Certificate::from_bytes(&proof.certificate).map_err(Error::Bls)?;
         let p = &proof.proposal;
         if keccak256(p) != certificate.block_hash
             || p.len() < anchor::MIN_LENGTH
@@ -155,7 +144,9 @@ pub fn group_key(compressed: &[u8]) -> Result<[u8; 256], Error> {
         .ok()
         .ok_or(Error::Bls(solo_bls::Error::InvalidLength))?;
     Ok(solo_bls::evm::encode_g2(
-        solo_bls::PublicKey::from_bytes(&bytes)?.point(),
+        solo_bls::PublicKey::from_bytes(&bytes)
+            .map_err(Error::Bls)?
+            .point(),
     ))
 }
 
@@ -324,7 +315,9 @@ pub fn sent_messages(chain_id: u64, logs: &[Log]) -> Vec<(Message, Hash)> {
 /// # Errors
 /// [`Error::Node`] if the query fails.
 pub fn finality_proof(node: &mut Node, height: u64) -> Result<Option<FinalityProof>, Error> {
-    let r = node.query(query::FINALITY_PROOF, &height.to_bytes())?;
+    let r = node
+        .query(query::FINALITY_PROOF, &height.to_bytes())
+        .map_err(Error::Node)?;
     Ok((r.status == 0)
         .then(|| solo_abi::Decode::from_bytes(&r.body).ok())
         .flatten())
@@ -337,21 +330,13 @@ pub fn finality_proof(node: &mut Node, height: u64) -> Result<Option<FinalityPro
 /// # Errors
 /// [`Error::Node`] if a query fails.
 pub fn submission_covering(node: &mut Node, height: u64) -> Result<Option<Submission>, Error> {
-    let top = node.finalized_height()?;
+    let top = node.finalized_height().map_err(Error::Node)?;
     let mut best: Option<Submission> = None;
     for h in (height + 1..=top).rev().take(PROOF_HISTORY) {
-        let Some(proof) = finality_proof(node, h)? else {
-            continue;
-        };
-        let Ok(submission) = Submission::new(&proof) else {
-            continue;
-        };
-        if submission.anchor_height >= height
-            && best
-                .as_ref()
-                .is_none_or(|b| submission.anchor_height > b.anchor_height)
-        {
-            best = Some(submission);
+        let candidate = finality_proof(node, h)?.and_then(|p| Submission::new(&p).ok());
+        let floor = height.max(best.as_ref().map_or(0, |b| b.anchor_height + 1));
+        if let Some(s) = candidate.filter(|s| s.anchor_height >= floor) {
+            best = Some(s);
         }
     }
     Ok(best)
@@ -364,7 +349,9 @@ pub fn submission_covering(node: &mut Node, height: u64) -> Result<Option<Submis
 /// [`Error::NotCommitted`] if the message is not in that state,
 /// [`Error::Node`] if a query fails.
 pub fn slot_proof(node: &mut Node, nonce: u64, height: u64) -> Result<Option<SlotProof>, Error> {
-    let message_hash = node.storage(&OUTBOX_ADDRESS, &message_slot(nonce))?;
+    let message_hash = node
+        .storage(&OUTBOX_ADDRESS, &message_slot(nonce))
+        .map_err(Error::Node)?;
     let Some(proof) = node.state_proof_at(height, &message_key(nonce)) else {
         return Ok(None);
     };
@@ -398,10 +385,6 @@ mod tests {
         ] {
             assert_eq!(e.to_string(), text);
         }
-        assert!(matches!(
-            Error::from(NodeError::Decode("x")),
-            Error::Node(_)
-        ));
     }
 
     #[test]

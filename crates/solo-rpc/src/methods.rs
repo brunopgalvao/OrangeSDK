@@ -123,7 +123,7 @@ pub fn sender(raw: &[u8]) -> Option<[u8; 20]> {
     keccak256(&point.as_bytes()[1..])[12..].try_into().ok()
 }
 
-fn param_str(params: &[Value], index: usize) -> Result<&str, RpcError> {
+pub(crate) fn param_str(params: &[Value], index: usize) -> Result<&str, RpcError> {
     params
         .get(index)
         .and_then(Value::as_str)
@@ -477,15 +477,8 @@ impl Rpc {
             "eth_feeHistory" => self.fee_history(params)?,
             "txpool_status" => crate::txpool::status(self.node.mempool()),
             "txpool_content" => crate::txpool::content(self.node.mempool()),
-            "solo_getFinalityProof" => crate::bridge::finality_proof(
-                &mut self.node,
-                parse_quantity(param_str(params, 0)?)?,
-            )?,
-            "solo_getOutboxProof" => crate::bridge::outbox_proof(
-                &mut self.node,
-                parse_quantity(param_str(params, 0)?)?,
-                parse_quantity(param_str(params, 1)?)?,
-            )?,
+            "solo_getFinalityProof" => crate::bridge::finality_proof(&mut self.node, params)?,
+            "solo_getOutboxProof" => crate::bridge::outbox_proof(&mut self.node, params)?,
             other => {
                 return Err(RpcError::with_code(
                     -32601,

@@ -166,4 +166,6 @@ fn a_relayer_gets_certificates_and_outbox_proofs() {
         err(&mut rpc, "solo_getOutboxProof", json!(["0x1"])).0,
         -32602
     );
+    assert_eq!(err(&mut rpc, "solo_getOutboxProof", json!([])).0, -32602);
+    assert_eq!(err(&mut rpc, "solo_getFinalityProof", json!([])).0, -32602);
 }

@@ -6,10 +6,11 @@
 use serde_json::{Value, json};
 use solo_node::Node;
 
-use crate::hex::{data, quantity};
-use crate::methods::RpcError;
+use crate::hex::{data, parse_quantity, quantity};
+use crate::methods::{RpcError, param_str};
 
-fn failed(e: &solo_bridge::Error) -> RpcError {
+#[allow(clippy::needless_pass_by_value)]
+fn failed(e: solo_bridge::Error) -> RpcError {
     RpcError::server(e.to_string())
 }
 
@@ -18,12 +19,14 @@ fn failed(e: &solo_bridge::Error) -> RpcError {
 /// `submit` calldata; `null` if the node stored none.
 ///
 /// # Errors
-/// A server error if the node fails or the stored proposal has no anchor.
-pub fn finality_proof(node: &mut Node, height: u64) -> Result<Value, RpcError> {
-    let Some(proof) = solo_bridge::finality_proof(node, height).map_err(|e| failed(&e))? else {
+/// Invalid params, or a server error if the node fails or the stored
+/// proposal has no anchor.
+pub fn finality_proof(node: &mut Node, params: &[Value]) -> Result<Value, RpcError> {
+    let height = parse_quantity(param_str(params, 0)?)?;
+    let Some(proof) = solo_bridge::finality_proof(node, height).map_err(failed)? else {
         return Ok(Value::Null);
     };
-    let s = solo_bridge::Submission::new(&proof).map_err(|e| failed(&e))?;
+    let s = solo_bridge::Submission::new(&proof).map_err(failed)?;
     Ok(json!({
         "height": quantity(u128::from(s.height)),
         "blockHash": data(&s.block_hash),
@@ -41,9 +44,14 @@ pub fn finality_proof(node: &mut Node, height: u64) -> Result<Value, RpcError> {
 /// of `height`; `null` if the node no longer keeps that height's state.
 ///
 /// # Errors
-/// A server error if the node fails or the message is not in that state.
-pub fn outbox_proof(node: &mut Node, nonce: u64, height: u64) -> Result<Value, RpcError> {
-    let Some(p) = solo_bridge::slot_proof(node, nonce, height).map_err(|e| failed(&e))? else {
+/// Invalid params, or a server error if the node fails or the message is
+/// not in that state.
+pub fn outbox_proof(node: &mut Node, params: &[Value]) -> Result<Value, RpcError> {
+    let (nonce, height) = (
+        parse_quantity(param_str(params, 0)?)?,
+        parse_quantity(param_str(params, 1)?)?,
+    );
+    let Some(p) = solo_bridge::slot_proof(node, nonce, height).map_err(failed)? else {
         return Ok(Value::Null);
     };
     Ok(json!({

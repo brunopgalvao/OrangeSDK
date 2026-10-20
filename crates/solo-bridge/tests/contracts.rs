@@ -844,3 +844,49 @@ fn proving_costs_grow_with_the_depth_of_the_proof() {
     assert!(outcome.success, "{outcome:?}");
     assert_eq!((proof.siblings.len(), outcome.gas), (14, PROVE_DEEP_TX_GAS));
 }
+
+#[test]
+fn relayer_inputs_that_a_light_client_would_refuse_are_refused_first() {
+    use solo_abi::bridge::FinalityProof;
+    use solo_bridge::{Error, Submission};
+    let sk = spec_key();
+    let certify = |p: &[u8], height: u64| {
+        let hash = keccak256(p);
+        let signature = sk.sign(&solo_bls::certificate::message(
+            SOLO_CHAIN_ID,
+            height,
+            &hash,
+        ));
+        FinalityProof {
+            certificate: solo_bls::Certificate {
+                height,
+                block_hash: hash,
+                signature,
+            }
+            .to_bytes()
+            .to_vec(),
+            proposal: p.to_vec(),
+        }
+    };
+    let none = proposal(9, 0, [0; 32]);
+    assert!(matches!(
+        Submission::new(&certify(&none, 9)),
+        Err(Error::NoAnchor)
+    ));
+    assert!(matches!(
+        Submission::new(&certify(&none, 8)),
+        Err(Error::ProposalMismatch)
+    ));
+    assert!(matches!(
+        Submission::new(&FinalityProof {
+            certificate: vec![2],
+            proposal: none
+        }),
+        Err(Error::Bls(_))
+    ));
+    let good = proposal(9, 7, [1; 32]);
+    let s = Submission::new(&certify(&good, 9)).unwrap();
+    assert_eq!((s.height, s.anchor_height, s.anchor_root), (9, 7, [1; 32]));
+    assert!(matches!(group_key(&[0; 95]), Err(Error::Bls(_))));
+    assert!(matches!(group_key(&[0; 96]), Err(Error::Bls(_))));
+}
