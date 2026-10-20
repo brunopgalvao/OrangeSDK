@@ -56,6 +56,7 @@ fn check(raw: &[u8]) -> Result<Signed, u32> {
     crate::governance::admit(&s)?;
     crate::staking::admit(&s)?;
     crate::modules::admit(&s)?;
+    crate::bridge::admit(&s)?;
     Ok(s)
 }
 

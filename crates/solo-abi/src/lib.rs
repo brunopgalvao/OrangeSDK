@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+pub mod bridge_in;
 pub mod chain;
 pub mod codec;
 pub mod conformance;

@@ -55,16 +55,27 @@ pub struct GatedFunction {
 /// node extension's own.
 pub const SECP256K1_VERIFY: u32 = 200;
 
+/// Handle of `bls12381_fast_aggregate_verify`.
+pub const BLS12381_FAST_AGGREGATE_VERIFY: u32 = 201;
+
 /// The gated host functions this host release serves.
-pub const GATED: &[GatedFunction] = &[GatedFunction {
-    name: "secp256k1_verify",
-    gate: gate::SECP256K1_VERIFY,
-    handle: SECP256K1_VERIFY,
-    sandboxed: true,
-}];
+pub const GATED: &[GatedFunction] = &[
+    GatedFunction {
+        name: "secp256k1_verify",
+        gate: gate::SECP256K1_VERIFY,
+        handle: SECP256K1_VERIFY,
+        sandboxed: true,
+    },
+    GatedFunction {
+        name: "bls12381_fast_aggregate_verify",
+        gate: gate::BLS12381_FAST_AGGREGATE_VERIFY,
+        handle: BLS12381_FAST_AGGREGATE_VERIFY,
+        sandboxed: true,
+    },
+];
 
 /// The feature gates this host release supports: one bit per gate in [`GATED`].
-pub const SUPPORTED: u64 = 1 << gate::SECP256K1_VERIFY;
+pub const SUPPORTED: u64 = 1 << gate::SECP256K1_VERIFY | 1 << gate::BLS12381_FAST_AGGREGATE_VERIFY;
 
 /// The handle of gated function `name` for `capability`, if its gate is in `active`.
 #[must_use]
@@ -107,6 +118,9 @@ impl<S: Storage> Extension<S> for GatedExtension {
     ) -> Result<(), Termination> {
         if handle == SECP256K1_VERIFY {
             return secp256k1_verify(ctx);
+        }
+        if handle == BLS12381_FAST_AGGREGATE_VERIFY {
+            return solo_host::gated::bls12381_fast_aggregate_verify(ctx);
         }
         self.inner.call(handle, ctx, state)
     }

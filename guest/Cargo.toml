@@ -2,7 +2,7 @@
 # host workspace because everything here targets riscv64imac-unknown-none-elf.
 [workspace]
 resolver = "2"
-members = ["solo-guest", "solo-module", "hello", "kernel", "modules/counter", "evm-conformance"]
+members = ["solo-guest", "solo-module", "hello", "kernel", "modules/counter", "modules/eth-light-client", "modules/eth-message-verifier", "evm-conformance"]
 
 [workspace.package]
 version = "0.0.1"
@@ -15,6 +15,17 @@ panic = "abort"
 lto = true
 codegen-units = 1
 debug = true
+
+# A module must fit one storage value (64 KiB, spec 16 §4); the light client
+# is optimized for size above all.
+[profile.release.package.eth-light-client]
+opt-level = "z"
+
+[profile.release.package.eth-message-verifier]
+opt-level = "z"
+
+[profile.release.package.solo-ethlc]
+opt-level = "z"
 
 [profile.dev]
 panic = "abort"
