@@ -901,6 +901,7 @@ dependencies = [
  "p256",
  "proptest",
  "solo-abi",
+ "solo-bls",
  "solo-eth",
  "solo-host",
  "solo-metrics",

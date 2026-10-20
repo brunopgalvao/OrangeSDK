@@ -163,6 +163,7 @@ pub fn genesis(validators: &[SigningKey], upgrades: UpgradeParams, max_txs: u32)
             ..Allocation::default()
         }]),
         upgrades,
+        ..GenesisParams::default()
     };
     Genesis {
         chain_id: CHAIN_ID,

@@ -109,6 +109,7 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
             .ok_or("genesis: maxTxs too large")?,
         allocations: Seq(allocations),
         upgrades: parse_upgrades(&v)?,
+        ..GenesisParams::default()
     };
     let mut validators = Vec::new();
     match v.get("validators") {

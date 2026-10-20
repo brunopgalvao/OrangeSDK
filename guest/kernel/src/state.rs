@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 
 use solo_abi::chain::consensus::EVIDENCE_PAGE;
-use solo_abi::chain::{Account, BlockHeader, Evidence, GenesisParams, Receipt, ValidatorSet, keys};
+use solo_abi::chain::{Account, BlockHeader, Evidence, GenesisParams, Receipt, keys};
 use solo_abi::types::{Address, Genesis, Hash};
 use solo_abi::{Decode, Encode};
 use solo_guest::host;
@@ -125,24 +125,17 @@ pub fn transaction(tx_hash: &Hash) -> Option<Vec<u8>> {
     get_raw(&concat(keys::TX_RAW, tx_hash))
 }
 
-/// Validator ids in leader-rotation order.
-pub fn validators() -> Vec<Hash> {
-    get_raw(b"meta/validators")
-        .and_then(|b| ValidatorSet::from_bytes(&b).ok())
-        .map(|set| set.validators.0.into_iter().map(|v| v.id).collect())
-        .unwrap_or_default()
-}
-
-/// Records `evidence` unless its offence is already on record.
-pub fn put_evidence(evidence: &Evidence) {
+/// Records `evidence` unless its offence is already on record; whether it did.
+pub fn put_evidence(evidence: &Evidence) -> bool {
     let seen = concat(keys::EVIDENCE_SEEN, &evidence.id());
     if get_raw(&seen).is_some() {
-        return;
+        return false;
     }
     let index: u64 = get(keys::EVIDENCE_COUNT).unwrap_or(0);
     set(&concat(keys::EVIDENCE, &index.to_be_bytes()), evidence);
     set(&seen, &index);
     set(keys::EVIDENCE_COUNT, &(index + 1));
+    true
 }
 
 /// Evidence records from index `first`, at most `EVIDENCE_PAGE` of them.

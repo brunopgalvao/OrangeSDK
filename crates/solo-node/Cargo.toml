@@ -14,6 +14,7 @@ solo-trie = { path = "../solo-trie" }
 solo-metrics = { path = "../solo-metrics" }
 solo-vm = { path = "../solo-vm" }
 solo-upgrade = { path = "../solo-upgrade" }
+solo-bls = { path = "../solo-bls" }
 solo-rlp = { path = "../solo-rlp" }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 

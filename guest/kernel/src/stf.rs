@@ -54,6 +54,7 @@ fn check(raw: &[u8]) -> Result<Signed, u32> {
     let s = decode_signed(raw, state::chain_id())?;
     well_formed(&s)?;
     crate::governance::admit(&s)?;
+    crate::staking::admit(&s)?;
     Ok(s)
 }
 
@@ -112,7 +113,8 @@ pub fn build(args: &BuildArgs) -> Block {
     Block { header: header.to_bytes(), txs: Seq(selected), participation: Vec::new() }
 }
 
-/// Whether both messages of `evidence` are signed by the validator it names.
+/// Whether both messages of `evidence` are signed by the validator it names
+/// in `validators`, the set of the epoch of its view.
 fn verified(evidence: &Evidence, validators: &[Hash], chain_id: u64) -> bool {
     let Some(id) = validators.get(evidence.validator as usize) else { return false };
     evidence.well_formed()
@@ -124,21 +126,19 @@ fn verified(evidence: &Evidence, validators: &[Hash], chain_id: u64) -> bool {
 
 /// Records the equivocation evidence a block carries (spec 08 §9): at most
 /// `MAX_EVIDENCE` records, each kept only if both signatures verify and the
-/// offence is new. Nothing here can make a block invalid.
-fn record_evidence(participation: &[u8]) {
+/// offence is new, and the DKG envelopes it carries (spec 15 §6.2). Nothing
+/// here can make a block invalid.
+fn record_participation(participation: &[u8], height: u64) {
     let Ok(participation) = Participation::from_bytes(participation) else { return };
-    if participation.evidence.0.is_empty() {
-        return;
-    }
-    let validators = state::validators();
     let chain_id = state::chain_id();
     for evidence in participation.evidence.0.iter().take(MAX_EVIDENCE) {
-        if verified(evidence, &validators, chain_id) {
-            // The slashing hook: once validators stake, the offender's stake is
-            // cut here, in the same state transition that records the offence.
-            state::put_evidence(evidence);
+        // The slashing hook: the offender's stake is cut in the same state
+        // transition that records the offence, once per offence.
+        if verified(evidence, &crate::staking::evidence_set(evidence.view), chain_id) && state::put_evidence(evidence) {
+            crate::staking::slash(evidence);
         }
     }
+    crate::staking::record_dkg(&participation.dkg.0, height);
 }
 
 fn failed(height: u64, index: u32, cumulative: u64) -> Receipt {
@@ -171,7 +171,11 @@ fn run_tx(raw: &[u8], chain_id: u64, block: BlockFields, index: u32, cumulative:
         nonce: Some(s.tx.nonce),
         access_list: s.tx.access_list.clone(),
     };
-    let outcome = crate::governance::run(&s, block.number, message, block);
+    let outcome = if crate::staking::is_staking(&s) {
+        crate::staking::run(&s, block.number, message, block)
+    } else {
+        crate::governance::run(&s, block.number, message, block)
+    };
     if outcome.status == call_status::INVALID {
         return None;
     }
@@ -204,7 +208,7 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let template = BlockHeader::from_bytes(&args.block.header).unwrap_or_else(|_| solo_guest::trap());
     let height = template.height;
     let block = BlockFields { number: height, timestamp: template.timestamp_ms / 1000 };
-    record_evidence(&args.block.participation);
+    record_participation(&args.block.participation, height);
     let mut receipts = Vec::new();
     let mut tx_hashes = Vec::new();
     let mut cumulative = 0u64;
@@ -226,6 +230,7 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     }
     let receipts_root = state::keccak256(&receipt_hashes);
     crate::governance::end_block(height);
+    crate::staking::end_block(height);
     let state_root = state::commit();
     let header = BlockHeader {
         height,
@@ -329,6 +334,6 @@ pub fn query(args: &QueryArgs) -> QueryResult {
             Ok(first) => found(Some(Seq(state::evidence_from(first)))),
             Err(_) => bad_params(),
         },
-        _ => crate::governance::query(method, &args.params),
+        _ => crate::staking::query(method, &args.params).unwrap_or_else(|| crate::governance::query(method, &args.params)),
     }
 }

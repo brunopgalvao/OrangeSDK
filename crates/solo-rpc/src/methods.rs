@@ -104,6 +104,7 @@ pub fn reason_text(code: u32) -> &'static str {
         reason::INITCODE_TOO_LARGE => "max initcode size exceeded",
         reason::SENDER_NOT_EOA => "sender not an eoa",
         reason::SYSTEM_ACTION => "not a valid upgrade action",
+        reason::STAKING_ACTION => "not a valid staking action",
         _ => "rejected",
     }
 }
