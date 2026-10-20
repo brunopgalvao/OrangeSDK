@@ -446,6 +446,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "solo-node"
+version = "0.0.1"
+dependencies = [
+ "k256",
+ "solo-abi",
+ "solo-host",
+ "solo-recompile",
+ "solo-rlp",
+ "solo-vm",
+]
+
+[[package]]
 name = "solo-recompile"
 version = "0.0.1"
 dependencies = [

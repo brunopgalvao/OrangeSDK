@@ -1,0 +1,20 @@
+[package]
+name = "solo-node"
+description = "Hosts a Solo kernel: privileged host functions, the driver loop, mempool and queries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+solo-abi = { path = "../solo-abi" }
+solo-host = { path = "../solo-host" }
+solo-vm = { path = "../solo-vm" }
+
+[dev-dependencies]
+solo-recompile = { path = "../solo-recompile" }
+solo-rlp = { path = "../solo-rlp" }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+
+[lints]
+workspace = true

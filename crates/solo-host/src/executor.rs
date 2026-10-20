@@ -109,6 +109,7 @@ pub struct Executor<S: Storage> {
     pub(crate) metrics: Vec<(String, i64, u32)>,
     max_depth: usize,
     extension: Option<Box<dyn Extension<S>>>,
+    last_position: Option<([u8; 32], u32, usize)>,
 }
 
 /// Default nesting limit (spec 05 §4.4).
@@ -125,7 +126,16 @@ impl<S: Storage> Executor<S> {
             metrics: Vec::new(),
             max_depth: MAX_DEPTH,
             extension: None,
+            last_position: None,
         }
+    }
+
+    /// Where the most recent call ended: its code hash, block index and
+    /// instruction index. With a module's debug map this names the faulting
+    /// instruction in the original binary.
+    #[must_use]
+    pub fn last_position(&self) -> Option<([u8; 32], u32, usize)> {
+        self.last_position
     }
 
     /// Installs the extension that serves handles from [`EXTENSION_HANDLE_BASE`] up.
@@ -264,6 +274,8 @@ impl<S: Storage> Executor<S> {
             Ok(mut instance) => {
                 let status = instance.run(self);
                 let used = gas_limit - instance.gas().max(0);
+                let (block, index) = instance.position();
+                self.last_position = Some((*code_hash, block, index));
                 (status, u64::try_from(used).unwrap_or(0), true)
             }
             Err(InstanceError::NoSuchExport | InstanceError::UnresolvedImport(_)) => (

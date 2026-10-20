@@ -1,0 +1,17 @@
+[package]
+name = "kernel"
+description = "The reference kernel: a dev driver and a state transition executing Ethereum legacy transfers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+solo-guest = { path = "../solo-guest" }
+solo-abi = { path = "../../crates/solo-abi", default-features = false }
+solo-rlp = { path = "../../crates/solo-rlp", default-features = false }

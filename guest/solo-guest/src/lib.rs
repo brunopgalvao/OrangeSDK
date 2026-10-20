@@ -90,6 +90,8 @@ pub mod host {
         pub fn __solo_import_storage_get(key: *const u8, key_len: u32, dst: *mut u8, cap: u32) -> u64;
         pub fn __solo_import_storage_set(key: *const u8, key_len: u32, val: *const u8, val_len: u32) -> u64;
         pub fn __solo_import_storage_delete(key: *const u8, key_len: u32) -> u64;
+        pub fn __solo_import_storage_commit(dst: *mut u8) -> u64;
+        pub fn __solo_import_secp256k1_recover(msg: *const u8, sig: *const u8, dst: *mut u8) -> u64;
         pub fn __solo_import_hash_keccak256(src: *const u8, len: u32, dst: *mut u8) -> u64;
         pub fn __solo_import_hash_sha256(src: *const u8, len: u32, dst: *mut u8) -> u64;
         pub fn __solo_import_log_emit(level: u32, msg: *const u8, len: u32) -> u64;
@@ -124,6 +126,12 @@ pub fn log(level: u32, msg: &str) {
     unsafe {
         host::__solo_import_log_emit(level, msg.as_ptr(), msg.len() as u32);
     }
+}
+
+/// Ends the instance with `Trap`.
+pub fn trap() -> ! {
+    // SAFETY: the stub never returns.
+    unsafe { host::__solo_trap() }
 }
 
 /// Ends the instance with `Halt` and the given return values.

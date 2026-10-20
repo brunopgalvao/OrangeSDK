@@ -18,7 +18,7 @@ Capabilities granted to kernel modules by the kernel's capability manager are a 
 ## 3. Calling convention
 
 - The module places arguments in `a0`–`a5` and executes `ecall i`. Results are returned in `a0` (and `a1` where stated). Every other register is preserved.
-- Pointers are 32-bit effective addresses into instance memory, passed in the low 32 bits of a register; lengths are 32-bit. The host validates that every (pointer, length) range it reads is readable and every range it writes is writable in the instance's memory map *before* performing any effect; a violation terminates the instance with `HostError(MemoryFault)`.
+- Pointers are 32-bit effective addresses into instance memory, passed in the low 32 bits of a register; lengths are 32-bit. The host validates that every (pointer, length) range it reads is readable and every range it writes is writable in the instance's memory map *before* performing any effect; a violation terminates the instance with `HostError(MemoryFault)`. A range of length zero is valid at any address.
 - Functions that return variable-length data take an output pointer and an output capacity, write at most `capacity` bytes, and return the full length in `a0` even when truncated. A caller that needs the rest calls again with a larger buffer. Truncation is never an error.
 - `a0` holds a status in the low 32 bits for functions marked *status-returning*: `0` success, otherwise a code from §6. Data results for such functions are in `a1` or in an output buffer.
 - Gas: the VM charges the base cost (04 §3.3). Per-unit costs stated per function are charged by the host from the instance's counter before any irreversible effect.

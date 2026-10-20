@@ -912,6 +912,7 @@ fn logs_metrics_and_call_errors() {
     );
     let ok = exec.call(&hash, NS, b"", 10, Capability::Sandboxed, Flags::default());
     assert_eq!(ok.status, Termination::Halt);
+    assert_eq!(exec.last_position(), Some((hash, 0, 0)));
     assert_eq!(ok.gas_used, 1);
     assert_eq!(ok.invoke_status(), HostStatus::Ok);
     assert!(ok.started);

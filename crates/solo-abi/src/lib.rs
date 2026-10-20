@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+pub mod chain;
 pub mod codec;
 pub mod types;
 

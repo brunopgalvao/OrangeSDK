@@ -20,6 +20,9 @@ pub struct Options {
     pub stack_size: u32,
     /// Initial `sp`; page-aligned, at most `0xFFFF_0000`.
     pub stack_top: u32,
+    /// Emit a debug section mapping every block index to the address of its
+    /// first instruction in the input ELF (see [`debug_map`]).
+    pub debug_map: bool,
 }
 
 impl Default for Options {
@@ -28,8 +31,22 @@ impl Default for Options {
             heap_max: 16 << 20,
             stack_size: 1 << 20,
             stack_top: 0xFFFF_0000,
+            debug_map: false,
         }
     }
+}
+
+/// Decodes a debug section written with `Options::debug_map`: a list of
+/// little-endian `u64` addresses, one per block in order.
+///
+/// # Panics
+/// Never; each chunk is exactly 8 bytes.
+#[must_use]
+pub fn debug_map(section: &[u8]) -> Vec<u64> {
+    section
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes")))
+        .collect()
 }
 
 /// Why an ELF could not be recompiled. Addresses are guest code addresses.
@@ -167,6 +184,7 @@ impl<'a> Ctx<'a> {
         };
         ctx.collect_stubs();
         ctx.collect_facts()?;
+        ctx.collect_local_pairs();
         ctx.collect_imports();
         ctx.collect_starts()?;
         ctx.assign_slots();
@@ -265,6 +283,49 @@ impl<'a> Ctx<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The assembler resolves pc-relative references to targets in the same
+    /// section without emitting relocations, so an `auipc` may arrive with no
+    /// fact attached. Its meaning is still fixed by the instruction that
+    /// consumes it: a `jalr` makes it a call pair, an `addi` makes it a code
+    /// pointer. Both targets must land in the text section.
+    fn collect_local_pairs(&mut self) {
+        let text_start = self.input.text.address;
+        let text_end = text_start + self.input.text.bytes.len() as u64;
+        for i in 0..self.insns.len() {
+            let Rv::Auipc { rd, imm } = self.insns[i].rv else {
+                continue;
+            };
+            let a = self.insns[i].address;
+            if self.facts.call_pair.contains_key(&a) || self.facts.hi.contains_key(&a) {
+                continue;
+            }
+            let Some(next) = self.insns.get(i + 1) else {
+                continue;
+            };
+            let pc_value = a.wrapping_add_signed(imm);
+            match next.rv {
+                Rv::Jalr { rs1, offset, .. } if rs1 == rd => {
+                    let target = pc_value.wrapping_add_signed(offset);
+                    if (text_start..text_end).contains(&target) {
+                        self.facts.call_pair.insert(a, target);
+                    }
+                }
+                Rv::OpImm {
+                    op: solo_vm::isa::AluImmOp::Addi,
+                    rd: rd2,
+                    rs1,
+                    imm: lo,
+                } if rs1 == rd && rd2 == rd => {
+                    let target = pc_value.wrapping_add_signed(lo);
+                    if (text_start..text_end).contains(&target) {
+                        self.facts.hi.insert(a, (target, true));
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn require_instruction(&self, address: u64) -> Result<(), RecompileError> {
@@ -410,18 +471,40 @@ impl<'a> Ctx<'a> {
     }
 
     /// A direct transfer to `target` from an instruction whose link register is `rd`.
+    ///
+    /// A call to a stub becomes the stub's instruction in place, and execution
+    /// continues with the caller's next instruction. A *tail call* to a stub
+    /// (`rd` is `zero`) must still return to the caller's caller, so it gets an
+    /// explicit `ret` after the instruction; the halt and trap stubs never return.
     fn direct(&self, rd: Reg, target: u64, after: u64) -> Result<Vec<Instruction>, RecompileError> {
+        let ret = Instruction::JumpIndirect {
+            rs1: Reg::RA,
+            off: 0,
+        };
         Ok(match self.stubs.get(&target) {
-            Some(Stub::Import(name)) => vec![Instruction::Ecall {
-                import: self.import_index(name),
-            }],
+            Some(Stub::Import(name)) => {
+                let ecall = Instruction::Ecall {
+                    import: self.import_index(name),
+                };
+                if is_call(rd) {
+                    vec![ecall]
+                } else {
+                    vec![ecall, ret]
+                }
+            }
+            Some(Stub::Sbrk) => {
+                let sbrk = Instruction::Sbrk {
+                    rd: Reg::A0,
+                    rs1: Reg::A0,
+                };
+                if is_call(rd) {
+                    vec![sbrk]
+                } else {
+                    vec![sbrk, ret]
+                }
+            }
             Some(Stub::Halt) => vec![Instruction::Halt],
             Some(Stub::Trap) => vec![Instruction::Trap],
-            // `__solo_sbrk(bytes) -> old_end` with the C convention: a0 in, a0 out.
-            Some(Stub::Sbrk) => vec![Instruction::Sbrk {
-                rd: Reg::A0,
-                rs1: Reg::A0,
-            }],
             None if is_call(rd) => vec![Instruction::Call {
                 rd,
                 block: self.block(target)?,
@@ -799,6 +882,13 @@ pub fn recompile(input: &Input, options: &Options) -> Result<Vec<u8>, RecompileE
     }
     if b.exports.is_empty() {
         return Err(RecompileError::NoExports);
+    }
+    if options.debug_map {
+        let mut map = Vec::with_capacity(ctx.starts.len() * 8);
+        for start in &ctx.starts {
+            map.extend_from_slice(&start.to_le_bytes());
+        }
+        b.debug = Some(map);
     }
     let bytes = b.build();
     Module::parse(&bytes, &|_| true).map_err(RecompileError::Validation)?;
@@ -1544,5 +1634,112 @@ mod tests {
         );
         assert!(m.imports.is_empty());
         assert_eq!(m.jump_table, vec![None]);
+    }
+
+    #[test]
+    fn relocation_less_local_pairs() {
+        // 0: auipc ra, 0 ; 4: jalr ra, 16(ra)  -> call f at 16, no relocation
+        // 8: auipc a0, 0 ; 12: addi a0, a0, 8  -> address of f (16) as a code pointer
+        // 16: f: ret
+        let words = [
+            auipc(1, 0),
+            jalr(1, 1, 16),
+            auipc(10, 0),
+            addi(10, 10, 8),
+            RET,
+        ];
+        let m = module_of(&input(&words, vec![func("f", 16)], vec![]));
+        // Slots in address order: the call continuation at 8 is slot 1, f at 16 is slot 2.
+        assert_eq!(m.jump_table, vec![None, Some(1), Some(2)]);
+        assert_eq!(
+            m.blocks[0],
+            vec![Instruction::Call {
+                rd: Reg::RA,
+                block: 2,
+                slot: 1
+            }]
+        );
+        // li a0, slot_address(16) - lo(8) = 8, then addi adds 8 -> slot address 16.
+        assert_eq!(
+            m.blocks[1][0],
+            Instruction::Li {
+                rd: Reg::A0,
+                imm: 8
+            }
+        );
+        assert_eq!(
+            m.blocks[1][1],
+            Instruction::AluImm {
+                op: AluImmOp::Addi,
+                rd: Reg::A0,
+                rs1: Reg::A0,
+                imm: 8
+            }
+        );
+        // A pair whose target falls outside the text is still unpaired.
+        let words = [auipc(1, 0), jalr(1, 1, 0x100), RET];
+        assert_eq!(
+            recompile(&input(&words, vec![], vec![]), &Options::default()),
+            Err(RecompileError::UnpairedAuipc { address: TEXT })
+        );
+        // An auipc followed by something else stays unpaired.
+        let words = [auipc(5, 0), enc_b(0, 0, 0, 4), RET];
+        assert_eq!(
+            recompile(&input(&words, vec![], vec![]), &Options::default()),
+            Err(RecompileError::UnpairedAuipc { address: TEXT })
+        );
+        // A trailing auipc with nothing after it is unpaired too.
+        let words = [RET, auipc(5, 0)];
+        assert_eq!(
+            recompile(&input(&words, vec![], vec![]), &Options::default()),
+            Err(RecompileError::UnpairedAuipc { address: TEXT + 4 })
+        );
+    }
+
+    #[test]
+    fn debug_map_lists_block_addresses() {
+        let words = [enc_b(0, 0, 0, 8), addi(10, 10, 1), RET];
+        let inp = input(&words, vec![], vec![]);
+        let plain = recompile(&inp, &Options::default()).unwrap();
+        assert!(Module::parse(&plain, &|_| true).unwrap().debug.is_none());
+        let with_map = recompile(
+            &inp,
+            &Options {
+                debug_map: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let module = Module::parse(&with_map, &|_| true).unwrap();
+        let map = debug_map(&module.debug.expect("debug section"));
+        assert_eq!(map, vec![TEXT, TEXT + 4, TEXT + 8]);
+        assert_eq!(map.len(), module.blocks.len());
+    }
+
+    #[test]
+    fn tail_calls_to_stubs_return() {
+        // 0: j import stub (12) ; 4: j sbrk stub (16) ; 8: ret ; 12: import stub ; 16: sbrk stub
+        let words = [jal(0, 12), jal(0, 12), RET, UNIMP, UNIMP];
+        let syms = vec![
+            func("__solo_import_output_write", 12),
+            func("__solo_sbrk", 16),
+        ];
+        let m = module_of(&input(&words, syms, vec![]));
+        let ret = Instruction::JumpIndirect {
+            rs1: Reg::RA,
+            off: 0,
+        };
+        assert_eq!(m.blocks[0], vec![Instruction::Ecall { import: 0 }, ret]);
+        assert_eq!(
+            m.blocks[1],
+            vec![
+                Instruction::Sbrk {
+                    rd: Reg::A0,
+                    rs1: Reg::A0
+                },
+                ret
+            ]
+        );
+        assert_eq!(m.blocks[2], vec![ret]);
     }
 }

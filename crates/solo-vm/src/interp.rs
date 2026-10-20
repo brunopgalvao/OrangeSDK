@@ -150,6 +150,14 @@ impl<'p> Instance<'p> {
         self.steps
     }
 
+    /// The program position: the current block index and the index of the
+    /// next instruction within it. After a termination this is where the
+    /// instance stopped, which names the faulting instruction.
+    #[must_use]
+    pub const fn position(&self) -> (u32, usize) {
+        (self.block, self.index)
+    }
+
     /// Runs to termination.
     pub fn run(&mut self, host: &mut dyn Host) -> Termination {
         self.run_with_step_limit(host, u64::MAX)
@@ -1292,6 +1300,7 @@ mod tests {
             inst.run_with_step_limit(&mut host, 2),
             Termination::StepLimit
         );
+        assert_eq!(inst.position(), (0, 2));
         assert_eq!(inst.steps(), 2);
         assert_eq!(inst.reg(A1), 2);
         assert_eq!(inst.reg(A2), 0);

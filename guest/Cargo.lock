@@ -10,5 +10,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel"
+version = "0.0.1"
+dependencies = [
+ "solo-abi",
+ "solo-guest",
+ "solo-rlp",
+]
+
+[[package]]
+name = "solo-abi"
+version = "0.0.1"
+
+[[package]]
 name = "solo-guest"
+version = "0.0.1"
+
+[[package]]
+name = "solo-rlp"
 version = "0.0.1"

@@ -48,7 +48,7 @@ An instance's memory consists of the following regions, each a multiple of the 4
 | Top guard | `[0xFFFF_0000, 2^32)` | none | Any access traps `MemoryFault`. |
 
 - Regions are laid out in the order above with at least one unmapped guard page between consecutive regions. The module header fixes `ro_base`, `rw_base`, `heap_base`, `heap_max`, `stack_base`, and `stack_top`; the loader validates that the layout satisfies this section (03 §6).
-- Access to any address not inside a mapped region, or a write to a read-only region, traps `MemoryFault` at the instruction that performed it. The instruction has no other effect. Partial accesses do not occur: a multi-byte access that would cross into an unmapped page traps before writing any byte.
+- Access to any address not inside a mapped region, or a write to a read-only region, traps `MemoryFault` at the instruction that performed it. An access of length zero touches no byte and never faults, whatever its address; empty buffers carry arbitrary pointers. The instruction has no other effect. Partial accesses do not occur: a multi-byte access that would cross into an unmapped page traps before writing any byte.
 - Code is not in the address space. Instructions are fetched from the module's code section by basic-block index (§4), never by memory address. A program cannot read, write, or jump into its own code bytes through memory. `pc`-relative data addressing emitted by toolchains is resolved by the recompiler (03 §8).
 
 ### 3.3 Initial contents

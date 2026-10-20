@@ -206,6 +206,11 @@ impl Memory {
     }
 
     fn locate_writable(&self, addr: u32, len: u32) -> Result<(Writable, usize), MemoryFault> {
+        if len == 0 {
+            // An empty range touches no byte and is valid anywhere; empty
+            // buffers routinely carry dangling pointers.
+            return Ok((Writable::Rw, 0));
+        }
         let start = u64::from(addr);
         let end = start + u64::from(len);
         let l = &self.layout;
@@ -224,6 +229,9 @@ impl Memory {
     }
 
     fn locate(&self, addr: u32, len: u32) -> Result<(Region, usize), MemoryFault> {
+        if len == 0 {
+            return Ok((Region::Rw, 0));
+        }
         let start = u64::from(addr);
         let end = start + u64::from(len);
         let l = &self.layout;
@@ -438,9 +446,11 @@ pub(crate) mod tests {
         assert_eq!(m.fill(0x1_0000, 1, 1), Err(MemoryFault));
         // Data is untouched after faults.
         assert_eq!(m.read(0x2_0000, 8).unwrap(), &[1, 2, 3, 4, 5, 6, 7, 8]);
-        // A zero-length access at an unmapped address still faults, matching the
-        // rule that every access names a mapped range.
-        assert_eq!(m.read(0, 0), Err(MemoryFault));
+        // A zero-length access touches nothing and succeeds anywhere.
+        assert_eq!(m.read(0, 0).unwrap(), &[]);
+        assert_eq!(m.write(0, &[]), Ok(()));
+        assert_eq!(m.copy(0, 0xFFFF_FFFF, 0), Ok(()));
+        assert_eq!(m.fill(0, 1, 0), Ok(()));
         assert_eq!(m.read(0x1_0000, 0).unwrap(), &[]);
     }
 

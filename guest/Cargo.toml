@@ -2,7 +2,7 @@
 # host workspace because everything here targets riscv64imac-unknown-none-elf.
 [workspace]
 resolver = "2"
-members = ["solo-guest", "hello"]
+members = ["solo-guest", "hello", "kernel"]
 
 [workspace.package]
 version = "0.0.1"
