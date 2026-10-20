@@ -8,15 +8,22 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
-/// Version of the VM specification this crate implements.
-pub const SPEC_VERSION: (u16, u16) = (0, 1);
+extern crate alloc;
+
+pub mod gas;
+pub mod isa;
+pub mod leb128;
+pub mod status;
+
+/// Version of the VM specification this crate implements, as `(major, minor)`.
+pub const SPEC_VERSION: (u8, u8) = (0, 1);
 
 #[cfg(test)]
 mod tests {
     use super::SPEC_VERSION;
 
     #[test]
-    fn spec_version_is_v0() {
-        assert_eq!(SPEC_VERSION.0, 0);
+    fn spec_version_is_v0_1() {
+        assert_eq!(SPEC_VERSION, (0, 1));
     }
 }

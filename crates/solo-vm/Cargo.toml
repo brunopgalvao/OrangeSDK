@@ -13,7 +13,7 @@ std = []
 [dependencies]
 
 [dev-dependencies]
-proptest = "1"
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true
