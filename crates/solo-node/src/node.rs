@@ -117,6 +117,8 @@ pub struct Node {
     /// Raw transactions admitted since the last [`Node::take_tx_gossip`],
     /// for the transport to forward to peers.
     tx_gossip: Vec<Vec<u8>>,
+    /// Telemetry (spec 11); consensus-ignored.
+    pub(crate) telemetry: solo_metrics::NodeMetrics,
 }
 
 impl Node {
@@ -166,6 +168,7 @@ impl Node {
             persisted_driver_state: None,
             kernel_gas: KERNEL_GAS,
             tx_gossip: Vec::new(),
+            telemetry: solo_metrics::NodeMetrics::new(),
         };
         node.call_unit(exports::INIT, &genesis.to_bytes())?;
         node.kernel_gas = config.kernel_gas;
@@ -174,6 +177,7 @@ impl Node {
 
     fn call_raw(&mut self, export: &'static str, input: &[u8]) -> Result<CallResult, NodeError> {
         let kernel = self.kernel;
+        let started = std::time::Instant::now();
         let r = self.exec.call_export(
             &kernel,
             export,
@@ -183,6 +187,7 @@ impl Node {
             Capability::Privileged,
             Flags::default(),
         );
+        crate::telemetry::record_call(&mut self.telemetry, &mut self.exec, export, started, &r);
         if r.status == Termination::Halt {
             Ok(r)
         } else {
@@ -336,6 +341,7 @@ impl Node {
                 .to_bytes();
                 self.call_unit(exports::FINALIZE_BLOCK, &args)?;
                 self.finalized.push(height);
+                self.telemetry.block_finalized(height);
                 None
             }
             Effect::PersistState { state } => {
@@ -363,6 +369,7 @@ impl Node {
                 None
             }
             Effect::Metric { name, value } => {
+                self.telemetry.driver_metric(&name, value);
                 self.metrics.push((name, value));
                 None
             }
@@ -437,6 +444,9 @@ impl Node {
         self.mempool
             .retain(|p| !stored.tx_hashes.0.contains(&p.hash));
         self.executed.push((height, block_hash));
+        let summary = &result.summary;
+        self.telemetry
+            .block_executed(height, summary.tx_count, summary.gas_used);
         Ok(Input::BlockExecuted {
             height,
             block_hash,

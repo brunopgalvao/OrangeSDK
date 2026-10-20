@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use solo_abi::codec::{Decode, DecodeError, Decoder, Encode, Encoder};
 use solo_abi::types::Input;
+use solo_metrics::{Direction, Traffic};
 
 use crate::extension::Outbound;
 use crate::node::{Node, NodeError};
@@ -203,6 +204,8 @@ pub struct Transport {
     /// Requests this node is serving: local id to `(peer, the peer's id)`.
     serving: BTreeMap<u64, ([u8; 32], u64)>,
     next_local_id: u64,
+    /// Traffic counted since the last poll handed it to the node's telemetry.
+    traffic: Traffic,
 }
 
 impl Transport {
@@ -227,6 +230,7 @@ impl Transport {
             last_dial_ms: None,
             serving: BTreeMap::new(),
             next_local_id: 0,
+            traffic: Traffic::default(),
         })
     }
 
@@ -247,6 +251,7 @@ impl Transport {
     fn accept(&mut self) {
         while let Ok((stream, _)) = self.listener.accept() {
             self.conns.push(Conn::new(stream, None, &self.hello));
+            self.traffic.frame(Direction::Out, "hello");
         }
     }
 
@@ -261,6 +266,7 @@ impl Transport {
             }
             if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
                 self.conns.push(Conn::new(stream, Some(addr), &self.hello));
+                self.traffic.frame(Direction::Out, "hello");
             }
         }
     }
@@ -307,12 +313,14 @@ impl Transport {
     fn send_to(&mut self, peer: &[u8; 32], frame: &Frame) {
         if let Some(conn) = self.conns.iter_mut().find(|c| c.peer == Some(*peer)) {
             conn.send(frame);
+            self.traffic.frame(Direction::Out, frame.kind());
         }
     }
 
     fn broadcast(&mut self, frame: &Frame) {
         for conn in self.conns.iter_mut().filter(|c| c.peer.is_some()) {
             conn.send(frame);
+            self.traffic.frame(Direction::Out, frame.kind());
         }
     }
 
@@ -324,12 +332,16 @@ impl Transport {
         self.accept();
         self.redial(now_ms);
         for i in 0..self.conns.len() {
+            let before = self.conns[i].inbuf.len();
             self.conns[i].read();
+            let read = self.conns[i].inbuf.len() - before;
+            self.traffic.bytes(Direction::In, read);
             let frames = take_frames(&mut self.conns[i].inbuf).unwrap_or_else(|_| {
                 self.conns[i].dead = true;
                 Vec::new()
             });
             for frame in frames {
+                self.traffic.frame(Direction::In, frame.kind());
                 self.handle(i, frame, node)?;
             }
         }
@@ -375,9 +387,14 @@ impl Transport {
             self.broadcast(&Frame::Tx { raw });
         }
         for conn in &mut self.conns {
+            let before = conn.outbuf.len();
             conn.flush();
+            self.traffic
+                .bytes(Direction::Out, before - conn.outbuf.len());
         }
         self.conns.retain(|c| !c.dead);
+        node.telemetry
+            .p2p(self.connected().len(), &mut self.traffic);
         Ok(())
     }
 }

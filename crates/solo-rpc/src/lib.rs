@@ -10,3 +10,5 @@ pub mod http;
 pub mod methods;
 
 pub use methods::{Rpc, RpcError};
+
+pub mod telemetry;

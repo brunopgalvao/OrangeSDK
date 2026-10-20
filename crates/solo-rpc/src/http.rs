@@ -1,5 +1,6 @@
 //! A minimal HTTP/1.1 server for JSON-RPC: one request per connection,
-//! `POST` bodies dispatched to [`Rpc`], `OPTIONS` answered for browsers.
+//! `POST` bodies dispatched to [`Rpc`], `OPTIONS` answered for browsers,
+//! and `GET /health`, `/metrics` and `/status` for operators (spec 11 §2).
 //! Deliberately small; a production node fronts this with a real server.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -73,6 +74,12 @@ pub fn serve_connection(rpc: &mut Rpc, stream: &mut TcpStream) {
         }
         Ok(req) if req.method == "GET" && req.path == "/health" => {
             response("200 OK", "text/plain", "ok")
+        }
+        Ok(req) if req.method == "GET" && req.path == "/metrics" => {
+            crate::telemetry::metrics_response(rpc)
+        }
+        Ok(req) if req.method == "GET" && req.path == "/status" => {
+            crate::telemetry::status_response(rpc)
         }
         Ok(_) => response("405 Method Not Allowed", "text/plain", "POST JSON-RPC here"),
         Err(e) => response("400 Bad Request", "text/plain", &e),

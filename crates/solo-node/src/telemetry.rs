@@ -1,0 +1,216 @@
+//! What a node records about itself (spec 11): the hooks the driver loop
+//! and the transport call, and the views behind `GET /metrics` and
+//! `GET /status`. Consensus-ignored throughout: nothing here feeds back
+//! into a kernel call.
+
+use std::time::Instant;
+
+use solo_host::{CallResult, Executor, MemStorage};
+use solo_metrics::{NodeMetrics, Origin, Status, VERSION};
+use solo_vm::host::Capability;
+use solo_vm::status::Termination;
+
+use crate::net::Frame;
+use crate::node::{Node, NodeError};
+
+/// The `status` label of `solo_kernel_faults_total` for a termination.
+#[must_use]
+pub fn fault_label(status: Termination) -> &'static str {
+    match status {
+        Termination::Halt => "halt",
+        Termination::OutOfGas => "out_of_gas",
+        Termination::Trap => "trap",
+        Termination::MemoryFault => "memory_fault",
+        Termination::InvalidJump => "invalid_jump",
+        Termination::HostError(_) => "host_error",
+        Termination::StepLimit => "step_limit",
+    }
+}
+
+/// Records one kernel entrypoint call: duration, gas, fault, and whatever
+/// the call emitted through `metric_emit` and `log_emit`.
+pub(crate) fn record_call(
+    telemetry: &mut NodeMetrics,
+    exec: &mut Executor<MemStorage>,
+    export: &str,
+    started: Instant,
+    r: &CallResult,
+) {
+    let fault = (r.status != Termination::Halt).then(|| fault_label(r.status));
+    telemetry.kernel_call(export, started.elapsed(), r.gas_used, fault);
+    for (name, value, kind, capability) in exec.take_metrics() {
+        let origin = match capability {
+            Capability::Privileged => Origin::Kernel,
+            Capability::Sandboxed => Origin::Sandboxed,
+        };
+        telemetry.emitted(origin, name.as_bytes(), value, kind);
+    }
+    telemetry.kernel_logs(exec.logs());
+}
+
+impl Frame {
+    /// The `kind` label of `solo_p2p_frames_total`.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Frame::Hello { .. } => "hello",
+            Frame::Message { .. } => "message",
+            Frame::Tx { .. } => "tx",
+            Frame::Request { .. } => "request",
+            Frame::Response { .. } => "response",
+        }
+    }
+}
+
+impl Node {
+    /// The node's metrics.
+    #[must_use]
+    pub fn telemetry(&self) -> &NodeMetrics {
+        &self.telemetry
+    }
+
+    /// The node's metrics, for a host component that records into them.
+    pub fn telemetry_mut(&mut self) -> &mut NodeMetrics {
+        &mut self.telemetry
+    }
+
+    /// Refreshes the gauges read at scrape time (chain id, mempool, timers,
+    /// head age) and renders every family: the body of `GET /metrics`.
+    pub fn metrics_text(&mut self) -> String {
+        let chain_id = self.chain_id().ok();
+        let bytes = self.mempool().iter().map(|p| p.raw.len()).sum();
+        let (count, timers) = (self.mempool().len(), self.timers().len());
+        self.telemetry.refresh(chain_id, count, bytes, timers);
+        self.telemetry.render()
+    }
+
+    /// The body of `GET /status`.
+    ///
+    /// # Errors
+    /// If the kernel cannot answer the chain id query.
+    pub fn status(&mut self) -> Result<Status, NodeError> {
+        let chain_id = self.chain_id()?;
+        let peers = self.telemetry.peers();
+        Ok(Status {
+            version: VERSION.to_owned(),
+            chain_id,
+            head: self.telemetry.head(),
+            head_age_seconds: self.telemetry.head_age_seconds(),
+            finalized: self.telemetry.finalized(),
+            p2p: peers.is_some(),
+            peers: peers.unwrap_or(0),
+            mempool: self.mempool().len() as u64,
+            uptime_seconds: self.telemetry.uptime_seconds(),
+            validator: self.validator_id(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solo_host::{Flags, ModuleCache};
+    use solo_metrics::node::{EMITTED_COUNTER, KERNEL_CALL_SECONDS, KERNEL_FAULTS, KERNEL_LOGS};
+    use solo_vm::builder::ModuleBuilder;
+    use solo_vm::isa::{Instruction, Reg};
+
+    /// A module whose `main` emits counter `hello` += 7 and an info log line.
+    fn emitter() -> Vec<u8> {
+        let li = |rd: Reg, imm: i64| Instruction::Li { rd, imm };
+        let mut b = ModuleBuilder::new().rodata(b"hello");
+        b.import("metric_emit");
+        b.import("log_emit");
+        b.block(&[
+            li(Reg::A0, 0x1_0000),
+            li(Reg::A1, 5),
+            li(Reg::A2, 7),
+            li(Reg::A3, 0),
+            Instruction::Ecall { import: 0 },
+            li(Reg::A0, 2),
+            li(Reg::A1, 0x1_0000),
+            li(Reg::A2, 5),
+            Instruction::Ecall { import: 1 },
+            Instruction::Halt,
+        ]);
+        b.export("main", 0).build()
+    }
+
+    #[test]
+    fn calls_record_what_the_instance_emitted() {
+        let mut exec = Executor::new(ModuleCache::default(), MemStorage::default());
+        let mut telemetry = NodeMetrics::new();
+        let hash = exec.load(&emitter(), Capability::Sandboxed).unwrap();
+        for (capability, gas) in [
+            (Capability::Privileged, 100_000),
+            (Capability::Sandboxed, 100_000),
+            (Capability::Sandboxed, 3),
+        ] {
+            let started = Instant::now();
+            let r = exec.call(&hash, [0; 32], b"", gas, capability, Flags::default());
+            record_call(&mut telemetry, &mut exec, "main", started, &r);
+        }
+        let reg = telemetry.registry();
+        assert_eq!(reg.value(&EMITTED_COUNTER, &["kernel", "hello"]), Some(7.0));
+        assert_eq!(
+            reg.value(&EMITTED_COUNTER, &["sandboxed", "hello"]),
+            Some(7.0)
+        );
+        assert_eq!(reg.value(&KERNEL_LOGS, &["info"]), Some(2.0));
+        assert_eq!(
+            reg.value(&KERNEL_FAULTS, &["main", "out_of_gas"]),
+            Some(1.0)
+        );
+        assert_eq!(reg.histogram(&KERNEL_CALL_SECONDS, &["main"]).unwrap().0, 3);
+        assert!(exec.metrics().is_empty());
+    }
+
+    #[test]
+    fn labels() {
+        let cases = [
+            (Termination::Halt, "halt"),
+            (Termination::OutOfGas, "out_of_gas"),
+            (Termination::Trap, "trap"),
+            (Termination::MemoryFault, "memory_fault"),
+            (Termination::InvalidJump, "invalid_jump"),
+            (Termination::HostError(8), "host_error"),
+            (Termination::StepLimit, "step_limit"),
+        ];
+        for (status, label) in cases {
+            assert_eq!(fault_label(status), label);
+        }
+        let frames = [
+            (
+                Frame::Hello {
+                    id: [0; 32],
+                    chain_id: 1,
+                },
+                "hello",
+            ),
+            (
+                Frame::Message {
+                    topic: 0,
+                    payload: vec![],
+                },
+                "message",
+            ),
+            (Frame::Tx { raw: vec![] }, "tx"),
+            (
+                Frame::Request {
+                    request_id: 0,
+                    payload: vec![],
+                },
+                "request",
+            ),
+            (
+                Frame::Response {
+                    request_id: 0,
+                    payload: vec![],
+                },
+                "response",
+            ),
+        ];
+        for (frame, kind) in frames {
+            assert_eq!(frame.kind(), kind);
+        }
+    }
+}
