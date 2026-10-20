@@ -1,6 +1,6 @@
 //! The node: kernel lifecycle, the driver loop, mempool and queries.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
@@ -18,6 +18,7 @@ use solo_vm::host::Capability;
 use solo_vm::status::Termination;
 
 use crate::extension::{NodeExtension, NodeServices, Outbound, validator_id};
+use crate::upgrade::{GatedExtension, Upgrades};
 
 /// How to open a node.
 #[derive(Clone)]
@@ -64,6 +65,8 @@ pub enum NodeError {
     },
     /// A kernel entrypoint returned bytes that do not decode as its result type.
     Decode(&'static str),
+    /// A kernel switch could not complete (spec 06 §7); the node has halted.
+    Upgrade(String),
 }
 
 impl fmt::Display for NodeError {
@@ -72,6 +75,7 @@ impl fmt::Display for NodeError {
             NodeError::Load(e) => write!(f, "kernel failed to load: {e:?}"),
             NodeError::Kernel { export, status } => write!(f, "{export} ended with {status:?}"),
             NodeError::Decode(export) => write!(f, "{export} returned an undecodable result"),
+            NodeError::Upgrade(why) => write!(f, "kernel upgrade halted the node: {why}"),
         }
     }
 }
@@ -100,8 +104,8 @@ pub struct Pending {
 
 /// A running node.
 pub struct Node {
-    exec: Executor<MemStorage>,
-    kernel: [u8; 32],
+    pub(crate) exec: Executor<MemStorage>,
+    pub(crate) kernel: [u8; 32],
     services: Rc<RefCell<NodeServices>>,
     mempool: Vec<Pending>,
     /// Blocks executed, in order, as `(height, block hash)`.
@@ -117,6 +121,8 @@ pub struct Node {
     /// Raw transactions admitted since the last [`Node::take_tx_gossip`],
     /// for the transport to forward to peers.
     tx_gossip: Vec<Vec<u8>>,
+    /// Kernel switchover and feature-gate state (`crate::upgrade`).
+    pub(crate) upgrades: Upgrades,
 }
 
 impl Node {
@@ -151,7 +157,11 @@ impl Node {
             ..NodeServices::default()
         }));
         let mut exec = Executor::new(ModuleCache::default(), MemStorage::default());
-        exec.set_extension(Box::new(NodeExtension::new(Rc::clone(&services))));
+        let active_gates = Rc::new(Cell::new(0));
+        exec.set_extension(Box::new(GatedExtension::new(
+            NodeExtension::new(Rc::clone(&services)),
+            Rc::clone(&active_gates),
+        )));
         let kernel = exec
             .load(kernel_module, Capability::Privileged)
             .map_err(NodeError::Load)?;
@@ -166,6 +176,7 @@ impl Node {
             persisted_driver_state: None,
             kernel_gas: KERNEL_GAS,
             tx_gossip: Vec::new(),
+            upgrades: Upgrades::new(active_gates),
         };
         node.call_unit(exports::INIT, &genesis.to_bytes())?;
         node.kernel_gas = config.kernel_gas;
@@ -290,6 +301,7 @@ impl Node {
     /// # Errors
     /// See [`NodeError`].
     pub fn step(&mut self, input: Input) -> Result<(), NodeError> {
+        self.upgrade_halted()?;
         let mut queue = VecDeque::from([input]);
         while let Some(input) = queue.pop_front() {
             let effects: Seq<Effect> = self.call(exports::DRIVER_STEP, &input.to_bytes())?;
@@ -298,7 +310,9 @@ impl Node {
                     queue.push_back(follow_up);
                 }
             }
+            self.switch_kernel_if_due(&mut queue)?;
         }
+        self.send_gate_signal();
         Ok(())
     }
 
@@ -324,7 +338,7 @@ impl Node {
                 self.services.borrow_mut().timers.remove(&timer_id);
                 None
             }
-            Effect::ExecuteBlock { block } => Some(self.execute_block(block)?),
+            Effect::ExecuteBlock { block } => self.execute_or_hold(block)?,
             Effect::FinalizeBlock {
                 height,
                 certificate,
@@ -422,7 +436,7 @@ impl Node {
         }
     }
 
-    fn execute_block(&mut self, block: Block) -> Result<Input, NodeError> {
+    pub(crate) fn execute_block(&mut self, block: Block) -> Result<Input, NodeError> {
         let header = BlockHeader::from_bytes(&block.header)
             .map_err(|_| NodeError::Decode("block header"))?;
         let context = Self::context_for(&header);

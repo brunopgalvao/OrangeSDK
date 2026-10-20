@@ -11,10 +11,11 @@ This directory is normative. An implementation that disagrees with it is wrong; 
 | 03 | [Module format](03-module-format.md) — container, sections, basic-block table, validation | draft |
 | 04 | [Gas](04-gas.md) — the instruction cost table, dynamic charges, the out-of-gas point | draft |
 | 05 | [Host ABI](05-host-abi.md) — the frozen interface between host and kernel, and the sandboxed subset for contracts | draft |
-| 06 | [Driver interface](06-driver-interface.md) — inputs and effects of the consensus state machine | draft |
+| 06 | [Driver interface](06-driver-interface.md) — inputs and effects of the consensus state machine, kernel versions and the switchover between kernels | draft |
 | 07 | [Conformance](07-conformance.md) — test vectors, differential oracles, coverage requirements | draft |
 | 08 | [Simplex driver](08-simplex-driver.md) — the reference kernel's consensus: views, votes, certificates, persistence | draft |
 | 09 | [Peer-to-peer transport](09-p2p.md) — TCP framing, handshake, mapping between frames and driver inputs and effects | draft |
+| 13 | [Kernel upgrades and feature gates](13-upgrades.md) — the upgrade address and its actions, the upgrade timeline, feature-gate signalling, lock-in and activation | draft |
 
 ## Conventions
 

@@ -74,9 +74,12 @@ Writes are buffered in a per-instance overlay and become visible to the instance
 | `hash_blake2b256` | `a0` src, `a1` len, `a2` dst(32) | `a0` = 0 | Sandboxed | 30 + 4 per 32 bytes |
 | `secp256k1_recover` | `a0` msg(32), `a1` sig(65), `a2` dst(64) | `a0` = status | Sandboxed | 3 000 |
 | `p256_verify` | `a0` msg(32), `a1` sig(64), `a2` pubkey(64) | `a0` = status (0 valid, 1 invalid) | Sandboxed | 6 900 |
+| `secp256k1_verify` | `a0` msg(32), `a1` sig(64), `a2` pubkey(64) | `a0` = status (0 valid, 1 invalid) | Sandboxed, behind gate 0 | 3 000 |
 | `bls12381_verify` | `a0` msg, `a1` msg_len, `a2` sig(96), `a3` pubkey(48) | `a0` = status (0 valid, 1 invalid) | Sandboxed | 100 000 |
 | `bls12381_pairing_check` | `a0` pairs, `a1` count | `a0` = status (0 holds, 1 fails) | Sandboxed | 70 000 + 50 000 per pair |
 | `sign` | `a0` key_role, `a1` msg, `a2` msg_len, `a3` dst, `a4` cap | `a0` = signature length or status | Privileged | 10 000 |
+
+`secp256k1_verify` checks an ECDSA signature `r || s` over a 32-byte digest against an uncompressed public key `x || y`, without recovery. A signature with `s` above half the group order is invalid, as Ethereum requires of transactions; so are an `r` or `s` of zero or not below the order, and a key that is not on the curve. It resolves only once feature gate 0 is active (spec 13 §8).
 
 `storage_commit` covers every key except those under the prefix `local/`, which a kernel uses for node-local bookkeeping that must not affect the root (the reference kernel keeps its finalized height there). `sign` is the only function that touches node keys. It writes the signature to `dst` when `cap` allows and returns its length (65 for the recoverable secp256k1 signature of key role 0 over a 32-byte message); it returns 0 when the node has no key for the role, the message is not 32 bytes, or `cap` is too small. `key_role` is a small integer naming a key in the host keystore (consensus, preconfirmation, identity); the host signs with the node's own key and never exports it. Precompile-grade operations beyond this list (modexp, bn254, point evaluation) are kernel-level precompiles implemented in modules with native acceleration, not host functions.
 
@@ -145,5 +148,5 @@ Every function in §4.1–§4.4 MUST return identical results on every node give
 ## 7. Versioning and growth
 
 - `abi_version` returns 1. A host supporting version `n` supports every function of every version `≤ n`.
-- New functions arrive in a new version behind a feature gate. A module importing a function from a version the host lacks fails to load, which is the intended failure: it is visible at install, never at run time.
+- New functions arrive in a new version behind a feature gate (spec 13 §8): a gated function resolves only once the chain has activated its gate. A module importing a function from a version the host lacks, or one whose gate is not active, fails to load, which is the intended failure: it is visible at install, never at run time.
 - Per-unit and base costs in this document are part of the host-call cost table, version 1, and are recalibrated and versioned exactly like the instruction cost table (04 §2). A kernel declares the cost-table versions it was built against; the host charges by the versions the active fee schedule names.
