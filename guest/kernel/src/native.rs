@@ -60,8 +60,8 @@ pub struct Batch {
     pub writes: Vec<Write>,
 }
 
-/// The precompile provider of the reference kernel: Ethereum's precompiles
-/// and native contracts.
+/// The precompile provider of the reference kernel: Ethereum's precompiles,
+/// the outbox (spec 17 §2) and native contracts.
 #[derive(Debug)]
 pub struct NativeProvider {
     eth: EthPrecompiles,
@@ -167,6 +167,9 @@ impl Precompiles for NativeProvider {
     /// A native contract keeps no EVM storage: its slot 0 holds the number
     /// of its latest standing batch, whose chain is applied to its namespace.
     fn commit_storage(&self, address: &Address, account: &RAccount) -> bool {
+        if crate::outbox::commit(address, account) {
+            return true;
+        }
         if !account.info.code.as_ref().is_some_and(|c| modules::designated(c.original_byte_slice()).is_some()) {
             return false;
         }
@@ -187,6 +190,9 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for NativeProvider {
     fn run(&mut self, context: &mut CTX, inputs: &CallInputs) -> Result<Option<InterpreterResult>, String> {
         if let Some(result) = <EthPrecompiles as PrecompileProvider<CTX>>::run(&mut self.eth, context, inputs)? {
             return Ok(Some(result));
+        }
+        if crate::outbox::is_outbox(inputs) {
+            return crate::outbox::call(context, inputs).map(Some);
         }
         match modules::designated(inputs.known_bytecode.1.original_byte_slice()) {
             Some(code_hash) => self.call(context, inputs, &code_hash).map(Some),

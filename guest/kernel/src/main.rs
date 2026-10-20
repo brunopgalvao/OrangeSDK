@@ -12,6 +12,7 @@ mod evm;
 mod governance;
 mod modules;
 mod native;
+mod outbox;
 mod persist;
 mod staking;
 mod state;
