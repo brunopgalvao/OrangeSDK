@@ -18,4 +18,7 @@ The long arc (vision, strategy, decisions, research) lives in the codex at `/Use
 
 - `spec/` — the VM, module format, gas, host ABI and driver interface specifications.
 - `crates/solo-vm` — reference interpreter, `no_std`-capable, the oracle for every other backend.
-- `tools/` — recompiler, conformance runners, differential fuzz harnesses (as they land).
+- `crates/solo-recompile` — RV64 ELF to Solo module. `crates/solo-host` — executor and host ABI. `crates/solo-abi` — codec and shared types. `crates/solo-rlp` — RLP.
+- `crates/solo-node` — node host (driver loop, mempool, queries). `crates/solo-rpc` — Ethereum JSON-RPC. `crates/solo-cli` — the `solo` command.
+- `guest/` — separate RISC-V workspace: `solo-guest` runtime, `hello`, the reference `kernel`. Rebuild fixtures with `tools/build-guest.sh` after touching it.
+- `tools/` — build scripts; conformance runners and differential fuzz harnesses as they land.

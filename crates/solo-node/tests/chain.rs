@@ -381,6 +381,16 @@ fn node_errors() {
         "{err}"
     );
     assert!(err.to_string().contains("kernel_init"));
+    // Starving kernel calls of gas turns every call into a kernel error.
+    let mut node = node(&alice);
+    node.kernel_gas = 0;
+    assert!(matches!(
+        node.block_number(),
+        Err(solo_node::NodeError::Kernel {
+            export: "kernel_query",
+            ..
+        })
+    ));
     assert!(
         solo_node::NodeError::Decode("x")
             .to_string()

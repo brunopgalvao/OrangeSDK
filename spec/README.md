@@ -27,4 +27,4 @@ The spec version is `major.minor`. A module declares the spec version it targets
 
 ## Relationship to RISC-V
 
-Instruction *semantics* are those of RISC-V RV64E base plus the M extension, restricted and clarified as this spec states (no floating point, no CSRs, no fences, atomics lowered to plain memory operations). Instruction *encoding* and the *program container* are Solo's own. A post-link recompiler translates standard RV64 ELF produced by stock toolchains into the Solo module format. Because semantics are preserved, riscv-tests, the Sail model, and QEMU remain conformance oracles through the recompiler.
+Instruction *semantics* are those of RISC-V RV64I base plus the M extension, restricted and clarified as this spec states (no floating point, no CSRs, no fences, atomics lowered to plain memory operations). Instruction *encoding* and the *program container* are Solo's own. A post-link recompiler translates standard RV64 ELF produced by stock toolchains into the Solo module format. Because semantics are preserved, riscv-tests, the Sail model, and QEMU remain conformance oracles through the recompiler.

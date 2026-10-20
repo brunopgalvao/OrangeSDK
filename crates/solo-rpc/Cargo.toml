@@ -1,0 +1,21 @@
+[package]
+name = "solo-rpc"
+description = "Ethereum JSON-RPC over a Solo node, with a minimal HTTP server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+solo-abi = { path = "../solo-abi" }
+solo-host = { path = "../solo-host" }
+solo-node = { path = "../solo-node" }
+solo-rlp = { path = "../solo-rlp" }
+serde_json = "1"
+
+[dev-dependencies]
+solo-recompile = { path = "../solo-recompile" }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+
+[lints]
+workspace = true

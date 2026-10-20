@@ -88,6 +88,8 @@ pub struct Node {
     pub metrics: Vec<(Vec<u8>, i64)>,
     /// The last state the driver asked to persist.
     pub persisted_driver_state: Option<Vec<u8>>,
+    /// Gas budget for each kernel call; see [`KERNEL_GAS`].
+    pub kernel_gas: i64,
 }
 
 impl Node {
@@ -114,6 +116,7 @@ impl Node {
             finalized: Vec::new(),
             metrics: Vec::new(),
             persisted_driver_state: None,
+            kernel_gas: KERNEL_GAS,
         };
         node.call_unit(exports::INIT, &genesis.to_bytes())?;
         Ok(node)
@@ -126,7 +129,7 @@ impl Node {
             export,
             KERNEL_NAMESPACE,
             input,
-            KERNEL_GAS,
+            self.kernel_gas,
             Capability::Privileged,
             Flags::default(),
         );

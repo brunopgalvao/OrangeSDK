@@ -2,7 +2,7 @@
 
 ## 1. Scope
 
-This document defines every instruction a Solo module may contain: its encoding, its operands, and its semantics. Semantics are those of RISC-V RV64E plus M wherever an instruction has a RISC-V counterpart; the encoding is Solo's own. Anything not listed here is not an instruction, and a module containing it is invalid at load time (03 §7). Nothing is decided at run time that can be decided at load time.
+This document defines every instruction a Solo module may contain: its encoding, its operands, and its semantics. Semantics are those of RISC-V RV64I plus M wherever an instruction has a RISC-V counterpart; the encoding is Solo's own. Anything not listed here is not an instruction, and a module containing it is invalid at load time (03 §7). Nothing is decided at run time that can be decided at load time.
 
 ## 2. Encoding primitives
 

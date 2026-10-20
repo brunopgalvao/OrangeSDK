@@ -1,0 +1,21 @@
+[package]
+name = "solo-cli"
+description = "The solo command: run a dev node with JSON-RPC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "solo"
+path = "src/main.rs"
+
+[dependencies]
+solo-abi = { path = "../solo-abi" }
+solo-node = { path = "../solo-node" }
+solo-recompile = { path = "../solo-recompile" }
+solo-rpc = { path = "../solo-rpc" }
+serde_json = "1"
+
+[lints]
+workspace = true

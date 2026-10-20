@@ -19,6 +19,7 @@ jobs:
       - run: cargo build -p solo-vm --no-default-features --target wasm32-unknown-unknown
       - run: cargo build --release --manifest-path guest/Cargo.toml
       - run: cargo run -q -p solo-recompile -- guest/target/riscv64imac-unknown-none-elf/release/hello /tmp/hello.solo
+      - run: cargo run -q -p solo-recompile -- guest/target/riscv64imac-unknown-none-elf/release/kernel /tmp/kernel.solo
   coverage:
     runs-on: ubuntu-latest
     steps:
