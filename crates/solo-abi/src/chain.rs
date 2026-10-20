@@ -135,8 +135,20 @@ record! {
 }
 
 record! {
-    /// `query::CALL` parameters: a message executed against the latest state
-    /// and thrown away (`eth_call`, `eth_estimateGas`).
+    /// An EIP-2930 access list entry: an account and the storage keys of it
+    /// that a message declares it will touch.
+    AccessItem {
+        /// Account.
+        address: Address,
+        /// Storage keys, big-endian.
+        keys: Seq<Hash>,
+    }
+}
+
+record! {
+    /// `query::CALL` parameters: a message executed against the head state,
+    /// with the head block's number and timestamp, and thrown away
+    /// (`eth_call`, `eth_estimateGas`).
     CallRequest {
         /// Caller.
         from: Address,
@@ -148,6 +160,9 @@ record! {
         data: Vec<u8>,
         /// Gas limit.
         gas: u64,
+        /// Access list: charged as intrinsic gas and warm from the start, as
+        /// in an EIP-2930 transaction.
+        access_list: Seq<AccessItem>,
     }
 }
 
@@ -211,7 +226,7 @@ pub mod query {
     pub const CODE: &str = "code";
     /// `(StorageQuery) -> Hash` storage slot value.
     pub const STORAGE: &str = "storage";
-    /// `(CallRequest) -> CallResult` a message against the latest state, discarded.
+    /// `(CallRequest) -> CallResult` a message against the head state, discarded.
     pub const CALL: &str = "call";
 }
 
@@ -630,6 +645,10 @@ mod tests {
             value: 2,
             data: vec![3],
             gas: 4,
+            access_list: Seq(vec![AccessItem {
+                address: [5; 20],
+                keys: Seq(vec![[6; 32], [7; 32]]),
+            }]),
         });
         roundtrip(&CallResult {
             status: call_status::REVERT,

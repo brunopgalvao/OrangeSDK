@@ -16,11 +16,21 @@ pub use crate::hex::{
     data, parse_address, parse_big, parse_hash, parse_hex, parse_quantity, parse_word, quantity,
     quantity_be,
 };
-use crate::views::{self, Position, decode_or_blank};
+use crate::views::{self, Destination, Position, created_address, decode_or_blank};
 
 /// Default widest block range one `eth_getLogs` request may search
 /// ([`Rpc::max_log_range`]): every block in it costs a kernel query.
 pub const MAX_LOG_RANGE: u64 = 10_000;
+
+/// Default most requests one batch may carry ([`Rpc::max_batch`]), geth's
+/// default.
+pub const MAX_BATCH: usize = 1000;
+
+/// Work the node must keep doing while requests are served: polling the
+/// network and ticking the clock. Requests run on the thread that drives
+/// consensus, so the server runs this between connections, and long requests
+/// run it between their steps (see [`Rpc::run_background`]).
+pub type Background = Box<dyn FnMut(&mut Node)>;
 
 /// Most blocks one `eth_feeHistory` request reports, as in geth.
 pub const MAX_FEE_HISTORY: u64 = 1024;
@@ -187,14 +197,23 @@ fn rewards(receipts: &[Receipt], gas_used: u64, percentiles: &[f64]) -> Vec<Stri
 }
 
 /// Serves Ethereum JSON-RPC over a node.
+///
+/// Requests run on the caller's thread, which also drives the node, so what
+/// one request can make the node compute is bounded: each kernel query by
+/// the node's query budget ([`Node::query_gas`]), and the requests that
+/// make many queries (batches, gas estimation, log and fee-history scans)
+/// hand the node its [`Background`] work between them.
 pub struct Rpc {
     node: Node,
+    background: Option<Background>,
     /// Priority fee the node suggests, in wei (`eth_maxPriorityFeePerGas`);
     /// `eth_gasPrice` adds the base fee, zero in the reference kernel.
     pub gas_price: u128,
     /// Widest block range one `eth_getLogs` request may search, counted
     /// within the chain; [`MAX_LOG_RANGE`] unless changed.
     pub max_log_range: u64,
+    /// Most requests one batch may carry; [`MAX_BATCH`] unless changed.
+    pub max_batch: usize,
     /// Set by `solo_stop`; the server loop exits when it sees it.
     pub stopped: bool,
 }
@@ -205,9 +224,27 @@ impl Rpc {
     pub fn new(node: Node) -> Rpc {
         Rpc {
             node,
+            background: None,
             gas_price: 1_000_000_000,
             max_log_range: MAX_LOG_RANGE,
+            max_batch: MAX_BATCH,
             stopped: false,
+        }
+    }
+
+    /// Sets the node's background work; see [`Rpc::run_background`].
+    pub fn set_background(&mut self, work: Background) {
+        self.background = Some(work);
+    }
+
+    /// Runs the background work once, if any is set. The HTTP server calls
+    /// this between connections; requests call it between batch entries,
+    /// between gas-estimation runs and between the blocks of a log or
+    /// fee-history scan, so the node keeps voting while they are served.
+    /// The head can move during such a request.
+    pub fn run_background(&mut self) {
+        if let Some(work) = self.background.as_mut() {
+            work(&mut self.node);
         }
     }
 
@@ -240,10 +277,24 @@ impl Rpc {
         }
     }
 
-    /// Handles a request body: a single request or a batch.
+    /// Handles a request body: a single request or a batch. A batch longer
+    /// than [`Rpc::max_batch`] gets one error, under the id of its first
+    /// request, as geth answers it.
     pub fn handle_body(&mut self, body: &str) -> Value {
         match serde_json::from_str::<Value>(body) {
-            Ok(Value::Array(batch)) => Value::Array(batch.iter().map(|r| self.handle(r)).collect()),
+            Ok(Value::Array(batch)) if batch.len() > self.max_batch => {
+                let id = batch.iter().find_map(|r| r.get("id")).cloned();
+                let error = RpcError::with_code(-32600, "batch too large".into());
+                json!([error_response(&id.unwrap_or(Value::Null), &error)])
+            }
+            Ok(Value::Array(batch)) => {
+                let mut out = Vec::with_capacity(batch.len());
+                for request in &batch {
+                    self.run_background();
+                    out.push(self.handle(request));
+                }
+                Value::Array(out)
+            }
             Ok(single) => self.handle(&single),
             Err(_) => error_response(
                 &Value::Null,
@@ -265,33 +316,53 @@ impl Rpc {
         })
     }
 
-    /// Checks the block parameter of a state method. State is served as of
-    /// the latest block whatever block is named, but a block that does not
-    /// exist is an error, as in geth. Accepts a tag, a number, a block hash,
-    /// or an EIP-1898 object with `blockHash` or `blockNumber`.
+    /// Checks the block parameter of a state method. The node keeps the
+    /// state at the head only, so the parameter must name the head: a tag
+    /// (`latest`, `pending`, `safe` and `finalized` all name it, spec 08
+    /// section 8), its number or its hash, directly or as an EIP-1898 object
+    /// with `blockHash` or `blockNumber`. A block above the head does not
+    /// exist and one below it has no state left, as on a pruned geth node;
+    /// both are errors rather than answers from another block's state.
     fn check_block(&mut self, param: Option<&Value>) -> Result<(), RpcError> {
         let height = match param {
             None | Some(Value::Null) => return Ok(()),
-            Some(Value::String(hash)) if hash.len() == 66 => return self.check_hash(hash),
-            Some(Value::String(tag)) => self.resolve_block(tag)?,
+            Some(Value::String(hash)) if hash.len() == 66 => self.hash_height(hash)?,
+            Some(Value::String(tag)) => self.state_height(tag)?,
             Some(Value::Object(object)) => {
                 if let Some(hash) = object.get("blockHash") {
-                    return self.check_hash(hash.as_str().unwrap_or_default());
+                    self.hash_height(hash.as_str().unwrap_or_default())?
+                } else {
+                    let number = object.get("blockNumber").and_then(Value::as_str);
+                    self.state_height(number.unwrap_or("latest"))?
                 }
-                let number = object.get("blockNumber").and_then(Value::as_str);
-                self.resolve_block(number.unwrap_or("latest"))?
             }
             Some(_) => return Err(RpcError::invalid_params("invalid block parameter")),
         };
-        if height > self.block_number()? {
+        let head = self.block_number()?;
+        if height > head {
             return Err(RpcError::server("header not found"));
+        }
+        if height < head {
+            return Err(RpcError::server(format!(
+                "historical state not available: block {height}, the node keeps the state of block {head} only"
+            )));
         }
         Ok(())
     }
 
-    fn check_hash(&mut self, hash: &str) -> Result<(), RpcError> {
+    /// The height a state method's block tag or number names; every tag but
+    /// `earliest` is the head.
+    fn state_height(&mut self, tag: &str) -> Result<u64, RpcError> {
+        match tag {
+            "latest" | "pending" | "safe" | "finalized" => self.block_number(),
+            "earliest" => Ok(0),
+            hex => parse_quantity(hex),
+        }
+    }
+
+    fn hash_height(&mut self, hash: &str) -> Result<u64, RpcError> {
         match self.node.block_by_hash(&parse_hash(hash)?)? {
-            Some(_) => Ok(()),
+            Some(header) => Ok(header.height),
             None => Err(RpcError::server("header for hash not found")),
         }
     }
@@ -313,10 +384,12 @@ impl Rpc {
             "eth_accounts" => json!([]),
             "eth_getBalance" => {
                 let address = address_param(params, 0)?;
+                self.check_block(params.get(1))?;
                 json!(quantity(self.node.account(&address)?.balance))
             }
             "eth_getTransactionCount" => {
                 let address = address_param(params, 0)?;
+                self.check_block(params.get(1))?;
                 json!(quantity(u128::from(self.node.account(&address)?.nonce)))
             }
             "eth_getCode" => {
@@ -465,10 +538,23 @@ impl Rpc {
                 )));
             }
         }
-        Ok(self.node.call(request)?)
+        self.execute(request)
     }
 
-    /// Runs `request` with `gas` and moves the bound of the search it settles.
+    /// Runs a message in the kernel. One that computes past the node's query
+    /// budget is aborted, as geth aborts a call past its RPC timeout.
+    fn execute(&mut self, request: &CallRequest) -> Result<CallResult, RpcError> {
+        match self.node.call(request) {
+            Err(e) if e.is_out_of_gas() => Err(RpcError::server(
+                "execution aborted: the message ran past the node's query budget",
+            )),
+            result => Ok(result?),
+        }
+    }
+
+    /// Runs `request` with `gas` and moves the bound of the search it
+    /// settles. The node's background work runs first: an estimate takes
+    /// several runs.
     fn narrow(
         &mut self,
         request: &mut CallRequest,
@@ -476,8 +562,9 @@ impl Rpc {
         lo: &mut u64,
         hi: &mut u64,
     ) -> Result<(), RpcError> {
+        self.run_background();
         request.gas = gas;
-        if self.node.call(request)?.status == call_status::SUCCESS {
+        if self.execute(request)?.status == call_status::SUCCESS {
             *hi = gas;
         } else {
             *lo = gas;
@@ -545,10 +632,21 @@ impl Rpc {
         Ok(out)
     }
 
-    /// The recipient of the transaction `hash`: `None` for a creation.
-    fn recipient(&mut self, hash: &[u8; 32]) -> Result<Option<[u8; 20]>, RpcError> {
+    /// Where the mined transaction `hash` went. Bytes that do not decode
+    /// went nowhere.
+    fn destination(&mut self, hash: &[u8; 32]) -> Result<Destination, RpcError> {
         let raw = self.node.transaction(hash)?.unwrap_or_default();
-        Ok(decode_or_blank(&raw).to)
+        Ok(match solo_eth::decode(&raw) {
+            Ok(tx) if tx.to.is_none() => Destination {
+                to: None,
+                contract: sender(&raw).map(|from| created_address(&from, tx.nonce)),
+            },
+            Ok(tx) => Destination {
+                to: tx.to,
+                contract: None,
+            },
+            Err(_) => Destination::default(),
+        })
     }
 
     fn receipt_json(&mut self, hash: &[u8; 32], receipt: &Receipt) -> Result<Value, RpcError> {
@@ -559,8 +657,14 @@ impl Rpc {
             let logs = self.node.receipt(tx_hash)?.unwrap_or_default().logs;
             first_log += logs.0.len() as u64;
         }
-        let to = self.recipient(hash)?;
-        Ok(views::receipt(hash, receipt, to, &block_hash, first_log))
+        let destination = self.destination(hash)?;
+        Ok(views::receipt(
+            hash,
+            receipt,
+            destination,
+            &block_hash,
+            first_log,
+        ))
     }
 
     fn block_receipts_json(
@@ -572,8 +676,14 @@ impl Rpc {
         let mut out = Vec::with_capacity(receipts.len());
         let mut first_log = 0;
         for (tx_hash, receipt) in header.tx_hashes.0.iter().zip(&receipts) {
-            let to = self.recipient(tx_hash)?;
-            out.push(views::receipt(tx_hash, receipt, to, hash, first_log));
+            let destination = self.destination(tx_hash)?;
+            out.push(views::receipt(
+                tx_hash,
+                receipt,
+                destination,
+                hash,
+                first_log,
+            ));
             first_log += receipt.logs.0.len() as u64;
         }
         Ok(Value::Array(out))
@@ -671,6 +781,7 @@ impl Rpc {
         let (from, to) = self.filter_heights(&filter.blocks)?;
         let mut out = Vec::new();
         for height in from..=to {
+            self.run_background();
             let (header, block_hash) = self.header_at(height)?.unwrap_or_default();
             let mut log_index = 0;
             for tx_hash in &header.tx_hashes.0 {
@@ -712,6 +823,7 @@ impl Rpc {
         let mut ratios = Vec::new();
         let mut reward = Vec::new();
         for height in oldest..=newest {
+            self.run_background();
             let (header, _) = self.header_at(height)?.unwrap_or_default();
             // Gas amounts are far below 2^53: the ratio is exact enough.
             ratios.push(header.gas_used as f64 / BLOCK_GAS_LIMIT as f64);

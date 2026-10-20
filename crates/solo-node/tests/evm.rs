@@ -4,7 +4,7 @@
 
 use k256::ecdsa::SigningKey;
 use solo_abi::Encode;
-use solo_abi::chain::{Allocation, CallRequest, GenesisParams, call_status};
+use solo_abi::chain::{AccessItem, Allocation, CallRequest, GenesisParams, call_status};
 use solo_abi::codec::Seq;
 use solo_abi::types::Genesis;
 use solo_host::hash::keccak256;
@@ -165,6 +165,7 @@ fn contracts_through_the_node() {
         value: 0,
         data: selector("count()"),
         gas: 0,
+        access_list: Seq(vec![]),
     };
     let read = node.call(&request).unwrap();
     assert_eq!(read.status, call_status::SUCCESS);
@@ -215,6 +216,7 @@ fn contracts_through_the_node() {
             value: 0,
             data: initcode,
             gas: 1_000_000,
+            access_list: Seq(vec![]),
         })
         .unwrap();
     assert_eq!(created.status, call_status::SUCCESS);
@@ -232,5 +234,71 @@ fn contracts_through_the_node() {
         node.storage(&counter, &word(0)),
         Err(NodeError::Kernel { .. })
     ));
-    assert!(matches!(node.call(&request), Err(NodeError::Kernel { .. })));
+    assert!(node.call(&request).unwrap_err().is_out_of_gas());
+    // A budget the executor refuses fails the call before it starts.
+    node.kernel_gas = -1;
+    let refused = node.call(&request).unwrap_err();
+    assert!(matches!(refused, NodeError::Kernel { .. }));
+    assert!(!refused.is_out_of_gas());
+}
+
+#[test]
+fn access_lists_and_the_query_budget() {
+    let alice = Wallet::new(1);
+    let mut node = node(&alice);
+    let mut initcode = hex(COUNTER);
+    initcode.extend_from_slice(&word(5));
+    node.submit(&alice.send(0, None, &initcode, 500_000))
+        .unwrap();
+    node.tick(1_000 + SLOT_MS).unwrap();
+    let counter = created_address(&alice.address, 0);
+    let mut count = CallRequest {
+        from: alice.address,
+        to: Some(counter),
+        value: 0,
+        data: selector("count()"),
+        gas: 0,
+        access_list: Seq(vec![]),
+    };
+    let read = node.call(&count).unwrap();
+    assert_eq!(read.output, word(5));
+
+    // An access list is charged up front and warms what it names: 2400 for
+    // the account and 1900 for the key, and the slot read then costs 100
+    // instead of 2100. The callee is warm anyway.
+    count.access_list = Seq(vec![AccessItem {
+        address: counter,
+        keys: Seq(vec![word(0)]),
+    }]);
+    let listed = node.call(&count).unwrap();
+    assert_eq!(listed.output, word(5));
+    assert_eq!(listed.gas_used, read.gas_used + 2_400 + 1_900 - 2_000);
+    count.access_list = Seq(vec![]);
+
+    // The call query sees the head block: its number and its timestamp.
+    let block = |code: &str| CallRequest {
+        to: None,
+        data: hex(code),
+        ..count.clone()
+    };
+    // NUMBER (TIMESTAMP) PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+    let number = node.call(&block("4360005260206000f3")).unwrap();
+    assert_eq!(number.output, word(1));
+    let timestamp = node.call(&block("4260005260206000f3")).unwrap();
+    let head = node.block_by_number(1).unwrap().unwrap();
+    assert_eq!(timestamp.output, word(head.timestamp_ms / 1000));
+
+    // Queries run within their own budget: a message that loops until its
+    // EVM gas runs out (JUMPDEST PUSH1 0 JUMP) stops at the budget instead,
+    // while ordinary calls fit.
+    let looping = block("5b600056");
+    node.query_gas = 2_000_000;
+    let aborted = node.call(&looping).unwrap_err();
+    assert!(aborted.is_out_of_gas(), "{aborted}");
+    assert_eq!(node.call(&count).unwrap().output, word(5));
+    let short = CallRequest {
+        gas: 60_000,
+        ..looping
+    };
+    assert_eq!(node.call(&short).unwrap().status, call_status::HALT);
 }

@@ -32,6 +32,8 @@ cast call $COUNTER 'count()(uint256)' --rpc-url $RPC
 cast logs --address $COUNTER --from-block 0 --rpc-url $RPC
 ```
 
+The node keeps the state of the head block only: state methods (`eth_getBalance`, `eth_call`, ...) answer for the head and refuse an older block rather than answer from the wrong state. Requests run on the thread that drives consensus, so each kernel query runs within a budget (`--query-gas`, 2^26 VM gas by default) and long requests (batches, gas estimation, log scans) let the node poll its peers and tick between their steps.
+
 Run a chain of several validators, each with its own key. `solo key` prints the validator id to list in the genesis file:
 
 ```sh

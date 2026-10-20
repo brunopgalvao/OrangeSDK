@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use solo_abi::chain::{BASE_FEE, BLOCK_GAS_LIMIT, BlockHeader, Log, Receipt};
 use solo_eth::Tx;
 use solo_host::hash::keccak256;
+use solo_rlp::{encode_bytes, encode_list, encode_uint};
 
 use crate::hex::{data, quantity, quantity_be};
 
@@ -40,6 +41,32 @@ pub fn decode_or_blank(raw: &[u8]) -> Tx {
         s: [0; 32],
         signing_payload: Vec::new(),
     })
+}
+
+/// The address a creation by `sender` at `nonce` deploys to:
+/// `keccak256(rlp([sender, nonce]))[12..]`.
+#[must_use]
+pub fn created_address(sender: &[u8; 20], nonce: u64) -> [u8; 20] {
+    let mut body = Vec::new();
+    encode_bytes(sender, &mut body);
+    encode_uint(u128::from(nonce), &mut body);
+    let mut list = Vec::new();
+    encode_list(&body, &mut list);
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&keccak256(&list)[12..]);
+    address
+}
+
+/// Where a mined transaction went: its recipient, `None` for a creation,
+/// and for a creation the address it deploys to. geth derives that address
+/// from the sender and nonce whatever the outcome, so a creation that
+/// reverted still names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Destination {
+    /// Recipient.
+    pub to: Option<[u8; 20]>,
+    /// Created contract.
+    pub contract: Option<[u8; 20]>,
 }
 
 fn address_or_null(address: Option<[u8; 20]>) -> Value {
@@ -129,13 +156,13 @@ pub fn log(log: &Log, tx_hash: &[u8; 32], position: &Position, log_index: u64) -
     })
 }
 
-/// A receipt. `to` is the transaction's recipient (`None` for a creation);
-/// `first_log` is the block-wide index of its first log.
+/// A receipt. `destination` is where the transaction went; `first_log` is
+/// the block-wide index of its first log.
 #[must_use]
 pub fn receipt(
     hash: &[u8; 32],
     receipt: &Receipt,
-    to: Option<[u8; 20]>,
+    destination: Destination,
     block_hash: &[u8; 32],
     first_log: u64,
 ) -> Value {
@@ -151,12 +178,12 @@ pub fn receipt(
         "blockHash": data(block_hash),
         "blockNumber": quantity(u128::from(receipt.height)),
         "from": data(&receipt.from),
-        "to": address_or_null(to),
+        "to": address_or_null(destination.to),
         "status": quantity(u128::from(receipt.status)),
         "gasUsed": quantity(u128::from(receipt.gas_used)),
         "cumulativeGasUsed": quantity(u128::from(receipt.cumulative_gas_used)),
         "effectiveGasPrice": quantity(receipt.effective_gas_price),
-        "contractAddress": address_or_null(receipt.contract),
+        "contractAddress": address_or_null(destination.contract),
         "logs": logs
             .iter()
             .zip(first_log..)

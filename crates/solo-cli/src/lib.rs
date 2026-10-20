@@ -1,8 +1,8 @@
 //! The `solo` command.
 //!
 //! `solo dev --kernel <kernel.elf|kernel.solo> --genesis <genesis.json>
-//! [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>]` runs a
-//! single-node development chain with Ethereum JSON-RPC. The genesis file is
+//! [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>]`
+//! runs a single-node development chain with Ethereum JSON-RPC. The genesis file is
 //! JSON: `{"chainId": 1337, "slotMs": 400, "maxTxs": 64,
 //! "alloc": {"0x<address>": "<wei>"}, "validators": ["0x<32-byte id>"]}`.
 //! Without `validators` the dev node is the only validator, signing with
@@ -10,6 +10,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -57,8 +59,8 @@ pub const DEFAULT_RPC: &str = "127.0.0.1:8545";
 
 /// Usage line printed on a command-line mistake.
 pub const USAGE: &str = "usage:
-  solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>]
-  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex>] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>]
+  solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>]
+  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex>] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>]
   solo key  <64 hex>";
 
 /// Where `solo node` listens for peers unless `--listen` says otherwise.
@@ -220,6 +222,11 @@ fn parse_number(args: &[String], name: &str) -> Result<Option<u64>, String> {
     }
 }
 
+/// A gas budget option: `default` when absent, saturating at `i64::MAX`.
+fn parse_gas(args: &[String], name: &str, default: i64) -> Result<i64, String> {
+    Ok(parse_number(args, name)?.map_or(default, |gas| i64::try_from(gas).unwrap_or(i64::MAX)))
+}
+
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -291,7 +298,8 @@ fn run_inner(
     let rpc_arg = arg(args, "--rpc");
     let rpc_addr = rpc_arg.as_deref().unwrap_or(DEFAULT_RPC);
     let max_blocks = parse_number(args, "--blocks")?;
-    let kernel_gas = parse_number(args, "--kernel-gas")?;
+    let kernel_gas = parse_gas(args, "--kernel-gas", solo_node::node::KERNEL_GAS)?;
+    let query_gas = parse_gas(args, "--query-gas", solo_node::node::QUERY_GAS)?;
     let key = if command == "dev" {
         Some(dev_key())
     } else {
@@ -306,9 +314,8 @@ fn run_inner(
         solo_node::NodeConfig {
             now_ms: epoch,
             key: key.clone(),
-            kernel_gas: kernel_gas.map_or(solo_node::node::KERNEL_GAS, |gas| {
-                i64::try_from(gas).unwrap_or(i64::MAX)
-            }),
+            kernel_gas,
+            query_gas,
             ..solo_node::NodeConfig::default()
         },
     )?;
@@ -344,28 +351,29 @@ fn run_inner(
         "solo {command} node: chain id {chain_id}, validator {validator}, JSON-RPC on http://{bound}"
     );
     let mut last_tick = Instant::now();
-    let blocks_seen = std::cell::Cell::new(0u64);
-    solo_rpc::http::serve(
-        &listener,
-        &mut rpc,
-        |rpc| {
-            let now = epoch + u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            if let Some(t) = transport.as_mut() {
-                report(t.poll(rpc.node_mut(), now));
-            }
-            if last_tick.elapsed() < Duration::from_millis(20) {
-                return;
-            }
-            last_tick = Instant::now();
-            report(rpc.node_mut().tick(now));
-            let executed = rpc.node_mut().executed.len();
-            if executed as u64 > blocks_seen.get() {
-                blocks_seen.set(executed as u64);
-                let (height, hash) = rpc.node_mut().executed[executed - 1];
-                eprintln!("block {height} {}", solo_rpc::methods::data(&hash));
-            }
-        },
-        |rpc| !rpc.stopped && max_blocks.is_none_or(|n| blocks_seen.get() < n) && keep_going(rpc),
-    );
+    let blocks_seen = Rc::new(Cell::new(0u64));
+    let seen = Rc::clone(&blocks_seen);
+    // The network and the clock, between connections and between the steps
+    // of long requests.
+    rpc.set_background(Box::new(move |node: &mut solo_node::Node| {
+        let now = epoch + u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some(t) = transport.as_mut() {
+            report(t.poll(node, now));
+        }
+        if last_tick.elapsed() < Duration::from_millis(20) {
+            return;
+        }
+        last_tick = Instant::now();
+        report(node.tick(now));
+        let executed = node.executed.len();
+        if executed as u64 > seen.get() {
+            seen.set(executed as u64);
+            let (height, hash) = node.executed[executed - 1];
+            eprintln!("block {height} {}", solo_rpc::methods::data(&hash));
+        }
+    }));
+    solo_rpc::http::serve(&listener, &mut rpc, |rpc| {
+        !rpc.stopped && max_blocks.is_none_or(|n| blocks_seen.get() < n) && keep_going(rpc)
+    });
     Ok(())
 }

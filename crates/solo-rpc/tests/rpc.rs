@@ -4,6 +4,9 @@
 
 mod common;
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use common::{CHAIN_ID, ETHER, Fields, GAS_PRICE, SLOT_MS, Wallet, call, err, err_code, node, ok};
 use serde_json::{Value, json};
 use solo_abi::chain::reason;
@@ -484,7 +487,7 @@ fn kernel_failures_are_internal_errors() {
     let a = data(&alice.address);
     // Starve every kernel call of gas: each method surfaces the failure as -32603.
     rpc.node_mut().kernel_gas = 0;
-    let methods: [(&str, Value); 21] = [
+    let methods: [(&str, Value); 19] = [
         ("eth_chainId", json!([])),
         ("net_version", json!([])),
         ("eth_blockNumber", json!([])),
@@ -504,9 +507,7 @@ fn kernel_failures_are_internal_errors() {
         ("eth_getBlockReceipts", json!(["0x1"])),
         ("eth_getCode", json!([a])),
         ("eth_getStorageAt", json!([a, "0x0"])),
-        ("eth_call", json!([{ "to": a }])),
         ("eth_call", json!([{ "to": a, "value": "0x1" }])),
-        ("eth_estimateGas", json!([{ "to": a }])),
         ("eth_getLogs", json!([{}])),
         ("eth_feeHistory", json!(["0x1", "latest"])),
     ];
@@ -515,4 +516,91 @@ fn kernel_failures_are_internal_errors() {
         assert_eq!(code, -32603, "{method}");
         assert!(message.contains("ended with"), "{method}: {message}");
     }
+    // A starved message runs out of the query budget, like a long one; a
+    // kernel the executor refuses to start is an internal error there too.
+    let to_alice = json!([{ "to": a }]);
+    for method in ["eth_call", "eth_estimateGas"] {
+        assert_eq!(
+            err(&mut rpc, method, to_alice.clone()),
+            (
+                -32000,
+                "execution aborted: the message ran past the node's query budget".into()
+            )
+        );
+    }
+    rpc.node_mut().kernel_gas = -1;
+    for method in ["eth_call", "eth_estimateGas"] {
+        let (code, message, _) = call(&mut rpc, method, to_alice.clone()).expect_err(method);
+        assert_eq!(code, -32603, "{method}");
+        assert!(message.contains("ended with"), "{method}: {message}");
+    }
+}
+
+#[test]
+fn long_requests_are_bounded_and_let_the_node_run() {
+    let alice = Wallet::new(1);
+    let bob = Wallet::new(2);
+    let mut rpc = rpc(&alice);
+    // The node produces a block each time it gets the thread back.
+    let turns = Rc::new(Cell::new(0u64));
+    let counter = Rc::clone(&turns);
+    rpc.set_background(Box::new(move |node| {
+        counter.set(counter.get() + 1);
+        node.tick(1_000 + counter.get() * SLOT_MS).unwrap();
+    }));
+    rpc.run_background();
+    assert_eq!(rpc.node().executed.len(), 1);
+
+    // Between batch entries, so the second request sees the next block.
+    let r = rpc.handle_body(
+        r#"[{"id":1,"method":"eth_blockNumber"},{"id":2,"method":"eth_blockNumber"}]"#,
+    );
+    assert_eq!(
+        (&r[0]["result"], &r[1]["result"]),
+        (&json!("0x2"), &json!("0x3"))
+    );
+    // Between the blocks of log and fee-history scans, and between the runs
+    // of a gas estimate (a transfer takes one run after the first).
+    let before = turns.get();
+    ok(
+        &mut rpc,
+        "eth_getLogs",
+        json!([{ "fromBlock": "0x1", "toBlock": "0x2" }]),
+    );
+    assert_eq!(turns.get(), before + 2);
+    ok(&mut rpc, "eth_feeHistory", json!(["0x3", "0x3"]));
+    assert_eq!(turns.get(), before + 5);
+    let pay = json!({ "from": data(&alice.address), "to": data(&bob.address), "value": "0x1" });
+    assert_eq!(ok(&mut rpc, "eth_estimateGas", json!([pay])), "0x5208");
+    assert_eq!(turns.get(), before + 6);
+
+    // A batch past the limit is refused whole, under the id of its first
+    // call, as geth refuses it, and runs nothing.
+    rpc.max_batch = 1;
+    let r = rpc.handle_body(r#"[{"method":"eth_chainId"},{"id":5,"method":"eth_chainId"}]"#);
+    assert_eq!(
+        r,
+        json!([{ "jsonrpc": "2.0", "id": 5, "error": { "code": -32600, "message": "batch too large" } }])
+    );
+    let r = rpc.handle_body(r#"[{"method":"eth_chainId"},{"method":"eth_chainId"}]"#);
+    assert_eq!(r[0]["id"], Value::Null);
+    assert_eq!(turns.get(), before + 6);
+    rpc.max_batch = solo_rpc::methods::MAX_BATCH;
+
+    // Each kernel query runs within the node's budget: a message that loops
+    // until its gas runs out (JUMPDEST PUSH1 0 JUMP) is aborted at it.
+    rpc.node_mut().query_gas = 2_000_000;
+    let looping = json!({ "input": "0x5b600056" });
+    let aborted = (
+        -32000,
+        "execution aborted: the message ran past the node's query budget".to_owned(),
+    );
+    assert_eq!(err(&mut rpc, "eth_call", json!([looping])), aborted);
+    assert_eq!(err(&mut rpc, "eth_estimateGas", json!([looping])), aborted);
+    let pay = json!({ "from": data(&alice.address), "to": data(&bob.address), "value": "0x1" });
+    assert_eq!(
+        ok(&mut rpc, "eth_call", json!([pay])),
+        "0x",
+        "ordinary calls fit"
+    );
 }

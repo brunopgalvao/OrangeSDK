@@ -100,7 +100,14 @@ fn deploy_code_storage_and_calls() {
     assert_eq!(ok(&mut rpc, "eth_getCode", json!([c, "latest"])), runtime);
     assert_eq!(ok(&mut rpc, "eth_getCode", json!([c])), runtime);
     assert_eq!(ok(&mut rpc, "eth_getCode", json!([c, null])), runtime);
-    assert_eq!(ok(&mut rpc, "eth_getCode", json!([c, "earliest"])), runtime);
+    assert_eq!(
+        err(&mut rpc, "eth_getCode", json!([c, "earliest"])),
+        (
+            -32000,
+            "historical state not available: block 0, the node keeps the state of block 1 only"
+                .into()
+        )
+    );
     assert_eq!(ok(&mut rpc, "eth_getCode", json!([c, "0x1"])), runtime);
     assert_eq!(ok(&mut rpc, "eth_getCode", json!([c, "safe"])), runtime);
     assert_eq!(
@@ -287,6 +294,215 @@ fn deploy_code_storage_and_calls() {
         err(&mut rpc, "eth_estimateGas", json!([{}, "0x9"])).1,
         "header not found"
     );
+
+    // A creation that reverts (PUSH1 0 PUSH1 0 REVERT) still names the
+    // address it would have deployed to, as geth's receipts do.
+    let reverting = Fields {
+        nonce: 0,
+        to: None,
+        value: 0,
+        gas_limit: 100_000,
+        data: &hex("60006000fd"),
+    };
+    let hash = send(&mut rpc, &bob.legacy(&reverting));
+    mine(&mut rpc);
+    let receipt = ok(&mut rpc, "eth_getTransactionReceipt", json!([hash]));
+    assert_eq!(receipt["status"], "0x0");
+    assert_eq!(receipt["to"], Value::Null);
+    assert_eq!(
+        receipt["contractAddress"],
+        data(&created_address(&bob.address, 0))
+    );
+    assert_eq!(
+        ok(&mut rpc, "eth_getBlockReceipts", json!(["latest"])),
+        json!([receipt])
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn state_at_the_head_only() {
+    let alice = Wallet::new(1);
+    let mut rpc = Rpc::new(node_funding(&[&alice]));
+    let counter = deploy(&mut rpc, &alice, 0, 5);
+    let first = ok(&mut rpc, "eth_getBlockByNumber", json!(["0x1"]))["hash"].clone();
+    mine(&mut rpc);
+    let head = ok(&mut rpc, "eth_getBlockByNumber", json!(["latest"]));
+    let head_hash = head["hash"].clone();
+    let a = data(&alice.address);
+    let c = data(&counter);
+    let count = to(&counter, &calldata("count()", &[]));
+    // Every state method answers for every name of the head, and refuses
+    // older blocks instead of answering from the head's state.
+    let methods = [
+        ("eth_getBalance", json!([a])),
+        ("eth_getTransactionCount", json!([a])),
+        ("eth_getCode", json!([c])),
+        ("eth_getStorageAt", json!([c, "0x0"])),
+        ("eth_call", json!([count])),
+        ("eth_estimateGas", json!([count])),
+    ];
+    let heads = [
+        json!("latest"),
+        json!("pending"),
+        json!("safe"),
+        json!("finalized"),
+        json!("0x2"),
+        head_hash.clone(),
+        json!({ "blockHash": head_hash }),
+        json!({ "blockNumber": "0x2" }),
+        json!({}),
+    ];
+    let older = [
+        json!("0x1"),
+        first.clone(),
+        json!({ "blockHash": first }),
+        json!({ "blockNumber": "0x1" }),
+    ];
+    let historical = |height: u64| {
+        (
+            -32000,
+            format!(
+                "historical state not available: block {height}, the node keeps the state of block 2 only"
+            ),
+        )
+    };
+    for (method, params) in methods {
+        let at = |block: &Value| {
+            let mut list = params.as_array().unwrap().clone();
+            list.push(block.clone());
+            Value::Array(list)
+        };
+        let answer = ok(&mut rpc, method, params.clone());
+        for block in &heads {
+            assert_eq!(ok(&mut rpc, method, at(block)), answer, "{method} {block}");
+        }
+        for block in &older {
+            assert_eq!(
+                err(&mut rpc, method, at(block)),
+                historical(1),
+                "{method} {block}"
+            );
+        }
+        assert_eq!(err(&mut rpc, method, at(&json!("earliest"))), historical(0));
+        assert_eq!(
+            err(&mut rpc, method, at(&json!("0x3"))),
+            (-32000, "header not found".into())
+        );
+    }
+    // A call runs in the head block, as geth's `latest`: NUMBER and
+    // TIMESTAMP (each followed by PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN)
+    // describe the same block.
+    let number = json!({ "input": "0x4360005260206000f3" });
+    assert_eq!(ok(&mut rpc, "eth_call", json!([number])), data(&word(2)));
+    let timestamp = json!({ "input": "0x4260005260206000f3" });
+    assert_eq!(
+        ok(&mut rpc, "eth_call", json!([timestamp])),
+        data(&word(quantity_of(&head["timestamp"])))
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn access_lists_in_calls_and_estimates() {
+    let alice = Wallet::new(1);
+    let bob = Wallet::new(2);
+    let mut rpc = Rpc::new(node_funding(&[&alice, &bob]));
+    let counter = deploy(&mut rpc, &alice, 0, 5);
+    let a = data(&alice.address);
+    let b = data(&bob.address);
+    let c = data(&counter);
+    let other = [0xde; 20];
+    let access = [(other, vec![word(1)])];
+    let list = json!([{ "address": data(&other), "storageKeys": [data(&word(1))] }]);
+
+    // An entry the message never touches costs its intrinsic gas, 2400 for
+    // the account and 1900 for the key, and the estimate includes it.
+    let pay = json!({ "from": b, "to": a, "value": "0x1", "type": "0x1", "accessList": list });
+    assert_eq!(
+        ok(&mut rpc, "eth_estimateGas", json!([pay])),
+        quantity(21_000 + 2_400 + 1_900)
+    );
+    let inc = calldata("increment(uint256)", &[2]);
+    let plain = quantity_of(&ok(
+        &mut rpc,
+        "eth_estimateGas",
+        json!([{ "from": a, "to": c, "input": data(&inc) }]),
+    ));
+    let listed = json!({ "from": a, "to": c, "input": data(&inc), "accessList": list });
+    let estimate = quantity_of(&ok(&mut rpc, "eth_estimateGas", json!([listed])));
+    assert_eq!(estimate, plain + 2_400 + 1_900);
+    // Transactions sent with those lists and estimates succeed, using
+    // exactly the estimate.
+    let transfer = bob.access_list_tx(
+        &Fields {
+            nonce: 0,
+            to: Some(alice.address),
+            value: 1,
+            gas_limit: 25_300,
+            data: &[],
+        },
+        &access,
+    );
+    let increment = alice.access_list_tx(
+        &Fields {
+            nonce: 1,
+            to: Some(counter),
+            value: 0,
+            gas_limit: estimate,
+            data: &inc,
+        },
+        &access,
+    );
+    let hashes = [send(&mut rpc, &transfer), send(&mut rpc, &increment)];
+    mine(&mut rpc);
+    for (hash, used) in hashes.iter().zip([25_300, estimate]) {
+        let receipt = ok(&mut rpc, "eth_getTransactionReceipt", json!([hash]));
+        assert_eq!(receipt["status"], "0x1", "{hash}");
+        assert_eq!(quantity_of(&receipt["gasUsed"]), used, "{hash}");
+    }
+
+    // A listed slot the message reads is warm: the first read costs 100
+    // instead of 2100.
+    let warm = json!([{ "address": c, "storageKeys": [data(&word(0))] }]);
+    let warmed = json!({ "from": a, "to": c, "input": data(&inc), "accessList": warm });
+    assert_eq!(
+        quantity_of(&ok(&mut rpc, "eth_estimateGas", json!([warmed]))),
+        plain + 2_400 + 1_900 - 2_000
+    );
+    // eth_call checks the list's intrinsic gas too.
+    let low = json!({ "from": a, "to": b, "gas": "0x5208", "accessList": list });
+    assert_eq!(
+        err(&mut rpc, "eth_call", json!([low])),
+        (
+            -32000,
+            "intrinsic gas too low: gas 21000, minimum needed 25300".into()
+        )
+    );
+    let none = json!({ "from": a, "to": b, "accessList": null });
+    assert_eq!(ok(&mut rpc, "eth_call", json!([none])), "0x");
+    let empty = json!({ "from": a, "to": b, "accessList": [] });
+    assert_eq!(ok(&mut rpc, "eth_estimateGas", json!([empty])), "0x5208");
+    // Lists that do not parse.
+    let bad = [
+        json!(5),
+        json!("x"),
+        json!([5]),
+        json!([{ "address": a }]),
+        json!([{ "storageKeys": [] }]),
+        json!([{ "address": "0x12", "storageKeys": [] }]),
+        json!([{ "address": a, "storageKeys": ["0x12"] }]),
+        json!([{ "address": a, "storageKeys": [5] }]),
+        json!([{ "address": 5, "storageKeys": [] }]),
+    ];
+    for list in bad {
+        let object = json!({ "to": b, "accessList": list });
+        assert_eq!(
+            err(&mut rpc, "eth_call", json!([object])).0,
+            -32602,
+            "{list}"
+        );
+    }
 }
 
 #[test]
@@ -595,6 +811,15 @@ fn every_transaction_type_with_receipts_and_logs() {
         "a null alternative matches anything"
     );
     assert_eq!(
+        logs(&mut rpc, json!({ "topics": [[]] })),
+        all,
+        "so does an empty list, as in geth"
+    );
+    assert_eq!(
+        logs(&mut rpc, json!({ "topics": [[], [topic(&bob.address)]] })),
+        json!([d])
+    );
+    assert_eq!(
         logs(
             &mut rpc,
             json!({ "topics": [data(&incremented), null, [data(&word(8)), data(&word(9))]] })
@@ -762,6 +987,7 @@ fn undecodable_transactions_show_as_blank() {
     let receipt = ok(&mut rpc, "eth_getTransactionReceipt", json!([hash]));
     assert_eq!(receipt["status"], "0x0");
     assert_eq!(receipt["to"], Value::Null);
+    assert_eq!(receipt["contractAddress"], Value::Null, "not a creation");
     assert_eq!(receipt["gasUsed"], "0x0");
     let tx = ok(&mut rpc, "eth_getTransactionByHash", json!([hash]));
     assert_eq!(tx["type"], "0x0");

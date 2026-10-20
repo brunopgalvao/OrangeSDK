@@ -93,21 +93,21 @@ pub fn bind(addr: impl ToSocketAddrs) -> std::io::Result<TcpListener> {
 
 /// Accepts connections until `keep_going` returns false (checked between
 /// connections, so a `solo_stop` request ends the loop), serving each one on
-/// the calling thread. `on_idle` runs whenever no connection is waiting so
-/// the caller can advance the node's clock; the listener must be
-/// non-blocking, as [`bind`] leaves it.
-pub fn serve(
-    listener: &TcpListener,
-    rpc: &mut Rpc,
-    mut on_idle: impl FnMut(&mut Rpc),
-    mut keep_going: impl FnMut(&Rpc) -> bool,
-) {
+/// the calling thread. The node's background work ([`Rpc::run_background`]) runs
+/// after every connection as well as while none is waiting, so a stream of
+/// requests cannot keep the node from its clock and its peers. The listener
+/// must be non-blocking, as [`bind`] leaves it.
+pub fn serve(listener: &TcpListener, rpc: &mut Rpc, mut keep_going: impl FnMut(&Rpc) -> bool) {
     while keep_going(rpc) {
-        if let Ok((mut stream, _)) = listener.accept() {
+        let served = if let Ok((mut stream, _)) = listener.accept() {
             let _ = stream.set_nonblocking(false);
             serve_connection(rpc, &mut stream);
+            true
         } else {
-            on_idle(rpc);
+            false
+        };
+        rpc.run_background();
+        if !served {
             std::thread::sleep(Duration::from_millis(5));
         }
     }

@@ -55,11 +55,16 @@ fn addresses(value: Option<&Value>) -> Result<Vec<[u8; 20]>, RpcError> {
     }
 }
 
-/// One topic position: null or a null member matches anything.
+/// One topic position: null, an empty list or a list with a null member
+/// matches anything, as in geth.
 fn position(value: &Value) -> Result<Option<Vec<[u8; 32]>>, RpcError> {
     match value {
         Value::Null => Ok(None),
-        Value::Array(alternatives) if alternatives.iter().any(Value::is_null) => Ok(None),
+        Value::Array(alternatives)
+            if alternatives.is_empty() || alternatives.iter().any(Value::is_null) =>
+        {
+            Ok(None)
+        }
         Value::Array(alternatives) => alternatives
             .iter()
             .map(|t| parse_hash(&string(t, "topic")?))
