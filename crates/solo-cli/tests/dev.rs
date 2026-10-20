@@ -124,6 +124,7 @@ fn genesis_parsing() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn genesis_accounts() {
     let g = parse_genesis(GENESIS).unwrap();
     let params = GenesisParams::from_bytes(&g.params).unwrap();
@@ -153,7 +154,9 @@ fn genesis_accounts() {
         r#"{"chainId": 1, "alloc": {
           "0x1111111111111111111111111111111111111111": {},
           "0x2222222222222222222222222222222222222222": {"balance": 7, "nonce": 3},
-          "0x3333333333333333333333333333333333333333": {"balance": "12", "nonce": "9"}}}"#,
+          "0x3333333333333333333333333333333333333333": {"balance": "12", "nonce": "9"},
+          "0x4444444444444444444444444444444444444444": {"storage": {"0x01": "0x00"}},
+          "0x5555555555555555555555555555555555555555": {"nonce": 1, "storage": {"0x01": "0x02"}}}}"#,
     )
     .unwrap();
     let accounts = GenesisParams::from_bytes(&minimal.params)
@@ -164,7 +167,16 @@ fn genesis_accounts() {
         .iter()
         .map(|a| (a.balance, a.nonce, a.code.len(), a.storage.0.len()))
         .collect();
-    assert_eq!(fields, vec![(0, 0, 0, 0), (7, 3, 0, 0), (12, 9, 0, 0)]);
+    assert_eq!(
+        fields,
+        vec![
+            (0, 0, 0, 0),
+            (7, 3, 0, 0),
+            (12, 9, 0, 0),
+            (0, 0, 0, 1),
+            (0, 1, 0, 1)
+        ]
+    );
     let cases = [
         (
             r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": {"balance": true}}}"#,
@@ -209,6 +221,11 @@ fn genesis_accounts() {
         (
             r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": {"storage": {"0x01": "0x000000000000000000000000000000000000000000000000000000000000000001"}}}}"#,
             "storage keys and values",
+        ),
+        // Storage on an account with neither code nor nonce, where a CREATE could land.
+        (
+            r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": {"storage": {"0x01": "0x02"}}}}"#,
+            "an account with storage needs code or a non-zero nonce",
         ),
     ];
     for (text, expected) in cases {

@@ -146,6 +146,11 @@ pub fn slot_key(address: &Address, slot: &Hash) -> Vec<u8> {
 /// Applies genesis: chain id, parameters, and the allocated accounts with
 /// their code and storage. The stored parameters leave the allocations out:
 /// the driver reads them on every step and the accounts already hold them.
+///
+/// Traps on an account with storage but neither code nor nonce. revm leaves
+/// out EIP-7610, so a CREATE could land on such an account and its slots would
+/// show through the new contract; refusing it here keeps every account with
+/// storage out of a creation's reach (see `evm::commit`).
 pub fn init(genesis: &Genesis) {
     set(keys::CHAIN_ID, &genesis.chain_id);
     let mut params = GenesisParams::from_bytes(&genesis.params).unwrap_or_else(|_| solo_guest::trap());
@@ -153,6 +158,10 @@ pub fn init(genesis: &Genesis) {
     set(b"meta/params", &params);
     set_raw(b"meta/validators", &genesis.validators);
     for allocation in &allocations {
+        let has_storage = allocation.storage.0.iter().any(|slot| slot.value != [0; 32]);
+        if has_storage && allocation.code.is_empty() && allocation.nonce == 0 {
+            solo_guest::trap();
+        }
         let code_hash = if allocation.code.is_empty() {
             [0; 32]
         } else {

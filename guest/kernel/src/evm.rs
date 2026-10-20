@@ -40,7 +40,7 @@ impl Database for StateDb {
         if code_hash == KECCAK_EMPTY {
             return Ok(Bytecode::default());
         }
-        Ok(state::get_raw(&state::code_key(&code_hash.0)).map_or_else(Bytecode::default, |code| Bytecode::new_raw(code.into())))
+        Ok(state::get_raw(&state::code_key(&code_hash.0)).map_or_else(Bytecode::default, bytecode))
     }
 
     fn storage(&mut self, address: RAddress, index: U256) -> Result<U256, Infallible> {
@@ -52,13 +52,35 @@ impl Database for StateDb {
     }
 }
 
+/// Stored code as revm runs it. A delegation designator delegates; anything
+/// else is legacy code, including genesis code that starts with 0xEF01 but is
+/// no designator, which geth runs the same way (0xEF is an invalid opcode).
+/// revm's `Bytecode::new_raw` would panic on such code and trap the kernel.
+fn bytecode(code: Vec<u8>) -> Bytecode {
+    let code = Bytes::from(code);
+    Bytecode::new_raw_checked(code.clone()).unwrap_or_else(|_| Bytecode::new_legacy(code))
+}
+
+/// Whether `code` is an EIP-7702 delegation designator, `0xef0100 ‖ address`:
+/// the only code an account may have and still send transactions (EIP-3607).
+pub fn is_delegation(code: &[u8]) -> bool {
+    code.len() == 23 && code.starts_with(&[0xEF, 0x01, 0x00])
+}
+
 fn u128_of(v: U256) -> u128 {
     u128::try_from(v).unwrap_or(u128::MAX)
 }
 
-/// Writes revm's changes to the kernel state, as revm's own `CacheDB` would,
-/// plus the EIP-161 rule that `CacheDB` leaves to its user: a touched account
-/// left empty (no code, nonce or balance) is removed.
+/// Writes revm's changes to the kernel state, plus the EIP-161 rule that
+/// revm's `CacheDB` leaves to its user: a touched account left empty (no code,
+/// nonce or balance) is removed.
+///
+/// Unlike `CacheDB`, this never clears an account's old slots, because no
+/// account it creates, destroys or removes has any. Every account with storage
+/// has code or a non-zero nonce: genesis refuses storage on any other account
+/// (`state::init`), only code writes storage, and creation sets the nonce to 1.
+/// revm creates only where there is neither code nor nonce, so it never creates
+/// over old slots, which is also why leaving out EIP-7610 is safe.
 fn commit(changes: impl IntoIterator<Item = (RAddress, RAccount)>) {
     for (address, account) in changes {
         if !account.is_touched() {
@@ -66,8 +88,8 @@ fn commit(changes: impl IntoIterator<Item = (RAddress, RAccount)>) {
         }
         let a = address.0.0;
         if account.is_selfdestructed() {
-            // Post-Cancun, only an account created in the same transaction self-destructs,
-            // so every slot it has is among the ones this transaction touched.
+            // Post-Cancun, only an account created in the same transaction self-destructs;
+            // it had no slots before, so every slot it has is one this transaction touched.
             for key in account.storage.keys() {
                 state::delete(&state::slot_key(&a, &key.to_be_bytes::<32>()));
             }
@@ -76,9 +98,9 @@ fn commit(changes: impl IntoIterator<Item = (RAddress, RAccount)>) {
         }
         let info = &account.info;
         if info.is_empty() {
-            // Only an account that never had code, nonce or storage can be empty after a
-            // transaction (a zero-value call, a zero fee to the beneficiary), so there is
-            // nothing else to remove.
+            // An account with neither code nor nonce has no storage (see above), so the
+            // account key is all there is to remove: after a zero-value call, or a zero
+            // fee paid to the beneficiary.
             state::delete(&state::account_key(&a));
             continue;
         }
@@ -267,7 +289,11 @@ fn install_host_crypto() {
 
 /// Contract code at `address`.
 pub fn code(address: &Address) -> Vec<u8> {
-    let account: Account = state::get(&state::account_key(address)).unwrap_or_default();
+    code_of(&state::account(address))
+}
+
+/// The code of `account`.
+pub fn code_of(account: &Account) -> Vec<u8> {
     if account.code_hash == [0; 32] {
         return Vec::new();
     }

@@ -18,7 +18,7 @@ use solo_abi::codec::Seq;
 use solo_abi::types::{Block, Effect, Hash, Input, MigrateArgs};
 use solo_abi::{Decode, Encode};
 
-use crate::{persist, state, tx};
+use crate::{persist, state, stf, tx};
 
 const STATE_KEY: &[u8] = b"simplex/state";
 const ZERO: Hash = [0; 32];
@@ -180,8 +180,7 @@ impl Ctx {
             return;
         }
         self.s.proposing = false;
-        let mut selected = txs.to_vec();
-        selected.truncate(self.params.max_txs as usize);
+        let selected = self.select(txs);
         let proposal = Proposal {
             view,
             height: self.s.tip_height + 1,
@@ -193,6 +192,33 @@ impl Ctx {
         let Some(signature) = self.sign(KIND_PROPOSE, view, &hash) else { return };
         self.broadcast(&ConsensusMessage::Propose { proposal: proposal.clone(), signature });
         self.handle_proposal(proposal, hash);
+    }
+
+    /// The mempool transactions to propose, at most `max_txs`, leaving out any
+    /// that an unexecuted ancestor of the tip carries or that has already run.
+    /// A leader can extend a block it has not executed yet (it executes on
+    /// finalization, a message delay after notarization), and until then its
+    /// mempool still holds that block's transactions.
+    fn select(&self, txs: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let executed = state::height().unwrap_or(0);
+        let mut carried = Vec::new();
+        let mut cursor = (self.s.tip_height > executed).then_some(self.s.tip_hash);
+        while let Some(hash) = cursor {
+            let Some(p) = Self::proposal(&hash) else { break };
+            carried.extend(p.txs.0.iter().map(|raw| state::keccak256(raw)));
+            cursor = (p.height > executed + 1).then_some(p.parent);
+        }
+        let mut selected = Vec::new();
+        for raw in txs {
+            if selected.len() >= self.params.max_txs as usize {
+                break;
+            }
+            let hash = state::keccak256(raw);
+            if !carried.contains(&hash) && !stf::has_run(&hash) {
+                selected.push(raw.clone());
+            }
+        }
+        selected
     }
 
     fn on_message(&mut self, m: ConsensusMessage) {

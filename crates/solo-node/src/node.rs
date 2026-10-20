@@ -427,15 +427,17 @@ impl Node {
             .map_err(|_| NodeError::Decode("block header"))?;
         let context = Self::context_for(&header);
         let height = header.height;
+        // Whatever the block carried is no longer pending, wherever it came from,
+        // including what the kernel left out of the executed block (a transaction
+        // an earlier block already recorded).
+        let carried: Vec<[u8; 32]> = block.txs.0.iter().map(|raw| keccak256(raw)).collect();
         let args = ExecuteArgs { block, context }.to_bytes();
         let result: ExecuteResult = self.call(exports::EXECUTE_BLOCK, &args)?;
         let stored = self
             .block_by_number(height)?
             .ok_or(NodeError::Decode("stored header"))?;
         let block_hash = keccak256(&stored.to_bytes());
-        // Whatever the block carried is no longer pending, wherever it came from.
-        self.mempool
-            .retain(|p| !stored.tx_hashes.0.contains(&p.hash));
+        self.mempool.retain(|p| !carried.contains(&p.hash));
         self.executed.push((height, block_hash));
         Ok(Input::BlockExecuted {
             height,

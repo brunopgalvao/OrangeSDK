@@ -175,6 +175,11 @@ fn parse_account(address: [u8; 20], entry: &Value) -> Result<Allocation, String>
         }
         Some(_) => return Err("genesis: storage must be an object".to_owned()),
     }
+    // A CREATE can land on an account with neither code nor nonce, and revm leaves
+    // out EIP-7610, so the reference kernel refuses storage on such an account.
+    if code.is_empty() && nonce == 0 && storage.iter().any(|slot| slot.value != [0; 32]) {
+        return Err("genesis: an account with storage needs code or a non-zero nonce".to_owned());
+    }
     Ok(Allocation {
         address,
         balance,

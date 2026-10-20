@@ -15,14 +15,14 @@ use std::sync::OnceLock;
 
 use k256::ecdsa::SigningKey;
 use solo_abi::chain::{
-    Account, Allocation, CallRequest, CallResult, GenesisParams, Log, Receipt, StorageQuery,
-    StorageSlot, call_status, keys, query, reason,
+    Account, Allocation, BlockHeader, CallRequest, CallResult, GenesisParams, Log, Proposal,
+    Receipt, StorageQuery, StorageSlot, call_status, keys, query, reason,
 };
 use solo_abi::codec::Seq;
-use solo_abi::types::Genesis;
+use solo_abi::types::{Block, Effect, ExecuteSummary, Genesis, Input};
 use solo_abi::{Decode, Encode};
 use solo_host::hash::{keccak256, sha256};
-use solo_node::{Node, NodeConfig, Sim, SubmitError};
+use solo_node::{Node, NodeConfig, NodeError, Sim, SubmitError};
 use solo_rlp::{encode_bytes, encode_list, encode_uint};
 
 const KERNEL: &[u8] = include_bytes!("fixtures/kernel.elf");
@@ -1187,6 +1187,22 @@ fn precompile(n: u8) -> [u8; 20] {
     a
 }
 
+/// Where the relay of `relay_runtime` lives.
+const RELAY: [u8; 20] = [0x54; 20];
+
+/// Runtime code that passes its calldata to precompile `n` and logs, with no
+/// topics, what came back: receipts carry no return data, logs do.
+fn relay_runtime(n: u8) -> Vec<u8> {
+    vec![
+        0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY(0, 0, CALLDATASIZE)
+        0x60, 0x20, 0x60, 0x00, 0x36, 0x60, 0x00, 0x60, n, 0x5A,
+        0xFA, // STATICCALL(GAS, n, 0, CALLDATASIZE, 0, 32)
+        0x50, // POP the success flag
+        0x3D, 0x60, 0x00, 0xA0, // LOG0(0, RETURNDATASIZE)
+        0x00, // STOP
+    ]
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn precompiles_match_host_side_vectors() {
@@ -1197,6 +1213,12 @@ fn precompiles_match_host_side_vectors() {
         funded(alice.address, 100 * ETHER),
         funded(bob.address, 100 * ETHER),
         predeploy(PROBE, PROBE_RUNTIME, &[]),
+        Allocation {
+            address: RELAY,
+            nonce: 1,
+            code: relay_runtime(1),
+            ..Allocation::default()
+        },
     ]);
     let call = |chain: &mut Chain, to: [u8; 20], data: &[u8]| {
         chain.call(alice.address, Some(to), 0, data, 1_000_000)
@@ -1299,7 +1321,9 @@ fn precompiles_match_host_side_vectors() {
     input[0] ^= 1;
     let out = call(&mut chain, p256_verify, &input);
     assert_eq!((out.status, out.output.len()), (call_status::SUCCESS, 0));
-    // Precompiles in block execution: transactions straight to sha256 and ecrecover.
+    // Precompiles in block execution: transactions straight to sha256 and ecrecover. A
+    // receipt shows only status and gas, which are the same whether recovery succeeds
+    // or not.
     let price = GWEI;
     let receipts = chain.block(&[
         alice.send(&Fee::Legacy(price), Some(precompile(2)), 0, b"abc", 100_000),
@@ -1315,6 +1339,24 @@ fn precompiles_match_host_side_vectors() {
     assert_eq!(receipts[0].gas_used, charged(b"abc", 72));
     assert_eq!(receipts[1].status, 1);
     assert_eq!(receipts[1].gas_used, charged(&flipped, 3_000));
+    // What ecrecover returns in a block, through the relay's log: the signer for the
+    // high-s form, nothing for a bad v.
+    let receipts = chain.block(&[
+        alice.send(&Fee::Legacy(price), Some(RELAY), 0, &flipped, 100_000),
+        bob.send(&Fee::Legacy(price), Some(RELAY), 0, &bad_v, 100_000),
+    ]);
+    let logged = |data: Vec<u8>| {
+        vec![Log {
+            address: RELAY,
+            topics: Seq(vec![]),
+            data,
+        }]
+    };
+    assert_eq!(
+        receipts[0].logs.0,
+        logged(address_word(&signer.address).to_vec())
+    );
+    assert_eq!(receipts[1].logs.0, logged(vec![]));
 }
 
 #[test]
@@ -1451,4 +1493,350 @@ fn contract_across_validators() {
         assert_eq!(<[u8; 32]>::from_bytes(&slot.body).unwrap(), word(77));
     }
     assert_eq!(receipt.unwrap().logs.0[0].topics.0[2], word(5));
+}
+
+/// An EIP-7702 delegation designator: `0xef0100 ‖ address`.
+fn delegation(to: &[u8; 20]) -> Vec<u8> {
+    [&[0xEF, 0x01, 0x00][..], &to[..]].concat()
+}
+
+#[test]
+fn malformed_delegation_code_runs_as_legacy() {
+    // Code from genesis that starts with 0xEF01 but is no delegation designator runs as
+    // legacy code, as geth runs it: 0xEF is an invalid opcode, so a call halts. It must not
+    // trap the kernel, which would drop the whole block.
+    let alice = Wallet::new(1);
+    let bob = Wallet::new(2);
+    let broken = [0x61; 20];
+    let delegated = [0x62; 20];
+    let mut chain = Chain::new(vec![
+        funded(alice.address, 100 * ETHER),
+        funded(bob.address, 100 * ETHER),
+        predeploy(STORE, STORE_RUNTIME, &[(word(0), word(42))]),
+        Allocation {
+            address: broken,
+            nonce: 1,
+            code: vec![0xEF, 0x01, 0x00],
+            ..Allocation::default()
+        },
+        Allocation {
+            address: delegated,
+            code: delegation(&STORE),
+            storage: Seq(vec![StorageSlot {
+                key: word(0),
+                value: word(77),
+            }]),
+            ..Allocation::default()
+        },
+    ]);
+    assert_eq!(chain.code(broken), vec![0xEF, 0x01, 0x00]);
+    let out = chain.call(alice.address, Some(broken), 0, &[], 100_000);
+    assert_eq!((out.status, out.gas_used), (call_status::HALT, 100_000));
+    // In a block, the call halts and the transaction beside it runs.
+    let receipts = chain.block(&[
+        alice.send(&Fee::Legacy(GWEI), Some(broken), 0, &[], 100_000),
+        bob.send(
+            &Fee::Legacy(GWEI),
+            Some(STORE),
+            0,
+            &calldata("set(uint256)", &[word(43)]),
+            100_000,
+        ),
+    ]);
+    assert_eq!((receipts[0].status, receipts[0].gas_used), (0, 100_000));
+    assert_eq!(receipts[1].status, 1);
+    assert_eq!(chain.storage(STORE, word(0)), word(43));
+    chain.block(&[]);
+    // A well-formed designator delegates: the delegate's code runs on the delegator's storage.
+    let read = chain.call(
+        alice.address,
+        Some(delegated),
+        0,
+        &calldata("value()", &[]),
+        100_000,
+    );
+    assert_eq!(
+        (read.status, read.output),
+        (call_status::SUCCESS, word(77).to_vec())
+    );
+}
+
+#[test]
+fn only_externally_owned_accounts_send() {
+    // Genesis can give a key's address code, or a nonce no transaction may carry (EIP-2681).
+    // Validation must refuse what execution would refuse, or the transaction could be
+    // included again and again for free.
+    let coder = Wallet::new(3);
+    let broken = Wallet::new(4);
+    let exhausted = Wallet::new(5);
+    let delegator = Wallet::new(6);
+    let bob = Wallet::new(2);
+    let mut exhausted_account = funded(exhausted.address, ETHER);
+    exhausted_account.nonce = u64::MAX;
+    let with_code = |w: &Wallet, code: Vec<u8>| Allocation {
+        address: w.address,
+        balance: ETHER,
+        code,
+        ..Allocation::default()
+    };
+    let mut chain = Chain::new(vec![
+        with_code(&coder, vec![0x00]),
+        with_code(&broken, vec![0xEF, 0x01, 0x00]),
+        exhausted_account,
+        with_code(&delegator, delegation(&STORE)),
+        predeploy(STORE, STORE_RUNTIME, &[]),
+    ]);
+    let transfer = |w: &Wallet, nonce: u64| {
+        w.sign(nonce, &Fee::Legacy(GWEI), Some(bob.address), 1, &[], 21_000)
+    };
+    for raw in [transfer(&coder, 0), transfer(&broken, 0)] {
+        assert_eq!(
+            chain.node.submit(&raw),
+            Err(SubmitError::Rejected(reason::SENDER_NOT_EOA))
+        );
+    }
+    assert_eq!(
+        chain.node.submit(&transfer(&exhausted, u64::MAX)),
+        Err(SubmitError::Rejected(reason::BAD_NONCE))
+    );
+    // A delegation designator leaves its account able to send (EIP-7702).
+    let r = chain.run(transfer(&delegator, 0));
+    assert_eq!(r.status, 1);
+    assert_eq!(chain.account(delegator.address).nonce, 1);
+    assert_eq!(chain.balance(bob.address), 1);
+}
+
+#[test]
+fn storage_needs_code_or_a_nonce_at_genesis() {
+    // revm leaves out EIP-7610, so a CREATE could land on an account that has storage but
+    // neither code nor nonce, and the old slots would show through the new contract. The
+    // reference kernel refuses such an account at genesis.
+    let alice = Wallet::new(1);
+    let orphan = Allocation {
+        address: [0x63; 20],
+        storage: Seq(vec![StorageSlot {
+            key: word(0),
+            value: word(0x99),
+        }]),
+        ..Allocation::default()
+    };
+    let config = NodeConfig {
+        now_ms: START_MS,
+        key: Some(node_key()),
+        ..NodeConfig::default()
+    };
+    let refused = Node::open(
+        kernel_module(),
+        &genesis(&[node_key()], vec![orphan.clone()]),
+        config,
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(NodeError::Kernel {
+                export: "kernel_init",
+                ..
+            })
+        ),
+        "{:?}",
+        refused.err()
+    );
+    // A zero value is no storage at all.
+    let mut zero = orphan.clone();
+    zero.storage.0[0].value = [0; 32];
+    // With a nonce, CREATE2 onto the account collides, and a zero-value call keeps it.
+    let salt = [0x5C; 32];
+    let target = create2_address(&FACTORY, &salt, &store_init(0));
+    let mut aged = orphan;
+    aged.address = target;
+    aged.nonce = 1;
+    let mut chain = Chain::new(vec![
+        funded(alice.address, 100 * ETHER),
+        predeploy(FACTORY, FACTORY_RUNTIME, &[]),
+        zero,
+        aged,
+    ]);
+    assert!(
+        chain
+            .node
+            .state_scan(&[keys::SLOT, &[0x63; 20][..]].concat())
+            .is_empty()
+    );
+    let r = chain.run(alice.send(
+        &Fee::Legacy(GWEI),
+        Some(FACTORY),
+        0,
+        &calldata("make2(bytes32,uint256)", &[salt, word(0)]),
+        1_000_000,
+    ));
+    assert_eq!(r.status, 0, "the CREATE2 collides");
+    assert!(chain.code(target).is_empty());
+    let r = chain.run(alice.send(&Fee::Legacy(GWEI), Some(target), 0, &[], 21_000));
+    assert_eq!(r.status, 1);
+    assert_eq!(chain.account(target).nonce, 1);
+    assert_eq!(chain.storage(target, word(0)), word(0x99));
+}
+
+/// Executes a block of `txs` at `height` directly, as a driver's
+/// `ExecuteBlock` would, and returns the stored header and the summary.
+fn execute_directly(
+    chain: &mut Chain,
+    height: u64,
+    txs: &[&Vec<u8>],
+) -> (BlockHeader, ExecuteSummary) {
+    let header = BlockHeader {
+        height,
+        timestamp_ms: chain.now_ms + height,
+        ..BlockHeader::default()
+    };
+    let block = Block {
+        header: header.to_bytes(),
+        txs: Seq(txs.iter().map(|raw| (*raw).clone()).collect()),
+        participation: vec![],
+    };
+    let Some(Input::BlockExecuted { result, .. }) = chain
+        .node
+        .apply_effect(Effect::ExecuteBlock { block })
+        .unwrap()
+    else {
+        panic!("executing a block reports it executed")
+    };
+    (chain.node.block_by_number(height).unwrap().unwrap(), result)
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_block_repeating_a_transaction_leaves_its_receipt_alone() {
+    // The driver keeps out what has run or what an unexecuted ancestor carries, but a
+    // faulty leader can still repeat a transaction. A transaction has one receipt, in the
+    // block that lists it; a repeat that cannot run is left out of the block.
+    let alice = Wallet::new(1);
+    let bob = Wallet::new(2);
+    let mut chain = Chain::new(vec![
+        funded(alice.address, 100 * ETHER),
+        funded(bob.address, 100 * ETHER),
+    ]);
+    let hash = |raw: &Vec<u8>| keccak256(raw);
+    let receipt = |chain: &mut Chain, raw: &Vec<u8>| chain.node.receipt(&keccak256(raw)).unwrap();
+    let first = alice.send(&Fee::Legacy(GWEI), Some(bob.address), ETHER, &[], 21_000);
+    let original = chain.run(first.clone());
+    // A creation that halts on an invalid opcode spends its whole limit, after which a
+    // transaction with the same limit no longer fits the block and cannot run there.
+    let big = 16_000_000;
+    let a = alice.send(&Fee::Legacy(GWEI), None, 0, &[0xFE], big);
+    let b = bob.send(&Fee::Legacy(GWEI), Some(alice.address), 1, &[], big);
+    let (header, summary) = execute_directly(&mut chain, 2, &[&first, &a, &b, &first]);
+    assert_eq!(header.tx_hashes.0, vec![hash(&a), hash(&b)]);
+    assert_eq!(summary.tx_count, 2);
+    assert_eq!(receipt(&mut chain, &first), Some(original));
+    let ra = receipt(&mut chain, &a).unwrap();
+    assert_eq!(
+        (ra.status, ra.gas_used, ra.height, ra.index),
+        (0, big, 2, 0)
+    );
+    assert_eq!(header.gas_used, big);
+    let rb = receipt(&mut chain, &b).unwrap();
+    assert_eq!(
+        (rb.status, rb.gas_used, rb.height, rb.index),
+        (0, 0, 2, 1),
+        "could not run"
+    );
+    assert_eq!(chain.account(alice.address).nonce, 2);
+    assert_eq!(chain.account(bob.address).nonce, 0);
+    // `b` still validates. A block where it cannot run again leaves it out and its failed
+    // receipt alone, and the node drops it from the mempool all the same.
+    chain.node.submit(&b).unwrap();
+    let a2 = alice.send(&Fee::Legacy(GWEI), None, 0, &[0xFE], big);
+    let (header, _) = execute_directly(&mut chain, 3, &[&a2, &b]);
+    assert_eq!(header.tx_hashes.0, vec![hash(&a2)]);
+    assert_eq!(receipt(&mut chain, &b), Some(rb));
+    assert!(chain.node.mempool().is_empty());
+    // Once it can run, it runs and its receipt moves to the block that ran it; a repeat
+    // in that same block is left out.
+    let (header, summary) = execute_directly(&mut chain, 4, &[&b, &b]);
+    assert_eq!(header.tx_hashes.0, vec![hash(&b)]);
+    assert_eq!(summary.tx_count, 1);
+    let rb = receipt(&mut chain, &b).unwrap();
+    assert_eq!(
+        (rb.status, rb.gas_used, rb.height, rb.index, rb.from),
+        (1, 21_000, 4, 0, bob.address)
+    );
+    assert_eq!(chain.account(bob.address).nonce, 1);
+    // A transaction that could not run and still cannot keeps its first failed receipt.
+    let early = alice.sign(9, &Fee::Legacy(GWEI), Some(bob.address), 1, &[], 21_000);
+    let (header, _) = execute_directly(&mut chain, 5, &[&early]);
+    assert_eq!(header.tx_hashes.0, vec![hash(&early)]);
+    let failed = receipt(&mut chain, &early).unwrap();
+    assert_eq!((failed.status, failed.height), (0, 5));
+    let (header, summary) = execute_directly(&mut chain, 6, &[&early]);
+    assert!(header.tx_hashes.0.is_empty());
+    assert_eq!((summary.tx_count, summary.gas_used), (0, 0));
+    assert_eq!(receipt(&mut chain, &early), Some(failed));
+}
+
+/// Hashes of the transactions the finalized proposals of `node` carry, one
+/// entry per inclusion, read from what its driver persisted.
+fn finalized_inclusions(node: &Node, height: u64) -> Vec<[u8; 32]> {
+    let persisted = node.persisted();
+    let mut out = Vec::new();
+    for h in 1..=height {
+        let hash = &persisted[&[&b"final/"[..], &h.to_le_bytes()].concat()];
+        let proposal =
+            Proposal::from_bytes(&persisted[&[&b"prop/"[..], &hash[..]].concat()]).unwrap();
+        out.extend(proposal.txs.0.iter().map(|raw| keccak256(raw)));
+    }
+    out
+}
+
+#[test]
+fn high_latency_includes_a_transaction_once() {
+    // With one-way latency above a third of a slot, the next leader proposes before it has
+    // executed the block it extends. It must not carry that block's transactions again.
+    let keys: Vec<SigningKey> = (1..=4u8)
+        .map(|i| SigningKey::from_slice(&[0x30 + i; 32]).unwrap())
+        .collect();
+    let alice = Wallet::new(1);
+    let bob = Wallet::new(2);
+    let genesis = genesis(&keys, vec![funded(alice.address, 100 * ETHER)]);
+    let config = NodeConfig {
+        now_ms: START_MS,
+        ..NodeConfig::default()
+    };
+    let mut sim = Sim::new(kernel_module(), &genesis, &keys, 0, &config, 150).unwrap();
+    sim.advance(10 * SLOT_MS).unwrap();
+    let tx = sim
+        .submit(
+            0,
+            &alice.send(&Fee::Legacy(GWEI), Some(bob.address), ETHER, &[], 21_000),
+        )
+        .unwrap();
+    assert!(
+        sim.run_until(40 * SLOT_MS, executed_everywhere(tx))
+            .unwrap(),
+        "executed everywhere"
+    );
+    sim.advance(10 * SLOT_MS).unwrap();
+    for node in &mut sim.nodes {
+        let receipt = node.receipt(&tx).unwrap().unwrap();
+        assert_eq!(
+            (receipt.status, receipt.from, receipt.gas_used),
+            (1, alice.address, 21_000)
+        );
+        let height = node.finalized_height().unwrap();
+        assert!(height > receipt.height + 2, "{height}");
+        let listing: Vec<u64> = (1..=height)
+            .filter(|h| {
+                node.block_by_number(*h)
+                    .unwrap()
+                    .unwrap()
+                    .tx_hashes
+                    .0
+                    .contains(&tx)
+            })
+            .collect();
+        assert_eq!(listing, vec![receipt.height]);
+        let inclusions = finalized_inclusions(node, height);
+        assert_eq!(inclusions.iter().filter(|h| **h == tx).count(), 1);
+        assert_eq!(node.account(&bob.address).unwrap().balance, ETHER);
+    }
 }

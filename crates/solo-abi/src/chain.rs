@@ -50,7 +50,9 @@ record! {
         nonce: u64,
         /// Contract code; empty for an account without code.
         code: Vec<u8>,
-        /// Storage slots; a zero value is the same as no entry.
+        /// Storage slots; a zero value is the same as no entry. The reference
+        /// kernel refuses non-zero storage on an account with neither code nor
+        /// nonce, where a creation could land (it does not apply EIP-7610).
         storage: Seq<StorageSlot>,
     }
 }
@@ -91,7 +93,9 @@ record! {
         state_root: Hash,
         /// Receipts root.
         receipts_root: Hash,
-        /// Transaction hashes in order.
+        /// Hashes of the transactions the block records, in order: each has its
+        /// receipt here. A transaction that cannot run and already has a
+        /// receipt from an earlier inclusion is left out.
         tx_hashes: Seq<Hash>,
         /// Gas used.
         gas_used: u64,
@@ -239,7 +243,8 @@ pub mod reason {
     pub const BAD_SIGNATURE: u32 = 2;
     /// Chain id mismatch.
     pub const WRONG_CHAIN: u32 = 3;
-    /// Nonce is not the account's next nonce.
+    /// Nonce is not the account's next nonce, or that nonce is 2^64 − 1, which
+    /// no transaction may carry (EIP-2681).
     pub const BAD_NONCE: u32 = 4;
     /// Balance below value plus the maximum fee.
     pub const INSUFFICIENT_FUNDS: u32 = 5;
@@ -253,6 +258,8 @@ pub mod reason {
     pub const GAS_LIMIT_TOO_HIGH: u32 = 9;
     /// Contract initcode above the EIP-3860 limit.
     pub const INITCODE_TOO_LARGE: u32 = 10;
+    /// The sender has code other than an EIP-7702 delegation designator (EIP-3607).
+    pub const SENDER_NOT_EOA: u32 = 11;
 }
 
 /// Storage key prefixes of the reference kernel.
