@@ -16,10 +16,10 @@ The long arc (vision, strategy, decisions, research) lives in the codex at `/Use
 
 ## Layout
 
-- `spec/` — the VM, module format, gas, host ABI, driver interface, reference consensus (08), transport (09), state commitment (10), telemetry (11), threshold certificates (12) and kernel upgrades and feature gates (13) specifications.
+- `spec/` — the VM, module format, gas, host ABI, driver interface, reference consensus (08), transport (09), state commitment (10), telemetry (11), threshold certificates (12), kernel upgrades and feature gates (13) and kernel modules and native contracts (16) specifications.
 - `crates/solo-vm` — reference interpreter, `no_std`-capable, the oracle for every other backend. `crates/solo-jit` — the native backend (AArch64, x86-64), differentially tested against it (spec 07 §4.1).
 - `crates/solo-recompile` — RV64 ELF to Solo module. `crates/solo-host` — executor and host ABI. `crates/solo-abi` — codec and shared types. `crates/solo-rlp` — RLP. `crates/solo-trie` — the binary Merkle trie of the state commitment (spec 10). `crates/solo-bls` — threshold BLS, DKG and resharing, finality certificates (spec 12). `crates/solo-upgrade` — kernel upgrade actions, their records and the feature-gate state machine (spec 13).
 - `crates/solo-node` — node host (driver loop, mempool, queries, kernel switchover and gated host functions) and `Sim`, the in-process multi-node network for consensus tests. `crates/solo-rpc` — Ethereum JSON-RPC. `crates/solo-cli` — the `solo` command.
-- `guest/` — separate RISC-V workspace: `solo-guest` runtime, `hello`, the reference `kernel`. Rebuild fixtures with `tools/build-guest.sh` after touching it; it builds `kernel.elf` and, with the `upgrade-test` feature, `kernel_v2.elf`.
+- `guest/` — separate RISC-V workspace: `solo-guest` runtime, `hello`, the reference `kernel`, `solo-module` and the example module `modules/counter`. Rebuild fixtures with `tools/build-guest.sh` after touching it; it builds `kernel.elf`, `counter.elf` and, with the `upgrade-test` feature, `kernel_v2.elf`.
 - `tools/` — build scripts; conformance runners and differential fuzz harnesses as they land.
 - `crates/solo-metrics` and `ops/` — telemetry (spec 11) and the alert rules and dashboard over it; a test keeps `ops/` and the spec's metric table in step with what the node exports.
