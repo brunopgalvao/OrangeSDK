@@ -344,12 +344,9 @@ pub fn decode(w: u32) -> Result<Rv, Unsupported> {
     Ok(ins)
 }
 
-const fn creg(bits: u16) -> Reg {
+fn creg(bits: u16) -> Reg {
     #[allow(clippy::cast_possible_truncation)]
-    match Reg::new(8 + (bits & 7) as u8) {
-        Some(r) => r,
-        None => Reg::ZERO,
-    }
+    Reg::new(8 + (bits & 7) as u8).expect("compressed registers are x8 to x15")
 }
 
 fn full(bits: u16) -> Reg {

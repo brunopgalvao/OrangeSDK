@@ -426,47 +426,51 @@ impl<'a> Ctx<'a> {
     }
 
     #[allow(clippy::cast_possible_wrap)]
-    fn translate_constant(&self, i: usize) -> Result<(Vec<Instruction>, bool), RecompileError> {
-        let d = &self.insns[i];
-        let a = d.address;
-        let out = match d.rv {
-            Rv::Lui { rd, imm } => match self.facts.lui_code.get(&a) {
-                Some(t) => {
-                    let lo = (*t as i64).wrapping_sub(imm);
-                    vec![Instruction::Li {
-                        rd,
-                        imm: self.slot_address(*t)?.wrapping_sub(lo),
-                    }]
-                }
-                None => vec![Instruction::Li { rd, imm }],
-            },
-            Rv::Auipc { rd, imm } => {
-                if let Some(t) = self.facts.call_pair.get(&a) {
-                    let jalr = &self.insns[i + 1];
-                    let Rv::Jalr { rd: link, .. } = jalr.rv else {
-                        unreachable!("checked in collect_facts")
-                    };
-                    return Ok((self.direct(link, *t, jalr.address + jalr.len as u64)?, true));
-                }
-                let (t, code) = *self
-                    .facts
-                    .hi
-                    .get(&a)
-                    .ok_or(RecompileError::UnpairedAuipc { address: a })?;
-                let pc_value = (a as i64).wrapping_add(imm);
-                if code && !self.stubs.contains_key(&t) {
-                    let lo = (t as i64).wrapping_sub(pc_value);
-                    vec![Instruction::Li {
-                        rd,
-                        imm: self.slot_address(t)?.wrapping_sub(lo),
-                    }]
-                } else {
-                    vec![Instruction::Li { rd, imm: pc_value }]
+    fn translate_lui(&self, a: u64, rd: Reg, imm: i64) -> Result<Instruction, RecompileError> {
+        Ok(match self.facts.lui_code.get(&a) {
+            Some(t) => {
+                let lo = (*t as i64).wrapping_sub(imm);
+                Instruction::Li {
+                    rd,
+                    imm: self.slot_address(*t)?.wrapping_sub(lo),
                 }
             }
-            _ => unreachable!("only called for lui and auipc"),
+            None => Instruction::Li { rd, imm },
+        })
+    }
+
+    /// Translates an `auipc`. Returns the instructions and whether the
+    /// following `jalr` was consumed as the second half of a call pair.
+    #[allow(clippy::cast_possible_wrap)]
+    fn translate_auipc(
+        &self,
+        i: usize,
+        rd: Reg,
+        imm: i64,
+    ) -> Result<(Vec<Instruction>, bool), RecompileError> {
+        let a = self.insns[i].address;
+        if let Some(t) = self.facts.call_pair.get(&a) {
+            let jalr = &self.insns[i + 1];
+            #[rustfmt::skip]
+            let Rv::Jalr { rd: link, .. } = jalr.rv else { unreachable!("checked in collect_facts") };
+            return Ok((self.direct(link, *t, jalr.address + jalr.len as u64)?, true));
+        }
+        let (t, code) = *self
+            .facts
+            .hi
+            .get(&a)
+            .ok_or(RecompileError::UnpairedAuipc { address: a })?;
+        let pc_value = (a as i64).wrapping_add(imm);
+        let ins = if code && !self.stubs.contains_key(&t) {
+            let lo = (t as i64).wrapping_sub(pc_value);
+            Instruction::Li {
+                rd,
+                imm: self.slot_address(t)?.wrapping_sub(lo),
+            }
+        } else {
+            Instruction::Li { rd, imm: pc_value }
         };
-        Ok((out, false))
+        Ok((vec![ins], false))
     }
 
     #[allow(clippy::cast_possible_wrap)]
@@ -475,7 +479,8 @@ impl<'a> Ctx<'a> {
         let a = d.address;
         let next = a + d.len as u64;
         let out = match d.rv {
-            Rv::Lui { .. } | Rv::Auipc { .. } => return self.translate_constant(i),
+            Rv::Lui { rd, imm } => vec![self.translate_lui(a, rd, imm)?],
+            Rv::Auipc { rd, imm } => return self.translate_auipc(i, rd, imm),
             Rv::Jal { rd, offset } => self.direct(rd, a.wrapping_add_signed(offset), next)?,
             Rv::Jalr { rd, rs1, offset } => {
                 if is_call(rd) {
@@ -714,10 +719,10 @@ fn patch_data(
         let target = r.symbol.value.wrapping_add_signed(r.addend);
         #[allow(clippy::cast_sign_loss)]
         let value = ctx.slot_address(target)? as u64;
-        let off = usize::try_from(r.offset)
-            .map_err(|_| RecompileError::DataRelocOutOfRange { address })?;
-        let field = bytes
-            .get_mut(off..off + width)
+        let off = usize::try_from(r.offset).unwrap_or(usize::MAX);
+        let field = off
+            .checked_add(width)
+            .and_then(|end| bytes.get_mut(off..end))
             .ok_or(RecompileError::DataRelocOutOfRange { address })?;
         field.copy_from_slice(&value.to_le_bytes()[..width]);
     }
@@ -790,4 +795,723 @@ pub fn recompile(input: &Input, options: &Options) -> Result<Vec<u8>, RecompileE
     let bytes = b.build();
     Module::parse(&bytes, &|_| true).map_err(RecompileError::Validation)?;
     Ok(bytes)
+}
+
+#[cfg(test)]
+#[allow(clippy::cast_possible_wrap)]
+mod tests {
+    use super::*;
+    use crate::elf::{Section, Symbol};
+    use crate::riscv::tests::{enc_b, enc_i, enc_j, enc_r, enc_s, enc_u};
+    use solo_vm::isa::{AluImmOp, Cond};
+
+    const TEXT: u64 = 0x4000_0000;
+
+    fn sym(name: &str, value: u64, in_text: bool) -> Symbol {
+        Symbol {
+            name: name.to_owned(),
+            value,
+            in_text,
+            is_function: in_text,
+        }
+    }
+
+    fn func(name: &str, offset: u64) -> Symbol {
+        sym(name, TEXT + offset, true)
+    }
+
+    fn rel(offset: u64, r_type: u32, symbol: Symbol, addend: i64) -> Reloc {
+        Reloc {
+            offset,
+            r_type,
+            symbol,
+            addend,
+        }
+    }
+
+    fn text(words: &[u32]) -> Section {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        Section {
+            address: TEXT,
+            size: bytes.len() as u64,
+            bytes,
+        }
+    }
+
+    fn input(words: &[u32], mut symbols: Vec<Symbol>, text_relocs: Vec<Reloc>) -> Input {
+        symbols.insert(0, func("solo_export_main", 0));
+        Input {
+            text: text(words),
+            symbols,
+            text_relocs,
+            ..Input::default()
+        }
+    }
+
+    fn module_of(input: &Input) -> Module {
+        let bytes = recompile(input, &Options::default()).expect("recompiles");
+        Module::parse(&bytes, &|_| true).expect("valid")
+    }
+
+    const RET: u32 = 0x0000_8067;
+    const UNIMP: u32 = 0xC000_1073;
+    const FENCE: u32 = 0x0FF0_000F;
+    const EBREAK: u32 = 0x0010_0073;
+    const ECALL: u32 = 0x0000_0073;
+
+    fn jal(rd: u8, off: i32) -> u32 {
+        enc_j(rd, off)
+    }
+    fn jalr(rd: u8, rs1: u8, off: i32) -> u32 {
+        enc_i(0x67, 0, rd, rs1, off)
+    }
+    fn auipc(rd: u8, imm: i32) -> u32 {
+        enc_u(0x17, rd, imm)
+    }
+    fn lui(rd: u8, imm: i32) -> u32 {
+        enc_u(0x37, rd, imm)
+    }
+    fn addi(rd: u8, rs1: u8, imm: i32) -> u32 {
+        enc_i(0x13, 0, rd, rs1, imm)
+    }
+    fn amo(funct5: u32, f3: u32, rd: u8, rs1: u8, rs2: u8) -> u32 {
+        enc_r(0x2F, f3, funct5 << 2, rd, rs1, rs2)
+    }
+    fn r(i: u8) -> Reg {
+        Reg::new(i).unwrap()
+    }
+
+    #[test]
+    fn direct_calls_jumps_and_stubs() {
+        // 0: call f (16) ; 4: call import stub (20) ; 8: jump halt stub (24)
+        // 12: ret ; 16: f: ret ; 20: import stub ; 24: halt stub
+        let words = [jal(1, 16), jal(1, 16), jal(0, 16), RET, RET, UNIMP, UNIMP];
+        let inp = input(
+            &words,
+            vec![
+                func("f", 16),
+                func("__solo_import_output_write", 20),
+                func("__solo_halt", 24),
+            ],
+            vec![],
+        );
+        let m = module_of(&inp);
+        assert_eq!(m.imports, vec!["output_write".to_owned()]);
+        assert_eq!(m.jump_table, vec![None, Some(1)]);
+        assert_eq!(
+            m.blocks[0],
+            vec![Instruction::Call {
+                rd: Reg::RA,
+                block: 4,
+                slot: 1
+            }]
+        );
+        assert_eq!(m.blocks[1], vec![Instruction::Ecall { import: 0 }]);
+        assert_eq!(m.blocks[2], vec![Instruction::Halt]);
+        assert_eq!(
+            m.blocks[3],
+            vec![Instruction::JumpIndirect {
+                rs1: Reg::RA,
+                off: 0
+            }]
+        );
+        assert_eq!(
+            m.blocks[4],
+            vec![Instruction::JumpIndirect {
+                rs1: Reg::RA,
+                off: 0
+            }]
+        );
+        assert_eq!(m.blocks[5], vec![Instruction::Trap]);
+        assert_eq!(m.blocks[6], vec![Instruction::Trap]);
+        assert_eq!(m.export("main"), Some(0));
+    }
+
+    #[test]
+    fn call_pairs_including_tail_calls_and_stubs() {
+        // 0: auipc ra ; 4: jalr ra (call f@24) ; 8: auipc t1 ; 12: jalr zero (tail call f)
+        // 16: auipc ra ; 20: jalr ra (call trap stub @28) ; 24: f: ret ; 28: trap stub
+        let words = [
+            auipc(1, 0),
+            jalr(1, 1, 24),
+            auipc(6, 0),
+            jalr(0, 6, 16),
+            auipc(1, 0),
+            jalr(1, 1, 12),
+            RET,
+            UNIMP,
+        ];
+        let f = func("f", 24);
+        let trap = func("__solo_trap", 28);
+        let relocs = vec![
+            rel(0, reloc::R_RISCV_CALL_PLT, f.clone(), 0),
+            rel(8, reloc::R_RISCV_CALL, f.clone(), 0),
+            rel(16, reloc::R_RISCV_CALL_PLT, trap.clone(), 0),
+        ];
+        let m = module_of(&input(&words, vec![f, trap], relocs));
+        let f_block = m.export("main").map(|_| 3).unwrap();
+        assert_eq!(
+            m.blocks[0],
+            vec![Instruction::Call {
+                rd: Reg::RA,
+                block: f_block,
+                slot: 1
+            }]
+        );
+        assert_eq!(m.blocks[1], vec![Instruction::Jump { block: f_block }]);
+        assert_eq!(m.blocks[2], vec![Instruction::Trap]);
+        assert_eq!(m.jump_table, vec![None, Some(1)]);
+        assert!(m.imports.is_empty());
+    }
+
+    #[test]
+    fn broken_call_pair_is_rejected() {
+        let words = [auipc(1, 0), addi(1, 1, 8), RET];
+        let f = func("f", 8);
+        let inp = input(
+            &words,
+            vec![f.clone()],
+            vec![rel(0, reloc::R_RISCV_CALL_PLT, f, 0)],
+        );
+        assert_eq!(
+            recompile(&inp, &Options::default()),
+            Err(RecompileError::BrokenCallPair { address: TEXT })
+        );
+        // A call pair at the very end of the text has no jalr either.
+        let words = [RET, auipc(1, 0)];
+        let f = func("f", 0);
+        let inp = input(
+            &words,
+            vec![f.clone()],
+            vec![rel(4, reloc::R_RISCV_CALL_PLT, f, 0)],
+        );
+        assert_eq!(
+            recompile(&inp, &Options::default()),
+            Err(RecompileError::BrokenCallPair { address: TEXT + 4 })
+        );
+    }
+
+    #[test]
+    fn pc_relative_constants_and_code_pointers() {
+        // 0: auipc a0 (data) ; 4: addi a0, a0, lo ; 8: auipc a1 (code f) ; 12: addi a1, a1, lo
+        // 16: lui a2 (code f, absolute) ; 20: addi a2, a2, lo ; 24: ret ; 28: f: ret
+        let data_sym = sym("buffer", 0x1_2000, false);
+        let f = func("f", 28);
+        let words = [
+            auipc(10, 0),
+            addi(10, 10, 0),
+            auipc(11, 0),
+            addi(11, 11, 0),
+            lui(12, 0x4000_0000u32 as i32),
+            addi(12, 12, 28),
+            RET,
+            RET,
+        ];
+        let relocs = vec![
+            rel(0, reloc::R_RISCV_PCREL_HI20, data_sym, 0),
+            rel(
+                4,
+                reloc::R_RISCV_PCREL_LO12_I,
+                sym(".Lpcrel_hi0", TEXT, true),
+                0,
+            ),
+            rel(8, reloc::R_RISCV_PCREL_HI20, f.clone(), 0),
+            rel(
+                12,
+                reloc::R_RISCV_PCREL_LO12_I,
+                sym(".Lpcrel_hi1", TEXT + 8, true),
+                0,
+            ),
+            rel(16, reloc::R_RISCV_HI20, f.clone(), 0),
+            rel(20, reloc::R_RISCV_LO12_I, f.clone(), 0),
+        ];
+        let m = module_of(&input(&words, vec![f], relocs));
+        // f is the only address-taken block: slot 1, slot address 8.
+        assert_eq!(m.jump_table, vec![None, Some(1)]);
+        let b0 = &m.blocks[0];
+        assert_eq!(
+            b0[0],
+            Instruction::Li {
+                rd: Reg::A0,
+                imm: TEXT as i64
+            }
+        ); // pc + 0; addi adds nothing
+        assert_eq!(
+            b0[1],
+            Instruction::AluImm {
+                op: AluImmOp::Addi,
+                rd: Reg::A0,
+                rs1: Reg::A0,
+                imm: 0
+            }
+        );
+        // auipc a1 to code: li a1, slot(8) - lo where lo = f - (pc+0) = 20.
+        assert_eq!(
+            b0[2],
+            Instruction::Li {
+                rd: Reg::A1,
+                imm: 8 - 20
+            }
+        );
+        assert_eq!(
+            b0[3],
+            Instruction::AluImm {
+                op: AluImmOp::Addi,
+                rd: Reg::A1,
+                rs1: Reg::A1,
+                imm: 0
+            }
+        );
+        // lui a2 to code: li a2, slot(8) - lo where lo = f - 0x4000_0000 = 28.
+        assert_eq!(
+            b0[4],
+            Instruction::Li {
+                rd: Reg::A2,
+                imm: 8 - 28
+            }
+        );
+        assert_eq!(
+            b0[5],
+            Instruction::AluImm {
+                op: AluImmOp::Addi,
+                rd: Reg::A2,
+                rs1: Reg::A2,
+                imm: 28
+            }
+        );
+        assert_eq!(
+            b0[6],
+            Instruction::JumpIndirect {
+                rs1: Reg::RA,
+                off: 0
+            }
+        );
+        // Plain lui with no relocation is a constant.
+        let m = module_of(&input(&[lui(5, 0x1_2000), RET], vec![], vec![]));
+        assert_eq!(
+            m.blocks[0][0],
+            Instruction::Li {
+                rd: r(5),
+                imm: 0x1_2000
+            }
+        );
+    }
+
+    #[test]
+    fn unpaired_auipc_is_rejected() {
+        let inp = input(&[auipc(10, 0), RET], vec![], vec![]);
+        assert_eq!(
+            recompile(&inp, &Options::default()),
+            Err(RecompileError::UnpairedAuipc { address: TEXT })
+        );
+    }
+
+    #[test]
+    fn indirect_calls_and_jumps() {
+        let words = [jalr(1, 10, 0), jalr(0, 10, 4), RET];
+        let m = module_of(&input(&words, vec![], vec![]));
+        assert_eq!(
+            m.blocks[0],
+            vec![Instruction::CallIndirect {
+                rd: Reg::RA,
+                rs1: Reg::A0,
+                off: 0,
+                slot: 1
+            }]
+        );
+        assert_eq!(
+            m.blocks[1],
+            vec![Instruction::JumpIndirect {
+                rs1: Reg::A0,
+                off: 4
+            }]
+        );
+        assert_eq!(m.jump_table, vec![None, Some(1)]);
+    }
+
+    #[test]
+    fn branches_fallthrough_padding_and_final_trap() {
+        // 0: beq zero, zero, +8 ; 4: fence ; 8: addi a0, a0, 1  (falls off the end)
+        let words = [enc_b(0, 0, 0, 8), FENCE, addi(10, 10, 1)];
+        let m = module_of(&input(&words, vec![], vec![]));
+        assert_eq!(
+            m.blocks[0],
+            vec![Instruction::Branch {
+                cond: Cond::Eq,
+                rs1: Reg::ZERO,
+                rs2: Reg::ZERO,
+                block: 2
+            }]
+        );
+        assert_eq!(
+            m.blocks[1],
+            vec![Instruction::AluImm {
+                op: AluImmOp::Addi,
+                rd: Reg::ZERO,
+                rs1: Reg::ZERO,
+                imm: 0
+            }]
+        );
+        assert_eq!(
+            m.blocks[2],
+            vec![Instruction::AluImm {
+                op: AluImmOp::Addi,
+                rd: Reg::A0,
+                rs1: Reg::A0,
+                imm: 1
+            }]
+        );
+        assert_eq!(m.blocks[3], vec![Instruction::Trap]);
+        // ebreak, ecall and unimp each become a trap and end a block.
+        let m = module_of(&input(&[EBREAK, ECALL, UNIMP, RET], vec![], vec![]));
+        assert_eq!(m.blocks[0], vec![Instruction::Trap]);
+        assert_eq!(m.blocks[1], vec![Instruction::Trap]);
+        assert_eq!(m.blocks[2], vec![Instruction::Trap]);
+        assert_eq!(
+            m.blocks[3],
+            vec![Instruction::JumpIndirect {
+                rs1: Reg::RA,
+                off: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn target_not_an_instruction() {
+        let inp = input(&[enc_b(0, 0, 0, 2), RET], vec![], vec![]);
+        assert_eq!(
+            recompile(&inp, &Options::default()),
+            Err(RecompileError::TargetNotInstruction { address: TEXT + 2 })
+        );
+    }
+
+    #[test]
+    fn unsupported_instruction() {
+        let inp = input(&[0x0000_0007, RET], vec![], vec![]);
+        assert_eq!(
+            recompile(&inp, &Options::default()),
+            Err(RecompileError::Unsupported {
+                address: TEXT,
+                word: 0x0000_0007
+            })
+        );
+    }
+
+    #[test]
+    fn atomics_lowering() {
+        let d = 3;
+        let w = 2;
+        let words = [
+            amo(0x02, d, 10, 11, 0),  // lr.d a0, (a1)
+            amo(0x03, d, 10, 11, 12), // sc.d a0, a2, (a1)
+            amo(0x01, d, 10, 11, 12), // amoswap.d a0, a2, (a1)
+            amo(0x00, w, 0, 11, 12),  // amoadd.w zero, a2, (a1)
+            amo(0x00, d, 10, 11, 12), // amoadd.d a0, a2, (a1)
+            amo(0x04, d, 10, 11, 12), // amoxor.d
+            amo(0x0C, w, 10, 11, 12), // amoand.w
+            amo(0x08, d, 10, 11, 12), // amoor.d
+            RET,
+        ];
+        let m = module_of(&input(&words, vec![], vec![]));
+        let b = &m.blocks[0];
+        let (a0, a1, a2, tp) = (Reg::A0, Reg::A1, Reg::A2, SCRATCH);
+        let ld = |rd| Instruction::Load {
+            width: LoadWidth::D,
+            rd,
+            rs1: a1,
+            off: 0,
+        };
+        let lw = |rd| Instruction::Load {
+            width: LoadWidth::W,
+            rd,
+            rs1: a1,
+            off: 0,
+        };
+        let sd = |rs2| Instruction::Store {
+            width: StoreWidth::D,
+            rs1: a1,
+            rs2,
+            off: 0,
+        };
+        let sw = |rs2| Instruction::Store {
+            width: StoreWidth::W,
+            rs1: a1,
+            rs2,
+            off: 0,
+        };
+        let mv = |rd, rs| Instruction::Alu {
+            op: AluOp::Add,
+            rd,
+            rs1: rs,
+            rs2: Reg::ZERO,
+        };
+        let op = |op, rd, rs1, rs2| Instruction::Alu { op, rd, rs1, rs2 };
+        let expected = vec![
+            ld(a0),
+            sd(a2),
+            Instruction::Li { rd: a0, imm: 0 },
+            ld(tp),
+            sd(a2),
+            mv(a0, tp),
+            lw(tp),
+            op(AluOp::Addw, tp, tp, a2),
+            sw(tp),
+            ld(tp),
+            op(AluOp::Add, a0, tp, a2),
+            sd(a0),
+            mv(a0, tp),
+            ld(tp),
+            op(AluOp::Xor, a0, tp, a2),
+            sd(a0),
+            mv(a0, tp),
+            lw(tp),
+            op(AluOp::And, a0, tp, a2),
+            sw(a0),
+            mv(a0, tp),
+            ld(tp),
+            op(AluOp::Or, a0, tp, a2),
+            sd(a0),
+            mv(a0, tp),
+            Instruction::JumpIndirect {
+                rs1: Reg::RA,
+                off: 0,
+            },
+        ];
+        assert_eq!(b, &expected);
+        for bad in [
+            amo(0x10, d, 10, 11, 12),
+            amo(0x00, d, 11, 11, 12),
+            amo(0x00, d, 12, 11, 12),
+        ] {
+            let inp = input(&[bad, RET], vec![], vec![]);
+            assert_eq!(
+                recompile(&inp, &Options::default()),
+                Err(RecompileError::UnsupportedAtomic { address: TEXT })
+            );
+        }
+    }
+
+    #[test]
+    fn relocation_errors() {
+        let f = func("f", 4);
+        let inp = input(&[RET, RET], vec![f.clone()], vec![rel(0, 99, f.clone(), 0)]);
+        assert_eq!(
+            recompile(&inp, &Options::default()),
+            Err(RecompileError::UnknownReloc {
+                address: TEXT,
+                r_type: 99
+            })
+        );
+        let mut inp = input(&[RET, RET], vec![f.clone()], vec![]);
+        inp.rodata = Section {
+            address: 0x1_0000,
+            bytes: vec![0; 16],
+            size: 16,
+        };
+        inp.rodata_relocs = vec![rel(0, 5, f.clone(), 0)];
+        assert_eq!(
+            recompile(&inp, &Options::default()),
+            Err(RecompileError::UnknownReloc {
+                address: 0x1_0000,
+                r_type: 5
+            })
+        );
+        inp.rodata_relocs = vec![rel(12, reloc::R_RISCV_64, f, 0)];
+        assert_eq!(
+            recompile(&inp, &Options::default()),
+            Err(RecompileError::DataRelocOutOfRange { address: 0x1_000C })
+        );
+    }
+
+    #[test]
+    fn code_pointers_in_data_are_rewritten() {
+        let f = func("f", 4);
+        let g = func("g", 8);
+        let mut inp = input(&[RET, RET, RET], vec![f.clone(), g.clone()], vec![]);
+        inp.rodata = Section {
+            address: 0x1_0000,
+            bytes: vec![0xAA; 12],
+            size: 12,
+        };
+        inp.rodata_relocs = vec![
+            rel(0, reloc::R_RISCV_64, f.clone(), 0),
+            rel(8, reloc::R_RISCV_32, g.clone(), 0),
+        ];
+        inp.data = Section {
+            address: 0x1_2000,
+            bytes: vec![0xBB; 16],
+            size: 16,
+        };
+        inp.data_relocs = vec![
+            rel(0, reloc::R_RISCV_64, sym("buffer", 0x1_2000, false), 0),
+            rel(8, reloc::R_RISCV_64, f, 0),
+        ];
+        let m = module_of(&inp);
+        // f and g are slots 1 and 2 in address order.
+        assert_eq!(m.jump_table, vec![None, Some(1), Some(2)]);
+        assert_eq!(&m.rodata[..8], &8u64.to_le_bytes());
+        assert_eq!(&m.rodata[8..12], &16u32.to_le_bytes());
+        assert_eq!(&m.data[..8], &[0xBB; 8]); // data symbol left as linked
+        assert_eq!(&m.data[8..16], &8u64.to_le_bytes());
+        assert_eq!(m.layout.rw_base, 0x1_2000);
+        assert_eq!(m.layout.data_size, 16);
+        assert_eq!(m.layout.bss_size, 0);
+    }
+
+    #[test]
+    fn layouts() {
+        // Neither data nor bss.
+        let m = module_of(&input(&[RET], vec![], vec![]));
+        assert_eq!(m.layout.ro_base, 0x1_0000);
+        assert_eq!(m.layout.ro_size, 0);
+        assert_eq!(m.layout.rw_base, 0x1_1000);
+        assert_eq!(m.layout.heap_base, 0x1_2000);
+        assert_eq!(m.layout.heap_max, 16 << 20);
+        assert_eq!(m.layout.stack_base, 0xFFEF_0000);
+        assert_eq!(m.layout.stack_top, 0xFFFF_0000);
+        // Data and bss with alignment padding between them.
+        let mut inp = input(&[RET], vec![], vec![]);
+        inp.data = Section {
+            address: 0x1_2000,
+            bytes: vec![1, 2, 3],
+            size: 3,
+        };
+        inp.bss = Section {
+            address: 0x1_2008,
+            bytes: vec![],
+            size: 100,
+        };
+        let m = module_of(&inp);
+        assert_eq!(m.layout.rw_base, 0x1_2000);
+        assert_eq!(m.layout.data_size, 3);
+        assert_eq!(m.layout.bss_size, 105);
+        assert_eq!(m.layout.heap_base, 0x1_4000);
+        assert_eq!(Options::default().stack_size, 1 << 20);
+    }
+
+    #[test]
+    fn exports_and_validation() {
+        let mut inp = input(&[RET], vec![], vec![]);
+        inp.symbols.clear();
+        assert_eq!(
+            recompile(&inp, &Options::default()),
+            Err(RecompileError::NoExports)
+        );
+        let inp = input(&[RET], vec![], vec![]);
+        let bad = Options {
+            heap_max: 1,
+            ..Options::default()
+        };
+        assert!(matches!(
+            recompile(&inp, &bad),
+            Err(RecompileError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn error_messages() {
+        let cases = [
+            (
+                RecompileError::Unsupported {
+                    address: 16,
+                    word: 7,
+                },
+                "unsupported instruction 0x00000007 at 0x10",
+            ),
+            (
+                RecompileError::UnpairedAuipc { address: 16 },
+                "auipc without relocation at 0x10",
+            ),
+            (
+                RecompileError::BrokenCallPair { address: 16 },
+                "call pair without jalr at 0x10",
+            ),
+            (
+                RecompileError::TargetNotInstruction { address: 16 },
+                "control-flow target 0x10 is not an instruction",
+            ),
+            (
+                RecompileError::UnsupportedAtomic { address: 16 },
+                "unsupported atomic at 0x10",
+            ),
+            (
+                RecompileError::UnknownReloc {
+                    address: 16,
+                    r_type: 9,
+                },
+                "unknown relocation type 9 at 0x10",
+            ),
+            (
+                RecompileError::DataRelocOutOfRange { address: 16 },
+                "data relocation outside its section at 0x10",
+            ),
+            (RecompileError::NoExports, "no solo_export_* symbol"),
+        ];
+        for (e, msg) in cases {
+            assert_eq!(e.to_string(), msg);
+        }
+        assert!(
+            RecompileError::Validation(ValidationError::BadMagic)
+                .to_string()
+                .contains("BadMagic")
+        );
+        let boxed: Box<dyn std::error::Error> = Box::new(RecompileError::NoExports);
+        assert!(boxed.to_string().contains("export"));
+    }
+
+    #[test]
+    fn plain_instructions_pass_through_and_bss_only_layout() {
+        // lw a0, 4(a1) ; sd a2, 8(a3) ; addi a0, a0, 1 ; add a0, a0, a1 ; ret
+        let words = [
+            enc_i(0x03, 2, 10, 11, 4),
+            enc_s(0x23, 3, 13, 12, 8),
+            addi(10, 10, 1),
+            enc_r(0x33, 0, 0, 10, 10, 11),
+            RET,
+        ];
+        let mut inp = input(&words, vec![sym("buffer", 0x1_2000, false)], vec![]);
+        inp.bss = Section {
+            address: 0x1_2000,
+            bytes: vec![],
+            size: 64,
+        };
+        let m = module_of(&inp);
+        assert_eq!(
+            m.blocks[0],
+            vec![
+                Instruction::Load {
+                    width: LoadWidth::W,
+                    rd: Reg::A0,
+                    rs1: Reg::A1,
+                    off: 4
+                },
+                Instruction::Store {
+                    width: StoreWidth::D,
+                    rs1: Reg::A3,
+                    rs2: Reg::A2,
+                    off: 8
+                },
+                Instruction::AluImm {
+                    op: AluImmOp::Addi,
+                    rd: Reg::A0,
+                    rs1: Reg::A0,
+                    imm: 1
+                },
+                Instruction::Alu {
+                    op: AluOp::Add,
+                    rd: Reg::A0,
+                    rs1: Reg::A0,
+                    rs2: Reg::A1
+                },
+                Instruction::JumpIndirect {
+                    rs1: Reg::RA,
+                    off: 0
+                },
+            ]
+        );
+        assert_eq!(m.layout.rw_base, 0x1_2000);
+        assert_eq!(m.layout.data_size, 0);
+        assert_eq!(m.layout.bss_size, 64);
+        assert!(m.imports.is_empty());
+    }
 }

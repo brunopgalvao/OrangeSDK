@@ -9,6 +9,8 @@ rust-version.workspace = true
 [[bin]]
 name = "solo-recompile"
 path = "src/main.rs"
+test = false
+bench = false
 
 [dependencies]
 solo-vm = { path = "../solo-vm" }

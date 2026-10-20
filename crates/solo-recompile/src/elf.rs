@@ -134,7 +134,7 @@ fn load_section(file: &Elf<'_>, name: &'static str, loaded: bool) -> Result<Sect
 fn symbol_table(file: &Elf<'_>, text_index: Option<SectionIndex>) -> HashMap<usize, Symbol> {
     let mut map = HashMap::new();
     for sym in file.symbols() {
-        let Ok(name) = sym.name() else { continue };
+        let name = sym.name().unwrap_or_default();
         map.insert(
             sym.index().0,
             Symbol {
@@ -163,9 +163,9 @@ fn relocations(
         let offset = r_offset
             .checked_sub(section.address())
             .ok_or(ElfError::Relocation(r_offset))?;
-        let RelocationFlags::Elf { r_type } = r.flags() else {
-            return Err(ElfError::Relocation(r_offset));
-        };
+        // An ELF file only ever yields ELF relocation flags.
+        #[rustfmt::skip]
+        let RelocationFlags::Elf { r_type } = r.flags() else { unreachable!() };
         let r_type = r_type.0;
         if r_type == reloc::R_RISCV_RELAX {
             continue;
@@ -176,7 +176,7 @@ fn relocations(
         let symbol = symbols
             .get(&index.0)
             .cloned()
-            .ok_or(ElfError::Relocation(offset))?;
+            .ok_or(ElfError::Relocation(r_offset))?;
         out.push(Reloc {
             offset,
             r_type,
@@ -313,6 +313,57 @@ mod tests {
         );
         let e: Box<dyn std::error::Error> = Box::new(ElfError::Section(".text"));
         assert!(e.to_string().contains(".text"));
+    }
+
+    fn rela_text_range() -> std::ops::Range<usize> {
+        let file: Elf<'_> = ElfFile64::parse(HELLO).unwrap();
+        let (start, len) = file
+            .section_by_name(".rela.text")
+            .unwrap()
+            .file_range()
+            .unwrap();
+        let start = usize::try_from(start).unwrap();
+        start..start + usize::try_from(len).unwrap()
+    }
+
+    #[test]
+    fn relocation_with_unknown_or_absent_symbol() {
+        let range = rela_text_range();
+        // Entry layout: r_offset u64, r_info u64 (symbol << 32 | type), r_addend i64.
+        let info_at = range.start + 8;
+        let mut bytes = HELLO.to_vec();
+        let info = u64::from_le_bytes(bytes[info_at..info_at + 8].try_into().unwrap());
+        let r_offset = u64::from_le_bytes(bytes[range.start..range.start + 8].try_into().unwrap());
+        // Symbol index far beyond the table.
+        let bad = (0xFFFF_u64 << 32) | (info & 0xFFFF_FFFF);
+        bytes[info_at..info_at + 8].copy_from_slice(&bad.to_le_bytes());
+        assert_eq!(Input::load(&bytes), Err(ElfError::Relocation(r_offset)));
+        // Symbol index zero: an absolute relocation with no symbol.
+        let absolute = info & 0xFFFF_FFFF;
+        bytes[info_at..info_at + 8].copy_from_slice(&absolute.to_le_bytes());
+        assert_eq!(Input::load(&bytes), Err(ElfError::Relocation(r_offset)));
+        // A relaxation marker is skipped, leaving one relocation fewer.
+        let mut bytes = HELLO.to_vec();
+        let relax = (info & !0xFFFF_FFFF) | u64::from(reloc::R_RISCV_RELAX);
+        bytes[info_at..info_at + 8].copy_from_slice(&relax.to_le_bytes());
+        let baseline = Input::load(HELLO).unwrap().text_relocs.len();
+        assert_eq!(Input::load(&bytes).unwrap().text_relocs.len(), baseline - 1);
+        // A relocation offset below the section start.
+        let mut bytes = HELLO.to_vec();
+        bytes[range.start..range.start + 8].copy_from_slice(&1u64.to_le_bytes());
+        assert_eq!(Input::load(&bytes), Err(ElfError::Relocation(1)));
+    }
+
+    #[test]
+    fn unreadable_section_data() {
+        // Stretch .rodata's size past the end of the file so its data cannot be read.
+        let file: Elf<'_> = ElfFile64::parse(HELLO).unwrap();
+        let index = file.section_by_name(".rodata").unwrap().index().0;
+        let shoff = usize::try_from(file.elf_header().e_shoff(file.endian())).unwrap();
+        let size_at = shoff + index * 64 + 32;
+        let mut bytes = HELLO.to_vec();
+        bytes[size_at..size_at + 8].copy_from_slice(&0xFFFF_FFFFu64.to_le_bytes());
+        assert_eq!(Input::load(&bytes), Err(ElfError::Section(".rodata")));
     }
 
     #[test]
