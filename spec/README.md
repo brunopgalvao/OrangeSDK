@@ -15,6 +15,7 @@ This directory is normative. An implementation that disagrees with it is wrong; 
 | 07 | [Conformance](07-conformance.md) — test vectors, differential oracles, coverage requirements | draft |
 | 08 | [Simplex driver](08-simplex-driver.md) — the reference kernel's consensus: views, votes, certificates, persistence | draft |
 | 09 | [Peer-to-peer transport](09-p2p.md) — TCP framing, handshake, mapping between frames and driver inputs and effects | draft |
+| 11 | [Telemetry](11-telemetry.md) — metrics endpoint and names, emitted metrics, status document, alert and health semantics | draft |
 
 ## Conventions
 

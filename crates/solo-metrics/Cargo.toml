@@ -1,0 +1,16 @@
+[package]
+name = "solo-metrics"
+description = "Node telemetry (spec 11): a metrics registry, Prometheus text exposition, the node's metric schema and health rules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+serde_json = "1"
+
+[lints]
+workspace = true
