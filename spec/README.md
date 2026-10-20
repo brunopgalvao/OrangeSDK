@@ -15,6 +15,7 @@ This directory is normative. An implementation that disagrees with it is wrong; 
 | 07 | [Conformance](07-conformance.md) — test vectors, differential oracles, coverage requirements | draft |
 | 08 | [Simplex driver](08-simplex-driver.md) — the reference kernel's consensus: views, votes, certificates, persistence | draft |
 | 09 | [Peer-to-peer transport](09-p2p.md) — TCP framing, handshake, mapping between frames and driver inputs and effects | draft |
+| 12 | [Threshold certificates](12-threshold-certificates.md) — threshold BLS over BLS12-381, the DKG and resharing, the finality certificate and its verification on Ethereum | draft |
 
 ## Conventions
 

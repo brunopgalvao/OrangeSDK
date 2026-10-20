@@ -20,3 +20,17 @@ pedantic = "warn"
 [profile.release]
 debug = 1
 lto = "thin"
+
+# Pairing arithmetic is impractically slow unoptimized; test and coverage
+# builds compile the curve crates with optimizations.
+[profile.dev.package.bls12_381]
+opt-level = 3
+
+[profile.dev.package.ark-bls12-381]
+opt-level = 3
+
+[profile.dev.package.ark-ec]
+opt-level = 3
+
+[profile.dev.package.ark-ff]
+opt-level = 3

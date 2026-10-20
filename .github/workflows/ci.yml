@@ -17,6 +17,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build -p solo-vm --no-default-features --target wasm32-unknown-unknown
+      - run: cargo build -p solo-bls --no-default-features --target riscv64imac-unknown-none-elf
       - run: cargo build --release
         working-directory: guest
       - run: cargo run -q -p solo-recompile -- guest/target/riscv64imac-unknown-none-elf/release/hello /tmp/hello.solo
