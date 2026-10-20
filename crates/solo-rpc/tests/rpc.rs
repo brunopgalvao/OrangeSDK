@@ -425,8 +425,8 @@ fn rejections_carry_reasons() {
     let a = data(&alice.address);
     let cases: [(Vec<u8>, String); 12] = [
         (
-            alice.transfer(1, bob.address, ETHER, 21_000),
-            format!("nonce too high: address {a}, tx: 1 state: 0"),
+            alice.transfer(u64::MAX, bob.address, ETHER, 21_000),
+            format!("nonce has max value: address {a}, nonce: {}", u64::MAX),
         ),
         (
             poor.transfer(0, bob.address, ETHER, 21_000),

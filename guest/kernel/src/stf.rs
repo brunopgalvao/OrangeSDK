@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use solo_abi::chain::consensus::{MAX_EVIDENCE, signing_preimage};
 use solo_abi::chain::{Account, BLOCK_GAS_LIMIT, BlockHeader, CallRequest, CallResult, Evidence, Participation, Receipt, StorageQuery, call_status, query, reason};
 use solo_abi::codec::Seq;
-use solo_abi::types::{Address, Block, BuildArgs, ExecuteArgs, ExecuteResult, ExecuteSummary, FinalizeArgs, Hash, QueryArgs, QueryResult, ValidateArgs, ValidateResult};
+use solo_abi::types::{Address, Ahead, Block, BuildArgs, ExecuteArgs, ExecuteResult, ExecuteSummary, FinalizeArgs, Hash, QueryArgs, QueryResult, ValidateArgs, ValidateResult};
 use solo_abi::{Decode, Encode};
 use solo_eth::MAX_TX_GAS;
 
@@ -56,9 +56,23 @@ fn check(raw: &[u8]) -> Result<Signed, u32> {
     Ok(s)
 }
 
-/// `kernel_stf_validate_tx`.
+/// The sender's account as it will be once the transactions a mempool holds
+/// ahead of this one have run (spec 06 §5.1): `ahead.nonces` more and
+/// `ahead.reserved` less. A nonce past the end of the range has no next
+/// transaction; a balance below the reserve pays for nothing.
+fn ahead_of(account: Account, ahead: &Ahead) -> Result<Account, u32> {
+    let nonce = account.nonce.checked_add(ahead.nonces).ok_or(reason::BAD_NONCE)?;
+    let balance = account.balance.checked_sub(ahead.reserved).ok_or(reason::INSUFFICIENT_FUNDS)?;
+    Ok(Account { nonce, balance, ..account })
+}
+
+/// `kernel_stf_validate_tx`: the transaction validates against the sender's
+/// account with what the mempool holds ahead of it already run. Only
+/// admission depends on `ahead`; block building and execution check every
+/// transaction against the state as it is, so a mempool that reports it
+/// wrongly can delay its own transactions but never make a block invalid.
 pub fn validate(args: &ValidateArgs) -> ValidateResult {
-    match check(&args.tx).and_then(|s| admissible(&s, &state::account(&s.from)).map(|()| s)) {
+    match check(&args.tx).and_then(|s| admissible(&s, &ahead_of(state::account(&s.from), &args.ahead)?).map(|()| s)) {
         Ok(s) => {
             let price = s.tx.effective_gas_price(u128::from(BASE_FEE)).unwrap_or(0);
             ValidateResult::Valid {

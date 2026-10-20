@@ -10,7 +10,7 @@ This document fixes the entrypoint names, the encoding of inputs and effects, th
 
 All structured data crossing the boundary uses the *Solo canonical encoding*:
 
-- Fixed-width integers little-endian: `u8`, `u16`, `u32`, `u64`, `i64`.
+- Fixed-width integers little-endian: `u8`, `u16`, `u32`, `u64`, `u128`, `i64`.
 - `bytes`: `u:n` length (canonical ULEB128) followed by the bytes.
 - `vec<T>`: `u:n` count followed by the elements.
 - `enum`: `u8` tag followed by the variant's fields in order.
@@ -29,7 +29,7 @@ Each entrypoint is an export (03 §5.2). The host places the encoded argument in
 | `kernel_driver_step` | driver | `Input` | `vec<Effect>` |
 | `kernel_driver_state` | driver | `()` | `bytes` (opaque driver state for migration) |
 | `kernel_migrate` | both | `MigrateArgs { from_version: u32, driver_state: bytes }` | `()` |
-| `kernel_stf_validate_tx` | stf | `ValidateArgs { tx: bytes, context: ExecContext }` | `ValidateResult` |
+| `kernel_stf_validate_tx` | stf | `ValidateArgs { tx: bytes, context: ExecContext, ahead: Ahead }` | `ValidateResult` |
 | `kernel_stf_build_block` | stf | `BuildArgs { context: ExecContext, limits: Limits, candidates: vec<bytes> }` | `Block` |
 | `kernel_stf_execute_block` | stf | `ExecuteArgs { block: Block, context: ExecContext }` | `ExecuteResult` |
 | `kernel_stf_finalize_block` | stf | `FinalizeArgs { height: u64, certificate: bytes }` | `()` |
@@ -81,7 +81,7 @@ enum Effect {
 
 The driver MAY also call the network, timer, and persistence host functions directly (05 §4.5–4.6) with identical meaning; the effect list exists so that a driver can be written as a pure function with no host imports at all, which is the form the simulator and the conformance suite use. A kernel SHOULD use one style, not both.
 
-Effects are applied by the host in list order after the entrypoint halts. `ExecuteBlock` causes the host to run `kernel_stf_execute_block` (asynchronously, in a separate instance) and to deliver `BlockExecuted` as a later input. `FinalizeBlock` causes `kernel_stf_finalize_block` and advances the finalized head. `PersistState` writes to node-local storage and is the state returned at `Started.resumed_state` after a restart.
+Effects are applied by the host in list order after the entrypoint halts. `MempoolTake` is answered by `MempoolContents` with transactions in an order a block can execute, within `max_bytes` bytes and `max_gas` gas limits in all (14 §3). `ExecuteBlock` causes the host to run `kernel_stf_execute_block` (asynchronously, in a separate instance) and to deliver `BlockExecuted` as a later input. `FinalizeBlock` causes `kernel_stf_finalize_block` and advances the finalized head. `PersistState` writes to node-local storage and is the state returned at `Started.resumed_state` after a restart.
 
 ### 4.3 Driver determinism
 
@@ -95,12 +95,21 @@ struct Limits      { max_gas: u64, max_bytes: u32, max_txs: u32 }
 struct Block       { header: bytes, txs: vec<bytes>, participation: bytes }
 struct ExecuteSummary { gas_used: u64, tx_count: u32, receipts_root: [32], logs_bloom: bytes }
 struct ExecuteResult  { state_root: [32], summary: ExecuteSummary, receipts: vec<bytes> }
+struct Ahead       { nonces: u64, reserved: u128 }
 enum   ValidateResult { 0 Valid { priority: u64, reserved_fee: u64 }, 1 Invalid { reason: u32 } }
 struct Genesis     { chain_id: u64, fee_schedule: bytes, modules: vec<ModuleInstall>, params: bytes, validators: bytes }
 struct ModuleInstall { address: [20], code_hash: [32], capabilities: u64, init: bytes }
 ```
 
 `header`, `txs`, `receipts`, `participation`, `fee_params`, and `validators` are opaque to this document; the kernel defines them (for a Type 2 kernel, `txs` are RLP-encoded Ethereum transactions and `receipts` Ethereum receipts). `kernel_stf_validate_tx` implements the reserve-balance admission rule against the state as of `height − exec_lag_k`; `kernel_stf_execute_block` executes against the state produced by the previous executed block and returns the root the driver places in the header of block `height + exec_lag_k`; for the reference kernel that is the state commitment of 10, as `storage_commit` reports it during the block. The reference kernel asks for it after recording the evidence the block carries (08 §9) and writing the block's receipts, and before storing the header, its hash index, the height and the last hash, so the root covers the block's evidence records and transactions but not that bookkeeping, which the next block's root covers; a block with neither transactions nor newly kept evidence commits to the state the block before left. A proof against a header therefore comes from the state as it was when the kernel asked for the root, not the state after the block.
+
+### 5.1 Validation ahead of the state
+
+A mempool holds transactions that cannot run yet because others of the same sender must run first (14 §2). `ValidateArgs.ahead` tells the kernel what the host's mempool holds ahead of the transaction: `nonces`, how many of the sender's transactions run before it, and `reserved`, the most they can cost in the chain's balance unit. The kernel validates the transaction against the sender's account as it will be after them: its nonce plus `nonces`, its balance minus `reserved`. A nonce sum past `2^64 − 1` is a bad nonce and a `reserved` above the balance is insufficient funds; every other check is unchanged. `Ahead` with both fields zero validates against the state as it is.
+
+The host computes `ahead` from its pool. For a transaction with nonce `n` from a sender whose account nonce is `s`: when `n > s`, `nonces = n − s` and `reserved` is the saturating sum of the costs of the pool's transactions of that sender with nonces in `[s, n)`; otherwise both are zero, and a transaction with `n < s` is rejected for its nonce.
+
+The kernel cannot check what `ahead` claims and does not need to. Only admission reads it: `kernel_stf_build_block` and `kernel_stf_execute_block` check every transaction against the state the transactions before it in the block left. A host that reports `ahead` wrongly admits transactions that will not run, or refuses ones that would; it cannot make a block invalid or change what a valid block does. The reference kernel's `reason` codes for a rejection are those of `solo_abi::chain::reason`.
 
 ## 6. Faults and resource limits
 

@@ -276,8 +276,18 @@ fn rejections() {
     let mut node = node(&alice);
     let gp = 1_000_000_000u128;
     let cases: Vec<(Vec<u8>, u32)> = vec![
+        // A nonce ahead of the account waits in the pool, but no transaction
+        // may carry the last nonce (EIP-2681).
         (
-            alice.transfer(1, bob.address, ETHER, gp, 21_000, Some(CHAIN_ID), &[]),
+            alice.transfer(
+                u64::MAX,
+                bob.address,
+                ETHER,
+                gp,
+                21_000,
+                Some(CHAIN_ID),
+                &[],
+            ),
             reason::BAD_NONCE,
         ),
         (
@@ -375,8 +385,8 @@ fn rejections() {
     node2.submit(&t1).unwrap();
     assert_eq!(
         node2.submit(&t2),
-        Err(SubmitError::Rejected(reason::BAD_NONCE)),
-        "mempool validation is against state"
+        Err(SubmitError::Rejected(reason::INSUFFICIENT_FUNDS)),
+        "the next nonce validates against the balance the first one leaves"
     );
 }
 
@@ -488,27 +498,28 @@ fn effects_injected_by_hand() {
     assert!(node.timers().is_empty());
     node.tick(10_000).unwrap();
     assert_eq!(node.block_number().unwrap(), 0);
-    // Two transactions in the pool; a take that fits only one leaves the other.
+    // Two transactions in the pool, nonces 0 and 1: a take that fits only one
+    // hands out the first, whatever the second pays, and the pool keeps both
+    // until a block includes them.
     let t1 = alice.transfer(0, bob.address, 1, 1, 21_000, Some(CHAIN_ID), &[]);
-    let t2 = alice.transfer(0, bob.address, 2, 2, 21_000, Some(CHAIN_ID), &[]);
+    let t2 = alice.transfer(1, bob.address, 2, 2, 21_000, Some(CHAIN_ID), &[]);
     let h1 = node.submit(&t1).unwrap();
     let h2 = node.submit(&t2).unwrap();
     assert_eq!(node.mempool().len(), 2);
     let taken = node
         .apply_effect(Effect::MempoolTake {
-            max_bytes: u32::try_from(t2.len()).unwrap(),
-            max_gas: 0,
+            max_bytes: u32::try_from(t1.len()).unwrap(),
+            max_gas: u64::MAX,
         })
         .unwrap();
     assert_eq!(
         taken,
         Some(solo_abi::types::Input::MempoolContents {
-            txs: Seq(vec![t2.clone()])
+            txs: Seq(vec![t1.clone()])
         }),
-        "higher priority first"
+        "nonce order first"
     );
-    assert_eq!(node.mempool().len(), 1);
-    assert_eq!(node.mempool()[0].hash, h1);
+    assert_eq!(node.mempool().len(), 2);
     // Rejection drops a pending transaction; an unknown hash is a no-op.
     assert_eq!(
         node.apply_effect(Effect::MempoolReject {

@@ -877,7 +877,9 @@ version = "0.0.1"
 dependencies = [
  "k256",
  "p256",
+ "proptest",
  "solo-abi",
+ "solo-eth",
  "solo-host",
  "solo-recompile",
  "solo-rlp",

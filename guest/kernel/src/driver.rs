@@ -14,7 +14,7 @@ use solo_abi::chain::consensus::{
     propose_timer, quorum, signing_preimage, timeout_timer, timer_view, view_timeout_ms,
 };
 use solo_abi::chain::{
-    BlockHeader, Certificate, ConsensusMessage, Evidence, GenesisParams, Participation, Proposal, Signature, SignedHash, SignedVote, SimplexState,
+    BLOCK_GAS_LIMIT, BlockHeader, Certificate, ConsensusMessage, Evidence, GenesisParams, Participation, Proposal, Signature, SignedHash, SignedVote, SimplexState,
     SyncRequest, SyncResponse, keys,
 };
 use solo_abi::codec::Seq;
@@ -178,7 +178,7 @@ impl Ctx {
 
     fn request_mempool(&mut self) {
         self.s.proposing = true;
-        self.effects.push(Effect::MempoolTake { max_bytes: 1 << 20, max_gas: u64::from(self.params.max_txs) * 21_000 });
+        self.effects.push(Effect::MempoolTake { max_bytes: 1 << 20, max_gas: BLOCK_GAS_LIMIT });
     }
 
     fn on_timer(&mut self, timer_id: u64, now_ms: u64) {

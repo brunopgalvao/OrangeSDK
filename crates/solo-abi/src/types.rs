@@ -144,12 +144,28 @@ record! {
 }
 
 record! {
+    /// What a mempool holds ahead of a transaction from the same sender
+    /// (spec 06 §5.1): the transaction is validated as if they had run first.
+    /// The default, all zero, validates against the state as it is.
+    Ahead {
+        /// Transactions of the sender that run before this one: the account's
+        /// nonce is taken to be this much higher.
+        nonces: u64,
+        /// The most they can cost, in the chain's balance unit: the account's
+        /// balance is taken to be this much lower.
+        reserved: u128,
+    }
+}
+
+record! {
     /// Argument of `kernel_stf_validate_tx`.
     ValidateArgs {
         /// Transaction bytes.
         tx: Vec<u8>,
         /// Context.
         context: ExecContext,
+        /// What the mempool holds ahead of it from the same sender.
+        ahead: Ahead,
     }
 }
 
@@ -722,6 +738,10 @@ mod tests {
         roundtrip(&ValidateArgs {
             tx: vec![1, 2],
             context: ctx(),
+            ahead: Ahead {
+                nonces: 3,
+                reserved: u128::MAX,
+            },
         });
         roundtrip(&BuildArgs {
             context: ctx(),
