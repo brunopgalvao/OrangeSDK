@@ -10,6 +10,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod doctor;
+
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -59,7 +61,8 @@ pub const DEFAULT_RPC: &str = "127.0.0.1:8545";
 pub const USAGE: &str = "usage:
   solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>]
   solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex>] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>]
-  solo key  <64 hex>";
+  solo key  <64 hex>
+  solo doctor [--rpc 127.0.0.1:8545] [--max-head-age <s>] [--max-finality-lag <blocks>] [--min-peers <n>] [--max-mempool <txs>] [--max-call-ms <ms>]";
 
 /// Where `solo node` listens for peers unless `--listen` says otherwise.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:30333";
@@ -276,6 +279,10 @@ fn run_inner(
     if command == "key" {
         let key = parse_key(args.get(2).ok_or("key: expected 64 hex digits")?)?;
         println!("{}", describe_key(&key));
+        return Ok(());
+    }
+    if command == "doctor" {
+        println!("{}", doctor::run(args)?);
         return Ok(());
     }
     if command != "dev" && command != "node" {

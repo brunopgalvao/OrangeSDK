@@ -22,3 +22,4 @@ The long arc (vision, strategy, decisions, research) lives in the codex at `/Use
 - `crates/solo-node` — node host (driver loop, mempool, queries) and `Sim`, the in-process multi-node network for consensus tests. `crates/solo-rpc` — Ethereum JSON-RPC. `crates/solo-cli` — the `solo` command.
 - `guest/` — separate RISC-V workspace: `solo-guest` runtime, `hello`, the reference `kernel`. Rebuild fixtures with `tools/build-guest.sh` after touching it.
 - `tools/` — build scripts; conformance runners and differential fuzz harnesses as they land.
+- `crates/solo-metrics` and `ops/` — telemetry (spec 11) and the alert rules and dashboard over it; a test keeps `ops/` and the spec's metric table in step with what the node exports.

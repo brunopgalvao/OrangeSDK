@@ -32,6 +32,14 @@ solo node --kernel kernel.elf --genesis genesis.json --key <seed 2> --listen 127
 
 A node without `--key` follows the chain as an observer. A node that falls behind syncs the finalized blocks it missed from its peers.
 
+Watch it: every node serves Prometheus metrics at `GET /metrics` and a JSON status at `GET /status` on its JSON-RPC address (spec 11), and `solo doctor` turns both into a verdict, exiting non-zero when the node is unhealthy. `ops/` has the alert rules, a Prometheus configuration and a Grafana dashboard:
+
+```sh
+curl -s http://127.0.0.1:8545/status
+solo doctor --rpc 127.0.0.1:8545
+prometheus --config.file=ops/prometheus.yml   # then import ops/grafana-solo.json into Grafana
+```
+
 Build everything and run the gates:
 
 ```sh
@@ -51,7 +59,9 @@ cargo llvm-cov --workspace --fail-under-lines 100
 - `crates/solo-rlp` — Ethereum RLP.
 - `crates/solo-node` — the node host: privileged functions (including `sign`), the driver loop, mempool, queries, the TCP transport, and `Sim`, an in-process network of nodes with a virtual clock.
 - `crates/solo-rpc` — Ethereum JSON-RPC over a node, with a minimal HTTP server.
-- `crates/solo-cli` — the `solo` command (`solo dev`, `solo node`, `solo key`).
+- `crates/solo-cli` — the `solo` command (`solo dev`, `solo node`, `solo key`, `solo doctor`).
+- `crates/solo-metrics` — telemetry: a metrics registry with Prometheus text exposition, the node's metric schema, and the health rules `solo doctor` applies.
 - `guest/` — separate workspace for programs that run on the VM: the `solo-guest` runtime, `hello`, and the reference `kernel`.
 - `examples/` — a genesis file for `solo dev`.
 - `tools/` — build scripts.
+- `ops/` — operator assets: Prometheus alert rules and configuration, a Grafana dashboard.
