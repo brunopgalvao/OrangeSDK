@@ -48,14 +48,22 @@ fn pending() -> Option<PendingUpgrade> {
     state::get(keys::PENDING)
 }
 
+/// Whether `code_hash` is the code of a kernel this chain has switched to:
+/// its staged code stays as it is for good (spec 13 §5).
+fn enacted(code_hash: &Hash) -> bool {
+    state::get_raw(&keys::kernel(code_hash)).is_some()
+}
+
 fn book() -> GateBook {
     state::get(keys::BOOK).unwrap_or_default()
 }
 
 /// The action a transaction to the upgrade address carries, if it can run:
-/// no value, calldata that is an action, and a sender that action authorizes.
+/// signed for this chain (EIP-155 or a typed transaction, so it cannot be
+/// replayed from another chain), no value, calldata that is an action, and a
+/// sender that action authorizes.
 fn action_of(s: &Signed) -> Option<Action> {
-    if s.tx.value != 0 {
+    if s.tx.chain_id != Some(state::chain_id()) || s.tx.value != 0 {
         return None;
     }
     let action = Action::decode(&s.tx.input)?;
@@ -96,8 +104,8 @@ pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Out
 fn apply(action: Action, from: &Address, height: u64) -> Option<Vec<Log>> {
     match action {
         Action::Stage { code_hash, index, chunk } => {
-            // The code of a pending upgrade is frozen.
-            if pending().is_some_and(|p| p.code_hash == code_hash) {
+            // The code of a pending upgrade, and of every enacted kernel, is frozen.
+            if pending().is_some_and(|p| p.code_hash == code_hash) || enacted(&code_hash) {
                 return None;
             }
             state::set_raw(&keys::chunk(&code_hash, index), &chunk);
@@ -105,7 +113,8 @@ fn apply(action: Action, from: &Address, height: u64) -> Option<Vec<Log>> {
         }
         Action::Propose { code_hash, activation_height, required_gates } => {
             let earliest = height.saturating_add(params().min_delay.max(1));
-            if pending().is_some() || activation_height < earliest {
+            // Block `H + 1` must exist, and a kernel the chain already ran never comes back.
+            if pending().is_some() || activation_height < earliest || activation_height == u64::MAX || enacted(&code_hash) {
                 return None;
             }
             let (code, chunks) = assemble(&code_hash)?;
@@ -202,5 +211,7 @@ pub fn migrate(args: &MigrateArgs) {
         solo_guest::trap();
     }
     state::delete(keys::PENDING);
-    state::set(keys::ENACTED, &EnactedUpgrade { code_hash: up.code_hash, height: up.activation_height, from_version: args.from_version, to_version: KERNEL_VERSION });
+    let enacted = EnactedUpgrade { code_hash: up.code_hash, height: up.activation_height, from_version: args.from_version, to_version: KERNEL_VERSION };
+    state::set(&keys::kernel(&up.code_hash), &enacted);
+    state::set(keys::ENACTED, &enacted);
 }

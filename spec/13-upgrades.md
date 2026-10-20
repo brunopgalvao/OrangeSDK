@@ -56,7 +56,7 @@ A chunk this size, and the raw transaction carrying it, each fit one storage val
 
 ### 2.3 Admission and execution
 
-A transaction to the upgrade address *can run* if it carries no value, its calldata is an action (§2.1), and its sender is authorized for that action (§2.2). Admission (`kernel_stf_validate_tx`, and selection in `kernel_stf_build_block`) rejects one that cannot run with reason 11 (`SYSTEM_ACTION`), after the checks every transaction gets.
+A transaction to the upgrade address *can run* if it is signed for this chain (a typed transaction, or a legacy one with an EIP-155 chain id; a pre-EIP-155 legacy transaction carries no chain id and could be replayed from any chain sharing the key), carries no value, its calldata is an action (§2.1), and its sender is authorized for that action (§2.2). Admission (`kernel_stf_validate_tx`, and selection in `kernel_stf_build_block`) rejects one that cannot run with reason 11 (`SYSTEM_ACTION`). That check comes after decoding, the chain-id check, signature recovery and the well-formedness checks every transaction gets, and before the checks against the sender's account (nonce, then funds): a transaction that cannot run gets reason 11 whatever its nonce and the sender's balance.
 
 In `kernel_stf_execute_block`, a transaction to the upgrade address that cannot run changes nothing and gets a failed receipt, as any transaction that should not have been included. One that can run executes in two steps:
 
@@ -69,8 +69,8 @@ Actions cost no gas beyond the intrinsic cost; only the authorized accounts can 
 
 Heights below are those of the block executing the action.
 
-- **`stage(codeHash, index, chunk)`** stores `chunk` as chunk `index` of `codeHash`, replacing any chunk already there. Fails if `codeHash` is the pending upgrade's: its code is frozen. Emits nothing.
-- **`propose(codeHash, activationHeight, requiredGates)`** at height `B` makes the code the *pending upgrade*. Fails if an upgrade is pending, if `activationHeight < B + max(N, 1)`, if chunk 0 of `codeHash` is not staged, or if the chunks staged from index 0 up to the first missing index, concatenated, do not hash to `codeHash` under `keccak256`. Records `PendingUpgrade { code_hash, activation_height, required_gates, size, chunks, proposed_at: B }` and emits `UpgradeProposed(codeHash, activationHeight, requiredGates)`.
+- **`stage(codeHash, index, chunk)`** stores `chunk` as chunk `index` of `codeHash`, replacing any chunk already there. Fails if `codeHash` is the pending upgrade's or that of a kernel the chain has switched to (§5): their code is frozen. Emits nothing.
+- **`propose(codeHash, activationHeight, requiredGates)`** at height `B` makes the code the *pending upgrade*. Fails if an upgrade is pending, if `activationHeight < B + max(N, 1)`, if `activationHeight` is `2^64 − 1` (block `H + 1` must have a height), if the chain has already switched to `codeHash` (a kernel never comes back: versions only increase, 06 §7.1), if chunk 0 of `codeHash` is not staged, or if the chunks staged from index 0 up to the first missing index, concatenated, do not hash to `codeHash` under `keccak256`. Records `PendingUpgrade { code_hash, activation_height, required_gates, size, chunks, proposed_at: B }` and emits `UpgradeProposed(codeHash, activationHeight, requiredGates)`.
 - **`cancel(codeHash)`** removes the pending upgrade. Fails unless an upgrade is pending and its code hash is `codeHash`. Emits `UpgradeCancelled(codeHash)`. Staged chunks stay; the same code may be proposed again without uploading it again.
 - **`signal(features)`** records `Signal { epoch: epoch(B), features }` as the sender's latest signal (§8.2). Emits nothing.
 
@@ -81,7 +81,7 @@ Heights below are those of the block executing the action.
 1. **Staging**, any number of blocks: `stage` transactions upload the module. A sender's transactions are admitted one nonce at a time, so the upload takes about one block per chunk.
 2. **Proposal** at block `B`: the upgrade becomes pending with activation height `H ≥ B + max(N, 1)`. From the end of block `B`, every host enacts it (06 §7.2) or raises an alert (§7.2).
 3. **Cancellation window**: a `cancel` in any block up to and including `H` withdraws it. So does lapsing: at the end of block `H`, if any gate in `requiredGates` is not active for block `H + 1` (§8.4), the kernel removes the pending upgrade. A withdrawn upgrade never switches.
-4. **Switch** after block `H` (06 §7.3). The new kernel's `kernel_migrate` accepts only the version its kernel supersedes (version − 1 for the reference kernel) and only while the pending upgrade's activation height equals the latest executed height; it removes the pending upgrade and records `EnactedUpgrade { code_hash, height: H, from_version, to_version }`. Both writes depend on chain state alone, so every node writes the same.
+4. **Switch** after block `H` (06 §7.3). The new kernel's `kernel_migrate` accepts only the version its kernel supersedes (version − 1 for the reference kernel) and only while the pending upgrade's activation height equals the latest executed height; it removes the pending upgrade and records `EnactedUpgrade { code_hash, height: H, from_version, to_version }`, under `gov/enacted` and under the new kernel's code hash (§5). The writes depend on chain state alone, so every node writes the same.
 5. **After `H`**: the old kernel, should a host still run it, traps at the end of any block above the activation height of a pending upgrade, so an outdated host halts instead of forking.
 
 ## 5. State
@@ -92,6 +92,7 @@ Under the reference kernel's state layout (all covered by the state commitment):
 |---|---|
 | `gov/pending` | `PendingUpgrade`, while one is pending |
 | `gov/enacted` | `EnactedUpgrade`, the latest switch |
+| `gov/kernel/` ‖ code hash | `EnactedUpgrade`, for every kernel the chain switched to |
 | `gov/chunk/` ‖ code hash ‖ index (big-endian `u32`) | chunk bytes |
 | `gate/book` | `GateBook` (§8.3) |
 | `gate/signal/` ‖ validator id | `Signal`, the validator's latest |
@@ -106,7 +107,7 @@ struct GateRecord     { gate: u8, streak: u32, activation_height: u64 }
 struct GateBook       { next_epoch: u64, gates: vec<GateRecord> }
 ```
 
-The code of an enacted kernel stays staged: the running kernel is a program in state (ADR 0004).
+The code of an enacted kernel stays staged and cannot be restaged (§3): the running kernel, and every kernel before it in the lineage other than the genesis kernel, is a program in state (ADR 0004), and `upgrade_code` of its code hash serves exactly that program.
 
 ## 6. Queries
 
@@ -139,7 +140,7 @@ After executing a block at height `h`, the host reads `upgrade_status` (a kernel
 
 A host reports, without stopping:
 
-- a pending upgrade it cannot enact: the code does not hash to its code hash, the module is invalid, or it imports a function this host cannot serve for block `H + 1`. This is the "host lacks the ABI a pending kernel needs" alert of ADR 0011: governance can cancel, or operators can install a host release, before `H`.
+- a pending upgrade it cannot enact: the code does not hash to its code hash, the module is invalid, it imports a function this host cannot serve for block `H + 1`, its `kernel_version` does not halt with a `u32`, or that version is not above the running kernel's (06 §7.2), so that its `kernel_migrate` would trap at `H`. This is the "host lacks the ABI a pending kernel needs" alert of ADR 0011: governance can cancel, or operators can install a host release, before `H`.
 - gates the chain has locked in that its release does not support: the host cannot serve their behaviour once they activate, and must be replaced by a release that does.
 
 ## 8. Feature gates

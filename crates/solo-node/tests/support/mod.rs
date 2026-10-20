@@ -100,6 +100,35 @@ impl Wallet {
         out
     }
 
+    /// A pre-EIP-155 legacy transaction (no chain id, `v` = 27 or 28) with gas price zero.
+    pub fn unprotected_tx(&self, nonce: u64, to: [u8; 20], gas: u64, data: &[u8]) -> Vec<u8> {
+        let fields = |out: &mut Vec<u8>| {
+            encode_uint(u128::from(nonce), out);
+            encode_uint(0, out);
+            encode_uint(u128::from(gas), out);
+            encode_bytes(&to, out);
+            encode_uint(0, out);
+            encode_bytes(data, out);
+        };
+        let mut unsigned = Vec::new();
+        fields(&mut unsigned);
+        let mut list = Vec::new();
+        encode_list(&unsigned, &mut list);
+        let (sig, rid) = self
+            .key
+            .sign_prehash_recoverable(&keccak256(&list))
+            .unwrap();
+        let mut signed = Vec::new();
+        fields(&mut signed);
+        encode_uint(u128::from(27 + rid.to_byte()), &mut signed);
+        let strip = |b: &[u8]| b[b.iter().take_while(|x| **x == 0).count()..].to_vec();
+        encode_bytes(&strip(&sig.r().to_bytes()), &mut signed);
+        encode_bytes(&strip(&sig.s().to_bytes()), &mut signed);
+        let mut out = Vec::new();
+        encode_list(&signed, &mut out);
+        out
+    }
+
     /// A transaction carrying `action` to the upgrade address.
     pub fn action(&self, nonce: u64, action: &Action) -> Vec<u8> {
         self.tx(nonce, UPGRADE_ADDRESS, 0, STAGE_GAS, &action.encode())

@@ -9,7 +9,7 @@
 mod support;
 
 use solo_abi::chain::{BlockHeader, Receipt, SimplexState, reason};
-use solo_abi::types::{Block, Effect, Genesis};
+use solo_abi::types::{Block, Effect, Genesis, MigrateArgs};
 use solo_abi::{Decode, Encode};
 use solo_host::hash::keccak256;
 use solo_node::{Node, NodeConfig, NodeError, Sim, SubmitError, Switch};
@@ -76,10 +76,15 @@ fn a_node_switches_kernels_at_the_activation_height() {
     let code_hash = keccak256(code);
     let stages = stage_actions(code);
     assert!(stages.len() > 10);
-    // Admission turns away a transaction to the upgrade address that cannot run.
+    // Admission turns away a transaction to the upgrade address that cannot
+    // run, before the nonce and balance checks; and one signed without a
+    // chain id, which could have been replayed from another chain.
     let rejected = Err(SubmitError::Rejected(reason::SYSTEM_ACTION));
     for raw in [
         alice.action(1, &stages[0]),
+        alice.action(7, &stages[0]),
+        Wallet::new(9).action(0, &stages[0]),
+        gov.unprotected_tx(0, UPGRADE_ADDRESS, STAGE_GAS, &stages[0].encode()),
         gov.tx(0, UPGRADE_ADDRESS, 1, STAGE_GAS, &stages[0].encode()),
         gov.tx(0, UPGRADE_ADDRESS, 0, STAGE_GAS, b"not an action"),
         gov.action(0, &Action::Signal { features: 1 }),
@@ -87,9 +92,14 @@ fn a_node_switches_kernels_at_the_activation_height() {
         assert_eq!(node.submit(&raw), rejected);
     }
     let mut nonce = upload(&mut node, code, 0);
-    // Too soon, or code never staged: the proposal reverts, gas and nonce spent.
+    // Too soon, no block after it, or code never staged: the proposal
+    // reverts, gas and nonce spent.
     let next = node.block_number().unwrap() + 1;
-    for action in [propose(code_hash, next + 1), propose([9; 32], next + 50)] {
+    for action in [
+        propose(code_hash, next + 1),
+        propose(code_hash, u64::MAX),
+        propose([9; 32], next + 50),
+    ] {
         let receipt = include(&mut node, &gov.action(nonce, &action));
         assert_eq!((receipt.status, receipt.logs.0.len()), (0, 0));
         nonce += 1;
@@ -138,6 +148,7 @@ fn a_node_switches_kernels_at_the_activation_height() {
         include(&mut node, &gov.action(nonce, &propose(code_hash, h))).status,
         1
     );
+    nonce += 1;
     run_until(&mut node, 20, &mut |n| n.block_number().unwrap() >= h + 2);
     // The old kernel executed and finalized `h`; the new one everything after.
     assert_eq!(
@@ -181,6 +192,22 @@ fn a_node_switches_kernels_at_the_activation_height() {
     let receipt: Receipt = include(&mut node, &alice.tx(1, bob.address, ETHER, 21_000, &[]));
     assert_eq!(receipt.status, 1);
     assert_eq!(node.account(&bob.address).unwrap().balance, 6 * ETHER);
+    // The running kernel's code is frozen for good, and it cannot be proposed again.
+    let restage = Action::Stage {
+        code_hash,
+        index: 0,
+        chunk: vec![0xAA; 32],
+    };
+    let far = node.block_number().unwrap() + 50;
+    for action in [
+        restage,
+        stages[stages.len() - 1].clone(),
+        propose(code_hash, far),
+    ] {
+        assert_eq!(include(&mut node, &gov.action(nonce, &action)).status, 0);
+        nonce += 1;
+    }
+    assert_eq!(node.upgrade_status().unwrap().pending, None);
     // The new kernel serves the staged code of itself, and nothing for an unknown hash.
     let code_query = node.query(query::CODE, &code_hash).unwrap();
     assert_eq!(Vec::<u8>::from_bytes(&code_query.body).unwrap(), code);
@@ -265,9 +292,126 @@ fn a_switch_that_cannot_complete_halts_the_node() {
     );
     assert!(err.to_string().contains("kernel upgrade halted the node"));
 
-    // A kernel whose version does not decode.
-    let (err, _, _) = halt_at_switch(&tiny_kernel(&[3, 0], false, None));
-    assert_eq!(err, NodeError::Decode("kernel_version"));
+    // A kernel whose version does not decode: an alert from the moment it is proposed, then a halt.
+    let (err, h, node) = halt_at_switch(&tiny_kernel(&[3, 0], false, None));
+    let alert = node.upgrades().alert.clone().unwrap();
+    assert!(alert.contains("cannot read the version"), "{alert}");
+    assert!(alert.contains("kernel_version"), "{alert}");
+    assert_eq!(
+        err,
+        NodeError::Upgrade(format!("no runnable kernel at height {h}: {alert}"))
+    );
+}
+
+#[test]
+fn an_upgrade_that_does_not_supersede_the_running_kernel_alerts_then_halts() {
+    // The running kernel itself, proposed again: its migrate would trap at
+    // `h` on every node, so the host says so while governance can cancel.
+    let (err, h, node) = halt_at_switch(v1());
+    let alert = node.upgrades().alert.clone().unwrap();
+    assert!(
+        alert.contains("is version 1, which does not supersede the running version 1"),
+        "{alert}"
+    );
+    assert_eq!(node.upgrades().prepared, None);
+    assert_eq!(
+        err,
+        NodeError::Upgrade(format!("no runnable kernel at height {h}: {alert}"))
+    );
+    assert_eq!(node.kernel_hash(), keccak256(v1()));
+}
+
+#[test]
+fn the_reference_migrate_accepts_only_its_predecessor_at_the_activation_height() {
+    let mut node = start(&genesis(&keys(1), governed(1, 0), 8));
+    let code = v2();
+    let code_hash = keccak256(code);
+    let nonce = upload(&mut node, code, 0);
+    let h = node.block_number().unwrap() + 4;
+    let receipt = include(
+        &mut node,
+        &governance().action(nonce, &propose(code_hash, h)),
+    );
+    assert_eq!(receipt.status, 1);
+    run_until(&mut node, 10, &mut |n| n.block_number().unwrap() >= h - 1);
+    assert_eq!(node.block_number().unwrap(), h - 1);
+    assert_eq!(node.upgrades().prepared, Some(code_hash));
+    let driver_state = node.driver_state().unwrap();
+    let migrate = |from_version: u32| {
+        MigrateArgs {
+            from_version,
+            driver_state: driver_state.clone(),
+        }
+        .to_bytes()
+    };
+    let trap = Err(NodeError::Kernel {
+        export: "kernel_migrate",
+        status: Termination::Trap,
+    });
+    // Before the activation height, even from its predecessor.
+    assert_eq!(
+        node.call_module(code_hash, "kernel_migrate", &migrate(1)),
+        trap
+    );
+    // The old kernel executes block `h`, by hand so that no switch follows.
+    let parent = node.block_by_number(h - 1).unwrap().unwrap();
+    let header = BlockHeader {
+        height: h,
+        parent_hash: keccak256(&parent.to_bytes()),
+        timestamp_ms: parent.timestamp_ms + SLOT_MS,
+        ..BlockHeader::default()
+    };
+    let block = Block {
+        header: header.to_bytes(),
+        ..Block::default()
+    };
+    node.apply_effect(Effect::ExecuteBlock { block }).unwrap();
+    assert_eq!(node.block_number().unwrap(), h);
+    // At `h`, any version but the one it supersedes traps, its own included.
+    for from_version in [0, 2, 3, u32::MAX] {
+        assert_eq!(
+            node.call_module(code_hash, "kernel_migrate", &migrate(from_version)),
+            trap,
+            "from {from_version}"
+        );
+    }
+    assert_eq!(node.upgrade_status().unwrap().enacted, None);
+    assert_eq!(
+        node.call_module(code_hash, "kernel_migrate", &migrate(1)),
+        Ok(Vec::new())
+    );
+    let enacted = EnactedUpgrade {
+        code_hash,
+        height: h,
+        from_version: 1,
+        to_version: 2,
+    };
+    let status = node.upgrade_status().unwrap();
+    assert_eq!((status.pending, status.enacted), (None, Some(enacted)));
+}
+
+#[test]
+fn a_cancel_in_the_activation_block_stops_the_switch() {
+    let mut node = start(&genesis(&keys(1), governed(1, 0), 8));
+    let tiny = tiny_kernel(&2u32.to_le_bytes(), false, None);
+    let code_hash = keccak256(&tiny);
+    let nonce = upload(&mut node, &tiny, 0);
+    let h = node.block_number().unwrap() + 4;
+    let receipt = include(
+        &mut node,
+        &governance().action(nonce, &propose(code_hash, h)),
+    );
+    assert_eq!(receipt.status, 1);
+    assert_eq!(node.upgrades().prepared, Some(code_hash));
+    run_until(&mut node, 10, &mut |n| n.block_number().unwrap() >= h - 1);
+    let cancel = governance().action(nonce + 1, &Action::Cancel { code_hash });
+    let receipt = include(&mut node, &cancel);
+    assert_eq!((receipt.status, receipt.height), (1, h));
+    run_until(&mut node, 10, &mut |n| n.block_number().unwrap() >= h + 2);
+    assert!(node.upgrades().switches.is_empty());
+    assert_eq!(node.upgrade_status().unwrap().pending, None);
+    assert_eq!(node.kernel_version().unwrap(), 1);
+    assert_eq!(node.upgrades().halted(), None);
 }
 
 #[test]

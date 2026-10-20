@@ -84,6 +84,8 @@ pub mod keys {
     pub const ENACTED: &[u8] = b"gov/enacted";
     /// `gov/chunk/` + code hash + index (big-endian u32) → chunk bytes.
     pub const CHUNK: &[u8] = b"gov/chunk/";
+    /// `gov/kernel/` + code hash → `EnactedUpgrade`, for every kernel switched to.
+    pub const KERNEL: &[u8] = b"gov/kernel/";
     /// `gate/book` → `GateBook`.
     pub const BOOK: &[u8] = b"gate/book";
     /// `gate/signal/` + validator id → `Signal`, the validator's latest.
@@ -95,6 +97,14 @@ pub mod keys {
         let mut k = CHUNK.to_vec();
         k.extend_from_slice(code_hash);
         k.extend_from_slice(&index.to_be_bytes());
+        k
+    }
+
+    /// The key recording the switch to the kernel `code_hash`.
+    #[must_use]
+    pub fn kernel(code_hash: &Hash) -> Vec<u8> {
+        let mut k = KERNEL.to_vec();
+        k.extend_from_slice(code_hash);
         k
     }
 
@@ -133,6 +143,11 @@ mod tests {
         let k = keys::signal(&[9; 32]);
         assert_eq!(k.len(), 44);
         assert_eq!(&k[..12], keys::SIGNAL);
+        let k = keys::kernel(&[5; 32]);
+        assert_eq!(
+            (k.len(), &k[..11], &k[11..]),
+            (43, keys::KERNEL, &[5u8; 32][..])
+        );
         assert_eq!(
             (keys::PENDING, keys::ENACTED, keys::BOOK),
             (&b"gov/pending"[..], &b"gov/enacted"[..], &b"gate/book"[..])

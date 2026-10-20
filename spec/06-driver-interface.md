@@ -126,6 +126,7 @@ A kernel announces a pending upgrade to the host: the code hash of the new modul
 1. It reads the module bytes and checks that their `keccak256` is the code hash.
 2. It validates the module (03 §7) for the `Privileged` set, resolving imports against the host functions available for block `H + 1`. These include the gated functions whose feature gates the chain has activated, or scheduled to activate, by height `H + 1` (spec 13 §8).
 3. It compiles the module and keeps it ready under its code hash.
+4. It calls the new module's `kernel_version` and checks that it halts with a `u32` above the running kernel's version (§7.1). A module that is not a later version cannot migrate from the running kernel (§7.4).
 
 A host that cannot enact a pending upgrade keeps running the old kernel and raises an alert (spec 13 §7.2). It tries again only when the pending upgrade or the set of gates it may count on changes. Unless the upgrade is cancelled or lapses before `H`, that host halts at `H` (§7.5).
 
@@ -146,7 +147,7 @@ A kernel's `kernel_migrate` MUST accept the driver state of the kernel version i
 
 ### 7.5 Halting
 
-The host halts if, at the switch, the pending upgrade was not enacted, if `kernel_version` of either kernel does not halt with a `u32`, or if `kernel_migrate` terminates with anything but `Halt`. A halted host delivers no further input and reports the same failure on every later attempt; queries still reach the old kernel. A failure that is deterministic, such as a `kernel_migrate` that traps, halts every node at the same height, which is why §7.2 alerts long before `H`: the chain cannot pass `H` without operators.
+The host halts if, at the switch, the pending upgrade was not enacted, if `kernel_version` of either kernel does not halt with a `u32`, or if `kernel_migrate` terminates with anything but `Halt`. A halted host delivers no further input and reports the same failure on every later attempt. Queries reach the kernel that was running when the failure occurred: the old kernel if the switch failed before `kernel_migrate` halted, the new kernel after that (a failure executing the held blocks, for instance), with the chain-state writes of `kernel_migrate` kept. A failure that is deterministic, such as a `kernel_migrate` that traps, halts every node at the same height, which is why §7.2 alerts long before `H`: the chain cannot pass `H` without operators.
 
 ### 7.6 Restarts
 

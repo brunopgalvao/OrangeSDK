@@ -317,7 +317,14 @@ impl Node {
             .map_err(|_| NodeError::Decode(query::STATUS))
     }
 
-    fn call_on(
+    /// Calls `export` of the compiled module `code_hash` against chain
+    /// state, with the `Privileged` set and the kernel gas budget, as the
+    /// kernel switch does: for inspecting a prepared upgrade. Writes are kept
+    /// if the call halts.
+    ///
+    /// # Errors
+    /// [`NodeError::Kernel`] unless the call halts.
+    pub fn call_module(
         &mut self,
         code_hash: [u8; 32],
         export: &'static str,
@@ -343,7 +350,7 @@ impl Node {
     }
 
     fn version_of(&mut self, code_hash: [u8; 32]) -> Result<u32, NodeError> {
-        let out = self.call_on(code_hash, exports::VERSION, &[])?;
+        let out = self.call_module(code_hash, exports::VERSION, &[])?;
         u32::from_bytes(&out)
             .ok()
             .ok_or(NodeError::Decode(exports::VERSION))
@@ -384,7 +391,9 @@ impl Node {
             .filter(|p| p.activation_height == height)
             .map(|p| (height, p.code_hash));
         if let Some(pending) = &status.pending {
-            let gates = status.gates.active_at(pending.activation_height + 1);
+            let gates = status
+                .gates
+                .active_at(pending.activation_height.saturating_add(1));
             self.prepare(pending, gates)?;
         } else {
             self.upgrades.prepared = None;
@@ -408,7 +417,10 @@ impl Node {
         }
         let r = self.query(query::CODE, &pending.code_hash)?;
         let code = Vec::<u8>::from_bytes(&r.body).unwrap_or_default();
-        match self.compile(&code, &pending.code_hash, gates) {
+        let prepared = self
+            .compile(&code, &pending.code_hash, gates)
+            .and_then(|()| self.supersedes(&pending.code_hash));
+        match prepared {
             Ok(()) => {
                 self.upgrades.prepared = Some(pending.code_hash);
                 self.upgrades.alert = None;
@@ -437,6 +449,26 @@ impl Node {
         let program = Program::new(module, self.exec.cache_mut().cost_table());
         self.exec.cache_mut().insert_program(*code_hash, program);
         Ok(())
+    }
+
+    /// Checks that the compiled module `code_hash` has a version above the
+    /// running kernel's (spec 06 §7.1): `kernel_migrate` of any other would
+    /// halt every node at the activation height.
+    fn supersedes(&mut self, code_hash: &[u8; 32]) -> Result<(), String> {
+        let versions = self
+            .kernel_version()
+            .and_then(|from| Ok((from, self.version_of(*code_hash)?)));
+        match versions {
+            Ok((from, to)) if to > from => Ok(()),
+            Ok((from, to)) => Err(format!(
+                "upgrade {} is version {to}, which does not supersede the running version {from}",
+                hex(code_hash)
+            )),
+            Err(e) => Err(format!(
+                "cannot read the version of upgrade {}: {e}",
+                hex(code_hash)
+            )),
+        }
     }
 
     /// Switches kernels once the old kernel has executed and finalized the
@@ -471,7 +503,7 @@ impl Node {
         let from_version = self.kernel_version()?;
         let to_version = self.version_of(code_hash)?;
         let driver_state = self.driver_state()?;
-        self.call_on(
+        self.call_module(
             code_hash,
             exports::MIGRATE,
             &MigrateArgs {
