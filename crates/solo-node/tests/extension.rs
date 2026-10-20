@@ -347,7 +347,7 @@ fn sign_uses_the_node_key() {
 
 #[test]
 fn storage_commit_is_deterministic_and_order_independent() {
-    let (mut exec, _) = setup();
+    let (mut exec, services) = setup();
     let body = vec![
         li(Reg::A0, BUF),
         Instruction::Ecall { import: 1 },
@@ -388,7 +388,7 @@ fn storage_commit_is_deterministic_and_order_independent() {
     let mut other = Overlay::new(MemStorage::default());
     other.set(b"a", b"1");
     other.set(b"b", b"2");
-    assert_eq!(root1, commitment(&other).to_vec());
+    assert_eq!(root1, commitment(&mut other).to_vec());
     // The root of spec 10: the trie over exactly the committed entries.
     let mut trie = Trie::new();
     trie.insert(b"b", b"2");
@@ -396,7 +396,7 @@ fn storage_commit_is_deterministic_and_order_independent() {
     assert_eq!(root1, trie.root().to_vec());
     assert_eq!(empty, solo_trie::EMPTY.to_vec());
     other.set(b"b", b"3");
-    assert_ne!(root1, commitment(&other).to_vec());
+    assert_ne!(root1, commitment(&mut other).to_vec());
     // Node-local keys are outside it.
     exec.state_mut().set(b"local/finalized", b"7");
     let root2 = exec
@@ -410,6 +410,14 @@ fn storage_commit_is_deterministic_and_order_independent() {
         )
         .output;
     assert_eq!(root2, root1);
+    // The node is handed the trie behind each root, to prove against later.
+    let kept: Vec<Vec<u8>> = services
+        .borrow()
+        .commitments
+        .iter()
+        .map(|trie| trie.root().to_vec())
+        .collect();
+    assert_eq!(kept, [empty, root1, root2]);
     // A bad destination pointer faults.
     let body = vec![li(Reg::A0, 0), Instruction::Ecall { import: 1 }];
     assert_eq!(
@@ -418,14 +426,24 @@ fn storage_commit_is_deterministic_and_order_independent() {
     );
 }
 
-/// Rodata of the proof modules: the pending entry `k = v`, then probe keys.
-const PROOF_RODATA: &[u8] = b"kvzlocal/x";
+/// Namespace of the sandboxed module in the proof tests.
+const SANDBOX_NS: [u8; 32] = [7; 32];
+/// The longest key a sandboxed module names; stored behind its namespace.
+const SANDBOX_KEY: [u8; 64] = [b'q'; 64];
+/// Where the 96-byte stored key `SANDBOX_NS || SANDBOX_KEY` sits in rodata.
+const STORED_KEY_PTR: i64 = 0x1_000A;
+
+/// Rodata of the proof modules: the pending entry `k = v`, probe keys, then
+/// the stored key of the sandboxed module.
+fn proof_rodata() -> Vec<u8> {
+    [&b"kvzlocal/x"[..], &SANDBOX_NS, &SANDBOX_KEY].concat()
+}
 
 /// A module that sets `k = v` in its own layer, then writes its output as
 /// `storage_commit` root (32) || `storage_proof` return value (8) || the
 /// `cap` bytes `storage_proof` was given for the key at `key_ptr`.
 fn proof_module(key_ptr: i64, key_len: i64, cap: i64) -> Vec<u8> {
-    let mut b = ModuleBuilder::new().rodata(PROOF_RODATA);
+    let mut b = ModuleBuilder::new().rodata(&proof_rodata());
     b.import("output_write");
     b.import("storage_set");
     b.import("storage_commit");
@@ -517,13 +535,57 @@ fn storage_proof_proves_against_the_commitment() {
     assert_eq!(prefix.len(), 5);
     assert!(len > 5);
     assert_eq!(prefix, expected.prove(b"k").encode()[..5]);
-    // Keys of no or too many bytes have no proof.
-    assert_eq!(prove(&mut exec, 0x1_0000, 0, 64).2, 0);
-    assert_eq!(prove(&mut exec, 0x1_0000, 65, 64).2, 0);
+    // A sandboxed module's longest key is stored behind its namespace, 96
+    // bytes in all; it moves the root, so it has a proof too.
+    let mut b = ModuleBuilder::new().rodata(&SANDBOX_KEY);
+    b.import("storage_set");
+    b.block(&[
+        li(Reg::A0, 0x1_0000),
+        li(Reg::A1, 64),
+        li(Reg::A2, 0x1_0000),
+        li(Reg::A3, 1),
+        Instruction::Ecall { import: 0 },
+        Instruction::Halt,
+    ]);
+    let sandboxed = exec
+        .load(&b.export("main", 0).build(), Capability::Sandboxed)
+        .unwrap();
+    let r = exec.call(
+        &sandboxed,
+        SANDBOX_NS,
+        b"",
+        100_000,
+        Capability::Sandboxed,
+        Flags::default(),
+    );
+    assert_eq!(r.status, Termination::Halt);
+    let stored = solo_host::storage::namespaced(&SANDBOX_NS, &SANDBOX_KEY);
+    assert_eq!(stored.len(), 96);
+    assert_eq!(exec.state().get(&stored), Some(b"q".to_vec()));
+    let (status, root, _, bytes) = prove(&mut exec, STORED_KEY_PTR, 96, 8_192);
+    assert_eq!(status, Termination::Halt);
+    expected.insert(&stored, b"q");
+    assert_eq!(root, expected.root());
+    assert_eq!(
+        Proof::decode(&bytes)
+            .unwrap()
+            .verify(keccak256, &root, &stored),
+        Ok(Some(keccak256(b"q")))
+    );
+    // Keys of no bytes or more than 96 have no proof: the call carries on
+    // with 0 and nothing written.
+    for key_len in [0, 97] {
+        let (status, _, len, bytes) = prove(&mut exec, 0x1_0000, key_len, 64);
+        assert_eq!(
+            (status, len, bytes.len()),
+            (Termination::Halt, 0, 0),
+            "{key_len}"
+        );
+    }
     // Unreadable keys and unwritable destinations fault.
     let fault = Termination::HostError(HostStatus::MemoryFault.code());
     assert_eq!(prove(&mut exec, 0, 1, 64).0, fault);
-    let mut b = ModuleBuilder::new().rodata(PROOF_RODATA);
+    let mut b = ModuleBuilder::new().rodata(&proof_rodata());
     b.import("storage_proof");
     b.block(&[
         li(Reg::A0, 0x1_0000),

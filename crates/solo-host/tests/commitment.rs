@@ -1,17 +1,20 @@
-//! The state commitment through overlays (spec 10 §2): the trie that
-//! `MemStorage` maintains write by write gives the same root as rebuilding
-//! from what is visible, however the writes are split into layers, merged
-//! or discarded, and agrees with the default rebuild of a store without one.
+//! The state commitment through overlays (spec 10 §2): the tries that
+//! `MemStorage` and the overlay layers keep write by write give the same
+//! root as rebuilding from what is visible, however the writes are split into
+//! layers, merged or discarded, and whenever roots are asked for; they agree
+//! with the default rebuild of a store without a trie; and asking again
+//! hashes only what was written since.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
-use solo_host::storage::{LOCAL_PREFIX, Pending, committed};
+use solo_host::storage::{LOCAL_PREFIX, committed};
 use solo_host::{MemStorage, Overlay, Storage};
-use solo_trie::Trie;
+use solo_trie::{Hash, Trie, keccak256};
 
 /// A store with only the required methods, so it takes the default
-/// `state_trie`.
+/// `state_trie` and `merge_layer`.
 #[derive(Default)]
 struct Plain(BTreeMap<Vec<u8>, Vec<u8>>);
 
@@ -55,6 +58,8 @@ enum Op {
     Push,
     Commit,
     Discard,
+    /// Ask for the root and a proof of this key, and check them.
+    Root(u8),
 }
 
 /// Keys 0..8 are committed, 8..12 are under `local/`.
@@ -76,6 +81,7 @@ fn ops() -> impl Strategy<Value = Vec<Op>> {
             1 => Just(Op::Push),
             1 => Just(Op::Commit),
             1 => Just(Op::Discard),
+            2 => (0u8..12).prop_map(Op::Root),
         ],
         0..80,
     )
@@ -90,7 +96,18 @@ fn step<S: Storage>(o: &mut Overlay<S>, op: &Op) {
         Op::Push => o.push(),
         Op::Commit => o.commit(),
         Op::Discard => o.discard(),
+        Op::Root(_) => {}
     }
+}
+
+/// What a root and proof of `k` show: the root, and the value hash proven.
+fn root_and_proof<S: Storage>(o: &mut Overlay<S>, k: u8) -> (Hash, Option<Hash>) {
+    let trie = o.state_trie();
+    let proven = trie
+        .prove(&key(k))
+        .verify(keccak256, &trie.root(), &key(k))
+        .expect("a proof from the trie verifies against its root");
+    (trie.root(), proven)
 }
 
 proptest! {
@@ -101,14 +118,23 @@ proptest! {
         for op in &ops {
             step(&mut mem, op);
             step(&mut plain, op);
-            prop_assert_eq!(mem.commitment(), rebuilt(mem.scan(&[])));
-            prop_assert_eq!(plain.commitment(), mem.commitment());
+            if let Op::Root(k) = op {
+                let (root, proven) = root_and_proof(&mut mem, *k);
+                prop_assert_eq!(root, rebuilt(mem.scan(&[])));
+                let visible = mem.get(&key(*k)).filter(|_| committed(&key(*k)));
+                prop_assert_eq!(proven, visible.map(|v| keccak256(&v)));
+                prop_assert_eq!(root_and_proof(&mut plain, *k), (root, proven));
+            }
         }
+        prop_assert_eq!(mem.commitment(), rebuilt(mem.scan(&[])));
+        prop_assert_eq!(plain.commitment(), mem.commitment());
         while mem.depth() > 0 {
             mem.commit();
+            plain.commit();
         }
+        prop_assert_eq!(plain.commitment(), mem.commitment());
         let base = mem.into_base();
-        prop_assert_eq!(base.state_trie(&Pending::new()).root(), rebuilt(base.scan(&[])));
+        prop_assert_eq!(base.state_trie().root(), rebuilt(base.scan(&[])));
     }
 
     /// Two stores that reach the same entries by different routes, one
@@ -142,4 +168,66 @@ fn the_default_rebuild_skips_local_keys() {
     assert!(plain.delete(b"a"));
     assert_eq!(plain.commitment(), solo_trie::EMPTY);
     assert!(format!("{:?}", Op::Push.clone()).contains("Push"));
+}
+
+thread_local! {
+    static HASHES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// `keccak256`, counting calls on this thread.
+fn counted(data: &[u8]) -> Hash {
+    HASHES.with(|n| n.set(n.get() + 1));
+    keccak256(data)
+}
+
+/// Hashes `f` makes.
+fn hashes(f: impl FnOnce()) -> usize {
+    let before = HASHES.with(Cell::get);
+    f();
+    HASHES.with(Cell::get) - before
+}
+
+#[test]
+fn roots_and_proofs_hash_only_what_was_written_since() {
+    // Spec 05 prices storage_commit and storage_proof flat: their work must
+    // not grow with the writes already hashed by an earlier call.
+    let mut o = Overlay::new(MemStorage::with_hasher(counted));
+    for i in 0..256u16 {
+        o.set(&i.to_be_bytes(), b"base");
+    }
+    o.push();
+    for i in 256..1_256u16 {
+        o.set(&i.to_be_bytes(), b"pending");
+    }
+    // The first root hashes each pending write once: key, value, and the
+    // nodes on its path.
+    let mut root = [0; 32];
+    let first = hashes(|| root = o.commitment());
+    assert!((3_000..30_000).contains(&first), "{first}");
+    // Asking again, for roots or proofs, hashes nothing but the proved key.
+    let again = hashes(|| {
+        for _ in 0..100 {
+            assert_eq!(o.commitment(), root);
+            assert!(o.state_trie().prove(b"absent").siblings.len() < 40);
+        }
+    });
+    assert_eq!(again, 100);
+    // A write costs one path at the next root, however often it was written.
+    let one = hashes(|| {
+        for v in 0..50u8 {
+            o.set(b"new", &[v]);
+        }
+        root = o.commitment();
+    });
+    assert!(one <= 3 + 40, "{one}");
+    // A nested layer built and discarded leaves the outer one as it was.
+    o.push();
+    o.set(b"inner", b"x");
+    assert_ne!(o.commitment(), root);
+    o.discard();
+    assert_eq!(hashes(|| assert_eq!(o.commitment(), root)), 0);
+    // Merging into the base adopts the trie: the writes are not hashed again.
+    assert_eq!(hashes(|| o.commit()), 0);
+    assert_eq!(hashes(|| assert_eq!(o.commitment(), root)), 0);
+    assert_eq!(root, rebuilt(o.scan(&[])));
 }

@@ -1,7 +1,9 @@
 //! The state commitment through a node running the reference kernel (spec
-//! 10): the root the node keeps incrementally is the trie of its state, its
-//! proofs verify against that root and the block headers, and nodes that
-//! executed the same blocks in different batches commit to the same roots.
+//! 10): the root the node keeps incrementally is the trie of its state and
+//! its proofs verify against it; a block header's root is the state before
+//! that block's own bookkeeping, which only the tries the node keeps per
+//! block prove against; and nodes that executed the same blocks in different
+//! batches commit to the same roots.
 
 use k256::ecdsa::SigningKey;
 use solo_abi::Encode;
@@ -160,6 +162,84 @@ fn the_kept_root_is_the_trie_of_the_state_and_proves_it() {
             .verify(keccak256, &root, keys::FINALIZED),
         Ok(None)
     );
+}
+
+fn block_key(height: u64) -> Vec<u8> {
+    [keys::BLOCK, &height.to_be_bytes()].concat()
+}
+
+/// What a proof against block `height`'s header root shows for `key`.
+fn proven_at(node: &mut Node, height: u64, key: &[u8]) -> Option<[u8; 32]> {
+    let header = node.block_by_number(height).unwrap().unwrap();
+    node.state_proof_at(height, key)
+        .unwrap()
+        .verify(keccak256, &header.state_root, key)
+        .unwrap()
+}
+
+#[test]
+fn proofs_verify_against_block_headers() {
+    // The kernel asks for the root after a block's transactions and receipts
+    // and before it stores the header, the block hash, the height and the
+    // last hash. So the state a node holds after block h is not what header
+    // h commits to: proofs against a header come from the trie the node kept
+    // when the kernel asked for that root.
+    let alice = SigningKey::from_slice(&[1; 32]).unwrap();
+    let (mut node, bob) = chain(&alice, 5);
+    let bob_key = account_key(&bob);
+    let header1 = node.block_by_number(1).unwrap().unwrap();
+    assert_ne!(header1.state_root, node.state_root());
+    assert_eq!(
+        node.state_proof(&bob_key)
+            .verify(keccak256, &header1.state_root, &bob_key),
+        Err(solo_trie::ProofError::RootMismatch)
+    );
+    // Bob was paid in blocks 1 and 4: his account as each header has it.
+    let after_one = proven_at(&mut node, 1, &bob_key);
+    assert!(after_one.is_some());
+    assert_eq!(proven_at(&mut node, 3, &bob_key), after_one);
+    let after_four = proven_at(&mut node, 4, &bob_key);
+    assert_ne!(after_four, after_one);
+    let now = node.state().get(&bob_key).unwrap();
+    assert_eq!(after_four, Some(keccak256(&now)));
+    assert_eq!(proven_at(&mut node, 5, &bob_key), after_four);
+    // A block's own header is in the next header's root, not its own.
+    for height in 1..5 {
+        let stored = node.state().get(&block_key(height)).unwrap();
+        assert_eq!(proven_at(&mut node, height, &block_key(height)), None);
+        assert_eq!(
+            proven_at(&mut node, height + 1, &block_key(height)),
+            Some(keccak256(&stored))
+        );
+    }
+    // Heights the node never executed have no trie.
+    assert!(node.state_proof_at(0, &bob_key).is_none());
+    assert!(node.state_proof_at(6, &bob_key).is_none());
+}
+
+#[test]
+fn the_node_keeps_the_tries_of_its_latest_blocks() {
+    let alice = SigningKey::from_slice(&[1; 32]).unwrap();
+    let (mut node, bob) = chain(&alice, 1);
+    assert_eq!(node.proof_history, solo_node::PROOF_HISTORY);
+    node.proof_history = 2;
+    let after_one = node.state_root();
+    for height in 2..=4 {
+        node.tick(1_000 + height * SLOT_MS).unwrap();
+        assert_eq!(node.block_number().unwrap(), height);
+    }
+    // Block 2 has no transactions, so it writes nothing before its root:
+    // its header commits to the state the node held after block 1.
+    let empty = node.block_by_number(2).unwrap().unwrap();
+    assert!(empty.tx_hashes.0.is_empty());
+    assert_eq!(empty.state_root, after_one);
+    let bob_key = account_key(&bob);
+    for height in 1..=2 {
+        assert!(node.state_proof_at(height, &bob_key).is_none(), "{height}");
+    }
+    for height in 3..=4 {
+        assert!(proven_at(&mut node, height, &bob_key).is_some(), "{height}");
+    }
 }
 
 #[test]

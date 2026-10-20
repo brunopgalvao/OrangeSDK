@@ -310,7 +310,7 @@ fn rejections_carry_reasons() {
     let bob = Wallet::new(2);
     let poor = Wallet::new(3);
     let mut rpc = rpc(&alice);
-    let cases: [(Vec<u8>, &str); 6] = [
+    let cases: [(Vec<u8>, &str); 7] = [
         (alice.transfer(1, bob.address, ETHER, 21_000), "nonce"),
         (
             poor.transfer(0, bob.address, ETHER, 21_000),
@@ -324,17 +324,18 @@ fn rejections_carry_reasons() {
             alice.transfer_on(0, bob.address, ETHER, 21_000, CHAIN_ID + 1, &[]),
             "wrong chain",
         ),
-        (
-            alice.transfer_on(0, bob.address, ETHER, 21_000, CHAIN_ID, &[1]),
-            "not supported",
-        ),
-        (b"garbage".to_vec(), "malformed"),
+        // Calldata is executed now; a blob transaction (type 3) is not, and
+        // a first byte below 0x80 such as 'g' names an unknown typed one.
+        (vec![0x03, 0xC0], "not supported"),
+        (b"garbage".to_vec(), "not supported"),
+        // A legacy transaction that is an empty RLP list.
+        (vec![0xC0], "malformed"),
     ];
     for (raw, text) in cases {
         let (code, message) =
             call(&mut rpc, "eth_sendRawTransaction", json!([data(&raw)])).unwrap_err();
         assert_eq!(code, -32000);
-        assert!(message.contains(text), "{message}");
+        assert!(message.contains(text), "{text}: {message}");
     }
 }
 

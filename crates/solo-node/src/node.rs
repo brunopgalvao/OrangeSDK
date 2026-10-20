@@ -13,7 +13,9 @@ use solo_abi::types::{
 };
 use solo_abi::{Decode, Encode};
 use solo_host::hash::keccak256;
-use solo_host::{CallResult, Executor, Flags, LoadError, MemStorage, ModuleCache, Overlay};
+use solo_host::{
+    CallResult, Executor, Flags, LoadError, MemStorage, ModuleCache, Overlay, Storage,
+};
 use solo_vm::host::Capability;
 use solo_vm::status::Termination;
 
@@ -46,6 +48,12 @@ impl Default for NodeConfig {
 /// Gas allowed to each kernel entrypoint call. Kernel work is bounded by the
 /// block limits it enforces, so this is a safety net, not a budget.
 pub const KERNEL_GAS: i64 = 1 << 40;
+
+/// How many of the most recently executed blocks a node keeps the state trie
+/// of, to prove entries against their header roots
+/// ([`Node::state_proof_at`]). The tries share every unchanged node, so each
+/// costs only the nodes its block changed.
+pub const PROOF_HISTORY: usize = 256;
 
 /// The kernel's storage namespace. Privileged instances use bare keys, so
 /// this value is only passed through.
@@ -117,6 +125,11 @@ pub struct Node {
     /// Raw transactions admitted since the last [`Node::take_tx_gossip`],
     /// for the transport to forward to peers.
     tx_gossip: Vec<Vec<u8>>,
+    /// The state trie behind the root each recent executed block returned,
+    /// by height; at most [`Node::proof_history`] of them.
+    committed: BTreeMap<u64, solo_trie::Trie>,
+    /// How many executed blocks' tries to keep; see [`PROOF_HISTORY`].
+    pub proof_history: usize,
 }
 
 impl Node {
@@ -166,6 +179,8 @@ impl Node {
             persisted_driver_state: None,
             kernel_gas: KERNEL_GAS,
             tx_gossip: Vec::new(),
+            committed: BTreeMap::new(),
+            proof_history: PROOF_HISTORY,
         };
         node.call_unit(exports::INIT, &genesis.to_bytes())?;
         node.kernel_gas = config.kernel_gas;
@@ -174,6 +189,7 @@ impl Node {
 
     fn call_raw(&mut self, export: &'static str, input: &[u8]) -> Result<CallResult, NodeError> {
         let kernel = self.kernel;
+        self.services.borrow_mut().commitments.clear();
         let r = self.exec.call_export(
             &kernel,
             export,
@@ -429,6 +445,19 @@ impl Node {
         let height = header.height;
         let args = ExecuteArgs { block, context }.to_bytes();
         let result: ExecuteResult = self.call(exports::EXECUTE_BLOCK, &args)?;
+        // Keep the trie behind the root the block returned, which the header
+        // carries: the kernel may write more after it asks for the root (the
+        // reference kernel stores the header itself), so no later state
+        // proves against it.
+        let captured = std::mem::take(&mut self.services.borrow_mut().commitments);
+        let kept = captured
+            .into_iter()
+            .rev()
+            .find(|trie| trie.root() == result.state_root);
+        self.committed.extend(kept.map(|trie| (height, trie)));
+        while self.committed.len() > self.proof_history {
+            self.committed.pop_first();
+        }
         let stored = self
             .block_by_number(height)?
             .ok_or(NodeError::Decode("stored header"))?;
@@ -629,15 +658,29 @@ impl Node {
 
     /// The state commitment (spec 10) of the current chain state: what
     /// `storage_commit` would return to a kernel call starting now.
+    ///
+    /// No block header carries this root when the kernel writes after it
+    /// asks for the root, as the reference kernel does when it stores the
+    /// header: a header's root is [`Node::state_proof_at`]'s.
     #[must_use]
     pub fn state_root(&self) -> [u8; 32] {
-        self.exec.state().commitment()
+        // Between kernel calls no overlay layer is open: the base is the state.
+        self.exec.state().base().state_trie().root()
     }
 
     /// The proof for `key` against [`Node::state_root`] (spec 10 §5).
     #[must_use]
     pub fn state_proof(&self, key: &[u8]) -> solo_trie::Proof {
-        self.exec.state().state_trie().prove(key)
+        self.exec.state().base().state_trie().prove(key)
+    }
+
+    /// The proof for `key` against the root that executing block `height`
+    /// returned, which is the `state_root` of that block's header for the
+    /// reference kernel (spec 06 §5, spec 10 §5). `None` unless this node
+    /// executed that block among its last [`Node::proof_history`].
+    #[must_use]
+    pub fn state_proof_at(&self, height: u64, key: &[u8]) -> Option<solo_trie::Proof> {
+        self.committed.get(&height).map(|trie| trie.prove(key))
     }
 
     /// Log lines emitted by the kernel.

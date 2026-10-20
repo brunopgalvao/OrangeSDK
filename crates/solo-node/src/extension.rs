@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use solo_host::storage::MAX_KEY_LEN;
+use solo_host::storage::MAX_STORED_KEY_LEN;
 use solo_host::{Extension, Overlay, Storage};
 use solo_vm::host::{Capability, HostContext};
 use solo_vm::isa::Reg;
@@ -61,6 +61,11 @@ pub struct NodeServices {
     pub key: Option<k256::ecdsa::SigningKey>,
     /// Request ids handed out by `net_request`.
     pub next_request_id: u64,
+    /// The state trie behind each root `storage_commit` returned, in order:
+    /// O(1) copy-on-write clones, so the node can keep the trie a block
+    /// header commits to and prove against it later. The node clears this
+    /// before every kernel call.
+    pub commitments: Vec<solo_trie::Trie>,
 }
 
 /// Handles served by the extension; all above `EXTENSION_HANDLE_BASE`.
@@ -117,7 +122,7 @@ impl NodeExtension {
 /// The state commitment (spec 10): the root of the binary Merkle trie over
 /// every visible key except those under `local/` (node-local bookkeeping such
 /// as the finalized height). What `storage_commit` writes.
-pub fn commitment<S: Storage>(state: &Overlay<S>) -> [u8; 32] {
+pub fn commitment<S: Storage>(state: &mut Overlay<S>) -> [u8; 32] {
     state.commitment()
 }
 
@@ -186,13 +191,15 @@ impl<S: Storage> Extension<S> for NodeExtension {
         match handle {
             h if h == Handle::StorageCommit as u32 => {
                 ctx.charge(10_000)?;
-                let root = state.commitment();
-                ctx.memory.write(a0, &root).map_err(|_| fault())?;
+                let trie = state.state_trie();
+                ctx.memory.write(a0, &trie.root()).map_err(|_| fault())?;
+                services.commitments.push(trie);
                 ctx.set(Reg::A0, 0);
             }
             h if h == Handle::StorageProof as u32 => {
                 ctx.charge(2_000)?;
-                if a1 == 0 || a1 as usize > MAX_KEY_LEN {
+                // Any stored key, a sandboxed one with its namespace included.
+                if a1 == 0 || a1 as usize > MAX_STORED_KEY_LEN {
                     ctx.set(Reg::A0, 0);
                 } else {
                     let key = read(ctx, a0, a1)?;
