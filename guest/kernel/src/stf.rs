@@ -275,7 +275,7 @@ fn call(request: CallRequest) -> CallResult {
         nonce: None,
         access_list,
     };
-    let outcome = evm::run(message, BlockFields { number: height, timestamp }, false);
+    let outcome = crate::native::run(message, BlockFields { number: height, timestamp }, false);
     CallResult { status: outcome.status, gas_used: outcome.gas_used, output: outcome.output }
 }
 

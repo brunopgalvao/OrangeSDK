@@ -80,6 +80,11 @@ pub const HOOK_GAS: u64 = 1 << 24;
 /// Largest key of a module's storage, as the host allows (spec 05 §4.2).
 pub const MAX_KEY_LEN: usize = 64;
 
+/// Largest key a sandboxed module's write set may name: the kernel stores
+/// it behind the 32-byte namespace, and the stored key must still fit
+/// [`MAX_KEY_LEN`].
+pub const MAX_NAMESPACED_KEY_LEN: usize = MAX_KEY_LEN - 32;
+
 /// Largest value of a module's storage, as the host allows (spec 05 §4.2).
 pub const MAX_VALUE_LEN: usize = 65_536;
 
@@ -100,11 +105,16 @@ pub fn write_gas(writes: &[Write]) -> u64 {
 }
 
 /// Whether every entry of a write set has a key the host would accept and
-/// a value it would store.
+/// a value it would store, behind the namespace if `namespaced`.
 #[must_use]
-pub fn writes_valid(writes: &[Write]) -> bool {
+pub fn writes_valid(writes: &[Write], namespaced: bool) -> bool {
+    let max_key = if namespaced {
+        MAX_NAMESPACED_KEY_LEN
+    } else {
+        MAX_KEY_LEN
+    };
     writes.iter().all(|w| {
-        (1..=MAX_KEY_LEN).contains(&w.key.len())
+        (1..=max_key).contains(&w.key.len())
             && w.value.as_ref().is_none_or(|v| v.len() <= MAX_VALUE_LEN)
     })
 }
@@ -473,30 +483,35 @@ mod tests {
 
     #[test]
     fn write_sets_are_checked() {
+        assert_eq!(MAX_NAMESPACED_KEY_LEN, 32);
         let ok = Write {
             key: vec![1],
             value: Some(vec![0; MAX_VALUE_LEN]),
         };
-        assert!(writes_valid(core::slice::from_ref(&ok)));
-        assert!(writes_valid(&[Write {
-            key: vec![1; MAX_KEY_LEN],
-            value: None
-        }]));
-        assert!(!writes_valid(&[Write {
-            key: vec![],
-            value: None
-        }]));
-        assert!(!writes_valid(&[Write {
-            key: vec![1; MAX_KEY_LEN + 1],
-            value: None
-        }]));
-        assert!(!writes_valid(&[
-            ok,
-            Write {
-                key: vec![1],
-                value: Some(vec![0; MAX_VALUE_LEN + 1])
-            }
-        ]));
+        let key = |len: usize| Write {
+            key: vec![1; len],
+            value: None,
+        };
+        for namespaced in [false, true] {
+            assert!(writes_valid(core::slice::from_ref(&ok), namespaced));
+            assert!(writes_valid(&[key(MAX_NAMESPACED_KEY_LEN)], namespaced));
+            assert!(!writes_valid(&[key(0)], namespaced));
+            assert!(!writes_valid(&[key(MAX_KEY_LEN + 1)], namespaced));
+            assert!(!writes_valid(
+                &[
+                    ok.clone(),
+                    Write {
+                        key: vec![1],
+                        value: Some(vec![0; MAX_VALUE_LEN + 1])
+                    }
+                ],
+                namespaced
+            ));
+        }
+        // Behind the namespace, a key longer than 32 bytes would be stored
+        // under more than 64.
+        assert!(writes_valid(&[key(MAX_KEY_LEN)], false));
+        assert!(!writes_valid(&[key(MAX_NAMESPACED_KEY_LEN + 1)], true));
     }
 
     #[test]

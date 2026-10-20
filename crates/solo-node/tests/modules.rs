@@ -2,8 +2,9 @@
 //! module installed and initialized by the kernel, its block hooks, the
 //! capability rules, storage namespaces, a Solidity contract calling the
 //! module as a native contract (return data, reverts, value, static and
-//! delegate calls, gas), a governance install, and validators agreeing on
-//! the state module calls leave.
+//! delegate calls, gas), write keys that must fit behind the namespace,
+//! failing hooks, a governance install, and validators agreeing on the
+//! state module calls leave.
 //!
 //! The module is `guest/modules/counter` (fixture `counter.elf`, built by
 //! `tools/build-guest.sh`); the Solidity caller is `fixtures/modules/Caller.sol`.
@@ -89,6 +90,24 @@ fn calldata(signature: &str, args: &[[u8; 32]]) -> Vec<u8> {
     for arg in args {
         data.extend_from_slice(arg);
     }
+    data
+}
+
+/// Calldata of `put(bytes,bytes)`.
+fn put(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let padded = |b: &[u8]| {
+        let mut v = word(b.len() as u128).to_vec();
+        v.extend_from_slice(b);
+        v.resize(32 + b.len().div_ceil(32) * 32, 0);
+        v
+    };
+    let key = padded(key);
+    let mut data = calldata(
+        "put(bytes,bytes)",
+        &[word(64), word(64 + key.len() as u128)],
+    );
+    data.extend(key);
+    data.extend(padded(value));
     data
 }
 
@@ -399,6 +418,16 @@ fn bad_genesis_modules_stop_the_chain() {
     });
     // Two installs at one address: the second finds the designator, not the module.
     refused(&|_, installs| installs.push(installs[0].clone()));
+    // A native contract's EVM storage must start empty: its slot 0 tracks
+    // its writes within a transaction.
+    let slot = || {
+        Seq(vec![StorageSlot {
+            key: [0; 32],
+            value: word(1),
+        }])
+    };
+    refused(&|allocations, _| allocations[1].storage = slot());
+    refused(&|allocations, _| allocations[2].storage = slot());
     // A module too large for one storage value never reaches state.
     refused(&|allocations, installs| {
         let mut big = counter().to_vec();
@@ -632,6 +661,85 @@ fn static_delegate_and_value_calls() {
     assert_eq!(r.status, call_status::HALT);
 }
 
+#[test]
+fn write_keys_fit_behind_the_namespace() {
+    let mut node = start();
+    let mut alice = Sender::alice();
+    let ns = modules::namespace(&TWIN);
+    // A sandboxed module's key is stored behind its 32-byte namespace, so
+    // 32 bytes is the longest key it can write.
+    let r = alice.send(&mut node, TWIN, 0, &put(&[7; 32], b"v"));
+    assert_eq!(r.status, 1);
+    assert_eq!(
+        node.state_get(&[&ns[..], &[7; 32]].concat()),
+        Some(b"v".to_vec())
+    );
+    // A longer key makes the output not count: the call halts with all
+    // its gas, and nothing it wrote is kept.
+    for len in [33, 64] {
+        let mut data = put(&vec![8; len], b"v");
+        let r = alice.send(&mut node, TWIN, 0, &data);
+        assert_eq!((r.status, r.gas_used), (0, GAS), "key of {len} bytes");
+        data = put(&vec![8; len], b"v");
+        let r = call(&mut node, TWIN, 0, &data);
+        assert_eq!(r.status, call_status::HALT);
+    }
+    let r = call(&mut node, TWIN, 0, &put(b"short", b"v"));
+    assert_eq!(r.status, call_status::SUCCESS);
+}
+
+#[test]
+fn failing_hooks_change_nothing_and_blocks_go_on() {
+    let mut node = start();
+    let mut alice = Sender::alice();
+    let set_hooks = |node: &mut Node, alice: &mut Sender, mode: u128| {
+        let r = alice.send(
+            node,
+            COUNTER,
+            0,
+            &calldata("setHooks(uint256)", &[word(mode)]),
+        );
+        assert_eq!(r.status, 1);
+        r.height
+    };
+    let counts = |node: &mut Node| {
+        (
+            view(node, COUNTER, "blocks()"),
+            view(node, COUNTER, "lastHeight()"),
+        )
+    };
+    // Hooks that revert after writing: the block that turned them on counted
+    // itself before the transaction, and its end_block already failed.
+    let on = u128::from(set_hooks(&mut node, &mut alice, 1));
+    let frozen = (on, on - 1);
+    assert_eq!(counts(&mut node), frozen);
+    let mut height = node.block_number().unwrap();
+    run_until(&mut node, 20, &mut |n| {
+        n.block_number().unwrap() >= height + 3
+    });
+    assert_eq!(counts(&mut node), frozen);
+    // Hooks that never finish: still nothing, and blocks go on, with
+    // transactions in them.
+    set_hooks(&mut node, &mut alice, 2);
+    height = node.block_number().unwrap();
+    run_until(&mut node, 20, &mut |n| {
+        n.block_number().unwrap() >= height + 2
+    });
+    assert_eq!(counts(&mut node), frozen);
+    let r = alice.send(&mut node, COUNTER, 0, &calldata("add(uint256)", &[word(1)]));
+    assert_eq!(r.status, 1);
+    assert_eq!(view(&mut node, COUNTER, "count()"), 6);
+    // Back to hooks that return: end_block of that block runs again.
+    let off = set_hooks(&mut node, &mut alice, 0);
+    assert_eq!(counts(&mut node), (on, u128::from(off)));
+    run_until(&mut node, 20, &mut |n| n.block_number().unwrap() >= off + 2);
+    let height = node.block_number().unwrap();
+    assert_eq!(
+        counts(&mut node),
+        (on + u128::from(height - off), u128::from(height))
+    );
+}
+
 /// The VM gas the module uses for `call`, run directly on a host executor
 /// over the same storage.
 fn module_vm_gas(call: &ModuleCall, storage: &[(Vec<u8>, Vec<u8>)]) -> u64 {
@@ -695,15 +803,21 @@ fn native_gas_is_one_unit_with_evm_gas() {
     let receipt = alice.send(&mut node, COUNTER, 0, &data);
     assert_eq!((receipt.status, receipt.gas_used), (1, expected));
 
-    // A module that never finishes uses all the gas it was given, and no more.
-    let r = call(
-        &mut node,
-        CALLER,
-        0,
-        &calldata("spinWith(uint256)", &[word(200_000)]),
-    );
-    assert_eq!(r.output, word(0).to_vec());
-    assert!(r.gas_used > 200_000);
+    // A module that never finishes uses all the gas it was given, and no
+    // more: 100 000 gas more given is exactly 100 000 more used.
+    let spin = |node: &mut Node, gas: u128| {
+        let r = call(
+            node,
+            CALLER,
+            0,
+            &calldata("spinWith(uint256)", &[word(gas)]),
+        );
+        assert_eq!(r.output, word(0).to_vec());
+        r.gas_used
+    };
+    let (less, more) = (spin(&mut node, 200_000), spin(&mut node, 300_000));
+    assert!(less > 200_000);
+    assert_eq!(more - less, 100_000);
     // Gas enough to run but not to pay for the write: the call fails and writes nothing.
     let short = modules::CALL_GAS + modules::evm_gas(vm) + 100;
     let r = call(
@@ -812,6 +926,15 @@ fn governance_installs_a_staged_module() {
             .status,
         1
     );
+    // An `init` that reverts installs nothing and takes the code it
+    // assembled from staging back out of state.
+    let reverting = Install {
+        init: b"bad".to_vec(),
+        ..good.clone()
+    };
+    assert_eq!(send(&mut node, &mut nonce, &reverting).status, 0);
+    assert_eq!(node.state_get(&code_key(&code_hash)), None);
+    assert_eq!(node.code(&target).unwrap(), Vec::<u8>::new());
     let receipt = send(&mut node, &mut nonce, &good);
     assert_eq!(receipt.status, 1);
     assert_eq!(receipt.logs.0.len(), 1);

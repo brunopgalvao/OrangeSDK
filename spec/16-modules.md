@@ -39,7 +39,7 @@ Tags 5 (`Epoch`) and 6 (`Migrate`) are reserved for the remaining entries of ADR
 struct ModuleOutput { status: u8, data: bytes, writes: vec<Write> }
 ```
 
-`status` 0 (`RETURN`) is success: `data` is the return data and `writes` the module's storage writes. `status` 1 (`REVERT`) is a revert: `data` is the revert data and `writes` is ignored. The output *counts* only if the module halted (`invoke` status 0), the output decodes exactly as a `ModuleOutput`, `status` is 0 or 1, and every write is *valid*: a key of 1 to 64 bytes and, unless the value is `None`, a value of at most 65 536 bytes (05 §4.2). Anything else is a *failure*: a trap, running out of gas, a module that does not load, or an output that does not count.
+`status` 0 (`RETURN`) is success: `data` is the return data and `writes` the module's storage writes. `status` 1 (`REVERT`) is a revert: `data` is the revert data and `writes` is ignored. The output *counts* only if the module halted (`invoke` status 0), the output decodes exactly as a `ModuleOutput`, `status` is 0 or 1, and every write is *valid*: a key of 1 to 32 bytes for a sandboxed module, whose stored key is the 32-byte namespace followed by it (§2.2), or of 1 to 64 bytes for a privileged one, so that every stored key fits the host's 64-byte limit for full keys, and, unless the value is `None`, a value of at most 65 536 bytes (05 §4.2). Anything else is a *failure*: a trap, running out of gas, a module that does not load, or an output that does not count.
 
 ### 2.3 Storage
 
@@ -84,6 +84,8 @@ Addresses whose first 18 bytes are zero (`0x0000…0000` to `0x0000…FFFF`) are
 A second entry for an address already installed fails the code-hash check: the account holds the designator by then.
 
 An allocation may also give an account the designator of a module directly; that account is a native contract (§5) with no record, no hooks and no `Init`. Its module must be in state, for instance installed at another address.
+
+`kernel_init` also traps if an allocation that is a native contract, one whose code is a designator or one at the address of a `Genesis::modules` entry, has any non-zero storage slot: slot 0 of a native contract's EVM storage tracks its writes within a transaction (§5.4) and starts every transaction at zero.
 
 The `solo` command reads genesis modules from a `"modules"` array of `{"address", "code", "capabilities", "init"}`, `code` being the module's bytes in hex, and adds the code to the address's allocation (which must not have code of its own).
 
@@ -144,8 +146,8 @@ A call that *fails* is an exceptional halt, as an EVM frame's: it consumes all o
 
 A native contract has no EVM storage of its own: its storage is its namespace (§2.3), and EVM storage reads of it (`eth_getStorageAt`) return zero. The kernel keeps the writes of a transaction's native calls as numbered *batches* (from 1), each naming the batch before it, and uses slot 0 of the native contract's EVM storage inside revm's journal to hold the number of its latest standing batch:
 
-- A native call that returns a non-empty write set appends a batch whose predecessor is the slot's current value, then sets the slot to the new batch's number through the journal.
-- A revert of any frame enclosing the call, the transaction itself included, rolls the slot back with everything else, so the batches *standing* for a contract are the chain that starts at the slot's value at the end of the transaction.
+- A native call that returns a non-empty write set appends a batch, naming the contract, whose predecessor is the slot's current value, then sets the slot to the new batch's number through the journal.
+- A revert of any frame enclosing the call, the transaction itself included, rolls the slot back with everything else, so the batches *standing* for a contract are the chain that starts at the slot's value at the end of the transaction. The chain ends at a batch of another contract as at 0; genesis keeps the slot at zero (§4.1), so this happens only by mistake, and then never mixes contracts' writes.
 - `pending` (§2.1) lists the writes of the standing chain at the time of the call, oldest batch first.
 - When the transaction's state is committed, the kernel applies each native contract's standing writes, oldest first, under its namespace, and writes no EVM storage for any native contract; the slot never reaches state. A query commits nothing.
 

@@ -13,7 +13,10 @@
 //! contract's EVM storage, which is otherwise unused, through revm's journal.
 //! Each batch names the batch the slot held before it. A revert of any
 //! enclosing frame rolls the slot back, so the chain from the slot's final
-//! value is exactly the batches that stand; `evm::commit` applies them.
+//! value is exactly the batches that stand; `evm::commit` has them applied.
+//! Each batch also names its contract, and a walk stops at a batch of
+//! another, so a slot 0 that held anything before the transaction (genesis
+//! refuses that, spec 16 §4.1) can never reach another contract's writes.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -23,17 +26,27 @@ use revm::handler::{EthPrecompiles, PrecompileProvider};
 use revm::interpreter::{CallInputs, CallScheme, Gas, InstructionResult, InterpreterResult};
 use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address as RAddress, AddressSet, Bytes, U256};
+use revm::state::Account as RAccount;
 use solo_abi::codec::Seq;
 use solo_abi::modules::{self, CallContext, ModuleCall, Write, status};
 use solo_abi::types::Address;
 
-use crate::evm::BlockFields;
+use crate::evm::{self, BlockFields, Message, Outcome, Precompiles};
 use crate::modules::{Invoked, invoke};
+
+/// Executes `message` at `block` with Ethereum's precompiles and native
+/// contracts; commits the state changes only if `commit_state`. Every
+/// message the kernel runs goes through here.
+pub fn run(message: Message, block: BlockFields, commit_state: bool) -> Outcome {
+    evm::run::<NativeProvider>(message, block, commit_state)
+}
 
 /// One native call's write set, and the batch before it in the chain of
 /// its contract.
 #[derive(Debug, Clone)]
 pub struct Batch {
+    /// The native contract that made the writes.
+    pub address: Address,
     /// The batch number slot 0 held before this one; 0 for none.
     pub previous: u64,
     /// The writes, in order.
@@ -63,10 +76,10 @@ impl NativeProvider {
     }
 
     /// The writes that stand for `address` when its slot 0 holds `head`, oldest first.
-    pub fn standing(&self, head: u64) -> Vec<&Write> {
+    pub fn standing(&self, address: &Address, head: u64) -> Vec<&Write> {
         let mut chain = Vec::new();
         let mut id = head;
-        while let Some(batch) = id.checked_sub(1).and_then(|i| self.batches.get(i as usize)) {
+        while let Some(batch) = id.checked_sub(1).and_then(|i| self.batches.get(i as usize)).filter(|b| b.address == *address) {
             chain.push(batch);
             id = batch.previous;
         }
@@ -102,7 +115,7 @@ impl NativeProvider {
         let head_word = ctx.journal_mut().sload(target, HEAD_SLOT).map_err(|_| String::from("database"))?.data;
         let head = u64::try_from(head_word).unwrap_or(0);
         let address: Address = target.0.0;
-        let pending = self.standing(head).into_iter().cloned().collect();
+        let pending = self.standing(&address, head).into_iter().cloned().collect();
         let call = ModuleCall::Call {
             context: CallContext {
                 address,
@@ -132,10 +145,28 @@ impl NativeProvider {
             return Ok(halt(InstructionResult::PrecompileOOG));
         }
         if !writes.is_empty() {
-            self.batches.push(Batch { previous: head, writes });
+            self.batches.push(Batch { address, previous: head, writes });
             ctx.journal_mut().sstore(target, HEAD_SLOT, U256::from(self.batches.len())).map_err(|_| String::from("database"))?;
         }
         Ok(finish(InstructionResult::Return, used, output.data))
+    }
+}
+
+impl Precompiles for NativeProvider {
+    fn for_message(block: BlockFields, query: bool) -> Self {
+        NativeProvider::new(SpecId::OSAKA, block, query)
+    }
+
+    /// A native contract keeps no EVM storage: its slot 0 holds the number
+    /// of its latest standing batch, whose chain is applied to its namespace.
+    fn commit_storage(&self, address: &Address, account: &RAccount) -> bool {
+        if !account.info.code.as_ref().is_some_and(|c| modules::designated(c.original_byte_slice()).is_some()) {
+            return false;
+        }
+        let head = account.storage.get(&HEAD_SLOT).map_or(0, |s| u64::try_from(s.present_value).unwrap_or(0));
+        let writes: Vec<_> = self.standing(address, head).into_iter().cloned().collect();
+        crate::modules::apply(Some(&modules::namespace(address)), &writes);
+        true
     }
 }
 

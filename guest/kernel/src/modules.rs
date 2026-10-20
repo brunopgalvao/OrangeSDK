@@ -5,7 +5,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use solo_abi::chain::{Log, call_status, reason};
+use solo_abi::chain::{GenesisParams, Log, call_status, reason};
 use solo_abi::codec::Seq;
 use solo_abi::modules::{self, Install, ModuleCall, ModuleOutput, ModuleQuery, ModuleRecord, Write, capability, keys, status};
 use solo_abi::types::{Address, Genesis, Hash, QueryResult};
@@ -51,7 +51,7 @@ pub fn invoke(code_hash: &Hash, namespace: &Hash, input: &[u8], gas_limit: u64, 
         host::__solo_import_invoke_output_read(buf.as_mut_ptr(), 0, len as u32);
         buf
     };
-    let output = ModuleOutput::from_bytes(&bytes).ok().filter(|o| (o.status == status::RETURN || o.status == status::REVERT) && modules::writes_valid(&o.writes.0));
+    let output = ModuleOutput::from_bytes(&bytes).ok().filter(|o| (o.status == status::RETURN || o.status == status::REVERT) && modules::writes_valid(&o.writes.0, !privileged));
     Invoked { output, gas_used: result.a1 }
 }
 
@@ -133,8 +133,17 @@ fn install(address: &Address, code_hash: &Hash, capabilities: u64, init: &[u8], 
 
 /// Installs the genesis modules (spec 16 §4.1), after the allocations: each
 /// module's bytes arrived as the code of the allocation at its address.
-/// Traps on anything that would leave the chain without the module.
+/// Traps on anything that would leave the chain without the module, and on
+/// EVM storage for a native contract: slot 0 of its storage tracks its
+/// writes within a transaction (spec 16 §5.4) and must start at zero.
 pub fn init(genesis: &Genesis) {
+    let params = GenesisParams::from_bytes(&genesis.params).unwrap_or_else(|_| solo_guest::trap());
+    for a in &params.allocations.0 {
+        let native = modules::designated(&a.code).is_some() || genesis.modules.0.iter().any(|m| m.address == a.address);
+        if native && a.storage.0.iter().any(|slot| slot.value != [0; 32]) {
+            solo_guest::trap();
+        }
+    }
     for m in &genesis.modules.0 {
         let account = state::account(&m.address);
         let size = state::get_raw(&state::code_key(&m.code_hash)).map_or(0, |c| c.len());
@@ -191,7 +200,7 @@ pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Out
     let Some(install) = install_of(s) else {
         return Outcome { status: call_status::INVALID, gas_used: 0, output: Vec::new(), logs: Vec::new(), contract: None };
     };
-    let mut outcome = evm::run(message, block, true);
+    let mut outcome = crate::native::run(message, block, true);
     if outcome.status == call_status::SUCCESS {
         match governance_install(&install, height) {
             Some(log) => outcome.logs.push(log),
