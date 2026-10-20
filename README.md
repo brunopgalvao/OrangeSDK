@@ -7,7 +7,7 @@ A framework for EVM-compatible solochains.
 - The kernel, including consensus, is upgraded by governance. The host is upgraded by releases behind feature gates.
 - Type 2 Ethereum compatibility: standard EVM bytecode, exact gas, full RPC.
 
-Status: spec v0 written; the reference kernel runs Simplex BFT consensus (spec 08) across validators connected over TCP (spec 09), with catch-up sync for nodes that fall behind, view synchronization for validators that drift into different views, and equivocation evidence recorded in chain state. Each block header commits to the state through a binary Merkle trie whose entries can be proven (spec 10). Ethereum transactions (legacy, EIP-2930 and EIP-1559) run on revm at the Osaka fork inside the kernel: contract creation, calls, storage, logs, reverts and precompiles are tested end to end through the node (`crates/solo-node/tests/evm.rs`). The JSON-RPC serves what wallets, `cast`, ethers, viem and explorers use: receipts with logs, `eth_call` and gas estimation, code and storage, log filters, fee history. A running chain upgrades its kernel by governance at an activation height, every node switching at the same block, and host behaviour activates behind stake-signalled feature gates (spec 13). See `spec/README.md`.
+Status: spec v0 written; the reference kernel runs Simplex BFT consensus (spec 08) across validators connected over TCP (spec 09), with catch-up sync for nodes that fall behind, view synchronization for validators that drift into different views, and equivocation evidence recorded in chain state. Each block header commits to the state through a binary Merkle trie whose entries can be proven (spec 10). Ethereum transactions (legacy, EIP-2930 and EIP-1559) run on revm at the Osaka fork inside the kernel: contract creation, calls, storage, logs, reverts and precompiles are tested end to end through the node (`crates/solo-node/tests/evm.rs`). The same EVM code, recompiled and run on the VM, passes Ethereum's execution-spec state tests for Osaka except those with blob or set-code transactions, which the kernel does not accept (spec 07 §4.2). The JSON-RPC serves what wallets, `cast`, ethers, viem and explorers use: receipts with logs, `eth_call` and gas estimation, code and storage, log filters, fee history. A running chain upgrades its kernel by governance at an activation height, every node switching at the same block, and host behaviour activates behind stake-signalled feature gates (spec 13). See `spec/README.md`.
 
 ## Try it
 
@@ -106,7 +106,8 @@ cargo test --release -p solo-jit --test bench --test guests -- --ignored --nocap
 - `crates/solo-rpc` — Ethereum JSON-RPC over a node, with a minimal HTTP server.
 - `crates/solo-cli` — the `solo` command (`solo dev`, `solo node`, `solo key`, `solo doctor`).
 - `crates/solo-metrics` — telemetry: a metrics registry with Prometheus text exposition, the node's metric schema, and the health rules `solo doctor` applies.
-- `guest/` — separate workspace for programs that run on the VM: the `solo-guest` runtime, `hello`, and the reference `kernel`.
+- `crates/solo-conformance` — Ethereum execution-spec state tests through the whole pipeline: the kernel's EVM code recompiled to a module, on the interpreter and the native backend, compared by Ethereum state root and logs hash (spec 07 §4.2).
+- `guest/` — separate workspace for programs that run on the VM: the `solo-guest` runtime, `hello`, the reference `kernel`, and `evm-conformance`, which runs one state test through the kernel's EVM code.
 - `examples/` — a genesis file for `solo dev`.
-- `tools/` — build scripts.
+- `tools/` — build scripts; `fetch-conformance.sh` downloads the pinned execution-spec fixture set for a full conformance run.
 - `ops/` — operator assets: Prometheus alert rules and configuration, a Grafana dashboard.

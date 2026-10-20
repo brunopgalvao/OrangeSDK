@@ -210,7 +210,7 @@ macro_rules! solo_main {
 
 #[cfg(feature = "allocator")]
 #[global_allocator]
-static ALLOCATOR: heap::Bump = heap::Bump::new();
+static ALLOCATOR: heap::Pool = heap::Pool::new();
 
 #[cfg(feature = "panic-handler")]
 #[panic_handler]

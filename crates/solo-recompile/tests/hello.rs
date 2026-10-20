@@ -133,7 +133,7 @@ fn hello_module_is_deterministic_and_small() {
     assert_eq!(module.rodata, b"hello, solo");
     assert_eq!(module.layout.rw_base, 0x1_2000);
     assert_eq!(module.layout.data_size, 0);
-    assert_eq!(module.layout.bss_size, 24);
+    assert_eq!(module.layout.bss_size, 248);
     assert_eq!(module.layout.heap_base, 0x1_4000);
     assert_eq!(module.layout.stack_top, 0xFFFF_0000);
     assert!(module.imports.iter().any(|i| i == "hash_keccak256"));

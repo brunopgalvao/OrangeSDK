@@ -13,4 +13,4 @@ pub mod riscv;
 pub mod translate;
 
 pub use elf::Input;
-pub use translate::{Options, RecompileError, recompile};
+pub use translate::{HEAP_MAX, Options, RecompileError, recompile};

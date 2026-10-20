@@ -1,0 +1,21 @@
+[package]
+name = "evm-conformance"
+description = "Runs one Ethereum state test case through the reference kernel's EVM code, for the conformance harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "evm-conformance"
+path = "src/main.rs"
+test = false
+bench = false
+
+# The same dependencies, at the same versions and features, as the kernel,
+# whose EVM, state and transaction modules this program compiles.
+[dependencies]
+solo-guest = { path = "../solo-guest" }
+solo-abi = { path = "../../crates/solo-abi", default-features = false }
+solo-rlp = { path = "../../crates/solo-rlp", default-features = false }
+solo-eth = { path = "../../crates/solo-eth", default-features = false }
+revm = { version = "43.0.3", default-features = false, features = ["optional_eip3607"] }
