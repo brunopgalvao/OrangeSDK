@@ -40,7 +40,7 @@ const PROVE_TX_GAS: u64 = 83_746;
 /// Gas of a `prove` transaction in a state of 4 099 entries, whose proof has 14 siblings.
 const PROVE_DEEP_TX_GAS: u64 = 95_906;
 /// Gas of the `execute` transaction that delivers it to `MessageRecipient`.
-const EXECUTE_TX_GAS: u64 = 204_445;
+const EXECUTE_TX_GAS: u64 = 204_362;
 
 /// Intrinsic gas of a call with `data` (EIP-2028), below the EIP-7623 floor
 /// only for calldata-heavy transactions, which these are not.
@@ -625,6 +625,34 @@ fn deliveries_are_rate_limited_per_window() {
     assert_eq!(word_u64(&b.get(b.inbox, "window()")), 10);
     assert_eq!(word_u64(&b.get(b.inbox, "maxMessagesPerWindow()")), 5);
     assert_eq!(word_u64(&b.get(b.inbox, "maxValuePerWindow()")), 7);
+}
+
+#[test]
+fn a_limit_lowered_mid_window_refuses_deliveries_until_the_window_ends() {
+    let mut b = Bridge::new(2, 1, 10, 1_000);
+    let messages = b.messages.clone();
+    for m in &messages {
+        assert!(b.prove(m).success);
+    }
+    b.eth.advance(DELAY);
+    assert!(b.execute(&messages[0]).success);
+    // The window has delivered 10 wei; a 5 wei limit now sits below that.
+    let lowered = [Value::uint(WINDOW.into()), Value::uint(10), Value::uint(5)];
+    assert!(
+        b.owner("setRateLimit(uint64,uint64,uint256)", &lowered)
+            .success
+    );
+    reverted_with(&b.execute(&messages[1]), "RateLimited()");
+    let raised = [
+        Value::uint(WINDOW.into()),
+        Value::uint(10),
+        Value::uint(1_000),
+    ];
+    assert!(
+        b.owner("setRateLimit(uint64,uint64,uint256)", &raised)
+            .success
+    );
+    assert!(b.execute(&messages[1]).success);
 }
 
 #[test]

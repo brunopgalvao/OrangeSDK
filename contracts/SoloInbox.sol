@@ -238,9 +238,12 @@ contract SoloInbox {
             windowMessages = 0;
             windowValue = 0;
         }
-        if (windowMessages >= maxMessagesPerWindow || value > maxValuePerWindow - windowValue) revert RateLimited();
+        uint256 delivered = windowValue;
+        uint256 cap = maxValuePerWindow;
+        // A limit lowered mid-window can sit below what the window already delivered.
+        if (windowMessages >= maxMessagesPerWindow || delivered > cap || value > cap - delivered) revert RateLimited();
         windowMessages += 1;
-        windowValue += value;
+        windowValue = delivered + value;
     }
 
     /// @dev The root a proof of the outbox slot of `nonce` holding `messageHash` leads to (spec 10 §5.3).
