@@ -89,7 +89,7 @@ fn ethereum() -> Ethereum {
     let mut evm = Evm::new();
     let mut init = fixture("EthereumOutbox.bin");
     init.extend_from_slice(&word(CHAIN_ID));
-    let outbox = evm.deploy([0xD0; 20], init);
+    let outbox = evm.deploy([0xD0; 20], init).unwrap();
     let mut messages = Vec::new();
     for (nonce, payload) in [b"hello solo".to_vec(), vec![0xAB; 70], b"third".to_vec()]
         .into_iter()
@@ -343,16 +343,12 @@ fn messages_from_ethereum_reach_their_recipient_once() {
             .timestamp_ms
             / 1000
     };
-    if head_time(&mut sim) < usable_at {
-        assert_eq!(
-            call(&mut sim.nodes[0], INBOX_ADDRESS, &d0).output,
-            abi::encode(abi::TOO_EARLY, &[word(usable_at)])
-        );
-    }
-    assert!(
-        sim.run_until(20_000, |s| head_time(s) > usable_at)
-            .unwrap()
+    assert!(head_time(&mut sim) < usable_at);
+    assert_eq!(
+        call(&mut sim.nodes[0], INBOX_ADDRESS, &d0).output,
+        abi::encode(abi::TOO_EARLY, &[word(usable_at)])
     );
+    assert!(sim.run_until(20_000, |s| head_time(s) > usable_at).unwrap());
     let mut forged = Delivery {
         anchor: word(16),
         message: eth.messages[0].clone(),

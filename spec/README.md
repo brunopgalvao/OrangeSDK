@@ -22,6 +22,7 @@ This directory is normative. An implementation that disagrees with it is wrong; 
 | 14 | [Mempool](14-mempool.md) — host policy: per-sender nonce queues, pending and queued, replacement, limits and eviction, the block-ordered take, gossip | draft |
 | 15 | [Staking, epochs, slashing and the threshold key](15-staking.md) — the staking address, epochs and validator sets, slashing, the DKG runs, their messages in blocks, key-set adoption, the host's threshold keystore | draft |
 | 16 | [Kernel modules and native contracts](16-modules.md) — the module interface, capabilities, genesis and governance installs, block hooks, native contracts called from the EVM (`0xEF02` designators), the native gas rate | draft |
+| 18 | [Ethereum to Solo](18-bridge-in.md) — the sync-committee light client of Ethereum, the outbox on Ethereum, message proofs, the message verifier and the inbox, delay, rate limit and pause, admission | draft |
 
 ## Conventions
 

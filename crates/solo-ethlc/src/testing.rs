@@ -70,17 +70,23 @@ pub fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// Bytes from hex, with or without `0x`.
-///
-/// # Panics
-/// On anything that is not an even number of hex digits.
+/// Bytes from hex, with or without `0x`. A character that is not a hex
+/// digit reads as zero, and an odd last digit as the high half of a byte.
 #[must_use]
 pub fn unhex(s: &str) -> Vec<u8> {
-    let s = s.trim().trim_start_matches("0x");
-    assert!(s.len().is_multiple_of(2), "odd hex");
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex digit"))
+    let digits: Vec<u8> = s
+        .trim()
+        .trim_start_matches("0x")
+        .chars()
+        .map(|c| {
+            c.to_digit(16)
+                .and_then(|d| u8::try_from(d).ok())
+                .unwrap_or(0)
+        })
+        .collect();
+    digits
+        .chunks(2)
+        .map(|p| p[0] << 4 | p.get(1).copied().unwrap_or(0))
         .collect()
 }
 
@@ -392,17 +398,15 @@ impl Evm {
         evm.transact_commit(tx).expect("a valid transaction")
     }
 
-    /// Deploys `initcode` from `from`; the new contract's address.
-    ///
-    /// # Panics
-    /// If the creation fails.
-    pub fn deploy(&mut self, from: Address, initcode: Vec<u8>) -> Address {
+    /// Deploys `initcode` from `from`: the new contract's address, or
+    /// `None` if the creation failed.
+    pub fn deploy(&mut self, from: Address, initcode: Vec<u8>) -> Option<Address> {
         match self.transact(from, TxKind::Create, initcode) {
             ExecutionResult::Success {
-                output: Output::Create(_, Some(address)),
+                output: Output::Create(_, address),
                 ..
-            } => address.0.0,
-            other => panic!("creation failed: {other:?}"),
+            } => address.map(|a| a.0.0),
+            _ => None,
         }
     }
 
@@ -429,11 +433,7 @@ impl Evm {
                 .filter(|(_, v)| !v.is_zero())
                 .map(|(k, v)| (k.to_be_bytes::<32>(), v.to_be_bytes::<32>()))
                 .collect();
-            let code_hash = if a.info.code_hash == KECCAK_EMPTY {
-                KECCAK_EMPTY.0
-            } else {
-                a.info.code_hash.0
-            };
+            let code_hash = a.info.code_hash.0;
             let account = Account {
                 nonce: a.info.nonce,
                 balance: u128::try_from(a.info.balance).unwrap_or(u128::MAX),
@@ -464,22 +464,45 @@ mod tests {
     use super::*;
 
     #[test]
-    #[should_panic(expected = "creation failed")]
-    fn a_failed_creation_panics() {
-        let _ = Evm::new().deploy([1; 20], vec![0xFE]);
+    fn a_failed_creation_has_no_address() {
+        assert_eq!(Evm::new().deploy([1; 20], vec![0xFE]), None);
     }
 
     #[test]
     fn a_halting_call_has_no_data() {
         let mut evm = Evm::new();
         // Returns the one-byte runtime 0xFE, an invalid opcode.
-        let to = evm.deploy(
-            [1; 20],
-            vec![0x60, 0xFE, 0x60, 0x00, 0x53, 0x60, 0x01, 0x60, 0x00, 0xF3],
-        );
+        let to = evm
+            .deploy(
+                [1; 20],
+                vec![0x60, 0xFE, 0x60, 0x00, 0x53, 0x60, 0x01, 0x60, 0x00, 0xF3],
+            )
+            .unwrap();
         assert_eq!(evm.call([1; 20], to, vec![]), Err(vec![]));
+        // Runtimes that return one word, and that revert with nothing.
+        let returns = evm
+            .deploy(
+                [1; 20],
+                vec![
+                    0x69, 0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, 0x60, 0x00,
+                    0x52, 0x60, 0x0a, 0x60, 0x16, 0xf3,
+                ],
+            )
+            .unwrap();
+        assert_eq!(evm.call([1; 20], returns, vec![]).unwrap()[31], 0x2a);
+        let reverts = evm
+            .deploy(
+                [1; 20],
+                vec![
+                    0x64, 0x60, 0x00, 0x60, 0x00, 0xfd, 0x60, 0x00, 0x52, 0x60, 0x05, 0x60, 0x1b,
+                    0xf3,
+                ],
+            )
+            .unwrap();
+        assert_eq!(evm.call([1; 20], reverts, vec![]), Err(vec![]));
         assert_eq!(evm.storage(&[9; 20], &ZERO), ZERO);
         assert_eq!(unhex("0x0aff"), vec![10, 255]);
+        assert_eq!(unhex("zz1"), vec![0, 16]);
     }
 
     #[test]
@@ -499,5 +522,45 @@ mod tests {
         );
         assert!(text.contains("Native") && text.contains("Chain") && text.contains("Evm"));
         assert_eq!(account, Account::default());
+    }
+
+    #[test]
+    fn a_synthetic_chain_signs_what_the_protocol_accepts() {
+        let c = Native;
+        let chain = Chain::minimal(8);
+        let mut evm = Evm::new();
+        // Stores 0x2a at slot 0 and 0x0100 at slot 1, then stops.
+        let code = vec![
+            0x60, 0x2a, 0x60, 0x00, 0x55, 0x61, 0x01, 0x00, 0x60, 0x01, 0x55, 0x00,
+        ];
+        let to = evm.deploy([1; 20], code).unwrap();
+        assert_eq!(evm.storage(&to, &ZERO)[31], 0x2a);
+        let state = evm.state();
+        let (account, storage) = state.proof(&to, &ZERO);
+        let root = crate::inbox::storage_root(&c, &state.root(), &to, &account).unwrap();
+        assert_eq!(
+            crate::mpt::verify(&c, &root, &c.keccak256(&ZERO), &storage),
+            Ok(Some(vec![0x2a]))
+        );
+        let message = crate::inbox::Message {
+            nonce: 0,
+            sender: [1; 20],
+            recipient: [2; 20],
+            payload: vec![],
+        };
+        assert!(
+            crate::inbox::verify(&c, &state.root(), &to, 1, &message, &account, &storage).is_err()
+        );
+        let b = chain.bootstrap(8, state.root());
+        assert_eq!(sync::bootstrap(&c, &chain.config, &b), Ok(()));
+        let f = chain.header(16, [1; 32], ZERO);
+        let u = chain.update(20, &f, true, 21, 8);
+        let st = sync::State {
+            finalized_slot: 8,
+            current: chain.committee(0).pubkeys,
+            next: None,
+        };
+        let applied = sync::process(&c, &chain.config, &st, &u).unwrap();
+        assert_eq!((applied.finalized, applied.committee), (true, Some(1)));
     }
 }

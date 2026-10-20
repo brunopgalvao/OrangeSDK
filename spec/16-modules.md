@@ -70,7 +70,7 @@ Installing the module with code hash `h` at address `a` with bits `c` and argume
 4. It stores the designator `0xEF02 ‖ h` (§5.1) under `code/` ‖ `keccak256(designator)` and sets the account's code hash to that hash, keeping its balance and nonce.
 5. It records `ModuleRecord { code_hash: h, capabilities: c, installed_at: n }` under `module/` ‖ `a` and inserts `a` into the ascending list of installed addresses under `meta/modules` (a `vec<[20]>`).
 
-Addresses whose first 18 bytes are zero (`0x0000…0000` to `0x0000…FFFF`) are the *system range*: the precompiles and system addresses live there, and no module may be installed there.
+Addresses whose first 18 bytes are zero (`0x0000…0000` to `0x0000…FFFF`) are the *system range*: the precompiles and system addresses live there, and no module may be installed there. The kernel itself may make a system address a native contract at genesis without installing a module there, as the bridge of spec 18 does (18 §4).
 
 ### 4.1 At genesis
 

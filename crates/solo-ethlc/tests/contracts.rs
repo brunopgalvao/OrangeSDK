@@ -56,7 +56,7 @@ fn the_outbox_stores_the_hash_the_inbox_proves() {
     let recipient = [0x7E; 20];
     let mut init = fixture("EthereumOutbox.bin");
     init.extend_from_slice(&word(7));
-    let outbox = evm.deploy(deployer, init);
+    let outbox = evm.deploy(deployer, init).unwrap();
     let payloads: [&[u8]; 2] = [b"hello solo", &[0xAB; 100]];
     for (nonce, payload) in payloads.iter().enumerate() {
         let out = evm

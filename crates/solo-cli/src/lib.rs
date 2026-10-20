@@ -13,9 +13,12 @@
 //! unless the file names a `"governance"` address (with an optional
 //! `"upgradeDelay"` in blocks) or a non-zero `"epochBlocks"`. Kernel modules
 //! installed at genesis (spec 16) are listed under `"modules"`; see [`modules`].
+//! The Ethereum-to-Solo bridge (spec 18) is configured under `"bridgeIn"`;
+//! see [`bridge`].
 
 #![forbid(unsafe_code)]
 
+pub mod bridge;
 pub mod doctor;
 pub mod modules;
 
@@ -112,6 +115,7 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
             .ok_or("genesis: maxTxs too large")?,
         allocations: Seq(allocations),
         upgrades: parse_upgrades(&v)?,
+        bridge_in: bridge::parse_bridge(&v)?,
         ..GenesisParams::default()
     };
     let mut validators = Vec::new();

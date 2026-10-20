@@ -154,6 +154,7 @@ A *gate* is a bit index from 0 to 63. A host release defines which behaviour eac
 | Gate | Guards |
 |---|---|
 | 0 | the host function `secp256k1_verify` (05 §4.3) |
+| 1 | the host function `bls12381_fast_aggregate_verify` (05 §4.3), which the Ethereum light client of spec 18 needs |
 
 The host functions of 05 §4 that carry no gate, the BLS12-381 functions included, are part of ABI version 1 and resolve from genesis on every chain. A gated host function resolves (03 §5.1) only while its gate is active: before that, a module importing it fails to load. Once active it behaves exactly as specified, on every node.
 

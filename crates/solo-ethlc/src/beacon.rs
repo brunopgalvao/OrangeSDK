@@ -692,6 +692,7 @@ mod tests {
         let mut backwards = h.execution.encode();
         backwards[436..440].copy_from_slice(&700u32.to_le_bytes());
         assert_eq!(ExecutionPayloadHeader::decode(&backwards), Err(Malformed));
+        assert_eq!(ExecutionPayloadHeader::decode(&[0; 10]), Err(Malformed));
         assert_eq!(Reader::new(&[]).take(usize::MAX), Err(Malformed));
         let mut r = Reader::new(&[0; 4]);
         r.pos = 1;

@@ -68,7 +68,7 @@ fn outbox() -> Outbox {
     );
     let mut init = unhex(&std::fs::read_to_string(root).unwrap());
     init.extend_from_slice(&word(7));
-    let address = evm.deploy([0xD0; 20], init);
+    let address = evm.deploy([0xD0; 20], init).unwrap();
     let mut messages = Vec::new();
     for (nonce, payload) in [b"one".to_vec(), vec![2; 50], b"three".to_vec()]
         .into_iter()
