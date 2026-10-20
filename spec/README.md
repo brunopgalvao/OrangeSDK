@@ -19,6 +19,7 @@ This directory is normative. An implementation that disagrees with it is wrong; 
 | 11 | [Telemetry](11-telemetry.md) — metrics endpoint and names, emitted metrics, status document, alert and health semantics | draft |
 | 12 | [Threshold certificates](12-threshold-certificates.md) — threshold BLS over BLS12-381, the DKG and resharing, the finality certificate and its verification on Ethereum | draft |
 | 13 | [Kernel upgrades and feature gates](13-upgrades.md) — the upgrade address and its actions, the upgrade timeline, feature-gate signalling, lock-in and activation | draft |
+| 14 | [Mempool](14-mempool.md) — host policy: per-sender nonce queues, pending and queued, replacement, limits and eviction, the block-ordered take, gossip | draft |
 
 ## Conventions
 

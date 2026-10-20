@@ -81,6 +81,7 @@ impl From<SubmitError> for RpcError {
         match e {
             SubmitError::Rejected(code) => RpcError::server(reason_text(code)),
             SubmitError::Node(e) => e.into(),
+            SubmitError::Pool(e) => RpcError::server(e.to_string()),
         }
     }
 }
@@ -392,7 +393,12 @@ impl Rpc {
             "eth_getTransactionCount" => {
                 let address = address_param(params, 0)?;
                 self.check_block(params.get(1))?;
-                json!(quantity(u128::from(self.node.account(&address)?.nonce)))
+                let nonce = if params.get(1).and_then(Value::as_str) == Some("pending") {
+                    self.node.pending_nonce(&address)?
+                } else {
+                    self.node.account(&address)?.nonce
+                };
+                json!(quantity(u128::from(nonce)))
             }
             "eth_getCode" => {
                 let address = address_param(params, 0)?;
@@ -467,6 +473,8 @@ impl Rpc {
             }
             "eth_getLogs" => self.logs(&Filter::parse(params.first())?)?,
             "eth_feeHistory" => self.fee_history(params)?,
+            "txpool_status" => crate::txpool::status(self.node.mempool()),
+            "txpool_content" => crate::txpool::content(self.node.mempool()),
             other => {
                 return Err(RpcError::with_code(
                     -32601,
@@ -484,16 +492,22 @@ impl Rpc {
             reason::BAD_NONCE => {
                 let from = sender(raw).unwrap_or_default();
                 let state = self.node.account(&from)?.nonce;
-                let which = if tx.nonce < state {
-                    "nonce too low"
+                // A nonce ahead of the account waits in the pool (spec 14),
+                // so a bad nonce is a used one, or the last one, which no
+                // transaction may carry (EIP-2681).
+                if tx.nonce < state {
+                    format!(
+                        "nonce too low: address {}, tx: {} state: {state}",
+                        data(&from),
+                        tx.nonce
+                    )
                 } else {
-                    "nonce too high"
-                };
-                format!(
-                    "{which}: address {}, tx: {} state: {state}",
-                    data(&from),
-                    tx.nonce
-                )
+                    format!(
+                        "nonce has max value: address {}, nonce: {}",
+                        data(&from),
+                        tx.nonce
+                    )
+                }
             }
             reason::GAS_TOO_LOW => format!(
                 "{text}: gas {}, minimum needed {}",
@@ -708,10 +722,9 @@ impl Rpc {
                 mined,
             ));
         }
-        let pending = self.node.mempool().iter().find(|p| p.hash == *hash);
+        let pending = self.node.mempool().get(hash);
         Ok(pending.map_or(Value::Null, |p| {
-            let from = sender(&p.raw).unwrap_or_default();
-            views::transaction(hash, &decode_or_blank(&p.raw), &from, None)
+            views::transaction(hash, &decode_or_blank(&p.raw), &p.sender, None)
         }))
     }
 

@@ -14,7 +14,7 @@ use solo_abi::chain::consensus::{
     propose_timer, quorum, signing_preimage, timeout_timer, timer_view, view_timeout_ms,
 };
 use solo_abi::chain::{
-    BlockHeader, Certificate, ConsensusMessage, Evidence, GenesisParams, Participation, Proposal, Signature, SignedHash, SignedVote, SimplexState,
+    BLOCK_GAS_LIMIT, BlockHeader, Certificate, ConsensusMessage, Evidence, GenesisParams, Participation, Proposal, Signature, SignedHash, SignedVote, SimplexState,
     SyncRequest, SyncResponse, keys,
 };
 use solo_abi::codec::Seq;
@@ -178,7 +178,8 @@ impl Ctx {
 
     fn request_mempool(&mut self) {
         self.s.proposing = true;
-        self.effects.push(Effect::MempoolTake { max_bytes: 1 << 20, max_gas: u64::from(self.params.max_txs) * 21_000 });
+        let skip = Seq(self.carried());
+        self.effects.push(Effect::MempoolTake { max_bytes: 1 << 20, max_gas: BLOCK_GAS_LIMIT, skip });
     }
 
     fn on_timer(&mut self, timer_id: u64, now_ms: u64) {
@@ -224,12 +225,12 @@ impl Ctx {
         self.handle_proposal(proposal, hash);
     }
 
-    /// The mempool transactions to propose, at most `max_txs`, leaving out any
-    /// that an unexecuted ancestor of the tip carries or that has already run.
-    /// A leader can extend a block it has not executed yet (it executes on
-    /// finalization, a message delay after notarization), and until then its
-    /// mempool still holds that block's transactions.
-    fn select(&self, txs: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    /// The hashes of the transactions that the unexecuted ancestors of the tip
+    /// carry. A leader can extend a block it has not executed yet (it executes
+    /// on finalization, a message delay after notarization), and until then
+    /// its mempool still holds that block's transactions; the take skips them
+    /// so that they do not use up the next block's budget.
+    fn carried(&self) -> Vec<[u8; 32]> {
         let executed = state::height().unwrap_or(0);
         let mut carried = Vec::new();
         let mut cursor = (self.s.tip_height > executed).then_some(self.s.tip_hash);
@@ -238,6 +239,14 @@ impl Ctx {
             carried.extend(p.txs.0.iter().map(|raw| state::keccak256(raw)));
             cursor = (p.height > executed + 1).then_some(p.parent);
         }
+        carried
+    }
+
+    /// The mempool transactions to propose, at most `max_txs`, leaving out any
+    /// that an unexecuted ancestor of the tip carries (should the host have
+    /// handed them out anyway) or that has already run.
+    fn select(&self, txs: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let carried = self.carried();
         let mut selected = Vec::new();
         for raw in txs {
             if selected.len() >= self.params.max_txs as usize {

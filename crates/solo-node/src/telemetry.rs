@@ -91,8 +91,8 @@ impl Node {
     pub fn metrics_text(&mut self) -> String {
         // Without a chain id the family stays empty; the rest still renders.
         self.telemetry_chain_id().ok();
-        let bytes = self.mempool().iter().map(|p| p.raw.len()).sum();
-        let (count, timers) = (self.mempool().len(), self.timers().len());
+        let (count, bytes) = (self.mempool().len(), self.mempool().bytes());
+        let timers = self.timers().len();
         self.telemetry.refresh(count, bytes, timers);
         let upgrades = &self.upgrades;
         self.telemetry

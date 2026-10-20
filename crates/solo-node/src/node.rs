@@ -10,8 +10,8 @@ use solo_abi::chain::{
 };
 use solo_abi::codec::Seq;
 use solo_abi::types::{
-    self, Block, Effect, ExecContext, ExecuteArgs, ExecuteResult, FinalizeArgs, Genesis, Input,
-    QueryArgs, QueryResult, ValidateArgs, ValidateResult, exports,
+    self, Ahead, Block, Effect, ExecContext, ExecuteArgs, ExecuteResult, FinalizeArgs, Genesis,
+    Input, QueryArgs, QueryResult, ValidateArgs, ValidateResult, exports,
 };
 use solo_abi::{Decode, Encode};
 use solo_host::hash::keccak256;
@@ -22,6 +22,7 @@ use solo_vm::host::Capability;
 use solo_vm::status::Termination;
 
 use crate::extension::{NodeExtension, NodeServices, Outbound, validator_id};
+use crate::mempool::{Mempool, PoolError, PoolLimits, PoolTx, rejection};
 use crate::upgrade::{GatedExtension, Upgrades};
 
 /// How to open a node.
@@ -127,17 +128,8 @@ pub enum SubmitError {
     Rejected(u32),
     /// The node failed while asking the kernel.
     Node(NodeError),
-}
-
-/// A transaction waiting in the mempool.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Pending {
-    /// `keccak256` of the raw bytes.
-    pub hash: [u8; 32],
-    /// Raw transaction.
-    pub raw: Vec<u8>,
-    /// Ordering priority from validation.
-    pub priority: u64,
+    /// The kernel accepted it but the mempool's policy refused it (spec 14).
+    Pool(PoolError),
 }
 
 /// A running node.
@@ -145,7 +137,7 @@ pub struct Node {
     pub(crate) exec: Executor<MemStorage>,
     pub(crate) kernel: [u8; 32],
     services: Rc<RefCell<NodeServices>>,
-    mempool: Vec<Pending>,
+    pool: Mempool,
     /// Blocks executed, in order, as `(height, block hash)`.
     pub executed: Vec<(u64, [u8; 32])>,
     /// Heights finalized, in order.
@@ -216,7 +208,7 @@ impl Node {
             exec,
             kernel,
             services,
-            mempool: Vec::new(),
+            pool: Mempool::default(),
             executed: Vec::new(),
             finalized: Vec::new(),
             metrics: Vec::new(),
@@ -304,7 +296,8 @@ impl Node {
         std::mem::take(&mut self.services.borrow_mut().outbound)
     }
 
-    /// Raw transactions admitted since the last call, for peers.
+    /// Raw transactions that became pending since the last call, for peers;
+    /// queued ones stay local until they are executable (spec 14 §6).
     pub fn take_tx_gossip(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.tx_gossip)
     }
@@ -344,10 +337,28 @@ impl Node {
         })
     }
 
-    /// The mempool contents.
+    /// The mempool.
     #[must_use]
-    pub fn mempool(&self) -> &[Pending] {
-        &self.mempool
+    pub fn mempool(&self) -> &Mempool {
+        &self.pool
+    }
+
+    /// Changes the mempool's limits; they apply to the next insertion.
+    pub fn set_mempool_limits(&mut self, limits: PoolLimits) {
+        self.pool.limits = limits;
+    }
+
+    /// The nonce of `address`'s next transaction counting the mempool's
+    /// pending ones: the account nonce plus that many (`eth_getTransactionCount`
+    /// at `pending`).
+    ///
+    /// # Errors
+    /// See [`NodeError`].
+    pub fn pending_nonce(&mut self, address: &types::Address) -> Result<u64, NodeError> {
+        match self.pool.pending_nonce(address) {
+            Some(nonce) => Ok(nonce),
+            None => Ok(self.account(address)?.nonce),
+        }
     }
 
     /// Starts the driver, optionally resuming from persisted state.
@@ -425,24 +436,16 @@ impl Node {
                 self.persisted_driver_state = Some(state);
                 None
             }
-            Effect::MempoolTake { max_bytes, .. } => {
-                let mut taken = Vec::new();
-                let mut bytes = 0usize;
-                self.mempool.sort_by_key(|p| core::cmp::Reverse(p.priority));
-                let mut rest = Vec::new();
-                for p in self.mempool.drain(..) {
-                    if bytes + p.raw.len() <= max_bytes as usize {
-                        bytes += p.raw.len();
-                        taken.push(p.raw);
-                    } else {
-                        rest.push(p);
-                    }
-                }
-                self.mempool = rest;
-                Some(Input::MempoolContents { txs: Seq(taken) })
+            Effect::MempoolTake {
+                max_bytes,
+                max_gas,
+                skip,
+            } => {
+                let txs = self.pool.take(max_bytes as usize, max_gas, &skip.0);
+                Some(Input::MempoolContents { txs: Seq(txs) })
             }
             Effect::MempoolReject { tx_hash, .. } => {
-                self.mempool.retain(|p| p.hash != tx_hash);
+                self.pool.remove(&tx_hash);
                 None
             }
             Effect::Metric { name, value } => {
@@ -534,7 +537,10 @@ impl Node {
             .block_by_number(height)?
             .ok_or(NodeError::Decode("stored header"))?;
         let block_hash = keccak256(&stored.to_bytes());
-        self.mempool.retain(|p| !carried.contains(&p.hash));
+        for hash in &carried {
+            self.pool.remove(hash);
+        }
+        self.reset_pool()?;
         self.executed.push((height, block_hash));
         let summary = &result.summary;
         self.telemetry
@@ -569,44 +575,78 @@ impl Node {
         Ok(())
     }
 
-    /// Validates a raw transaction with the kernel and admits it to the mempool.
-    ///
-    /// # Errors
-    /// [`SubmitError::Rejected`] with the kernel's reason, or a node error.
-    pub fn submit(&mut self, raw: &[u8]) -> Result<[u8; 32], SubmitError> {
-        let hash = keccak256(raw);
+    /// Brings the mempool up to the state the last block left (spec 14 §5)
+    /// and hands the transactions that became pending to gossip.
+    fn reset_pool(&mut self) -> Result<(), NodeError> {
+        for sender in self.pool.senders() {
+            let account = self.account(&sender)?;
+            self.pool.reset(&sender, account);
+            let promoted = self.pool.announce(&sender);
+            self.tx_gossip.extend(promoted);
+        }
+        Ok(())
+    }
+
+    /// Asks the kernel whether `raw` is valid for the next block, with
+    /// `ahead` held ahead of it by the mempool (spec 06 §5.1).
+    fn validate(&mut self, raw: &[u8], ahead: Ahead) -> Result<ValidateResult, SubmitError> {
         let next = self.block_number().map_err(SubmitError::Node)? + 1;
-        let context = ExecContext {
-            height: next,
-            slot: next,
-            ..ExecContext::default()
-        };
         let args = ValidateArgs {
             tx: raw.to_vec(),
-            context,
+            context: ExecContext {
+                height: next,
+                slot: next,
+                ..ExecContext::default()
+            },
+            ahead,
         };
-        let result: ValidateResult = self
-            .call_decoded(exports::VALIDATE_TX, &args.to_bytes())
-            .map_err(SubmitError::Node)?;
-        match result {
-            ValidateResult::Valid { priority, .. } => {
-                if !self.mempool.iter().any(|p| p.hash == hash) {
-                    self.mempool.push(Pending {
-                        hash,
-                        raw: raw.to_vec(),
-                        priority,
-                    });
-                    self.tx_gossip.push(raw.to_vec());
-                }
-                self.step(Input::TxArrived {
-                    tx_hash: hash,
-                    size: u32::try_from(raw.len()).unwrap_or(u32::MAX),
-                })
-                .map_err(SubmitError::Node)?;
-                Ok(hash)
-            }
-            ValidateResult::Invalid { reason } => Err(SubmitError::Rejected(reason)),
+        self.call_decoded(exports::VALIDATE_TX, &args.to_bytes())
+            .map_err(SubmitError::Node)
+    }
+
+    /// Validates a raw transaction with the kernel and admits it to the
+    /// mempool (spec 14 §2). A transaction whose nonce is ahead of its
+    /// sender's account validates as if the pool's transactions before it
+    /// had run; it waits as queued until the nonces between are filled.
+    /// Submitting a transaction the pool holds changes nothing.
+    ///
+    /// # Errors
+    /// [`SubmitError::Rejected`] with the kernel's reason,
+    /// [`SubmitError::Pool`] when the pool's policy refuses it, or a node
+    /// error.
+    pub fn submit(&mut self, raw: &[u8]) -> Result<[u8; 32], SubmitError> {
+        let hash = keccak256(raw);
+        if self.pool.get(&hash).is_none() {
+            self.admit(raw)?;
         }
+        self.step(Input::TxArrived {
+            tx_hash: hash,
+            size: u32::try_from(raw.len()).unwrap_or(u32::MAX),
+        })
+        .map_err(SubmitError::Node)?;
+        Ok(hash)
+    }
+
+    fn admit(&mut self, raw: &[u8]) -> Result<(), SubmitError> {
+        let Some(mut tx) = PoolTx::parse(raw) else {
+            let result = self.validate(raw, Ahead::default())?;
+            return Err(SubmitError::Rejected(rejection(&result)));
+        };
+        let sender = tx.sender;
+        let account = match self.pool.account(&sender) {
+            Some(account) => account.clone(),
+            None => self.account(&sender).map_err(SubmitError::Node)?,
+        };
+        self.pool.check(&tx).map_err(SubmitError::Pool)?;
+        let ahead = self.pool.ahead(&sender, account.nonce, tx.nonce);
+        match self.validate(raw, ahead)? {
+            ValidateResult::Valid { priority, .. } => tx.priority = priority,
+            ValidateResult::Invalid { reason } => return Err(SubmitError::Rejected(reason)),
+        }
+        self.pool.insert(tx, account).map_err(SubmitError::Pool)?;
+        let announced = self.pool.announce(&sender);
+        self.tx_gossip.extend(announced);
+        Ok(())
     }
 
     /// Runs a kernel query within [`Node::query_gas`].

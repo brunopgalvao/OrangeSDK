@@ -32,6 +32,8 @@ cast call $COUNTER 'count()(uint256)' --rpc-url $RPC
 cast logs --address $COUNTER --from-block 0 --rpc-url $RPC
 ```
 
+The mempool works as geth's does (spec 14): an account can have many transactions waiting, so `cast send` twice in a row, `forge script` and batch senders work without waiting for blocks. A transaction whose nonce is ahead of the account waits, queued, until the nonces before it arrive; a block takes each account's transactions in nonce order; a transaction replaces the waiting one with the same nonce only if it raises both fee fields by 10% and the account can still pay for the ones behind it. A transaction over 128 KiB is refused, as geth refuses it. `eth_getTransactionCount` at `pending` counts the waiting transactions, and `txpool_status` and `txpool_content` show the pool.
+
 The node keeps the state of the head block only: state methods (`eth_getBalance`, `eth_call`, ...) answer for the head and refuse an older block rather than answer from the wrong state. Requests run on the thread that drives consensus, so each kernel query runs within a budget (`--query-gas`, 2^26 VM gas by default) and long requests (batches, gas estimation, log scans) let the node poll its peers and tick between their steps.
 
 An `alloc` entry is either a balance in wei (a decimal string, `0x` hex, or a JSON number) or a geth-style account, which is how a chain predeploys contracts at genesis:
@@ -92,7 +94,7 @@ cargo test --release -p solo-jit --test bench --test guests -- --ignored --nocap
 
 ## Layout
 
-- `spec/` — normative specification (machine model, instruction set, module format, gas, host ABI, driver interface, conformance, consensus, transport, state commitment, telemetry, threshold certificates, kernel upgrades and feature gates).
+- `spec/` — normative specification (machine model, instruction set, module format, gas, host ABI, driver interface, conformance, consensus, transport, state commitment, telemetry, threshold certificates, kernel upgrades and feature gates, mempool).
 - `crates/solo-vm` — reference interpreter, `no_std`-capable, the oracle for every other backend.
 - `crates/solo-jit` — the native backend: compiles a program ahead of time to AArch64 (Apple silicon) or x86-64 (Unix) machine code and runs it with the interpreter's interface and results.
 - `crates/solo-recompile` — turns a linked RV64 ELF into a Solo module.
@@ -102,8 +104,8 @@ cargo test --release -p solo-jit --test bench --test guests -- --ignored --nocap
 - `crates/solo-trie` — the binary Merkle trie of the state commitment (spec 10), with inclusion and exclusion proofs, `no_std`.
 - `crates/solo-bls` — threshold BLS over BLS12-381: the DKG and resharing, finality certificates and their Ethereum verification inputs (spec 12), `no_std`.
 - `crates/solo-upgrade` — kernel upgrades and feature gates (spec 13): the upgrade-address actions, their records, the gate state machine.
-- `crates/solo-node` — the node host: privileged functions (including `sign`), the driver loop, mempool, queries, the kernel switchover and gated host functions of spec 13, telemetry, the TCP transport, and `Sim`, an in-process network of nodes with a virtual clock.
-- `crates/solo-rpc` — Ethereum JSON-RPC over a node, with a minimal HTTP server.
+- `crates/solo-node` — the node host: privileged functions (including `sign`), the driver loop, the mempool of spec 14 (per-sender nonce queues, replacement, limits), queries, the kernel switchover and gated host functions of spec 13, telemetry, the TCP transport, and `Sim`, an in-process network of nodes with a virtual clock.
+- `crates/solo-rpc` — Ethereum JSON-RPC over a node, including `txpool_status` and `txpool_content`, with a minimal HTTP server.
 - `crates/solo-cli` — the `solo` command (`solo dev`, `solo node`, `solo key`, `solo doctor`).
 - `crates/solo-metrics` — telemetry: a metrics registry with Prometheus text exposition, the node's metric schema, and the health rules `solo doctor` applies.
 - `crates/solo-conformance` — Ethereum execution-spec state tests through the whole pipeline: the kernel's EVM code recompiled to a module, on the interpreter and the native backend, compared by Ethereum state root and logs hash (spec 07 §4.2).

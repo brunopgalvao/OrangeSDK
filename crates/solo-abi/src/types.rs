@@ -144,12 +144,28 @@ record! {
 }
 
 record! {
+    /// What a mempool holds ahead of a transaction from the same sender
+    /// (spec 06 §5.1): the transaction is validated as if they had run first.
+    /// The default, all zero, validates against the state as it is.
+    Ahead {
+        /// Transactions of the sender that run before this one: the account's
+        /// nonce is taken to be this much higher.
+        nonces: u64,
+        /// The most they can cost, in the chain's balance unit: the account's
+        /// balance is taken to be this much lower.
+        reserved: u128,
+    }
+}
+
+record! {
     /// Argument of `kernel_stf_validate_tx`.
     ValidateArgs {
         /// Transaction bytes.
         tx: Vec<u8>,
         /// Context.
         context: ExecContext,
+        /// What the mempool holds ahead of it from the same sender.
+        ahead: Ahead,
     }
 }
 
@@ -473,6 +489,9 @@ pub enum Effect {
     MempoolTake {
         max_bytes: u32,
         max_gas: u64,
+        /// Transactions to treat as already taken: carried by a block the
+        /// kernel builds on but has not executed (spec 14 §3).
+        skip: Seq<Hash>,
     },
     MempoolAdmit {
         tx_hash: Hash,
@@ -551,9 +570,13 @@ impl Encode for Effect {
                 e.raw(&[10]);
                 e.put(peer).put(delta);
             }
-            Effect::MempoolTake { max_bytes, max_gas } => {
+            Effect::MempoolTake {
+                max_bytes,
+                max_gas,
+                skip,
+            } => {
                 e.raw(&[11]);
-                e.put(max_bytes).put(max_gas);
+                e.put(max_bytes).put(max_gas).put(skip);
             }
             Effect::MempoolAdmit { tx_hash } => {
                 e.raw(&[12]);
@@ -614,6 +637,7 @@ impl Decode for Effect {
             11 => Effect::MempoolTake {
                 max_bytes: d.get()?,
                 max_gas: d.get()?,
+                skip: d.get()?,
             },
             12 => Effect::MempoolAdmit { tx_hash: d.get()? },
             13 => Effect::MempoolReject {
@@ -724,6 +748,10 @@ mod tests {
         roundtrip(&ValidateArgs {
             tx: vec![1, 2],
             context: ctx(),
+            ahead: Ahead {
+                nonces: 3,
+                reserved: u128::MAX,
+            },
         });
         roundtrip(&BuildArgs {
             context: ctx(),
@@ -872,6 +900,7 @@ mod tests {
             Effect::MempoolTake {
                 max_bytes: 1,
                 max_gas: 2,
+                skip: Seq(vec![[3; 32]]),
             },
             Effect::MempoolAdmit { tx_hash: [1; 32] },
             Effect::MempoolReject {

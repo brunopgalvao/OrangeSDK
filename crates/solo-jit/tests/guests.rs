@@ -10,7 +10,7 @@ use k256::ecdsa::SigningKey;
 use solo_abi::Encode;
 use solo_abi::chain::{Allocation, GenesisParams, query};
 use solo_abi::codec::Seq;
-use solo_abi::types::{ExecContext, Genesis, QueryArgs, ValidateArgs, exports};
+use solo_abi::types::{Ahead, ExecContext, Genesis, QueryArgs, ValidateArgs, exports};
 use solo_host::hash::keccak256;
 use solo_host::{Backend, CallResult, Executor, Flags, MemStorage, ModuleCache};
 use solo_jit::Compiled;
@@ -203,6 +203,7 @@ fn kernel_trace(module: &[u8], backend: Backend) -> Trace {
             slot: 1,
             ..ExecContext::default()
         },
+        ahead: Ahead::default(),
     };
     let calls: Vec<(&str, Vec<u8>, i64)> = vec![
         (exports::INIT, genesis().to_bytes(), 1 << 40),

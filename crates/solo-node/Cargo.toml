@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 solo-abi = { path = "../solo-abi" }
+solo-eth = { path = "../solo-eth" }
 solo-host = { path = "../solo-host" }
 solo-trie = { path = "../solo-trie" }
 solo-metrics = { path = "../solo-metrics" }
@@ -17,6 +18,7 @@ solo-rlp = { path = "../solo-rlp" }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
 [dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
 solo-recompile = { path = "../solo-recompile" }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
