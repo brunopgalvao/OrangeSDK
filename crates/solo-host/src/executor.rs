@@ -354,24 +354,12 @@ impl<S: Storage> Executor<S> {
         if self.frames.len() >= self.max_depth {
             return fail(HostStatus::DepthExceeded);
         }
-        let Some((program, load_cost)) = self.program_for(code_hash, capability) else {
-            return fail(HostStatus::NotFound);
-        };
         // Loading from chain state is paid out of the callee's limit.
-        let in_range = (0..=solo_vm::gas::MAX_GAS_LIMIT).contains(&gas_limit);
-        if in_range && gas_limit < load_cost {
-            return CallResult {
-                status: Termination::OutOfGas,
-                output: Vec::new(),
-                gas_used: gas_limit.unsigned_abs(),
-                started: true,
-            };
-        }
-        let run_limit = if in_range {
-            gas_limit - load_cost
-        } else {
-            gas_limit
+        let (program, load_cost) = match self.program_for(code_hash, capability, gas_limit) {
+            Ok(found) => found,
+            Err(result) => return result,
         };
+        let run_limit = gas_limit - load_cost;
         let parent_static = self.frames.last().is_some_and(|f| f.static_call);
         self.frames.push(Frame {
             namespace,
@@ -403,7 +391,7 @@ impl<S: Storage> Executor<S> {
             }
             Err(InstanceError::NoSuchExport | InstanceError::UnresolvedImport(_)) => (
                 Termination::HostError(HostStatus::NotFound.code()),
-                0,
+                load_cost.unsigned_abs(),
                 false,
             ),
             Err(InstanceError::GasLimit) => (

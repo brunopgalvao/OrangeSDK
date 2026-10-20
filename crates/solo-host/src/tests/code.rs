@@ -145,3 +145,45 @@ fn invoke_reaches_modules_in_state() {
     let r = run(&mut exec, &invoker, b"", 100_000);
     assert_eq!(regs(&r).0, 0, "invoke status Ok");
 }
+
+#[test]
+fn caches_never_change_a_result() {
+    // A module that imports a privileged function, in the state of two
+    // executors; only one of them has run it, privileged, and cached it.
+    let mut body = vec![li(Reg::A0, 21), ecall(1)];
+    body.extend(report());
+    let bytes = module(&["output_write", "ext_double"], &body, &[]);
+    let hash = keccak256(&bytes);
+    let cost = load_cost(bytes.len());
+    let [mut warm, mut fresh] = [executor(), executor()];
+    for exec in [&mut warm, &mut fresh] {
+        exec.set_extension(Box::new(Doubler));
+        exec.state_mut().set(&code_key(&hash), &bytes);
+    }
+    assert_eq!(
+        regs(&call(&mut warm, &hash, 10_000, Capability::Privileged)).0,
+        42
+    );
+    for gas in [-1, 0, cost - 1, cost, 10_000] {
+        assert_eq!(
+            call(&mut warm, &hash, gas, Capability::Sandboxed),
+            call(&mut fresh, &hash, gas, Capability::Sandboxed),
+            "limit {gas}"
+        );
+    }
+    // A load that fails validation is paid for like one that succeeds.
+    let refused = call(&mut fresh, &hash, 10_000, Capability::Sandboxed);
+    assert_eq!(refused.status, not_found());
+    assert_eq!(refused.gas_used, cost.unsigned_abs());
+    assert_eq!(refused.invoke_status(), HostStatus::NotFound);
+    // So is one whose bytes do not hash to the key, and a limit below the
+    // cost stops it before they are hashed.
+    for exec in [&mut warm, &mut fresh] {
+        exec.state_mut().set(&code_key(&hash), &[0; 640]);
+    }
+    for gas in [19, 20, 10_000] {
+        let r = call(&mut warm, &hash, gas, Capability::Privileged);
+        assert_eq!(r, call(&mut fresh, &hash, gas, Capability::Privileged));
+        assert_eq!(r.gas_used, gas.min(20).unsigned_abs());
+    }
+}

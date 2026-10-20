@@ -105,9 +105,12 @@ Precompile-grade operations beyond this list (modexp, bn254, point evaluation) a
 
 A host runs a module it was handed directly (the kernel, and whatever else it loads itself) by its code hash alone. For any other code hash `h`, the module is the value of the key `code/` ‖ `h` (`63 6f 64 65 2f` followed by the 32 bytes) in the state visible to the caller, its own pending overlay writes included, so a kernel can store a module and invoke it within one entrypoint:
 
-- The value must hash to `h` under `keccak256` and validate (03 §7) for the capability set of the call; otherwise the call fails before instantiating, and `invoke` returns `NotFound`.
-- The callee pays for loading: `⌈len / 32⌉` VM gas, `len` being the module's length, is taken from its gas limit before its first instruction, on every call. A limit below that ends the callee with `OutOfGas` having used its whole limit, and `invoke` returns `CalleeTrapped`.
-- A host MAY cache what it loaded, but runs it only while the key still holds the same bytes, since another node may have no cache.
+The steps run in this order, and each outcome is the same whether or not the host has the module cached:
+
+1. A gas limit the VM rejects (04 §4) fails the call before instantiating with `InvalidArgument`, no gas used.
+2. The callee pays for loading: `⌈len / 32⌉` VM gas, `len` being the length of the value, is taken from its gas limit before any work on the value, on every call. A limit below that ends the callee with `OutOfGas` having used its whole limit, and `invoke` returns `CalleeTrapped`.
+3. The value must hash to `h` under `keccak256` and validate (03 §7) for the capability set of the call; otherwise the call fails before instantiating having used the load cost, and `invoke` returns `NotFound` with that gas used in `a1`. A missing export fails the same way.
+4. A host MAY cache what it loaded, but runs it only while the key still holds the same bytes, since another node may have no cache, and checks a cached module's imports against the capability set of each call, since it may have been validated for a wider one.
 
 This lookup is part of ABI version 1 as spec 16 publishes it: before it no chain kept modules under `code/`, so no earlier call observes a difference, and invoking a hash whose value there is not a module (EVM bytecode, which the reference kernel keeps under the same prefix) still returns `NotFound`.
 

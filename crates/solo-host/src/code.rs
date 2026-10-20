@@ -9,10 +9,11 @@
 
 use std::sync::Arc;
 
-use solo_vm::host::Capability;
+use solo_vm::host::{Capability, Host};
 use solo_vm::module::Program;
+use solo_vm::status::{HostStatus, Termination};
 
-use crate::executor::Executor;
+use crate::executor::{CallResult, Executor};
 use crate::storage::Storage;
 
 /// Prefix of the chain-state key that holds a module's bytes, followed by
@@ -35,37 +36,89 @@ pub fn load_cost(len: usize) -> i64 {
     i64::try_from(len.div_ceil(32)).unwrap_or(i64::MAX)
 }
 
+/// A call that ends before instantiating with `status`, having used `gas_used`.
+fn unstarted(status: HostStatus, gas_used: i64) -> CallResult {
+    CallResult {
+        status: Termination::HostError(status.code()),
+        output: Vec::new(),
+        gas_used: gas_used.unsigned_abs(),
+        started: false,
+    }
+}
+
 impl<S: Storage> Executor<S> {
-    /// The program to run for `code_hash` and the gas its loading costs the
-    /// callee: an explicitly loaded program for free, otherwise the module
-    /// under [`code_key`] if its bytes hash to `code_hash` and validate for
-    /// `capability`. `None` when neither exists.
+    /// The program to run for `code_hash` under `capability` with
+    /// `gas_limit`, and the gas its loading costs the callee: an explicitly
+    /// loaded program for free, otherwise the module under [`code_key`].
+    ///
+    /// A module from state is paid for before the host does any work on its
+    /// bytes, and the same way whether or not this host has it cached
+    /// (spec 05 §4.4.1): a limit the VM rejects fails with `InvalidArgument`,
+    /// one below the load cost ends with `OutOfGas`, and bytes that do not
+    /// hash to `code_hash` or validate for `capability` fail with `NotFound`
+    /// having used the load cost. The `Err` is the result of such a call.
     pub(crate) fn program_for(
         &mut self,
         code_hash: &[u8; 32],
         capability: Capability,
-    ) -> Option<(Arc<Program>, i64)> {
+        gas_limit: i64,
+    ) -> Result<(Arc<Program>, i64), CallResult> {
         if !self.from_state.contains_key(code_hash)
             && let Some(program) = self.cache.get(code_hash)
         {
-            return Some((program, 0));
+            return Ok((program, 0));
         }
-        let bytes = self.state.get(&code_key(code_hash))?;
+        let Some(bytes) = self.state.get(&code_key(code_hash)) else {
+            return Err(unstarted(HostStatus::NotFound, 0));
+        };
+        if !(0..=solo_vm::gas::MAX_GAS_LIMIT).contains(&gas_limit) {
+            return Err(unstarted(HostStatus::InvalidArgument, 0));
+        }
         let cost = load_cost(bytes.len());
-        if self.from_state.get(code_hash) == Some(&bytes) {
-            return self.cache.get(code_hash).map(|p| (p, cost));
+        if gas_limit < cost {
+            return Err(CallResult {
+                status: Termination::OutOfGas,
+                output: Vec::new(),
+                gas_used: gas_limit.unsigned_abs(),
+                started: true,
+            });
         }
+        let cached = (self.from_state.get(code_hash) == Some(&bytes))
+            .then(|| self.cache.get(code_hash))
+            .flatten();
+        let program = cached.or_else(|| self.parse_from_state(code_hash, bytes));
+        // A cached program may have been validated for a wider set than
+        // this call's, so its imports are checked for this one every time.
+        match program {
+            Some(p)
+                if p.module
+                    .imports
+                    .iter()
+                    .all(|n| self.resolve(n, capability).is_some()) =>
+            {
+                Ok((p, cost))
+            }
+            _ => Err(unstarted(HostStatus::NotFound, cost)),
+        }
+    }
+
+    /// Parses `bytes`, found under the key of `code_hash`, and caches them if
+    /// they hash to it and validate for some capability set.
+    fn parse_from_state(&mut self, code_hash: &[u8; 32], bytes: Vec<u8>) -> Option<Arc<Program>> {
         if crate::hash::keccak256(&bytes) != *code_hash {
             return None;
         }
         let program = {
             let resolver = self.resolver();
-            let module =
-                solo_vm::module::Module::parse(&bytes, &|name| resolver(name, capability)).ok()?;
+            // The privileged set contains the sandboxed one.
+            let module = solo_vm::module::Module::parse(&bytes, &|name| {
+                resolver(name, Capability::Privileged)
+            })
+            .ok()?;
             Program::new(module, self.cache.cost_table())
         };
         self.cache.insert_program(*code_hash, program);
         self.from_state.insert(*code_hash, bytes);
-        self.cache.get(code_hash).map(|p| (p, cost))
+        self.cache.get(code_hash)
     }
 }
