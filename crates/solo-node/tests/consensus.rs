@@ -1191,6 +1191,8 @@ fn the_chain_keeps_only_evidence_that_verifies() {
         height: state.tip_height + 1,
         parent: state.tip_hash,
         timestamp_ms: sim.now_ms.max(state.tip_timestamp_ms + 1),
+        anchor_height: 0,
+        anchor_root: [0; 32],
         txs: Seq(vec![]),
         evidence: Seq(vec![
             wrong_signer,
@@ -1226,6 +1228,8 @@ fn the_chain_keeps_only_evidence_that_verifies() {
         height: state.tip_height + 1,
         parent: state.tip_hash,
         timestamp_ms: sim.now_ms.max(state.tip_timestamp_ms + 1),
+        anchor_height: 0,
+        anchor_root: [0; 32],
         txs: Seq(vec![]),
         evidence: Seq(vec![good; MAX_EVIDENCE + 1]),
         dkg: Seq(vec![]),

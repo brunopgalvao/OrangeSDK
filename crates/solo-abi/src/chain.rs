@@ -307,6 +307,9 @@ pub mod reason {
     /// disabled, calldata that is not a staking action, or an action the
     /// sender's stake does not allow (spec 15 §3).
     pub const STAKING_ACTION: u32 = 13;
+    /// A transaction to the outbox address whose calldata is not a `send`
+    /// the outbox accepts (spec 17 §2.2).
+    pub const OUTBOX_MESSAGE: u32 = 14;
 }
 
 /// Storage key prefixes of the reference kernel.
@@ -386,6 +389,11 @@ record! {
         parent: Hash,
         /// Proposer's clock when it built the block.
         timestamp_ms: u64,
+        /// Height of an executed block whose state root this proposal
+        /// carries for light clients (spec 08 §5, spec 17 §4); 0 for none.
+        anchor_height: u64,
+        /// That block's state root; zero for none.
+        anchor_root: Hash,
         /// Transactions, raw.
         txs: Seq<Vec<u8>>,
         /// Equivocation evidence for the chain to record, at most
@@ -979,6 +987,8 @@ mod tests {
             height: 2,
             parent: [1; 32],
             timestamp_ms: 9,
+            anchor_height: 1,
+            anchor_root: [5; 32],
             txs: Seq(vec![vec![1, 2], vec![]]),
             evidence: Seq(vec![Evidence::default()]),
             dkg: Seq(vec![vec![3]]),

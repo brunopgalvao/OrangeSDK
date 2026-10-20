@@ -977,6 +977,8 @@ fn shareholders_with_little_stake_cannot_certify_blocks_to_a_syncing_node() {
         height: fin + 1,
         parent: finalized_hash(&sim.nodes[4], fin),
         timestamp_ms: st.tip_timestamp_ms + 1,
+        anchor_height: 0,
+        anchor_root: [0; 32],
         txs: Seq(vec![]),
         evidence: Seq(vec![]),
         dkg: Seq(vec![]),

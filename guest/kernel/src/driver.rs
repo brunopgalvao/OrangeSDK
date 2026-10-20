@@ -20,6 +20,7 @@ use solo_abi::chain::{
     BLOCK_GAS_LIMIT, BlockHeader, Certificate, ConsensusMessage, Evidence, GenesisParams, Participation, Proposal, Signature, SignedHash, SignedVote, SimplexState,
     SyncRequest, SyncResponse, keys,
 };
+use solo_abi::bridge::FinalityProof;
 use solo_abi::codec::Seq;
 use solo_abi::staking::{MAX_DKG, PartialShare, epoch_end, epoch_of, first_view, view_epoch};
 use solo_abi::types::{Block, Effect, Hash, Input, MigrateArgs};
@@ -45,6 +46,32 @@ const FUTURE_PER_SIGNER: usize = 4;
 /// known signed, so any verified trigger may replace it.
 const WEAK_SYNC_KEY: &[u8] = b"simplex/weak_sync";
 const ZERO: Hash = [0; 32];
+
+/// The anchor a leader puts in its proposal (spec 08 §5): its executed
+/// head and that block's state root, or none before the first block.
+fn anchor() -> (u64, Hash) {
+    state::height().and_then(|h| state::block_by_number(h).map(|b| (h, b.state_root))).unwrap_or((0, ZERO))
+}
+
+/// Whether a shareholder signs the certificate of `p` (spec 08 §6a): its
+/// anchor is none, or names a block below it that this node has executed,
+/// with that block's state root. A certificate therefore vouches for the
+/// anchor as it does for the proposal (spec 17 §4).
+fn anchored(p: &Proposal) -> bool {
+    if p.anchor_height == 0 {
+        return p.anchor_root == ZERO;
+    }
+    p.anchor_height < p.height && state::block_by_number(p.anchor_height).is_some_and(|b| b.state_root == p.anchor_root)
+}
+
+/// `query::FINALITY_PROOF` (spec 17 §5): the threshold certificate this
+/// node stored for `height` and the encoded proposal it certifies.
+pub fn finality_proof(height: u64) -> Option<FinalityProof> {
+    let certificate = persist::get_raw(&key(b"bcert/", &[&height.to_le_bytes()]))?;
+    let (_, hash, _) = solo_abi::staking::certificate_parts(&certificate)?;
+    let proposal = persist::get_raw(&key(b"prop/", &[&hash]))?;
+    Some(FinalityProof { certificate, proposal })
+}
 
 /// The persisted driver state.
 pub fn load() -> SimplexState {
@@ -411,6 +438,8 @@ impl Ctx {
             height: self.s.tip_height + 1,
             parent: self.s.tip_hash,
             timestamp_ms: self.s.now_ms.max(self.s.tip_timestamp_ms + 1),
+            anchor_height: 0,
+            anchor_root: ZERO,
             txs: Seq(Vec::new()),
             evidence: Seq(Vec::new()),
             dkg: Seq(Vec::new()),
@@ -420,6 +449,7 @@ impl Ctx {
             proposal.txs = Seq(self.select(txs));
             proposal.evidence = Self::pending_evidence();
             proposal.dkg = dkg::for_proposal();
+            (proposal.anchor_height, proposal.anchor_root) = anchor();
         }
         let hash = state::keccak256(&proposal.to_bytes());
         let Some(signature) = self.sign(KIND_PROPOSE, view, &hash) else { return };
@@ -742,7 +772,7 @@ impl Ctx {
             return;
         }
         let partial = Self::proposal(&hash)
-            .filter(|p| !self.is_suffix(p))
+            .filter(|p| !self.is_suffix(p) && anchored(p))
             .zip(dkg::my_id(self.chain_id))
             .and_then(|(p, id)| dkg::partial(self.chain_id, &id, p.height, &hash));
         match partial {

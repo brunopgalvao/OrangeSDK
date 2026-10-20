@@ -105,6 +105,7 @@ pub fn reason_text(code: u32) -> &'static str {
         reason::SENDER_NOT_EOA => "sender not an eoa",
         reason::SYSTEM_ACTION => "not a valid system action (upgrade or module install)",
         reason::STAKING_ACTION => "not a valid staking action",
+        reason::OUTBOX_MESSAGE => "not a valid outbox message",
         _ => "rejected",
     }
 }
@@ -122,7 +123,7 @@ pub fn sender(raw: &[u8]) -> Option<[u8; 20]> {
     keccak256(&point.as_bytes()[1..])[12..].try_into().ok()
 }
 
-fn param_str(params: &[Value], index: usize) -> Result<&str, RpcError> {
+pub(crate) fn param_str(params: &[Value], index: usize) -> Result<&str, RpcError> {
     params
         .get(index)
         .and_then(Value::as_str)
@@ -476,6 +477,8 @@ impl Rpc {
             "eth_feeHistory" => self.fee_history(params)?,
             "txpool_status" => crate::txpool::status(self.node.mempool()),
             "txpool_content" => crate::txpool::content(self.node.mempool()),
+            "solo_getFinalityProof" => crate::bridge::finality_proof(&mut self.node, params)?,
+            "solo_getOutboxProof" => crate::bridge::outbox_proof(&mut self.node, params)?,
             other => {
                 return Err(RpcError::with_code(
                     -32601,

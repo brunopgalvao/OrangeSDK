@@ -56,6 +56,7 @@ fn check(raw: &[u8]) -> Result<Signed, u32> {
     crate::governance::admit(&s)?;
     crate::staking::admit(&s)?;
     crate::modules::admit(&s)?;
+    crate::outbox::admit(&s)?;
     Ok(s)
 }
 
@@ -337,6 +338,10 @@ pub fn query(args: &QueryArgs) -> QueryResult {
         },
         query::EVIDENCE => match u64::from_bytes(&args.params) {
             Ok(first) => found(Some(Seq(state::evidence_from(first)))),
+            Err(_) => bad_params(),
+        },
+        solo_abi::bridge::query::FINALITY_PROOF => match u64::from_bytes(&args.params) {
+            Ok(height) => found(crate::driver::finality_proof(height)),
             Err(_) => bad_params(),
         },
         _ => crate::staking::query(method, &args.params)

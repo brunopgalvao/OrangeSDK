@@ -126,7 +126,7 @@ A *designator* is the 34 bytes `0xEF 0x02 ‖ code_hash`. An account whose code 
 
 ### 5.2 Dispatch
 
-The reference kernel runs revm (Osaka) with its own precompile provider, which revm consults for every message call after the depth check, the call's journal checkpoint and the value transfer, and before running any bytecode. The provider serves the Ethereum precompiles first, by address. Otherwise, when the code being called (for a call to an EIP-7702 delegated account, the delegate's code) is a designator, the call is a *native call* and the provider produces its result; revm commits the checkpoint when the result is a success and reverts it otherwise, the value transfer included. In every other case the EVM runs the code.
+The reference kernel runs revm (Osaka) with its own precompile provider, which revm consults for every message call after the depth check, the call's journal checkpoint and the value transfer, and before running any bytecode. The provider serves the Ethereum precompiles first, by address, then the outbox of spec 17 §2.3, by code address. Otherwise, when the code being called (for a call to an EIP-7702 delegated account, the delegate's code) is a designator, the call is a *native call* and the provider produces its result; revm commits the checkpoint when the result is a success and reverts it otherwise, the value transfer included. In every other case the EVM runs the code.
 
 A native call runs the module only as the account that holds the designator: if the call is a `DELEGATECALL` or `CALLCODE`, or the target account's own code hash is not the designator's (a call to an EIP-7702 account delegating to a native contract), the call fails (§5.3) without running the module.
 

@@ -87,8 +87,9 @@ fn u128_of(v: U256) -> u128 {
 /// over old slots, which is also why leaving out EIP-7610 is safe.
 ///
 /// An account whose storage the precompile provider commits itself (a
-/// native contract, spec 16 §5) gets only its balance, nonce and code hash
-/// written here.
+/// native contract, spec 16 §5, or the outbox, spec 17 §2.3) gets only its
+/// balance, nonce and code hash written here, and is deleted when it has none
+/// of them.
 fn commit<P: Precompiles>(changes: impl IntoIterator<Item = (RAddress, RAccount)>, precompiles: &P) {
     for (address, account) in changes {
         if !account.is_touched() {
@@ -97,8 +98,14 @@ fn commit<P: Precompiles>(changes: impl IntoIterator<Item = (RAddress, RAccount)
         let a = address.0.0;
         if precompiles.commit_storage(&a, &account) {
             let info = &account.info;
-            let code_hash = if info.code_hash == KECCAK_EMPTY { [0; 32] } else { info.code_hash.0 };
-            state::set_account(&a, &Account { balance: u128_of(info.balance), nonce: info.nonce, code_hash });
+            if info.is_empty() {
+                // A provider-kept account with no code, nonce or balance (the
+                // empty outbox) is left out of state; its slots are its provider's.
+                state::delete(&state::account_key(&a));
+            } else {
+                let code_hash = if info.code_hash == KECCAK_EMPTY { [0; 32] } else { info.code_hash.0 };
+                state::set_account(&a, &Account { balance: u128_of(info.balance), nonce: info.nonce, code_hash });
+            }
             continue;
         }
         if account.is_selfdestructed() {
