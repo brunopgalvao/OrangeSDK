@@ -847,6 +847,7 @@ dependencies = [
  "k256",
  "p256",
  "sha2",
+ "solo-bls",
  "solo-recompile",
  "solo-vm",
  "tiny-keccak",
