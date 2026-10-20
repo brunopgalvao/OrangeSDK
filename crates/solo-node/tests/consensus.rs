@@ -10,7 +10,7 @@ use solo_abi::chain::consensus::{
 };
 use solo_abi::chain::{
     Allocation, Certificate, ConsensusMessage, Evidence, GenesisParams, Proposal, Signature,
-    SignedHash, SignedVote, SimplexState, SyncResponse,
+    SignedHash, SignedVote, SimplexState, SyncResponse, keys,
 };
 use solo_abi::codec::Seq;
 use solo_abi::types::{Genesis, Input};
@@ -1111,6 +1111,34 @@ fn equivocations_inside_certificates_are_detected() {
     assert_eq!(kinds, vec![(KIND_FINALIZE, 1), (KIND_FINALIZE, 7)]);
 }
 
+/// Block `height` of `node` carries no transactions, yet its header's root covers the
+/// evidence record `good` it kept (spec 06 §5): a proof against that header shows the
+/// record and the count, a proof against the header before it shows neither.
+fn assert_root_covers_evidence(node: &mut Node, height: u64, good: &Evidence) {
+    let header = node.block_by_number(height).unwrap().unwrap();
+    assert!(header.tx_hashes.0.is_empty());
+    let before = node.block_by_number(height - 1).unwrap().unwrap();
+    let proven = |node: &Node, at: u64, root: &[u8; 32], key: &[u8]| {
+        node.state_proof_at(at, key)
+            .unwrap()
+            .verify(keccak256, root, key)
+            .unwrap()
+    };
+    let first = [keys::EVIDENCE, &0u64.to_be_bytes()].concat();
+    let count = keys::EVIDENCE_COUNT;
+    assert_eq!(
+        proven(node, height, &header.state_root, &first),
+        Some(keccak256(&good.to_bytes()))
+    );
+    assert_eq!(
+        proven(node, height, &header.state_root, count),
+        Some(keccak256(&1u64.to_bytes()))
+    );
+    for key in [first.as_slice(), count] {
+        assert_eq!(proven(node, height - 1, &before.state_root, key), None);
+    }
+}
+
 #[test]
 fn the_chain_keeps_only_evidence_that_verifies() {
     let keys = keys(4);
@@ -1185,6 +1213,8 @@ fn the_chain_keeps_only_evidence_that_verifies() {
     for i in 0..3 {
         assert_eq!(sim.nodes[i].evidence(0).unwrap(), vec![good.clone()]);
     }
+    // The block carries no transactions, yet its root covers the evidence it recorded.
+    assert_root_covers_evidence(&mut sim.nodes[0], height, &good);
     // A proposal with more evidence than one block may carry gets no votes.
     assert!(sim.run_until(40 * SLOT_MS, in_led_view).unwrap());
     let state = simplex(&sim, 0);
