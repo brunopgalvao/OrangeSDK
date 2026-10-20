@@ -31,6 +31,12 @@ pub fn set_raw(key: &[u8], value: &[u8]) {
     unsafe { host::__solo_import_storage_set(key.as_ptr(), key.len() as u32, value.as_ptr(), value.len() as u32) };
 }
 
+/// Deletes a value.
+pub fn delete(key: &[u8]) {
+    // SAFETY: a valid pointer into our own buffer.
+    unsafe { host::__solo_import_storage_delete(key.as_ptr(), key.len() as u32) };
+}
+
 /// Reads a decoded value, trapping on a corrupt encoding.
 pub fn get<T: Decode>(key: &[u8]) -> Option<T> {
     get_raw(key).map(|b| T::from_bytes(&b).unwrap_or_else(|_| solo_guest::trap()))
@@ -130,7 +136,7 @@ pub fn init(genesis: &Genesis) {
     set(b"meta/params", &params);
     set_raw(b"meta/validators", &genesis.validators);
     for allocation in &params.allocations.0 {
-        set_account(&allocation.address, &Account { balance: allocation.balance, nonce: 0 });
+        set_account(&allocation.address, &Account { balance: allocation.balance, ..Account::default() });
     }
     set(keys::FINALIZED, &0u64);
 }

@@ -1,6 +1,6 @@
 [package]
 name = "kernel"
-description = "The reference kernel: a dev driver and a state transition executing Ethereum legacy transfers"
+description = "The reference kernel: the Simplex driver and an EVM state transition"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,3 +15,5 @@ bench = false
 solo-guest = { path = "../solo-guest" }
 solo-abi = { path = "../../crates/solo-abi", default-features = false }
 solo-rlp = { path = "../../crates/solo-rlp", default-features = false }
+solo-eth = { path = "../../crates/solo-eth", default-features = false }
+revm = { version = "43.0.3", default-features = false }

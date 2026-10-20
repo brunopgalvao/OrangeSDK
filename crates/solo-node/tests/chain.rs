@@ -292,7 +292,7 @@ fn rejections() {
         ),
         (
             alice.transfer(0, bob.address, ETHER, gp, 21_000, Some(CHAIN_ID), &[1]),
-            reason::UNSUPPORTED,
+            reason::GAS_TOO_LOW,
         ),
         (
             alice.transfer(
@@ -307,7 +307,16 @@ fn rejections() {
             reason::INSUFFICIENT_FUNDS,
         ),
         (vec![0xC0], reason::MALFORMED),
-        (b"garbage".to_vec(), reason::MALFORMED),
+        // A first byte below 0x80 names a typed envelope (EIP-2718); 'g' is no known type.
+        (b"garbage".to_vec(), reason::UNSUPPORTED),
+        (vec![0xF8], reason::MALFORMED),
+        // Blob transactions (type 3) are not executed by this kernel.
+        (vec![0x03, 0xC0], reason::UNSUPPORTED),
+        // Above the EIP-7825 per-transaction gas cap.
+        (
+            alice.transfer(0, bob.address, 1, 1, 1 << 25, Some(CHAIN_ID), &[]),
+            reason::GAS_LIMIT_TOO_HIGH,
+        ),
     ];
     for (raw, expected) in cases {
         assert_eq!(node.submit(&raw), Err(SubmitError::Rejected(expected)));
@@ -331,8 +340,8 @@ fn rejections() {
     encode_list(&fields, &mut list);
     assert_eq!(
         node.submit(&list),
-        Err(SubmitError::Rejected(reason::UNSUPPORTED)),
-        "zero-length recipient"
+        Err(SubmitError::Rejected(reason::BAD_SIGNATURE)),
+        "v of 5 is neither 27/28 nor EIP-155"
     );
     assert!(node.mempool().is_empty());
     assert_eq!(node.block_number().unwrap(), 0);

@@ -34,6 +34,8 @@ record! {
         balance: u128,
         /// Next nonce.
         nonce: u64,
+        /// `keccak256` of the contract code; zero for an account without code.
+        code_hash: Hash,
     }
 }
 
@@ -83,13 +85,13 @@ record! {
 record! {
     /// A transaction receipt.
     Receipt {
-        /// 1 for success, 0 for a transaction that was included but failed validation.
+        /// 1 if execution succeeded, 0 if it reverted, halted, or could not run.
         status: u8,
-        /// Gas used.
+        /// Gas used by this transaction.
         gas_used: u64,
         /// Sender.
         from: Address,
-        /// Recipient.
+        /// Recipient; zero for a contract creation.
         to: Address,
         /// Value transferred.
         value: u128,
@@ -97,7 +99,80 @@ record! {
         height: u64,
         /// Index within the block.
         index: u32,
+        /// Gas used by this and every earlier transaction in the block.
+        cumulative_gas_used: u64,
+        /// The created contract, for a successful creation.
+        contract: Option<Address>,
+        /// Logs emitted, in order.
+        logs: Seq<Log>,
+        /// Transaction type: 0 legacy, 1 access list, 2 dynamic fee.
+        tx_type: u8,
+        /// Price paid per gas.
+        effective_gas_price: u128,
     }
+}
+
+record! {
+    /// A log entry emitted by a contract.
+    Log {
+        /// Emitting contract.
+        address: Address,
+        /// Indexed topics.
+        topics: Seq<Hash>,
+        /// Data.
+        data: Vec<u8>,
+    }
+}
+
+record! {
+    /// `query::STORAGE` parameters.
+    StorageQuery {
+        /// Contract.
+        address: Address,
+        /// Slot, big-endian.
+        slot: Hash,
+    }
+}
+
+record! {
+    /// `query::CALL` parameters: a message executed against the latest state
+    /// and thrown away (`eth_call`, `eth_estimateGas`).
+    CallRequest {
+        /// Caller.
+        from: Address,
+        /// Callee; `None` runs `data` as initcode.
+        to: Option<Address>,
+        /// Value in wei.
+        value: u128,
+        /// Calldata or initcode.
+        data: Vec<u8>,
+        /// Gas limit.
+        gas: u64,
+    }
+}
+
+record! {
+    /// `query::CALL` result.
+    CallResult {
+        /// `call_status::*`.
+        status: u8,
+        /// Gas the message used.
+        gas_used: u64,
+        /// Return data, or revert data.
+        output: Vec<u8>,
+    }
+}
+
+/// `CallResult::status` values.
+pub mod call_status {
+    /// Execution succeeded.
+    pub const SUCCESS: u8 = 0;
+    /// Execution reverted; the output is the revert data.
+    pub const REVERT: u8 = 1;
+    /// Execution halted (out of gas, invalid opcode, ...).
+    pub const HALT: u8 = 2;
+    /// The message could not run (for example, the caller cannot pay the value).
+    pub const INVALID: u8 = 3;
 }
 
 record! {
@@ -132,6 +207,12 @@ pub mod query {
     pub const RECEIPT: &str = "receipt";
     /// `(Hash) -> bytes` raw transaction.
     pub const TRANSACTION: &str = "transaction";
+    /// `(Address) -> bytes` contract code.
+    pub const CODE: &str = "code";
+    /// `(StorageQuery) -> Hash` storage slot value.
+    pub const STORAGE: &str = "storage";
+    /// `(CallRequest) -> CallResult` a message against the latest state, discarded.
+    pub const CALL: &str = "call";
 }
 
 /// Validation failure reasons reported by the reference kernel.
@@ -148,8 +229,14 @@ pub mod reason {
     pub const INSUFFICIENT_FUNDS: u32 = 5;
     /// Gas limit below the intrinsic cost.
     pub const GAS_TOO_LOW: u32 = 6;
-    /// Contract creation or calldata, which the reference kernel does not execute.
+    /// A transaction type the kernel does not execute (blob, set-code).
     pub const UNSUPPORTED: u32 = 7;
+    /// The maximum fee per gas is below the base fee.
+    pub const FEE_TOO_LOW: u32 = 8;
+    /// The gas limit is above the per-transaction cap (EIP-7825) or the block's.
+    pub const GAS_LIMIT_TOO_HIGH: u32 = 9;
+    /// Contract initcode above the EIP-3860 limit.
+    pub const INITCODE_TOO_LARGE: u32 = 10;
 }
 
 /// Storage key prefixes of the reference kernel.
@@ -175,10 +262,17 @@ pub mod keys {
     pub const RECEIPT: &[u8] = b"receipt/";
     /// `txraw/` + tx hash → raw transaction bytes.
     pub const TX_RAW: &[u8] = b"txraw/";
+    /// `code/` + code hash → contract code.
+    pub const CODE: &[u8] = b"code/";
+    /// `slot/` + address + slot → 32-byte value; absent means zero.
+    pub const SLOT: &[u8] = b"slot/";
 }
 
 /// Intrinsic gas of a value transfer.
 pub const TRANSFER_GAS: u64 = 21_000;
+
+/// Gas limit of every block.
+pub const BLOCK_GAS_LIMIT: u64 = 30_000_000;
 
 record! {
     /// A consensus validator. `id` is `keccak256` of the uncompressed
@@ -480,10 +574,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn records_roundtrip() {
         roundtrip(&Account {
             balance: 5,
             nonce: 1,
+            code_hash: [9; 32],
         });
         roundtrip(&GenesisParams {
             slot_ms: 400,
@@ -510,7 +606,41 @@ mod tests {
             value: 3,
             height: 4,
             index: 5,
+            cumulative_gas_used: 42_000,
+            contract: Some([3; 20]),
+            logs: Seq(vec![Log {
+                address: [4; 20],
+                topics: Seq(vec![[5; 32]]),
+                data: vec![6],
+            }]),
+            tx_type: 2,
+            effective_gas_price: 7,
         });
+        roundtrip(&StorageQuery {
+            address: [1; 20],
+            slot: [2; 32],
+        });
+        roundtrip(&CallRequest {
+            from: [1; 20],
+            to: None,
+            value: 2,
+            data: vec![3],
+            gas: 4,
+        });
+        roundtrip(&CallResult {
+            status: call_status::REVERT,
+            gas_used: 5,
+            output: vec![6],
+        });
+        assert_eq!(
+            (
+                call_status::SUCCESS,
+                call_status::HALT,
+                call_status::INVALID,
+                BLOCK_GAS_LIMIT
+            ),
+            (0, 2, 3, 30_000_000)
+        );
         roundtrip(&DriverState {
             next_height: 1,
             last_hash: [0; 32],

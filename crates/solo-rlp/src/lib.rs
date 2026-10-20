@@ -189,6 +189,21 @@ fn encode_length(len: usize, offset: u8, out: &mut Vec<u8>) {
     }
 }
 
+/// Re-encodes a decoded item. Decoding enforces canonical form, so this
+/// reproduces the original bytes exactly.
+pub fn encode_item(item: &Item<'_>, out: &mut Vec<u8>) {
+    match item {
+        Item::Bytes(bytes) => encode_bytes(bytes, out),
+        Item::List(items) => {
+            let mut payload = Vec::new();
+            for i in items {
+                encode_item(i, &mut payload);
+            }
+            encode_list(&payload, out);
+        }
+    }
+}
+
 /// Appends the encoding of a byte string.
 pub fn encode_bytes(bytes: &[u8], out: &mut Vec<u8>) {
     if bytes.len() == 1 && bytes[0] < 0x80 {
@@ -313,6 +328,22 @@ mod tests {
         assert_eq!(decode(&[0xF8]), Err(Error::Truncated));
         assert!(alloc::format!("{:?}", Error::Shape).contains("Shape"));
         assert!(alloc::format!("{:?}", Item::Bytes(&[1])).contains("Bytes"));
+    }
+
+    #[test]
+    fn items_reencode_exactly() {
+        let mut inner = Vec::new();
+        encode_bytes(&[1, 2, 3], &mut inner);
+        encode_bytes(&[0x7F], &mut inner);
+        encode_bytes(&[0xAB; 60], &mut inner);
+        let mut nested = Vec::new();
+        encode_list(&inner, &mut nested);
+        let mut outer = Vec::new();
+        encode_list(&[nested.clone(), enc_b(&[])].concat(), &mut outer);
+        let item = decode(&outer).unwrap();
+        let mut again = Vec::new();
+        encode_item(&item, &mut again);
+        assert_eq!(again, outer);
     }
 
     proptest! {

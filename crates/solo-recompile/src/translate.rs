@@ -305,27 +305,48 @@ impl<'a> Ctx<'a> {
                 continue;
             };
             let pc_value = a.wrapping_add_signed(imm);
-            match next.rv {
-                Rv::Jalr { rs1, offset, .. } if rs1 == rd => {
-                    let target = pc_value.wrapping_add_signed(offset);
-                    if (text_start..text_end).contains(&target) {
-                        self.facts.call_pair.insert(a, target);
-                    }
+            if let Rv::Jalr { rs1, offset, .. } = next.rv
+                && rs1 == rd
+            {
+                let target = pc_value.wrapping_add_signed(offset);
+                if (text_start..text_end).contains(&target) {
+                    self.facts.call_pair.insert(a, target);
                 }
-                Rv::OpImm {
-                    op: solo_vm::isa::AluImmOp::Addi,
-                    rd: rd2,
-                    rs1,
-                    imm: lo,
-                } if rs1 == rd && rd2 == rd => {
-                    let target = pc_value.wrapping_add_signed(lo);
-                    if (text_start..text_end).contains(&target) {
-                        self.facts.hi.insert(a, (target, true));
-                    }
+                continue;
+            }
+            if let Some(lo) = self.sole_low_part(i, rd) {
+                let target = pc_value.wrapping_add_signed(lo);
+                if (text_start..text_end).contains(&target) {
+                    self.facts.hi.insert(a, (target, true));
                 }
-                _ => {}
             }
         }
+    }
+
+    /// The low offset of a relocation-less `auipc rd` at `i`, if every read of
+    /// `rd` before it is overwritten (within straight-line code) is an
+    /// `addi _, rd, lo` with the same `lo`. The `auipc` is then rewritten so
+    /// that each such `addi` yields the code slot of the target.
+    fn sole_low_part(&self, i: usize, rd: Reg) -> Option<i64> {
+        let mut lo_seen = None;
+        for d in self.insns.iter().skip(i + 1).take(LOCAL_PAIR_WINDOW) {
+            let (dest, sources, control) = registers(&d.rv);
+            if sources.contains(&Some(rd)) {
+                match d.rv {
+                    Rv::OpImm {
+                        op: solo_vm::isa::AluImmOp::Addi,
+                        rs1,
+                        imm,
+                        ..
+                    } if rs1 == rd && lo_seen.is_none_or(|l| l == imm) => lo_seen = Some(imm),
+                    _ => return None,
+                }
+            }
+            if control || dest == Some(rd) {
+                break;
+            }
+        }
+        lo_seen
     }
 
     fn require_instruction(&self, address: u64) -> Result<(), RecompileError> {
@@ -712,6 +733,73 @@ const fn store_width(w: AmoWidth) -> StoreWidth {
     }
 }
 
+/// How far past a relocation-less `auipc` to look for its uses.
+const LOCAL_PAIR_WINDOW: usize = 16;
+
+/// The register an instruction writes, the registers it reads, and whether
+/// it transfers control (ending the straight-line run).
+fn registers(rv: &Rv) -> (Option<Reg>, [Option<Reg>; 2], bool) {
+    match *rv {
+        Rv::Lui { rd, .. } | Rv::Auipc { rd, .. } => (Some(rd), [None, None], false),
+        Rv::Jal { rd, .. } => (Some(rd), [None, None], true),
+        Rv::Jalr { rd, rs1, .. } => (Some(rd), [Some(rs1), None], true),
+        Rv::Branch { rs1, rs2, .. } => (None, [Some(rs1), Some(rs2)], true),
+        Rv::Load { rd, rs1, .. } | Rv::OpImm { rd, rs1, .. } | Rv::Lr { rd, rs1, .. } => {
+            (Some(rd), [Some(rs1), None], false)
+        }
+        Rv::Store { rs1, rs2, .. } => (None, [Some(rs1), Some(rs2)], false),
+        Rv::Op { rd, rs1, rs2, .. }
+        | Rv::Sc { rd, rs1, rs2, .. }
+        | Rv::Amo { rd, rs1, rs2, .. } => (Some(rd), [Some(rs1), Some(rs2)], false),
+        Rv::Fence => (None, [None, None], false),
+        Rv::Ecall | Rv::Ebreak | Rv::Unimp => (None, [None, None], true),
+    }
+}
+
+/// `amo<op> rd, rs2, (rd)`: the address register is about to be overwritten
+/// with the old value, so compute the new value in the scratch register and
+/// recover the old one by inverting the operation. Only invertible operations
+/// qualify.
+fn lower_amo_into_address(
+    alu: AluOp,
+    width: AmoWidth,
+    rd: Reg,
+    rs1: Reg,
+    rs2: Reg,
+    load: Instruction,
+) -> Option<Vec<Instruction>> {
+    let inverse = match alu {
+        AluOp::Add => AluOp::Sub,
+        AluOp::Addw => AluOp::Subw,
+        AluOp::Xor => AluOp::Xor,
+        _ => return None,
+    };
+    if rd == rs2 {
+        return None;
+    }
+    Some(vec![
+        load,
+        Instruction::Alu {
+            op: alu,
+            rd: SCRATCH,
+            rs1: SCRATCH,
+            rs2,
+        },
+        Instruction::Store {
+            width: store_width(width),
+            rs1,
+            rs2: SCRATCH,
+            off: 0,
+        },
+        Instruction::Alu {
+            op: inverse,
+            rd,
+            rs1: SCRATCH,
+            rs2,
+        },
+    ])
+}
+
 fn lower_amo(op: AmoOp, width: AmoWidth, rd: Reg, rs1: Reg, rs2: Reg) -> Option<Vec<Instruction>> {
     let load = Instruction::Load {
         width: load_width(width),
@@ -761,9 +849,10 @@ fn lower_amo(op: AmoOp, width: AmoWidth, rd: Reg, rs1: Reg, rs2: Reg) -> Option<
             },
         ]);
     }
-    if rd == rs1 || rd == rs2 {
-        return None;
+    if rd == rs1 {
+        return lower_amo_into_address(alu, width, rd, rs1, rs2, load);
     }
+    // `rd == rs2` is fine: the operation reads `rs2` before writing `rd`.
     Some(vec![
         load,
         Instruction::Alu {
@@ -1296,6 +1385,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn atomics_lowering() {
         let d = 3;
         let w = 2;
@@ -1376,10 +1466,57 @@ mod tests {
             },
         ];
         assert_eq!(b, &expected);
+        // The destination aliasing the value or the address register.
+        let aliased = [
+            amo(0x00, d, 12, 11, 12), // amoadd.d a2, a2, (a1)
+            amo(0x00, d, 11, 11, 12), // amoadd.d a1, a2, (a1)
+            amo(0x00, w, 11, 11, 12), // amoadd.w a1, a2, (a1)
+            amo(0x04, d, 11, 11, 12), // amoxor.d a1, a2, (a1)
+            RET,
+        ];
+        let m = module_of(&input(&aliased, vec![], vec![]));
+        let b = &m.blocks[0];
+        let sw_tp = Instruction::Store {
+            width: StoreWidth::W,
+            rs1: a1,
+            rs2: tp,
+            off: 0,
+        };
+        assert_eq!(
+            b[..4],
+            [ld(tp), op(AluOp::Add, a2, tp, a2), sd(a2), mv(a2, tp)]
+        );
+        assert_eq!(
+            b[4..8],
+            [
+                ld(tp),
+                op(AluOp::Add, tp, tp, a2),
+                sd(tp),
+                op(AluOp::Sub, a1, tp, a2)
+            ]
+        );
+        assert_eq!(
+            b[8..12],
+            [
+                lw(tp),
+                op(AluOp::Addw, tp, tp, a2),
+                sw_tp,
+                op(AluOp::Subw, a1, tp, a2)
+            ]
+        );
+        assert_eq!(
+            b[12..16],
+            [
+                ld(tp),
+                op(AluOp::Xor, tp, tp, a2),
+                sd(tp),
+                op(AluOp::Xor, a1, tp, a2)
+            ]
+        );
         for bad in [
-            amo(0x10, d, 10, 11, 12),
-            amo(0x00, d, 11, 11, 12),
-            amo(0x00, d, 12, 11, 12),
+            amo(0x10, d, 10, 11, 12), // amomin
+            amo(0x0C, d, 11, 11, 12), // amoand into the address register
+            amo(0x00, d, 11, 11, 11), // everything aliased
         ] {
             let inp = input(&[bad, RET], vec![], vec![]);
             assert_eq!(
