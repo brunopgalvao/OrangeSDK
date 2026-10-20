@@ -1,0 +1,20 @@
+[package]
+name = "solo-recompile"
+description = "Turns standard RV64 ELF binaries into Solo modules (spec 03 §8)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "solo-recompile"
+path = "src/main.rs"
+
+[dependencies]
+solo-vm = { path = "../solo-vm" }
+object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
+
+[dev-dependencies]
+
+[lints]
+workspace = true
