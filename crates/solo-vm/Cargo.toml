@@ -1,0 +1,19 @@
+[package]
+name = "solo-vm"
+description = "Reference implementation of the Solo VM: a metered, sandboxed RISC-V derived virtual machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
