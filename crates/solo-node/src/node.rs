@@ -13,7 +13,7 @@ use solo_abi::types::{
 };
 use solo_abi::{Decode, Encode};
 use solo_host::hash::keccak256;
-use solo_host::{CallResult, Executor, Flags, LoadError, MemStorage, ModuleCache};
+use solo_host::{CallResult, Executor, Flags, LoadError, MemStorage, ModuleCache, Overlay};
 use solo_vm::host::Capability;
 use solo_vm::status::Termination;
 
@@ -619,6 +619,25 @@ impl Node {
     /// See [`NodeError`].
     pub fn driver_state(&mut self) -> Result<Vec<u8>, NodeError> {
         self.call_raw(exports::DRIVER_STATE, &[]).map(|r| r.output)
+    }
+
+    /// The chain state as the kernel left it after its last call.
+    #[must_use]
+    pub fn state(&self) -> &Overlay<MemStorage> {
+        self.exec.state()
+    }
+
+    /// The state commitment (spec 10) of the current chain state: what
+    /// `storage_commit` would return to a kernel call starting now.
+    #[must_use]
+    pub fn state_root(&self) -> [u8; 32] {
+        self.exec.state().commitment()
+    }
+
+    /// The proof for `key` against [`Node::state_root`] (spec 10 §5).
+    #[must_use]
+    pub fn state_proof(&self, key: &[u8]) -> solo_trie::Proof {
+        self.exec.state().state_trie().prove(key)
     }
 
     /// Log lines emitted by the kernel.

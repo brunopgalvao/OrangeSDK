@@ -1,0 +1,340 @@
+//! The state commitment through a node running the reference kernel (spec
+//! 10): the root the node keeps incrementally is the trie of its state, its
+//! proofs verify against that root and the block headers, and nodes that
+//! executed the same blocks in different batches commit to the same roots.
+
+use k256::ecdsa::SigningKey;
+use solo_abi::Encode;
+use solo_abi::chain::{Allocation, BlockHeader, GenesisParams, keys};
+use solo_abi::codec::Seq;
+use solo_abi::types::{Block, Effect, Genesis};
+use solo_host::hash::keccak256;
+use solo_host::storage::committed;
+use solo_node::{Node, NodeConfig, Sim};
+use solo_rlp::{encode_bytes, encode_list, encode_uint};
+use solo_trie::Trie;
+
+const KERNEL: &[u8] = include_bytes!("fixtures/kernel.elf");
+const CHAIN_ID: u64 = 1337;
+const SLOT_MS: u64 = 400;
+const ETHER: u128 = 1_000_000_000_000_000_000;
+
+fn kernel_module() -> Vec<u8> {
+    solo_recompile::recompile(
+        &solo_recompile::Input::load(KERNEL).unwrap(),
+        &solo_recompile::Options::default(),
+    )
+    .unwrap()
+}
+
+fn address(key: &SigningKey) -> [u8; 20] {
+    let point = key.verifying_key().to_encoded_point(false);
+    let digest = keccak256(&point.as_bytes()[1..]);
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&digest[12..]);
+    address
+}
+
+fn genesis(validators: &[SigningKey], funded: [u8; 20]) -> Genesis {
+    let params = GenesisParams {
+        slot_ms: SLOT_MS,
+        max_txs: 8,
+        allocations: Seq(vec![Allocation {
+            address: funded,
+            balance: 100 * ETHER,
+        }]),
+    };
+    Genesis {
+        chain_id: CHAIN_ID,
+        fee_schedule: vec![],
+        modules: Seq(vec![]),
+        params: params.to_bytes(),
+        validators: Sim::validator_set(validators).to_bytes(),
+    }
+}
+
+/// An EIP-155 legacy transfer.
+fn transfer(key: &SigningKey, nonce: u64, to: [u8; 20], value: u128) -> Vec<u8> {
+    let fields = |out: &mut Vec<u8>| {
+        encode_uint(u128::from(nonce), out);
+        encode_uint(1_000_000_000, out);
+        encode_uint(21_000, out);
+        encode_bytes(&to, out);
+        encode_uint(value, out);
+        encode_bytes(&[], out);
+    };
+    let mut unsigned = Vec::new();
+    fields(&mut unsigned);
+    encode_uint(u128::from(CHAIN_ID), &mut unsigned);
+    encode_uint(0, &mut unsigned);
+    encode_uint(0, &mut unsigned);
+    let mut list = Vec::new();
+    encode_list(&unsigned, &mut list);
+    let (sig, rid) = key.sign_prehash_recoverable(&keccak256(&list)).unwrap();
+    let mut signed = Vec::new();
+    fields(&mut signed);
+    encode_uint(
+        u128::from(CHAIN_ID * 2 + 35 + u64::from(rid.to_byte())),
+        &mut signed,
+    );
+    let strip = |b: &[u8]| -> Vec<u8> {
+        let skip = b.iter().take_while(|x| **x == 0).count();
+        b[skip..].to_vec()
+    };
+    encode_bytes(&strip(&sig.r().to_bytes()), &mut signed);
+    encode_bytes(&strip(&sig.s().to_bytes()), &mut signed);
+    let mut out = Vec::new();
+    encode_list(&signed, &mut out);
+    out
+}
+
+/// The root by definition: a fresh trie over the node's committed entries.
+fn rebuilt(node: &Node) -> [u8; 32] {
+    let mut trie = Trie::new();
+    for (key, value) in node.state().scan(&[]) {
+        if committed(&key) {
+            trie.insert(&key, &value);
+        }
+    }
+    trie.root()
+}
+
+fn account_key(address: &[u8; 20]) -> Vec<u8> {
+    let mut key = keys::ACCOUNT.to_vec();
+    key.extend_from_slice(address);
+    key
+}
+
+/// A single validator that has made `blocks` blocks, with a transfer from
+/// `alice` in every third one.
+fn chain(alice: &SigningKey, blocks: u64) -> (Node, [u8; 20]) {
+    let validator = SigningKey::from_slice(&[0x42; 32]).unwrap();
+    let bob = address(&SigningKey::from_slice(&[2; 32]).unwrap());
+    let config = NodeConfig {
+        now_ms: 1_000,
+        key: Some(validator.clone()),
+        ..NodeConfig::default()
+    };
+    let mut node = Node::open(
+        &kernel_module(),
+        &genesis(&[validator], address(alice)),
+        config,
+    )
+    .unwrap();
+    node.start(None).unwrap();
+    for height in 1..=blocks {
+        if height % 3 == 1 {
+            node.submit(&transfer(alice, height / 3, bob, ETHER))
+                .unwrap();
+        }
+        node.tick(1_000 + height * SLOT_MS).unwrap();
+        assert_eq!(node.block_number().unwrap(), height);
+    }
+    (node, bob)
+}
+
+#[test]
+fn the_kept_root_is_the_trie_of_the_state_and_proves_it() {
+    let alice = SigningKey::from_slice(&[1; 32]).unwrap();
+    let (node, bob) = chain(&alice, 4);
+    let root = node.state_root();
+    assert_eq!(root, rebuilt(&node));
+    // Bob's account is in the state, with the value the store holds.
+    let key = account_key(&bob);
+    let value = node.state().get(&key).unwrap();
+    let proof = node.state_proof(&key);
+    assert_eq!(
+        proof.verify(keccak256, &root, &key),
+        Ok(Some(keccak256(&value)))
+    );
+    // A never-funded account, and the node-local finalized height, are not.
+    let nobody = account_key(&[0x99; 20]);
+    assert_eq!(
+        node.state_proof(&nobody).verify(keccak256, &root, &nobody),
+        Ok(None)
+    );
+    assert!(node.state().get(keys::FINALIZED).is_some());
+    assert_eq!(solo_host::storage::LOCAL_PREFIX, keys::LOCAL);
+    assert_eq!(
+        node.state_proof(keys::FINALIZED)
+            .verify(keccak256, &root, keys::FINALIZED),
+        Ok(None)
+    );
+}
+
+#[test]
+fn headers_carry_the_commitment_of_the_state_they_were_built_on() {
+    // The root in block h's header is storage_commit's answer during block h:
+    // the state after block h-1 plus block h's own writes before the header.
+    // Replaying block h on a node holding the state after h-1 reproduces it.
+    let alice = SigningKey::from_slice(&[1; 32]).unwrap();
+    let (mut live, _) = chain(&alice, 3);
+    let validator = SigningKey::from_slice(&[0x42; 32]).unwrap();
+    let mut replay = Node::open(
+        &kernel_module(),
+        &genesis(&[validator], address(&alice)),
+        NodeConfig::default(),
+    )
+    .unwrap();
+    for height in 1..=3 {
+        let header = live.block_by_number(height).unwrap().unwrap();
+        replay
+            .apply_effect(Effect::ExecuteBlock {
+                block: block_of(&mut live, height),
+            })
+            .unwrap();
+        let mine = replay.block_by_number(height).unwrap().unwrap();
+        assert_eq!(mine.state_root, header.state_root, "height {height}");
+        assert_ne!(mine.state_root, solo_trie::EMPTY);
+    }
+}
+
+/// Block `height` of `node` as an `ExecuteBlock` effect carries it.
+fn block_of(node: &mut Node, height: u64) -> Block {
+    let header = node.block_by_number(height).unwrap().unwrap();
+    let txs = header
+        .tx_hashes
+        .0
+        .iter()
+        .map(|hash| node.transaction(hash).unwrap().unwrap())
+        .collect();
+    let template = BlockHeader {
+        height,
+        parent_hash: header.parent_hash,
+        timestamp_ms: header.timestamp_ms,
+        ..BlockHeader::default()
+    };
+    Block {
+        header: template.to_bytes(),
+        txs: Seq(txs),
+        participation: Vec::new(),
+    }
+}
+
+#[test]
+fn different_batching_gives_identical_roots() {
+    // A validator that finalized every block as it made it, an observer that
+    // executes all blocks first and finalizes them at the end, and one that
+    // finalizes each block before executing the next: the finalized height
+    // they keep differs throughout, the roots never do.
+    const BLOCKS: u64 = 9;
+    let alice = SigningKey::from_slice(&[1; 32]).unwrap();
+    let (mut live, _) = chain(&alice, BLOCKS);
+    let blocks: Vec<Block> = (1..=BLOCKS).map(|h| block_of(&mut live, h)).collect();
+    let validator = SigningKey::from_slice(&[0x42; 32]).unwrap();
+    let observer = || {
+        Node::open(
+            &kernel_module(),
+            &genesis(std::slice::from_ref(&validator), address(&alice)),
+            NodeConfig::default(),
+        )
+        .unwrap()
+    };
+    let finalize = |height| Effect::FinalizeBlock {
+        height,
+        certificate: Vec::new(),
+    };
+    let mut batched = observer();
+    for block in &blocks {
+        batched
+            .apply_effect(Effect::ExecuteBlock {
+                block: block.clone(),
+            })
+            .unwrap();
+    }
+    assert_eq!(batched.finalized_height().unwrap(), 0);
+    let mut stepped = observer();
+    for (block, height) in blocks.iter().zip(1..) {
+        stepped
+            .apply_effect(Effect::ExecuteBlock {
+                block: block.clone(),
+            })
+            .unwrap();
+        stepped.apply_effect(finalize(height)).unwrap();
+    }
+    // Same blocks, so the same block hashes, which cover the header roots.
+    assert_eq!(batched.executed, live.executed);
+    assert_eq!(stepped.executed, live.executed);
+    for height in 1..=BLOCKS {
+        let root = live.block_by_number(height).unwrap().unwrap().state_root;
+        assert_eq!(
+            batched.block_by_number(height).unwrap().unwrap().state_root,
+            root
+        );
+        assert_eq!(
+            stepped.block_by_number(height).unwrap().unwrap().state_root,
+            root
+        );
+    }
+    // And the same current state, finalized or not.
+    assert_eq!(batched.state_root(), live.state_root());
+    for height in 1..=BLOCKS {
+        batched.apply_effect(finalize(height)).unwrap();
+    }
+    assert_eq!(batched.finalized_height().unwrap(), BLOCKS);
+    assert_eq!(batched.state_root(), live.state_root());
+    assert_eq!(stepped.state_root(), live.state_root());
+    assert_eq!(live.state_root(), rebuilt(&live));
+    assert_eq!(batched.state_root(), rebuilt(&batched));
+}
+
+#[test]
+fn a_synced_observer_and_the_live_validators_commit_to_the_same_state() {
+    // Four validators make blocks while an observer is offline, then it syncs
+    // them in batches of up to 16 and follows live. Every header root and the
+    // current root agree across all five once they stand at the same height.
+    let validators: Vec<SigningKey> = (1..=4u8)
+        .map(|i| SigningKey::from_slice(&[0x10 + i; 32]).unwrap())
+        .collect();
+    let funded = SigningKey::from_slice(&[1u8; 32]).unwrap();
+    let kernel = kernel_module();
+    let genesis = genesis(&validators, address(&funded));
+    let config = NodeConfig {
+        now_ms: 1_000,
+        ..NodeConfig::default()
+    };
+    let mut sim = Sim::new(&kernel, &genesis, &validators, 1, &config, 10).unwrap();
+    sim.crash(4);
+    let to = address(&validators[3]);
+    sim.submit(0, &transfer(&funded, 0, to, ETHER)).unwrap();
+    assert!(
+        sim.run_until(60 * SLOT_MS, |s| s.nodes[0].finalized.len() >= 20)
+            .unwrap(),
+        "{:?}",
+        sim.finalized_heights().unwrap()
+    );
+    sim.submit(1, &transfer(&funded, 1, to, ETHER)).unwrap();
+    sim.revive(4, &kernel, &genesis).unwrap();
+    let target = sim.nodes[0].executed.len() + 2;
+    let level = sim
+        .run_until(40 * SLOT_MS, |s| {
+            let heights: Vec<usize> = s.nodes.iter().map(|n| n.executed.len()).collect();
+            heights[0] >= target && heights.iter().all(|h| *h == heights[0])
+        })
+        .unwrap();
+    assert!(
+        level,
+        "{:?}",
+        sim.nodes
+            .iter()
+            .map(|n| n.executed.len())
+            .collect::<Vec<_>>()
+    );
+    let height = sim.nodes[0].executed.len() as u64;
+    for h in 1..=height {
+        let root = sim.nodes[0].block_by_number(h).unwrap().unwrap().state_root;
+        for node in &mut sim.nodes[1..] {
+            assert_eq!(
+                node.block_by_number(h).unwrap().unwrap().state_root,
+                root,
+                "height {h}"
+            );
+        }
+    }
+    let root = sim.nodes[0].state_root();
+    for node in &sim.nodes {
+        assert_eq!(node.state_root(), root);
+    }
+    assert_eq!(root, rebuilt(&sim.nodes[4]));
+    assert_eq!(sim.nodes[4].account(&to).unwrap().balance, 2 * ETHER);
+}

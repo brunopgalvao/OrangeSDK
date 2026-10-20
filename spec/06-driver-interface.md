@@ -100,7 +100,7 @@ struct Genesis     { chain_id: u64, fee_schedule: bytes, modules: vec<ModuleInst
 struct ModuleInstall { address: [20], code_hash: [32], capabilities: u64, init: bytes }
 ```
 
-`header`, `txs`, `receipts`, `participation`, `fee_params`, and `validators` are opaque to this document; the kernel defines them (for a Type 2 kernel, `txs` are RLP-encoded Ethereum transactions and `receipts` Ethereum receipts). `kernel_stf_validate_tx` implements the reserve-balance admission rule against the state as of `height − exec_lag_k`; `kernel_stf_execute_block` executes against the state produced by the previous executed block and returns the root the driver places in the header of block `height + exec_lag_k`.
+`header`, `txs`, `receipts`, `participation`, `fee_params`, and `validators` are opaque to this document; the kernel defines them (for a Type 2 kernel, `txs` are RLP-encoded Ethereum transactions and `receipts` Ethereum receipts). `kernel_stf_validate_tx` implements the reserve-balance admission rule against the state as of `height − exec_lag_k`; `kernel_stf_execute_block` executes against the state produced by the previous executed block and returns the root the driver places in the header of block `height + exec_lag_k`; for the reference kernel that is the state commitment of 10, as `storage_commit` reports it during the block.
 
 ## 6. Faults and resource limits
 
