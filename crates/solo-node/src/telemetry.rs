@@ -74,13 +74,26 @@ impl Node {
         &mut self.telemetry
     }
 
+    /// The chain id for telemetry: asked of the kernel until it first
+    /// answers, then kept (spec 11 section 2), so that a scrape does not run
+    /// a kernel call once the id is known.
+    fn telemetry_chain_id(&mut self) -> Result<u64, NodeError> {
+        if let Some(id) = self.telemetry.chain_id() {
+            return Ok(id);
+        }
+        let id = self.chain_id()?;
+        self.telemetry.set_chain_id(id);
+        Ok(id)
+    }
+
     /// Refreshes the gauges read at scrape time (chain id, mempool, timers,
     /// head age) and renders every family: the body of `GET /metrics`.
     pub fn metrics_text(&mut self) -> String {
-        let chain_id = self.chain_id().ok();
+        // Without a chain id the family stays empty; the rest still renders.
+        self.telemetry_chain_id().ok();
         let bytes = self.mempool().iter().map(|p| p.raw.len()).sum();
         let (count, timers) = (self.mempool().len(), self.timers().len());
-        self.telemetry.refresh(chain_id, count, bytes, timers);
+        self.telemetry.refresh(count, bytes, timers);
         self.telemetry.render()
     }
 
@@ -89,7 +102,7 @@ impl Node {
     /// # Errors
     /// If the kernel cannot answer the chain id query.
     pub fn status(&mut self) -> Result<Status, NodeError> {
-        let chain_id = self.chain_id()?;
+        let chain_id = self.telemetry_chain_id()?;
         let peers = self.telemetry.peers();
         Ok(Status {
             version: VERSION.to_owned(),

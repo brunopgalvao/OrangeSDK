@@ -16,14 +16,14 @@ Telemetry is served by the node's JSON-RPC HTTP server, on the same address (`--
 | `GET /status` | `200`, `Content-Type: application/json`, the document of §6; `503` with a plain-text reason when the kernel cannot answer the chain id query |
 | `GET /health` | `200`, `ok`: the server is accepting connections |
 
-One address keeps the deployment to one port to open and one process to scrape. An operator who must not expose JSON-RPC to the monitoring network fronts the address with a proxy that forwards only these paths. Answering a request reads node state on the node's own thread; it never blocks consensus for longer than rendering takes.
+One address keeps the deployment to one port to open and one process to scrape. An operator who must not expose JSON-RPC to the monitoring network fronts the address with a proxy that forwards only these paths. Answering a request reads node state on the node's own thread; it never blocks consensus for longer than rendering takes. The one kernel call telemetry makes is the chain id query (`kernel_query`): the node asks it on a `/metrics` or `/status` request until the kernel first answers, then keeps the id for its life and asks no more. Each such call is a kernel call like any other and is counted in the `solo_kernel_*` families of §4, faults included.
 
 ## 3. Exposition format
 
 `/metrics` is the Prometheus text exposition format, version 0.0.4:
 
 - Families appear in bytewise order of name. Each starts with `# HELP <name> <text>` and `# TYPE <name> <counter|gauge|histogram>`, followed by its samples, one per line: the sample name, the label set in braces if not empty, a space, the value, a line feed. No timestamps are written.
-- A family is listed, with its `HELP` and `TYPE` lines, from the moment the node opens, even before it has samples. A labelled series appears once it is first recorded and stays until the node exits.
+- A family is listed, with its `HELP` and `TYPE` lines, from the moment the node opens, even before it has samples. A labelled series appears once it is first recorded and stays until the node exits, except that the series of `solo_kernel_faults_total` for every `entrypoint` of 06 §3 and every `status` of §4, and of `solo_emitted_dropped_total` for every `reason` of §5, exist at `0` from the moment the node opens.
 - Label values are written between double quotes with `\` as `\\`, `"` as `\"` and line feed as `\n`; `HELP` text escapes `\` and line feed the same way. Label names are written in the order §4 lists them.
 - Values are written as the shortest decimal that reads back as the same IEEE 754 double, or `NaN`, `+Inf`, `-Inf`.
 - A counter's family name ends in `_total`. A histogram family `h` writes, per series, one `h_bucket` sample per bucket bound with the label `le` (the bound, last label) counting the observations less than or equal to it, a final `h_bucket{le="+Inf"}` equal to the count, then `h_sum` and `h_count`.
@@ -39,7 +39,7 @@ Names follow EIP-2159 where it defines a metric (`ethereum_*`); every other name
 | `ethereum_peer_count` | gauge | — | Peers that completed the handshake (09 §3) (EIP-2159). Absent on a node without a peer-to-peer transport. |
 | `solo_chain_finalized_height` | gauge | — | The last height this node finalized. |
 | `solo_chain_head_age_seconds` | gauge | — | Seconds since the head last advanced, or since the node opened if it has executed no block. Computed at scrape time. |
-| `solo_chain_id` | gauge | — | The chain id the kernel reports, refreshed at scrape time. Absent until the kernel has answered once. |
+| `solo_chain_id` | gauge | — | The chain id the kernel reports (§2). Absent until the kernel has answered once, then kept. |
 | `solo_blocks_executed_total` | counter | — | Blocks this node executed (`ExecuteBlock` applied). |
 | `solo_blocks_finalized_total` | counter | — | Blocks this node finalized (`FinalizeBlock` applied). |
 | `solo_block_transactions_total` | counter | — | Transactions in executed blocks, from each `ExecuteSummary.tx_count`. |
@@ -79,14 +79,14 @@ The driver emits metrics with the `Metric { name, value }` effect (06 §4.2); an
 | 0 | counter step: `value` (≥ 0) is added to the counter `name` | `solo_emitted_counter_total` |
 | 1 | gauge: the gauge `name` is set to `value` | `solo_emitted_gauge` |
 
-The `Metric` effect is a counter step (kind 0). The `origin` label says who emitted: `driver` for the effect, `kernel` for `metric_emit` from a `Privileged` instance, `sandboxed` for `metric_emit` from a `Sandboxed` instance (a kernel module or contract run through `invoke`). The same `name` from two origins is two series, so a contract cannot move a kernel metric.
+The `Metric` effect is a counter step (kind 0). The `origin` label says who emitted: `driver` for the effect, `kernel` for `metric_emit` from a `Privileged` instance, `sandboxed` for `metric_emit` from a `Sandboxed` instance (a kernel module or contract run through `invoke`). The same `name` from two origins is two series, so a contract cannot move a kernel metric, and the series limit below is kept per origin, so a contract cannot keep a kernel or driver metric from being recorded.
 
 A name is 1 to 64 bytes of ASCII letters, digits, `_`, `.`, `:` and `-`, exported verbatim as the `name` label. The node drops an emitted metric, and counts it in `solo_emitted_dropped_total` with `reason`:
 
 - `name`: the name breaks the rule above;
 - `kind`: `kind` is neither 0 nor 1;
 - `negative`: a counter step is negative;
-- `cardinality`: the name is new and the family already holds 256 series.
+- `cardinality`: the name is new and the family already holds 256 series of the same origin.
 
 Dropping is the "MAY drop" of 05 §4.7; it never changes what the instance observes. Emitted metrics are recorded after the call that emitted them ends, whatever its status, since they are not state.
 
@@ -111,7 +111,7 @@ Fields are only ever added; a client ignores fields it does not know.
 
 ## 7. Alerts and the health verdict
 
-The framework ships alert rules for Prometheus (`ops/alerts.yml`), a scrape configuration (`ops/prometheus.yml`) and a Grafana dashboard (`ops/grafana-solo.json`) over the metrics of §4. A test keeps them honest: every metric name in an alert expression or a dashboard query must be one a node exports, and every threshold below must equal the default the health verdict uses.
+The framework ships alert rules for Prometheus (`ops/alerts.yml`), a scrape configuration (`ops/prometheus.yml`) and a Grafana dashboard (`ops/grafana-solo.json`) over the metrics of §4. A test keeps them honest: every metric name in an alert expression or a dashboard query must be one a node exports; every threshold in the rule file, in the table below and in the list of health checks must equal the default the health verdict uses; and every series an alert reads with `increase` must exist at `0` when the node opens (§3), since `increase` sees no step in a series whose first sample is already `1`, and the first fault would otherwise go unalerted.
 
 | Alert | Condition | For | Severity |
 |---|---|---|---|
@@ -138,4 +138,4 @@ The doctor prints a summary line and `healthy` and exits with status 0, or print
 
 ## 8. Cost
 
-Recording is a constant number of map updates per kernel call, block and transport poll; rendering happens only when `/metrics` is requested. The budget of decision 0014, under 2% of node CPU, holds with a scrape interval of one second or more.
+Recording is a constant number of map updates per kernel call, block and transport poll; rendering happens only when `/metrics` is requested, and a request runs no kernel call once the chain id is known (§2). The budget of decision 0014, under 2% of node CPU, holds with a scrape interval of one second or more.

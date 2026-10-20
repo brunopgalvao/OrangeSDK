@@ -17,8 +17,37 @@ pub const LATENCY_BUCKETS: &[f64] = &[
 /// Longest name a kernel or module may give an emitted metric, in bytes.
 pub const MAX_EMITTED_NAME: usize = 64;
 
-/// Most series each emitted family holds; later names are dropped.
+/// Most series each emitted family holds per origin; later names from that
+/// origin are dropped.
 pub const MAX_EMITTED_SERIES: usize = 256;
+
+/// The kernel entrypoints of spec 06 section 3, in its order: the
+/// `entrypoint` values whose fault series exist from the moment the node opens.
+pub const ENTRYPOINTS: [&str; 9] = [
+    "kernel_init",
+    "kernel_driver_step",
+    "kernel_driver_state",
+    "kernel_migrate",
+    "kernel_stf_validate_tx",
+    "kernel_stf_build_block",
+    "kernel_stf_execute_block",
+    "kernel_stf_finalize_block",
+    "kernel_query",
+];
+
+/// `status` label values of `solo_kernel_faults_total`: every termination
+/// but halt (spec 01 section 6).
+pub const FAULT_STATUSES: [&str; 6] = [
+    "out_of_gas",
+    "trap",
+    "memory_fault",
+    "invalid_jump",
+    "host_error",
+    "step_limit",
+];
+
+/// `reason` label values of `solo_emitted_dropped_total` (spec 11 section 5).
+pub const DROP_REASONS: [&str; 4] = ["name", "kind", "negative", "cardinality"];
 
 /// `level` label values of `solo_kernel_logs_total`, indexed by the
 /// `log_emit` level; any other level is `other`.
@@ -247,7 +276,7 @@ pub fn exported_names() -> Vec<String> {
 }
 
 /// Who emitted a metric (the `origin` label).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Origin {
     /// The consensus driver, through `Effect::Metric`.
     Driver,
@@ -345,6 +374,10 @@ pub struct NodeMetrics {
     head: u64,
     finalized: u64,
     logs_seen: usize,
+    chain_id: Option<u64>,
+    /// Series of each emitted family (by name) per origin, for the
+    /// per-origin cardinality limit.
+    emitted_series: BTreeMap<(&'static str, Origin), usize>,
 }
 
 impl Default for NodeMetrics {
@@ -372,7 +405,8 @@ pub fn emitted_name(name: &[u8]) -> Option<&str> {
 
 impl NodeMetrics {
     /// Metrics for a node opening now: every family registered, the chain
-    /// gauges at zero, `solo_build_info` and the start time set.
+    /// gauges and the fault and drop counters at zero, `solo_build_info` and
+    /// the start time set.
     #[must_use]
     pub fn new() -> NodeMetrics {
         let mut registry = Registry::new();
@@ -394,6 +428,16 @@ impl NodeMetrics {
         ] {
             registry.set(d, &[], 0.0);
         }
+        // Series that alerts read with `increase()` exist at zero from the
+        // start, so that their first event is a step Prometheus can see.
+        for entrypoint in ENTRYPOINTS {
+            for status in FAULT_STATUSES {
+                registry.set(&KERNEL_FAULTS, &[entrypoint, status], 0.0);
+            }
+        }
+        for reason in DROP_REASONS {
+            registry.set(&EMITTED_DROPPED, &[reason], 0.0);
+        }
         registry.set(&BUILD_INFO, &[VERSION], 1.0);
         let unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -407,6 +451,8 @@ impl NodeMetrics {
             head: 0,
             finalized: 0,
             logs_seen: 0,
+            chain_id: None,
+            emitted_series: BTreeMap::new(),
         }
     }
 
@@ -451,7 +497,9 @@ impl NodeMetrics {
 
     /// Records an emitted metric (spec 11 §5): kind 0 adds a non-negative
     /// step to a counter, kind 1 sets a gauge; anything else, a bad name,
-    /// or a new name past [`MAX_EMITTED_SERIES`] is dropped and counted.
+    /// or a new name past [`MAX_EMITTED_SERIES`] for its origin is dropped
+    /// and counted. Each origin has its own limit, so sandboxed instances
+    /// cannot crowd out the kernel's and the driver's series.
     pub fn emitted(&mut self, origin: Origin, name: &[u8], value: i64, kind: u32) {
         let Some(name) = emitted_name(name) else {
             return self.drop_emitted("name");
@@ -463,10 +511,15 @@ impl NodeMetrics {
             _ => return self.drop_emitted("kind"),
         };
         let labels = [origin.as_str(), name];
-        if !self.registry.contains(family, &labels)
-            && self.registry.series(family) >= MAX_EMITTED_SERIES
-        {
-            return self.drop_emitted("cardinality");
+        if !self.registry.contains(family, &labels) {
+            let series = self
+                .emitted_series
+                .entry((family.name, origin))
+                .or_default();
+            if *series >= MAX_EMITTED_SERIES {
+                return self.drop_emitted("cardinality");
+            }
+            *series += 1;
         }
         #[allow(clippy::cast_precision_loss)]
         let value = value as f64;
@@ -515,17 +568,21 @@ impl NodeMetrics {
         }
     }
 
+    /// Records the chain id the kernel reported. It is kept for the node's
+    /// life (spec 11 section 2), so later scrapes need not ask the kernel.
+    pub fn set_chain_id(&mut self, id: u64) {
+        self.chain_id = Some(id);
+        self.registry.set(&CHAIN_ID, &[], float(id));
+    }
+
+    /// The chain id, once the kernel has reported it.
+    #[must_use]
+    pub fn chain_id(&self) -> Option<u64> {
+        self.chain_id
+    }
+
     /// Sets the gauges read from the node at scrape time.
-    pub fn refresh(
-        &mut self,
-        chain_id: Option<u64>,
-        mempool_transactions: usize,
-        mempool_bytes: usize,
-        timers: usize,
-    ) {
-        if let Some(id) = chain_id {
-            self.registry.set(&CHAIN_ID, &[], float(id));
-        }
+    pub fn refresh(&mut self, mempool_transactions: usize, mempool_bytes: usize, timers: usize) {
         self.registry.set(
             &MEMPOOL_TRANSACTIONS,
             &[],
@@ -648,7 +705,10 @@ mod tests {
             r(&m, &KERNEL_FAULTS, &["kernel_driver_step", "out_of_gas"]),
             Some(1.0)
         );
-        assert_eq!(m.registry().series(&KERNEL_FAULTS), 1);
+        assert_eq!(
+            m.registry().series(&KERNEL_FAULTS),
+            ENTRYPOINTS.len() * FAULT_STATUSES.len()
+        );
         let line = |level: u32| (level, b"line".to_vec());
         m.kernel_logs(&[line(0), line(2)]);
         m.kernel_logs(&[line(0), line(2), line(9), line(4)]);
@@ -671,8 +731,10 @@ mod tests {
         assert_eq!(r(&m, &P2P_BYTES, &["out"]), Some(5.0));
         assert_eq!(r(&m, &P2P_FRAMES, &["out", "message"]), Some(2.0));
         assert_eq!(r(&m, &P2P_FRAMES, &["in", "hello"]), Some(1.0));
-        m.refresh(Some(1337), 4, 400, 2);
-        m.refresh(None, 4, 400, 2);
+        assert_eq!((m.chain_id(), r(&m, &CHAIN_ID, &[])), (None, None));
+        m.set_chain_id(1337);
+        m.refresh(4, 400, 2);
+        assert_eq!(m.chain_id(), Some(1337));
         assert_eq!(r(&m, &CHAIN_ID, &[]), Some(1337.0));
         assert_eq!(r(&m, &MEMPOOL_BYTES, &[]), Some(400.0));
         assert_eq!(r(&m, &DRIVER_TIMERS, &[]), Some(2.0));
@@ -716,10 +778,39 @@ mod tests {
         m.emitted(Origin::Sandboxed, b"g1", 9, 1);
         assert_eq!(r(&m, &EMITTED_DROPPED, &["cardinality"]), Some(1.0));
         assert_eq!(r(&m, &EMITTED_GAUGE, &["sandboxed", "g1"]), Some(9.0));
+        // The limit is per origin: sandboxed instances that fill a family
+        // leave the kernel and the driver their own room in it.
+        for i in 0..=MAX_EMITTED_SERIES {
+            m.emitted(Origin::Sandboxed, format!("spam{i}").as_bytes(), 1, 0);
+        }
+        assert_eq!(r(&m, &EMITTED_DROPPED, &["cardinality"]), Some(2.0));
+        m.driver_metric(b"late", 1);
+        m.emitted(Origin::Kernel, b"txs", 5, 0);
+        m.emitted(Origin::Kernel, b"depth", 3, 1);
+        assert_eq!(r(&m, &EMITTED_COUNTER, &["driver", "late"]), Some(1.0));
+        assert_eq!(r(&m, &EMITTED_COUNTER, &["kernel", "txs"]), Some(5.0));
+        assert_eq!(r(&m, &EMITTED_GAUGE, &["kernel", "depth"]), Some(3.0));
+        assert_eq!(r(&m, &EMITTED_DROPPED, &["cardinality"]), Some(2.0));
         assert_eq!(emitted_name(b"a:b-c_d.e9"), Some("a:b-c_d.e9"));
         assert_eq!(emitted_name("é".as_bytes()), None);
         assert_eq!(Origin::Kernel.as_str(), "kernel");
         assert_eq!(Direction::In.as_str(), "in");
+    }
+
+    #[test]
+    fn fault_and_drop_series_exist_from_the_start() {
+        let samples = parse(&NodeMetrics::new().render()).unwrap();
+        let faults: Vec<_> = samples
+            .iter()
+            .filter(|s| s.name == KERNEL_FAULTS.name)
+            .collect();
+        assert_eq!(faults.len(), ENTRYPOINTS.len() * FAULT_STATUSES.len());
+        assert!(faults.iter().all(|s| s.value == 0.0));
+        for reason in DROP_REASONS {
+            assert!(samples.iter().any(|s| s.name == EMITTED_DROPPED.name
+                && s.label("reason") == Some(reason)
+                && s.value == 0.0));
+        }
     }
 
     #[test]

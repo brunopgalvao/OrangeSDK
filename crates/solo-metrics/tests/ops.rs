@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 use solo_metrics::node::ALL;
-use solo_metrics::{DEFAULT_LIMITS, exported_names};
+use solo_metrics::{DEFAULT_LIMITS, NodeMetrics, exported_names, parse};
 
 const ALERTS: &str = include_str!("../../../ops/alerts.yml");
 const PROMETHEUS: &str = include_str!("../../../ops/prometheus.yml");
@@ -196,10 +196,41 @@ fn alert_rules_read_exported_metrics() {
     assert!(PROMETHEUS.contains("job_name: solo"));
 }
 
-/// The number after the last comparison operator of an expression.
+/// The number after the last comparison operator of an expression, up to
+/// the first character that cannot be part of it.
 fn threshold(expr: &str) -> f64 {
     let at = expr.rfind(['>', '<']).expect("a comparison");
-    expr[at + 1..].trim().parse().expect("a numeric threshold")
+    leading_number(&expr[at + 1..])
+}
+
+fn leading_number(text: &str) -> f64 {
+    let text = text.trim_start();
+    let end = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(text.len());
+    text[..end]
+        .parse()
+        .unwrap_or_else(|_| panic!("a number at the start of `{text}`"))
+}
+
+/// The Condition cell of `alert`'s row in the alert table of spec 11 §7.
+fn spec_condition(alert: &str) -> &'static str {
+    let row = SPEC
+        .lines()
+        .find(|l| l.starts_with(&format!("| `{alert}` |")))
+        .unwrap_or_else(|| panic!("{alert} is not in the spec's alert table"));
+    row.split('|').nth(2).unwrap()
+}
+
+/// The default the spec 11 §7 doctor list gives for `flag`, read from
+/// `(default N <unit>, `flag`)`.
+fn spec_default(flag: &str) -> f64 {
+    let item = SPEC
+        .lines()
+        .find(|l| l.contains(&format!("`{flag}`")) && l.contains("(default "))
+        .unwrap_or_else(|| panic!("{flag} has no default in the spec"));
+    let at = item.find("(default ").unwrap() + "(default ".len();
+    leading_number(&item[at..])
 }
 
 #[test]
@@ -226,6 +257,27 @@ fn alert_thresholds_are_the_doctor_defaults() {
             "{alert}: `{}` does not use the doctor's limit {limit}",
             expr(alert)
         );
+        // The spec's alert table states the same threshold.
+        assert!(
+            (threshold(spec_condition(alert)) - limit).abs() < f64::EPSILON,
+            "{alert}: spec 11 says `{}`, the doctor's limit is {limit}",
+            spec_condition(alert)
+        );
+    }
+    // So does the spec's list of the doctor's checks.
+    let defaults = [
+        ("--max-head-age", d.max_head_age_seconds),
+        ("--max-finality-lag", d.max_finality_lag as f64),
+        ("--min-peers", d.min_peers as f64),
+        ("--max-mempool", d.max_mempool as f64),
+        ("--max-call-ms", d.max_call_seconds),
+    ];
+    for (flag, limit) in defaults {
+        assert!(
+            (spec_default(flag) - limit).abs() < f64::EPSILON,
+            "{flag}: spec 11 says {}, the doctor's default is {limit}",
+            spec_default(flag)
+        );
     }
     // Every alert spec 11 §7 lists is in the rule file, and only those.
     let listed: BTreeSet<String> = SPEC
@@ -235,6 +287,40 @@ fn alert_thresholds_are_the_doctor_defaults() {
         .collect();
     let shipped: BTreeSet<String> = rules.into_iter().map(|(name, _)| name).collect();
     assert_eq!(listed, shipped);
+}
+
+#[test]
+fn spec_thresholds_are_read_from_the_right_place() {
+    assert!((threshold("p99 of `x` over 5 m `> 1` s, per entrypoint") - 1.0).abs() < f64::EPSILON);
+    assert!((leading_number(" 16, `--x`)") - 16.0).abs() < f64::EPSILON);
+    assert_eq!(
+        spec_condition("SoloMempoolBacklog").trim(),
+        "`solo_mempool_transactions > 1000`"
+    );
+}
+
+/// An alert on `increase(c[w]) > 0` misses the first event of a series that
+/// is born at 1, since `increase` needs two samples of the same series:
+/// every series such a rule reads exists, at zero, from the moment the
+/// node opens.
+#[test]
+fn increase_alerts_read_series_that_exist_from_the_start() {
+    let at_open = parse(&NodeMetrics::new().render()).unwrap();
+    let mut checked = 0;
+    for (alert, expr) in alert_rules() {
+        if !expr.contains("increase(") {
+            continue;
+        }
+        for name in metric_names(&expr) {
+            let series: Vec<_> = at_open.iter().filter(|s| s.name == name).collect();
+            assert!(
+                !series.is_empty() && series.iter().all(|s| s.value == 0.0),
+                "{alert}: `{name}` has no zero series when the node opens"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 3);
 }
 
 fn queries(v: &Value, out: &mut Vec<String>) {

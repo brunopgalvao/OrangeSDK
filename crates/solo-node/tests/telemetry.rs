@@ -13,8 +13,9 @@ use solo_abi::chain::GenesisParams;
 use solo_abi::codec::Seq;
 use solo_abi::types::{Effect, Genesis, exports};
 use solo_metrics::node::{
-    BLOCK_GAS, BLOCK_TRANSACTIONS, BLOCKS_EXECUTED, BLOCKS_FINALIZED, EMITTED_COUNTER, FINALIZED,
-    HEAD, KERNEL_CALL_SECONDS, KERNEL_FAULTS, KERNEL_GAS, P2P_BYTES, P2P_FRAMES,
+    BLOCK_GAS, BLOCK_TRANSACTIONS, BLOCKS_EXECUTED, BLOCKS_FINALIZED, EMITTED_COUNTER, ENTRYPOINTS,
+    FAULT_STATUSES, FINALIZED, HEAD, KERNEL_CALL_SECONDS, KERNEL_FAULTS, KERNEL_GAS, P2P_BYTES,
+    P2P_FRAMES,
 };
 use solo_metrics::{Desc, VERSION, parse};
 use solo_node::{Node, NodeConfig, Sim, Transport};
@@ -95,7 +96,12 @@ fn the_driver_loop_records_progress_and_kernel_calls() {
     assert_eq!(calls(&node, exports::EXECUTE_BLOCK), 2);
     assert_eq!(calls(&node, exports::FINALIZE_BLOCK), 2);
     assert!(value(&node, &KERNEL_GAS, &[exports::DRIVER_STEP]) > 0.0);
-    assert_eq!(node.telemetry().registry().series(&KERNEL_FAULTS), 0);
+    // Every fault series exists from the start, at zero (spec 11 section 3).
+    for entrypoint in ENTRYPOINTS {
+        for status in FAULT_STATUSES {
+            assert_eq!(value(&node, &KERNEL_FAULTS, &[entrypoint, status]), 0.0);
+        }
+    }
     // An injected metric is recorded like an emitted one.
     node.apply_effect(Effect::Metric {
         name: b"injected".to_vec(),
@@ -121,7 +127,12 @@ fn the_driver_loop_records_progress_and_kernel_calls() {
     assert!(text.contains(&format!("solo_build_info{{version=\"{VERSION}\"}} 1\n")));
     assert!(text.contains("# TYPE ethereum_peer_count gauge\n"));
     assert!(!samples.iter().any(|s| s.name == "ethereum_peer_count"));
+    // The chain id is asked of the kernel once; later scrapes reuse it.
+    let queries = calls(&node, exports::QUERY);
+    assert!(queries >= 1);
     let status = node.status().unwrap();
+    node.metrics_text();
+    assert_eq!(calls(&node, exports::QUERY), queries);
     assert_eq!(status.chain_id, CHAIN_ID);
     assert_eq!((status.head, status.finalized), (2, 2));
     assert_eq!((status.p2p, status.peers, status.mempool), (false, 0, 0));
@@ -130,6 +141,25 @@ fn the_driver_loop_records_progress_and_kernel_calls() {
     assert!(status.uptime_seconds >= status.head_age_seconds);
     node.telemetry_mut().block_finalized(9);
     assert_eq!(node.telemetry().finalized(), 9);
+}
+
+#[test]
+fn fault_series_cover_every_entrypoint_of_spec_06() {
+    let mut names = vec![
+        exports::INIT,
+        exports::DRIVER_STEP,
+        exports::DRIVER_STATE,
+        exports::MIGRATE,
+        exports::VALIDATE_TX,
+        exports::BUILD_BLOCK,
+        exports::EXECUTE_BLOCK,
+        exports::FINALIZE_BLOCK,
+        exports::QUERY,
+    ];
+    assert_eq!(names, ENTRYPOINTS);
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), ENTRYPOINTS.len());
 }
 
 #[test]
@@ -143,6 +173,8 @@ fn kernel_faults_are_counted_and_status_fails_loudly() {
     );
     assert!(node.status().is_err());
     // Metrics still render, without a chain id the kernel could not give.
+    // Until the kernel answers, each request asks it again, and each of
+    // those calls is counted: here the status and the metrics request.
     let text = node.metrics_text();
     assert!(
         text.contains(
