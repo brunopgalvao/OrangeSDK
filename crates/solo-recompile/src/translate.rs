@@ -100,6 +100,7 @@ enum Stub {
     Import(String),
     Halt,
     Trap,
+    Sbrk,
 }
 
 struct Decoded {
@@ -183,6 +184,8 @@ impl<'a> Ctx<'a> {
                 Stub::Halt
             } else if sym.name == "__solo_trap" {
                 Stub::Trap
+            } else if sym.name == "__solo_sbrk" {
+                Stub::Sbrk
             } else {
                 continue;
             };
@@ -414,6 +417,11 @@ impl<'a> Ctx<'a> {
             }],
             Some(Stub::Halt) => vec![Instruction::Halt],
             Some(Stub::Trap) => vec![Instruction::Trap],
+            // `__solo_sbrk(bytes) -> old_end` with the C convention: a0 in, a0 out.
+            Some(Stub::Sbrk) => vec![Instruction::Sbrk {
+                rd: Reg::A0,
+                rs1: Reg::A0,
+            }],
             None if is_call(rd) => vec![Instruction::Call {
                 rd,
                 block: self.block(target)?,
@@ -1513,5 +1521,28 @@ mod tests {
         assert_eq!(m.layout.data_size, 0);
         assert_eq!(m.layout.bss_size, 64);
         assert!(m.imports.is_empty());
+    }
+
+    #[test]
+    fn sbrk_stub_becomes_the_instruction() {
+        // 0: call sbrk stub (8) ; 4: ret ; 8: stub
+        let words = [jal(1, 8), RET, UNIMP];
+        let m = module_of(&input(&words, vec![func("__solo_sbrk", 8)], vec![]));
+        assert_eq!(
+            m.blocks[0],
+            vec![Instruction::Sbrk {
+                rd: Reg::A0,
+                rs1: Reg::A0
+            }]
+        );
+        assert_eq!(
+            m.blocks[1],
+            vec![Instruction::JumpIndirect {
+                rs1: Reg::RA,
+                off: 0
+            }]
+        );
+        assert!(m.imports.is_empty());
+        assert_eq!(m.jump_table, vec![None]);
     }
 }

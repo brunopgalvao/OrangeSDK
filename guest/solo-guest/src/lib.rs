@@ -7,7 +7,11 @@
 
 #![no_std]
 
+extern crate alloc;
+
 use core::arch::global_asm;
+
+pub mod heap;
 
 /// Declares the stub symbols the recompiler recognises. Each is a function
 /// whose body is `unimp`, so running one unrecompiled traps immediately.
@@ -29,6 +33,7 @@ macro_rules! stubs {
 stubs!(
     __solo_halt,
     __solo_trap,
+    __solo_sbrk,
     __solo_import_abi_version,
     __solo_import_input_len,
     __solo_import_input_read,
@@ -74,6 +79,9 @@ pub mod host {
         pub fn __solo_halt(a0: u64, a1: u64) -> !;
         /// Ends the instance with `Trap`.
         pub fn __solo_trap() -> !;
+        /// Grows the heap by `bytes` (rounded up to pages); returns the old heap
+        /// end, or 0 if the heap is full.
+        pub fn __solo_sbrk(bytes: u64) -> u64;
         pub fn __solo_import_abi_version() -> u64;
         pub fn __solo_import_input_len() -> u64;
         pub fn __solo_import_input_read(dst: *mut u8, offset: u32, len: u32) -> u64;
@@ -136,6 +144,10 @@ macro_rules! solo_main {
         }
     };
 }
+
+#[cfg(feature = "allocator")]
+#[global_allocator]
+static ALLOCATOR: heap::Bump = heap::Bump::new();
 
 #[cfg(feature = "panic-handler")]
 #[panic_handler]

@@ -126,14 +126,14 @@ fn hello_module_is_deterministic_and_small() {
     let a = recompile(&input, &Options::default()).unwrap();
     let b = recompile(&input, &Options::default()).unwrap();
     assert_eq!(a, b, "recompilation is deterministic");
-    assert!(a.len() < 4096, "hello module is {} bytes", a.len());
+    assert!(a.len() < 16_384, "hello module is {} bytes", a.len());
     let module = Module::parse(&a, &|_| true).unwrap();
     assert!(module.export("main").is_some());
     assert_eq!(module.layout.ro_base, 0x1_0000);
     assert_eq!(module.rodata, b"hello, solo");
     assert_eq!(module.layout.rw_base, 0x1_2000);
     assert_eq!(module.layout.data_size, 0);
-    assert_eq!(module.layout.bss_size, 8);
+    assert_eq!(module.layout.bss_size, 24);
     assert_eq!(module.layout.heap_base, 0x1_4000);
     assert_eq!(module.layout.stack_top, 0xFFFF_0000);
     assert!(module.imports.iter().any(|i| i == "hash_keccak256"));

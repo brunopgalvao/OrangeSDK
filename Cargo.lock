@@ -426,6 +426,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "solo-abi"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "solo-host"
 version = "0.0.1"
 dependencies = [

@@ -1,0 +1,19 @@
+[package]
+name = "solo-abi"
+description = "The canonical encoding and the kernel entrypoint types of spec 06, shared by host and guest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

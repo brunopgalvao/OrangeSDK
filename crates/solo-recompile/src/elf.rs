@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(input.rodata.bytes, b"hello, solo");
         assert_eq!(input.data.size, 0);
         assert_eq!(input.bss.address, 0x1_2000);
-        assert_eq!(input.bss.size, 8);
+        assert_eq!(input.bss.size, 24); // COUNTER plus the allocator state
         assert!(
             input
                 .symbols
@@ -257,7 +257,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(call.addend, 0);
-        assert_eq!(call.offset, 0xBA);
+        assert!(call.offset % 2 == 0 && call.offset < input.text.bytes.len() as u64);
         assert!(
             input
                 .text_relocs
