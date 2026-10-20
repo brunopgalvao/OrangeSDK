@@ -14,6 +14,7 @@ use crate::hash::{blake2b256, keccak256, sha256};
 use crate::storage::MemStorage;
 
 mod bls;
+mod code;
 
 /// Writable scratch in the default layout's stack region.
 const BUF: i64 = 0xFFFC_0000;

@@ -10,6 +10,7 @@
 
 pub mod abi;
 pub mod cache;
+pub mod code;
 pub mod executor;
 pub mod hash;
 pub mod storage;

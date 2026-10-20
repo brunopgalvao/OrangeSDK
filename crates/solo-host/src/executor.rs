@@ -118,6 +118,9 @@ pub struct Executor<S: Storage> {
     native: HashMap<[u8; 32], Option<Arc<Compiled>>>,
     native_stats: NativeStats,
     native_budget: usize,
+    /// Programs cached from chain state, with the bytes they were loaded
+    /// from (spec 05 §4.4.1).
+    pub(crate) from_state: HashMap<[u8; 32], Vec<u8>>,
 }
 
 /// Default bound on the native code an executor keeps, in bytes.
@@ -167,6 +170,7 @@ impl<S: Storage> Executor<S> {
             native: HashMap::new(),
             native_stats: NativeStats::default(),
             native_budget: NATIVE_CODE_BUDGET,
+            from_state: HashMap::new(),
         }
     }
 
@@ -217,6 +221,7 @@ impl<S: Storage> Executor<S> {
             let program = solo_vm::module::Program::new(module, self.cache.cost_table());
             self.cache.insert_program(hash, program);
         }
+        self.from_state.remove(&hash);
         Ok(hash)
     }
 
@@ -349,8 +354,23 @@ impl<S: Storage> Executor<S> {
         if self.frames.len() >= self.max_depth {
             return fail(HostStatus::DepthExceeded);
         }
-        let Some(program): Option<Arc<Program>> = self.cache.get(code_hash) else {
+        let Some((program, load_cost)) = self.program_for(code_hash, capability) else {
             return fail(HostStatus::NotFound);
+        };
+        // Loading from chain state is paid out of the callee's limit.
+        let in_range = (0..=solo_vm::gas::MAX_GAS_LIMIT).contains(&gas_limit);
+        if in_range && gas_limit < load_cost {
+            return CallResult {
+                status: Termination::OutOfGas,
+                output: Vec::new(),
+                gas_used: gas_limit.unsigned_abs(),
+                started: true,
+            };
+        }
+        let run_limit = if in_range {
+            gas_limit - load_cost
+        } else {
+            gas_limit
         };
         let parent_static = self.frames.last().is_some_and(|f| f.static_call);
         self.frames.push(Frame {
@@ -370,9 +390,9 @@ impl<S: Storage> Executor<S> {
         // Both backends report (status, gas left, position); spec 07 §4
         // holds them to identical values.
         let started = match &native {
-            Some(code) => solo_jit::Instance::new(code, self, capability, export, &[], gas_limit)
+            Some(code) => solo_jit::Instance::new(code, self, capability, export, &[], run_limit)
                 .map(|mut i| (i.run(self), i.gas(), i.position())),
-            None => Instance::new(&program, self, capability, export, &[], gas_limit)
+            None => Instance::new(&program, self, capability, export, &[], run_limit)
                 .map(|mut i| (i.run(self), i.gas(), i.position())),
         };
         let (status, gas_used, ran) = match started {
