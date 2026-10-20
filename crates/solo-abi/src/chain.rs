@@ -300,7 +300,8 @@ pub mod reason {
     pub const SENDER_NOT_EOA: u32 = 11;
     /// A transaction to the upgrade system address that cannot run: value
     /// attached, calldata that is not an action, or a sender the action does
-    /// not authorize (spec 13 §2).
+    /// not authorize (spec 13 §2). Also a transaction to the module address
+    /// that is not a module install that can run (spec 16 §4.2).
     pub const SYSTEM_ACTION: u32 = 12;
     /// A transaction to the staking address that cannot run: staking
     /// disabled, calldata that is not a staking action, or an action the

@@ -78,7 +78,7 @@ prometheus --config.file=ops/prometheus.yml   # then import ops/grafana-solo.jso
 Build everything and run the gates:
 
 ```sh
-tools/build-guest.sh                      # builds guest/hello and guest/kernel for riscv64imac-unknown-none-elf
+tools/build-guest.sh                      # builds hello, kernel, kernel_v2 (upgrade-test), modules/counter and evm-conformance for riscv64imac-unknown-none-elf and refreshes their fixtures
 cargo run -p solo-recompile -- guest/target/riscv64imac-unknown-none-elf/release/hello hello.solo
 cargo test --workspace                    # includes running the recompiled guests on the interpreter
 cargo llvm-cov --workspace --fail-under-lines 100
@@ -106,7 +106,7 @@ cargo test --release -p solo-jit --test bench --test guests -- --ignored --nocap
 - `crates/solo-trie` — the binary Merkle trie of the state commitment (spec 10), with inclusion and exclusion proofs, `no_std`.
 - `crates/solo-bls` — threshold BLS over BLS12-381: the DKG and resharing, finality certificates and their Ethereum verification inputs (spec 12), `no_std`.
 - `crates/solo-upgrade` — kernel upgrades and feature gates (spec 13): the upgrade-address actions, their records, the gate state machine.
-- `crates/solo-node` — the node host: privileged functions (including `sign`), the driver loop, the mempool of spec 14 (per-sender nonce queues, replacement, limits), queries, the kernel switchover and gated host functions of spec 13, telemetry, the TCP transport, and `Sim`, an in-process network of nodes with a virtual clock.
+- `crates/solo-node` — the node host: privileged functions (including `sign`), the driver loop, the mempool of spec 14 (per-sender nonce queues, replacement, limits), queries, the kernel switchover and gated host functions of spec 13, telemetry, the threshold keystore behind `sign` key role 2 (spec 15 §6.4), the TCP transport, and `Sim`, an in-process network of nodes with a virtual clock.
 - `crates/solo-rpc` — Ethereum JSON-RPC over a node, including `txpool_status` and `txpool_content`, with a minimal HTTP server.
 - `crates/solo-cli` — the `solo` command (`solo dev`, `solo node`, `solo key`, `solo doctor`).
 - `crates/solo-metrics` — telemetry: a metrics registry with Prometheus text exposition, the node's metric schema, and the health rules `solo doctor` applies.
