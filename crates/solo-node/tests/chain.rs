@@ -99,6 +99,7 @@ fn genesis(alice: &Wallet) -> Genesis {
         allocations: Seq(vec![Allocation {
             address: alice.address,
             balance: 100 * ETHER,
+            ..Allocation::default()
         }]),
     };
     Genesis {
@@ -267,6 +268,7 @@ fn transfers_make_blocks() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn rejections() {
     let alice = Wallet::new(1);
     let bob = Wallet::new(2);
@@ -358,6 +360,7 @@ fn rejections() {
                 allocations: Seq(vec![Allocation {
                     address: whale.address,
                     balance: ETHER + 21_000 * gp,
+                    ..Allocation::default()
                 }]),
             };
             g.params = params.to_bytes();

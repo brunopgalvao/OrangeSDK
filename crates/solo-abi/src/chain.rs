@@ -40,12 +40,28 @@ record! {
 }
 
 record! {
-    /// A genesis balance.
+    /// A genesis account: a balance and, for a predeploy, a nonce, code and storage.
     Allocation {
         /// Account.
         address: Address,
         /// Balance in wei.
         balance: u128,
+        /// Nonce.
+        nonce: u64,
+        /// Contract code; empty for an account without code.
+        code: Vec<u8>,
+        /// Storage slots; a zero value is the same as no entry.
+        storage: Seq<StorageSlot>,
+    }
+}
+
+record! {
+    /// A storage slot set at genesis.
+    StorageSlot {
+        /// Slot, big-endian.
+        key: Hash,
+        /// Value, big-endian.
+        value: Hash,
     }
 }
 
@@ -56,7 +72,7 @@ record! {
         slot_ms: u64,
         /// Maximum transactions per block.
         max_txs: u32,
-        /// Initial balances.
+        /// Initial accounts: balances and predeployed contracts.
         allocations: Seq<Allocation>,
     }
 }
@@ -587,6 +603,12 @@ mod tests {
             allocations: Seq(vec![Allocation {
                 address: [1; 20],
                 balance: 7,
+                nonce: 1,
+                code: vec![0x60, 0x00],
+                storage: Seq(vec![StorageSlot {
+                    key: [1; 32],
+                    value: [2; 32],
+                }]),
             }]),
         });
         roundtrip(&BlockHeader {

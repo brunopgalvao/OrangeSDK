@@ -101,6 +101,7 @@ pub fn genesis(alice: &Wallet) -> Genesis {
         allocations: Seq(vec![Allocation {
             address: alice.address,
             balance: 100 * ETHER,
+            ..Allocation::default()
         }]),
     };
     Genesis {

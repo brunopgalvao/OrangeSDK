@@ -129,14 +129,43 @@ pub fn params() -> GenesisParams {
     get(b"meta/params").unwrap_or_default()
 }
 
-/// Applies genesis: chain id, parameters, allocations.
+/// Key of contract code by its hash.
+pub fn code_key(code_hash: &Hash) -> Vec<u8> {
+    concat(keys::CODE, code_hash)
+}
+
+/// Key of a storage slot.
+pub fn slot_key(address: &Address, slot: &Hash) -> Vec<u8> {
+    let mut k = Vec::with_capacity(keys::SLOT.len() + 20 + 32);
+    k.extend_from_slice(keys::SLOT);
+    k.extend_from_slice(address);
+    k.extend_from_slice(slot);
+    k
+}
+
+/// Applies genesis: chain id, parameters, and the allocated accounts with
+/// their code and storage. The stored parameters leave the allocations out:
+/// the driver reads them on every step and the accounts already hold them.
 pub fn init(genesis: &Genesis) {
     set(keys::CHAIN_ID, &genesis.chain_id);
-    let params = GenesisParams::from_bytes(&genesis.params).unwrap_or_else(|_| solo_guest::trap());
+    let mut params = GenesisParams::from_bytes(&genesis.params).unwrap_or_else(|_| solo_guest::trap());
+    let allocations = core::mem::take(&mut params.allocations.0);
     set(b"meta/params", &params);
     set_raw(b"meta/validators", &genesis.validators);
-    for allocation in &params.allocations.0 {
-        set_account(&allocation.address, &Account { balance: allocation.balance, ..Account::default() });
+    for allocation in &allocations {
+        let code_hash = if allocation.code.is_empty() {
+            [0; 32]
+        } else {
+            let hash = keccak256(&allocation.code);
+            set_raw(&code_key(&hash), &allocation.code);
+            hash
+        };
+        set_account(&allocation.address, &Account { balance: allocation.balance, nonce: allocation.nonce, code_hash });
+        for slot in &allocation.storage.0 {
+            if slot.value != [0; 32] {
+                set_raw(&slot_key(&allocation.address, &slot.key), &slot.value);
+            }
+        }
     }
     set(keys::FINALIZED, &0u64);
 }

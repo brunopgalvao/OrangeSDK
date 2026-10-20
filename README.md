@@ -19,7 +19,25 @@ cast chain-id --rpc-url http://127.0.0.1:8545
 cast balance 0x1a642f0e3c3af545e7acbd38b07251b3990914f1 --rpc-url http://127.0.0.1:8545
 ```
 
-The genesis address above is the account of the private key `0x01…01` (32 bytes of `0x01`), funded with one million ether. The kernel is a Rust guest compiled to RISC-V and recompiled to a Solo module on start; value transfers work, contracts arrive with the EVM interpreter.
+The genesis address above is the account of the private key `0x01…01` (32 bytes of `0x01`), funded with one million ether. The kernel is a Rust guest compiled to RISC-V and recompiled to a Solo module on start.
+
+An `alloc` entry is either a balance in wei (a decimal string, `0x` hex, or a JSON number) or a geth-style account, which is how a chain predeploys contracts at genesis:
+
+```json
+"alloc": {
+  "0x1a642f0e3c3af545e7acbd38b07251b3990914f1": "1000000000000000000000000",
+  "0x4200000000000000000000000000000000000001": {
+    "balance": "0x0",
+    "nonce": "0x1",
+    "code": "0x<runtime bytecode>",
+    "storage": {"0x00": "0x2a"}
+  }
+}
+```
+
+Every field of an account is optional. Storage keys and values are hex of at most 32 bytes, left-padded with zeros. The kernel stores the code under its `keccak256` hash and the non-zero slots under the account, exactly as if a transaction had deployed it.
+
+The reference kernel's base fee is zero and its block beneficiary is the zero address, so every fee, `gas used × price paid`, is credited to `0x0000…0000`, where no one can spend it. The genesis block has no header and its hash is zero: block 1's parent hash, `BLOCKHASH(0)` and the RPC's block 0 all say so.
 
 Run a chain of several validators, each with its own key. `solo key` prints the validator id to list in the genesis file:
 

@@ -23,7 +23,9 @@ const HELLO: &str = concat!(
 const STARVED_GAS: &str = "80000";
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4,
-  "alloc": {"0x1111111111111111111111111111111111111111": "1000000000000000000", "0x2222222222222222222222222222222222222222": 5}}"#;
+  "alloc": {"0x1111111111111111111111111111111111111111": "1000000000000000000", "0x2222222222222222222222222222222222222222": 5,
+    "0x3333333333333333333333333333333333333333": {"balance": "0x10", "nonce": "0x1", "code": "0x602a60005260206000f3",
+      "storage": {"0x00": "0x2a", "0x0000000000000000000000000000000000000000000000000000000000000001": "0x0102"}}}}"#;
 
 fn scratch(name: &str) -> String {
     let dir = std::env::temp_dir().join(format!("solo-cli-{}", std::process::id()));
@@ -64,7 +66,7 @@ fn genesis_parsing() {
     assert_eq!(g.chain_id, 1337);
     let params = GenesisParams::from_bytes(&g.params).unwrap();
     assert_eq!((params.slot_ms, params.max_txs), (60, 4));
-    assert_eq!(params.allocations.0.len(), 2);
+    assert_eq!(params.allocations.0.len(), 3);
     assert_eq!(params.allocations.0[0].balance, 1_000_000_000_000_000_000);
     assert_eq!(params.allocations.0[1].balance, 5);
     // Without validators the dev key is the single validator; with them, the given ids.
@@ -92,7 +94,11 @@ fn genesis_parsing() {
         (r#"{"chainId": 1, "alloc": {"0x11": 1}}"#, "20 bytes"),
         (
             r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": "x"}}"#,
-            "decimal string",
+            "decimal or 0x hex",
+        ),
+        (
+            r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": "0xzz"}}"#,
+            "decimal or 0x hex",
         ),
         (
             r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": -1}}"#,
@@ -110,6 +116,100 @@ fn genesis_parsing() {
         (r#"{"chainId": 1, "validators": ["zz"]}"#, "0x hex"),
         (r#"{"chainId": 1, "validators": ["0x01"]}"#, "32 bytes"),
         (r#"{"chainId": 1, "validators": {}}"#, "must be an array"),
+    ];
+    for (text, expected) in cases {
+        let message = parse_genesis(text).unwrap_err();
+        assert!(message.contains(expected), "{text}: {message}");
+    }
+}
+
+#[test]
+fn genesis_accounts() {
+    let g = parse_genesis(GENESIS).unwrap();
+    let params = GenesisParams::from_bytes(&g.params).unwrap();
+    // A geth-style account predeploys a contract: code, nonce and storage words left-padded.
+    let predeploy = &params.allocations.0[2];
+    assert_eq!(predeploy.address, [0x33; 20]);
+    assert_eq!((predeploy.balance, predeploy.nonce), (16, 1));
+    assert_eq!(
+        predeploy.code,
+        vec![0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]
+    );
+    let mut one = [0u8; 32];
+    one[31] = 1;
+    let mut value = [0u8; 32];
+    value[30..].copy_from_slice(&[1, 2]);
+    let slots: Vec<([u8; 32], [u8; 32])> = predeploy
+        .storage
+        .0
+        .iter()
+        .map(|s| (s.key, s.value))
+        .collect();
+    let mut answer = [0u8; 32];
+    answer[31] = 0x2a;
+    assert_eq!(slots, vec![([0; 32], answer), (one, value)]);
+    // Every field of an account is optional; numbers may be decimal or hex, strings or not.
+    let minimal = parse_genesis(
+        r#"{"chainId": 1, "alloc": {
+          "0x1111111111111111111111111111111111111111": {},
+          "0x2222222222222222222222222222222222222222": {"balance": 7, "nonce": 3},
+          "0x3333333333333333333333333333333333333333": {"balance": "12", "nonce": "9"}}}"#,
+    )
+    .unwrap();
+    let accounts = GenesisParams::from_bytes(&minimal.params)
+        .unwrap()
+        .allocations
+        .0;
+    let fields: Vec<(u128, u64, usize, usize)> = accounts
+        .iter()
+        .map(|a| (a.balance, a.nonce, a.code.len(), a.storage.0.len()))
+        .collect();
+    assert_eq!(fields, vec![(0, 0, 0, 0), (7, 3, 0, 0), (12, 9, 0, 0)]);
+    let cases = [
+        (
+            r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": {"balance": true}}}"#,
+            "string or number",
+        ),
+        (
+            r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": {"nonce": -1}}}"#,
+            "nonce must be a non-negative integer",
+        ),
+        (
+            r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": {"nonce": "0x10000000000000000"}}}"#,
+            "nonce must be a decimal or 0x hex string",
+        ),
+        (
+            r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": {"nonce": "one"}}}"#,
+            "nonce must be a decimal or 0x hex string",
+        ),
+        (
+            r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": {"nonce": []}}}"#,
+            "nonce must be a string or number",
+        ),
+        (
+            r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": {"code": 5}}}"#,
+            "code must be 0x hex",
+        ),
+        (
+            r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": {"code": "6000"}}}"#,
+            "code must be 0x hex",
+        ),
+        (
+            r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": {"storage": []}}}"#,
+            "storage must be an object",
+        ),
+        (
+            r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": {"storage": {"0x1": "0x01"}}}}"#,
+            "storage keys and values",
+        ),
+        (
+            r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": {"storage": {"0x01": 1}}}}"#,
+            "storage keys and values",
+        ),
+        (
+            r#"{"chainId": 1, "alloc": {"0x1111111111111111111111111111111111111111": {"storage": {"0x01": "0x000000000000000000000000000000000000000000000000000000000000000001"}}}}"#,
+            "storage keys and values",
+        ),
     ];
     for (text, expected) in cases {
         let message = parse_genesis(text).unwrap_err();
@@ -302,6 +402,28 @@ fn live_node_serves_rpc_and_stops_after_blocks() {
     let rest: Vec<String> = (&mut live.stderr).lines().map(Result::unwrap).collect();
     assert!(rest.iter().any(|l| l.starts_with("block 1 0x")), "{rest:?}");
     assert!(rest.iter().any(|l| l.starts_with("block 2 0x")), "{rest:?}");
+}
+
+#[test]
+fn live_node_applies_geth_style_accounts() {
+    // No block limit: the node runs until asked to stop, so no request races its exit.
+    let mut live = start(&[]);
+    let reply = post(
+        &live.addr,
+        r#"{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionCount","params":["0x3333333333333333333333333333333333333333","latest"]}"#,
+    );
+    assert!(reply.contains(r#""result":"0x1""#), "{reply}");
+    let reply = post(
+        &live.addr,
+        r#"{"jsonrpc":"2.0","id":2,"method":"eth_getBalance","params":["0x3333333333333333333333333333333333333333","latest"]}"#,
+    );
+    assert!(reply.contains(r#""result":"0x10""#), "{reply}");
+    let reply = post(
+        &live.addr,
+        r#"{"jsonrpc":"2.0","id":3,"method":"solo_stop"}"#,
+    );
+    assert!(reply.contains(r#""result":true"#), "{reply}");
+    assert!(live.child.wait().unwrap().success());
 }
 
 #[test]

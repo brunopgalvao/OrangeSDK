@@ -12,7 +12,7 @@ use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address as RAddress, B256, Bytes, KECCAK_EMPTY, TxKind, U256};
 use revm::state::{Account as RAccount, AccountInfo};
 use revm::{Database, ExecuteEvm, MainBuilder, MainContext};
-use solo_abi::chain::{Account, BLOCK_GAS_LIMIT, Log, call_status, keys};
+use solo_abi::chain::{Account, BLOCK_GAS_LIMIT, Log, call_status};
 use solo_abi::codec::Seq;
 use solo_abi::types::{Address, Hash};
 use solo_guest::host;
@@ -21,14 +21,6 @@ use crate::state;
 
 /// Base fee per gas. Constant in this kernel version; fees go to the zero address.
 pub const BASE_FEE: u64 = 0;
-
-fn concat(prefix: &[u8], parts: &[&[u8]]) -> Vec<u8> {
-    let mut k = prefix.to_vec();
-    for p in parts {
-        k.extend_from_slice(p);
-    }
-    k
-}
 
 /// Kernel state seen through revm's `Database`.
 pub struct StateDb;
@@ -48,12 +40,11 @@ impl Database for StateDb {
         if code_hash == KECCAK_EMPTY {
             return Ok(Bytecode::default());
         }
-        Ok(state::get_raw(&concat(keys::CODE, &[&code_hash.0])).map_or_else(Bytecode::default, |code| Bytecode::new_raw(code.into())))
+        Ok(state::get_raw(&state::code_key(&code_hash.0)).map_or_else(Bytecode::default, |code| Bytecode::new_raw(code.into())))
     }
 
     fn storage(&mut self, address: RAddress, index: U256) -> Result<U256, Infallible> {
-        let key = concat(keys::SLOT, &[&address.0.0, &index.to_be_bytes::<32>()]);
-        Ok(state::get_raw(&key).map_or(U256::ZERO, |v| U256::from_be_slice(&v)))
+        Ok(state::get_raw(&state::slot_key(&address.0.0, &index.to_be_bytes::<32>())).map_or(U256::ZERO, |v| U256::from_be_slice(&v)))
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Infallible> {
@@ -76,7 +67,7 @@ fn commit(changes: impl IntoIterator<Item = (RAddress, RAccount)>) {
             // Post-Cancun, only an account created in the same transaction self-destructs,
             // so every slot it has is among the ones this transaction touched.
             for key in account.storage.keys() {
-                state::delete(&concat(keys::SLOT, &[&a, &key.to_be_bytes::<32>()]));
+                state::delete(&state::slot_key(&a, &key.to_be_bytes::<32>()));
             }
             state::delete(&state::account_key(&a));
             continue;
@@ -87,11 +78,11 @@ fn commit(changes: impl IntoIterator<Item = (RAddress, RAccount)>) {
             && code_hash != [0; 32]
             && account.is_created()
         {
-            state::set_raw(&concat(keys::CODE, &[&code_hash]), code.original_byte_slice());
+            state::set_raw(&state::code_key(&code_hash), code.original_byte_slice());
         }
         state::set_account(&a, &Account { balance: u128_of(info.balance), nonce: info.nonce, code_hash });
         for (key, slot) in account.changed_storage_slots() {
-            let k = concat(keys::SLOT, &[&a, &key.to_be_bytes::<32>()]);
+            let k = state::slot_key(&a, &key.to_be_bytes::<32>());
             if slot.present_value.is_zero() {
                 state::delete(&k);
             } else {
@@ -253,10 +244,10 @@ pub fn code(address: &Address) -> Vec<u8> {
     if account.code_hash == [0; 32] {
         return Vec::new();
     }
-    state::get_raw(&concat(keys::CODE, &[&account.code_hash])).unwrap_or_default()
+    state::get_raw(&state::code_key(&account.code_hash)).unwrap_or_default()
 }
 
 /// Storage slot of `address`.
 pub fn storage(address: &Address, slot: &Hash) -> Hash {
-    state::get_raw(&concat(keys::SLOT, &[address, slot])).and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()).unwrap_or([0; 32])
+    state::get_raw(&state::slot_key(address, slot)).and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()).unwrap_or([0; 32])
 }
