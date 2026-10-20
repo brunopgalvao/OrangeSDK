@@ -175,7 +175,7 @@ Extensions planned for a later minor, each behind a feature gate and each additi
 
 - **`lui`, `auipc`, `jal`, `jalr`**: folded into `li`, `call`, `jump`, and the indirect forms by the recompiler. Code is not addressable, so pc-relative anything has no meaning in a module.
 - **Floating point (F, D)**: nondeterminism and spec surface. Toolchains target soft-float.
-- **Atomics (A)**: an instance is single-threaded. The recompiler lowers each `amo*` and `lr/sc` to the equivalent plain load, operation, and store; `lr/sc` always succeeds.
+- **Atomics (A)**: an instance is single-threaded. The recompiler lowers each `amo*` and `lr/sc` to the equivalent plain load, operation, and store, using `tp` as its scratch register; `lr/sc` always succeeds.
 - **`fence`, `fence.i`, CSRs, `wfi`, `mret`, and every privileged instruction**: nothing to order, no CSRs exist. The recompiler deletes fences and rejects the rest.
 - **Compressed (C)**: an encoding concern of the input ELF; the recompiler expands it. Solo's own encoding is already compact.
 - **Immediate-form branches, conditional moves, bit-manipulation (B)**: candidates for a later minor if profiling justifies them. Not in 0.1.

@@ -14,7 +14,7 @@ Thirty-two 64-bit general registers, numbered 0–31, with the standard RISC-V L
 | `ra` | 1 | Return address |
 | `sp` | 2 | Stack pointer |
 | `gp` | 3 | Global pointer |
-| `tp` | 4 | Thread pointer (unused; preserved) |
+| `tp` | 4 | Reserved: the recompiler's scratch register for lowering atomics (03 §8). Guest code MUST NOT rely on its value. |
 | `t0`–`t2` | 5–7 | Temporaries |
 | `s0`/`fp`, `s1` | 8–9 | Saved registers |
 | `a0`–`a7` | 10–17 | Arguments and return values |
