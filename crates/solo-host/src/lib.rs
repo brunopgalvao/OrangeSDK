@@ -1,0 +1,22 @@
+//! The host side of the Solo VM boundary (spec 05).
+//!
+//! `solo-vm` executes one instance and knows nothing about storage, code, or
+//! nested calls. This crate supplies those: a [`cache::ModuleCache`] keyed by
+//! code hash, [`storage`] with per-call overlays and namespaces, the host ABI
+//! functions in [`abi`], and the frame stack that makes `invoke` work in
+//! [`executor`].
+
+#![forbid(unsafe_code)]
+
+pub mod abi;
+pub mod cache;
+pub mod executor;
+pub mod hash;
+pub mod storage;
+
+#[cfg(test)]
+mod tests;
+
+pub use cache::{LoadError, ModuleCache};
+pub use executor::{CallResult, Executor, Flags};
+pub use storage::{MemStorage, Overlay, Storage};

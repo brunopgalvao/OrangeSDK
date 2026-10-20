@@ -1,0 +1,21 @@
+[package]
+name = "solo-host"
+description = "The host side of the Solo VM boundary: module cache, storage overlays, the host ABI, nested invoke"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+solo-vm = { path = "../solo-vm" }
+tiny-keccak = { version = "2", features = ["keccak"] }
+sha2 = "0.10"
+blake2 = "0.10"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+
+[dev-dependencies]
+solo-recompile = { path = "../solo-recompile" }
+
+[lints]
+workspace = true
