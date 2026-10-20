@@ -1,7 +1,7 @@
 //! The node: kernel lifecycle, the driver loop, mempool and queries.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
 
@@ -17,7 +17,31 @@ use solo_host::{CallResult, Executor, Flags, LoadError, MemStorage, ModuleCache}
 use solo_vm::host::Capability;
 use solo_vm::status::Termination;
 
-use crate::extension::{NodeExtension, NodeServices};
+use crate::extension::{NodeExtension, NodeServices, Outbound, validator_id};
+
+/// How to open a node.
+#[derive(Clone)]
+pub struct NodeConfig {
+    /// Clock at start, in milliseconds.
+    pub now_ms: u64,
+    /// Consensus key; a node without one follows the chain but never votes.
+    pub key: Option<k256::ecdsa::SigningKey>,
+    /// Node-local persisted data from a previous run (`persist_*`).
+    pub persisted: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Gas budget per kernel call once running; `kernel_init` always gets [`KERNEL_GAS`].
+    pub kernel_gas: i64,
+}
+
+impl Default for NodeConfig {
+    fn default() -> NodeConfig {
+        NodeConfig {
+            now_ms: 0,
+            key: None,
+            persisted: BTreeMap::new(),
+            kernel_gas: KERNEL_GAS,
+        }
+    }
+}
 
 /// Gas allowed to each kernel entrypoint call. Kernel work is bounded by the
 /// block limits it enforces, so this is a safety net, not a budget.
@@ -90,6 +114,9 @@ pub struct Node {
     pub persisted_driver_state: Option<Vec<u8>>,
     /// Gas budget for each kernel call; see [`KERNEL_GAS`].
     pub kernel_gas: i64,
+    /// Raw transactions admitted since the last [`Node::take_tx_gossip`],
+    /// for the transport to forward to peers.
+    tx_gossip: Vec<Vec<u8>>,
 }
 
 impl Node {
@@ -98,8 +125,29 @@ impl Node {
     /// # Errors
     /// [`NodeError::Load`] if the module is invalid; [`NodeError::Kernel`] if init fails.
     pub fn new(kernel_module: &[u8], genesis: &Genesis, now_ms: u64) -> Result<Node, NodeError> {
+        Node::open(
+            kernel_module,
+            genesis,
+            NodeConfig {
+                now_ms,
+                ..NodeConfig::default()
+            },
+        )
+    }
+
+    /// Loads a kernel with a key and persisted data, then runs `kernel_init`.
+    ///
+    /// # Errors
+    /// As [`Node::new`].
+    pub fn open(
+        kernel_module: &[u8],
+        genesis: &Genesis,
+        config: NodeConfig,
+    ) -> Result<Node, NodeError> {
         let services = Rc::new(RefCell::new(NodeServices {
-            now_ms,
+            now_ms: config.now_ms,
+            key: config.key,
+            persisted: config.persisted,
             ..NodeServices::default()
         }));
         let mut exec = Executor::new(ModuleCache::default(), MemStorage::default());
@@ -117,8 +165,10 @@ impl Node {
             metrics: Vec::new(),
             persisted_driver_state: None,
             kernel_gas: KERNEL_GAS,
+            tx_gossip: Vec::new(),
         };
         node.call_unit(exports::INIT, &genesis.to_bytes())?;
+        node.kernel_gas = config.kernel_gas;
         Ok(node)
     }
 
@@ -171,10 +221,49 @@ impl Node {
             .collect()
     }
 
-    /// Network effects the kernel issued through host functions.
+    /// Messages waiting for the transport, drained.
+    pub fn take_outbound(&mut self) -> Vec<Outbound> {
+        std::mem::take(&mut self.services.borrow_mut().outbound)
+    }
+
+    /// Raw transactions admitted since the last call, for peers.
+    pub fn take_tx_gossip(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.tx_gossip)
+    }
+
+    /// This node's validator id, if it has a consensus key.
     #[must_use]
-    pub fn network_log(&self) -> Vec<(&'static str, Vec<u8>)> {
-        self.services.borrow().network.clone()
+    pub fn validator_id(&self) -> Option<[u8; 32]> {
+        self.services.borrow().key.as_ref().map(validator_id)
+    }
+
+    /// The consensus key, for reopening the node.
+    #[must_use]
+    pub fn services_key(&self) -> Option<k256::ecdsa::SigningKey> {
+        self.services.borrow().key.clone()
+    }
+
+    /// A copy of the node-local persisted data, to reopen the node with.
+    #[must_use]
+    pub fn persisted(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        self.services.borrow().persisted.clone()
+    }
+
+    /// Delivers a network message from `peer`.
+    ///
+    /// # Errors
+    /// See [`NodeError`].
+    pub fn deliver(
+        &mut self,
+        peer: [u8; 32],
+        topic: u16,
+        payload: Vec<u8>,
+    ) -> Result<(), NodeError> {
+        self.step(Input::NetworkMessage {
+            peer,
+            topic,
+            payload,
+        })
     }
 
     /// The mempool contents.
@@ -277,15 +366,46 @@ impl Node {
                 self.metrics.push((name, value));
                 None
             }
-            // The dev node has no peers; admission is implicit in `submit`.
-            Effect::MempoolAdmit { .. }
-            | Effect::Send { .. }
-            | Effect::Broadcast { .. }
-            | Effect::Disseminate { .. }
-            | Effect::Request { .. }
-            | Effect::Respond { .. }
-            | Effect::PeerScore { .. } => None,
+            // Admission is implicit in `submit`.
+            Effect::MempoolAdmit { .. } => None,
+            Effect::Send {
+                peer,
+                topic,
+                payload,
+            } => self.outbound(Outbound::Send {
+                peer,
+                topic,
+                payload,
+            }),
+            Effect::Broadcast { topic, payload } => {
+                self.outbound(Outbound::Broadcast { topic, payload })
+            }
+            Effect::Disseminate { blob_id, payload } => {
+                self.outbound(Outbound::Disseminate { blob_id, payload })
+            }
+            Effect::Request {
+                peer,
+                request_id,
+                payload,
+            } => self.outbound(Outbound::Request {
+                peer,
+                request_id,
+                payload,
+            }),
+            Effect::Respond {
+                request_id,
+                payload,
+            } => self.outbound(Outbound::Respond {
+                request_id,
+                payload,
+            }),
+            Effect::PeerScore { peer, delta } => self.outbound(Outbound::PeerScore { peer, delta }),
         })
+    }
+
+    fn outbound(&mut self, message: Outbound) -> Option<Input> {
+        self.services.borrow_mut().outbound.push(message);
+        None
     }
 
     fn context_for(header: &BlockHeader) -> ExecContext {
@@ -313,6 +433,9 @@ impl Node {
             .block_by_number(height)?
             .ok_or(NodeError::Decode("stored header"))?;
         let block_hash = keccak256(&stored.to_bytes());
+        // Whatever the block carried is no longer pending, wherever it came from.
+        self.mempool
+            .retain(|p| !stored.tx_hashes.0.contains(&p.hash));
         self.executed.push((height, block_hash));
         Ok(Input::BlockExecuted {
             height,
@@ -371,6 +494,7 @@ impl Node {
                         raw: raw.to_vec(),
                         priority,
                     });
+                    self.tx_gossip.push(raw.to_vec());
                 }
                 self.step(Input::TxArrived {
                     tx_hash: hash,

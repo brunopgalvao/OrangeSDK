@@ -1,4 +1,4 @@
-//! The reference kernel (spec 06): a single-node dev driver and a state
+//! The reference kernel (spec 06): the Simplex driver (spec 08) and a state
 //! transition that executes Ethereum legacy value transfers.
 
 #![no_std]
@@ -7,6 +7,7 @@
 extern crate alloc;
 
 mod driver;
+mod persist;
 mod state;
 mod stf;
 mod tx;

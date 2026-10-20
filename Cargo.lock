@@ -502,6 +502,7 @@ dependencies = [
 name = "solo-cli"
 version = "0.0.1"
 dependencies = [
+ "k256",
  "serde_json",
  "solo-abi",
  "solo-node",

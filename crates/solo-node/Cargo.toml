@@ -10,11 +10,11 @@ rust-version.workspace = true
 solo-abi = { path = "../solo-abi" }
 solo-host = { path = "../solo-host" }
 solo-vm = { path = "../solo-vm" }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
 [dev-dependencies]
 solo-recompile = { path = "../solo-recompile" }
 solo-rlp = { path = "../solo-rlp" }
-k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
 [lints]
 workspace = true

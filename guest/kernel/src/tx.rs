@@ -48,17 +48,20 @@ fn sighash(fields: &[Item<'_>], chain_id: Option<u64>) -> Hash {
     keccak256(&out)
 }
 
+/// The uncompressed public key (64 bytes) that signed `msg`, via the host.
+pub fn recover_pubkey(msg: &Hash, sig: &[u8; 65]) -> Option<[u8; 64]> {
+    let mut pubkey = [0u8; 64];
+    // SAFETY: valid pointers into our own buffers of the stated sizes.
+    let status = unsafe { host::__solo_import_secp256k1_recover(msg.as_ptr(), sig.as_ptr(), pubkey.as_mut_ptr()) };
+    (status == 0).then_some(pubkey)
+}
+
 fn recover(msg: &Hash, r: &[u8; 32], s: &[u8; 32], recid: u8) -> Option<Address> {
     let mut sig = [0u8; 65];
     sig[..32].copy_from_slice(r);
     sig[32..64].copy_from_slice(s);
     sig[64] = recid;
-    let mut pubkey = [0u8; 64];
-    // SAFETY: valid pointers into our own buffers of the stated sizes.
-    let status = unsafe { host::__solo_import_secp256k1_recover(msg.as_ptr(), sig.as_ptr(), pubkey.as_mut_ptr()) };
-    if status != 0 {
-        return None;
-    }
+    let pubkey = recover_pubkey(msg, &sig)?;
     let digest = keccak256(&pubkey);
     let mut address = [0u8; 20];
     address.copy_from_slice(&digest[12..]);

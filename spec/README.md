@@ -13,6 +13,7 @@ This directory is normative. An implementation that disagrees with it is wrong; 
 | 05 | [Host ABI](05-host-abi.md) — the frozen interface between host and kernel, and the sandboxed subset for contracts | draft |
 | 06 | [Driver interface](06-driver-interface.md) — inputs and effects of the consensus state machine | draft |
 | 07 | [Conformance](07-conformance.md) — test vectors, differential oracles, coverage requirements | draft |
+| 08 | [Simplex driver](08-simplex-driver.md) — the reference kernel's consensus: views, votes, certificates, persistence | draft |
 
 ## Conventions
 

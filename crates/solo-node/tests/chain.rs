@@ -4,11 +4,12 @@
 
 use k256::ecdsa::SigningKey;
 use solo_abi::Encode;
+use solo_abi::chain::consensus::{propose_timer, timeout_timer};
 use solo_abi::chain::{Allocation, GenesisParams, reason};
 use solo_abi::codec::Seq;
 use solo_abi::types::Genesis;
 use solo_host::hash::keccak256;
-use solo_node::{Node, SubmitError};
+use solo_node::{Node, NodeConfig, Sim, SubmitError};
 use solo_recompile::{Input, Options, recompile};
 use solo_rlp::{encode_bytes, encode_list, encode_uint};
 
@@ -105,15 +106,30 @@ fn genesis(alice: &Wallet) -> Genesis {
         fee_schedule: vec![],
         modules: Seq(vec![]),
         params: params.to_bytes(),
-        validators: vec![],
+        validators: Sim::validator_set(&[node_key()]).to_bytes(),
     }
 }
 
-fn node(alice: &Wallet) -> Node {
+/// The node's consensus key: the single validator of these chains.
+fn node_key() -> SigningKey {
+    SigningKey::from_slice(&[0x42; 32]).unwrap()
+}
+
+/// A validator node started at `now_ms`, resuming `state` if given.
+fn node_at(alice: &Wallet, now_ms: u64, state: Option<Vec<u8>>) -> Node {
+    let config = NodeConfig {
+        now_ms,
+        key: Some(node_key()),
+        ..NodeConfig::default()
+    };
     let mut node =
-        Node::new(&kernel_module(), &genesis(alice), 1_000).expect("kernel loads and inits");
-    node.start(None).unwrap();
+        Node::open(&kernel_module(), &genesis(alice), config).expect("kernel loads and inits");
+    node.start(state).unwrap();
     node
+}
+
+fn node(alice: &Wallet) -> Node {
+    node_at(alice, 1_000, None)
 }
 
 #[test]
@@ -131,12 +147,22 @@ fn genesis_state_and_queries() {
     assert!(node.transaction(&[0; 32]).unwrap().is_none());
     assert_eq!(node.query("no_such_method", &[]).unwrap().status, 3);
     assert_eq!(node.query("account", &[1, 2]).unwrap().status, 2);
-    // Started armed the slot timer.
-    assert_eq!(node.timers(), vec![(1, 1_000 + SLOT_MS)]);
+    // Started armed the view timeout and the leader's proposal time, one slot out.
+    assert_eq!(
+        node.timers(),
+        vec![
+            (timeout_timer(1), 1_000 + 3 * SLOT_MS),
+            (propose_timer(1), 1_000 + SLOT_MS)
+        ]
+    );
     assert!(node.persisted_driver_state.is_some());
     assert!(node.mempool().is_empty());
     assert!(node.logs().is_empty());
-    assert!(node.network_log().is_empty());
+    assert!(node.take_outbound().is_empty());
+    assert_eq!(
+        node.validator_id(),
+        Some(solo_node::validator_id(&node_key()))
+    );
     assert_eq!(node.now_ms(), 1_000);
 }
 
@@ -174,8 +200,17 @@ fn transfers_make_blocks() {
     assert_eq!(node.executed.len(), 1);
     assert_eq!(node.finalized, vec![1]);
     assert!(node.mempool().is_empty());
-    assert_eq!(node.timers(), vec![(1, 1_000 + 2 * SLOT_MS)]);
+    assert_eq!(
+        node.timers(),
+        vec![
+            (timeout_timer(2), 1_000 + 4 * SLOT_MS),
+            (propose_timer(2), 1_000 + 2 * SLOT_MS)
+        ]
+    );
     assert_eq!(node.metrics, vec![(b"blocks".to_vec(), 1)]);
+    // The single validator proposed, voted, and finalized on its own.
+    let outbound = node.take_outbound();
+    assert_eq!(outbound.len(), 3, "{outbound:?}");
     let fee = 21_000 * gas_price;
     assert_eq!(node.account(&bob.address).unwrap().balance, 5 * ETHER);
     let a = node.account(&alice.address).unwrap();
@@ -345,16 +380,21 @@ fn restart_resumes_from_persisted_state() {
     let state = node.persisted_driver_state.clone().unwrap();
     assert_eq!(node.driver_state().unwrap(), state);
     // A fresh node over the same genesis (state is in memory, so blocks are gone) resumes the
-    // driver at height 2 and links to the persisted last hash.
-    let mut fresh = Node::new(&kernel_module(), &genesis(&alice), 5_000).unwrap();
-    fresh.start(Some(state)).unwrap();
-    assert_eq!(fresh.timers(), vec![(1, 5_000 + SLOT_MS)]);
-    fresh.tick(5_000 + SLOT_MS).unwrap();
+    // driver at height 2; its slot is long overdue, so it proposes on start.
+    let mut fresh = node_at(&alice, 5_000, Some(state));
     assert_eq!(fresh.executed.len(), 1);
     assert_eq!(fresh.executed[0].0, 2, "continues at the next height");
+    assert_eq!(
+        fresh.timers(),
+        vec![
+            (timeout_timer(3), 5_000 + 3 * SLOT_MS),
+            (propose_timer(3), 5_000 + SLOT_MS)
+        ]
+    );
+    fresh.tick(5_000 + SLOT_MS).unwrap();
+    assert_eq!(fresh.executed.len(), 2);
     // Garbage persisted state is ignored and the driver starts from scratch.
-    let mut again = Node::new(&kernel_module(), &genesis(&alice), 7_000).unwrap();
-    again.start(Some(vec![1, 2, 3])).unwrap();
+    let mut again = node_at(&alice, 7_000, Some(vec![1, 2, 3]));
     again.tick(7_000 + SLOT_MS).unwrap();
     assert_eq!(again.executed[0].0, 1);
 }
@@ -407,17 +447,18 @@ fn node_errors() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn effects_the_dev_driver_never_emits() {
+fn effects_injected_by_hand() {
     use solo_abi::types::Effect;
     let alice = Wallet::new(1);
     let bob = Wallet::new(2);
     let mut node = node(&alice);
-    // Cancelling the slot timer stops block production until re-armed.
-    assert_eq!(
-        node.apply_effect(Effect::CancelTimer { timer_id: 1 })
-            .unwrap(),
-        None
-    );
+    // Cancelling the view's timers stops block production until re-armed.
+    for timer_id in [timeout_timer(1), propose_timer(1)] {
+        assert_eq!(
+            node.apply_effect(Effect::CancelTimer { timer_id }).unwrap(),
+            None
+        );
+    }
     assert!(node.timers().is_empty());
     node.tick(10_000).unwrap();
     assert_eq!(node.block_number().unwrap(), 0);
@@ -460,7 +501,8 @@ fn effects_the_dev_driver_never_emits() {
         None
     );
     assert!(node.mempool().is_empty());
-    // Network effects are accepted and ignored by the dev node.
+    // Network effects are queued for the transport.
+    assert!(node.take_outbound().is_empty());
     for effect in [
         Effect::Send {
             peer: [1; 32],
@@ -492,6 +534,16 @@ fn effects_the_dev_driver_never_emits() {
     ] {
         assert_eq!(node.apply_effect(effect).unwrap(), None);
     }
+    let queued = node.take_outbound();
+    assert_eq!(queued.len(), 6, "{queued:?}");
+    assert!(matches!(
+        queued[0],
+        solo_node::Outbound::Send { topic: 0, .. }
+    ));
+    assert!(matches!(
+        queued[5],
+        solo_node::Outbound::PeerScore { delta: 1, .. }
+    ));
     // A block whose header does not decode is a node error, not a kernel call.
     let bad = Effect::ExecuteBlock {
         block: solo_abi::types::Block {
@@ -516,7 +568,7 @@ fn effects_the_dev_driver_never_emits() {
     assert_eq!(node.metrics.last(), Some(&(b"m".to_vec(), 3)));
     assert_eq!(
         node.apply_effect(Effect::SetTimer {
-            timer_id: 1,
+            timer_id: propose_timer(1),
             deadline_ms: 20_000
         })
         .unwrap(),

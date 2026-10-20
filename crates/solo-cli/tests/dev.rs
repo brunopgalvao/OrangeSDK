@@ -18,9 +18,9 @@ const HELLO: &str = concat!(
     "/../solo-recompile/tests/fixtures/hello.elf"
 );
 
-/// A kernel gas budget that lets the driver start (about 20k) but not produce a block
-/// (about 45k) with the pinned kernel fixture; rebuilding the fixture may move both numbers.
-const STARVED_GAS: &str = "30000";
+/// A kernel gas budget that lets the driver start (about 50k) but not produce a block
+/// (about 120k) with the pinned kernel fixture; rebuilding the fixture may move both numbers.
+const STARVED_GAS: &str = "80000";
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4,
   "alloc": {"0x1111111111111111111111111111111111111111": "1000000000000000000", "0x2222222222222222222222222222222222222222": 5}}"#;
@@ -67,6 +67,20 @@ fn genesis_parsing() {
     assert_eq!(params.allocations.0.len(), 2);
     assert_eq!(params.allocations.0[0].balance, 1_000_000_000_000_000_000);
     assert_eq!(params.allocations.0[1].balance, 5);
+    // Without validators the dev key is the single validator; with them, the given ids.
+    let set = <solo_abi::chain::ValidatorSet as Decode>::from_bytes(&g.validators).unwrap();
+    assert_eq!(set.validators.0.len(), 1);
+    assert_eq!(
+        set.validators.0[0].id,
+        solo_node::validator_id(&solo_cli::dev_key())
+    );
+    let explicit = parse_genesis(
+        r#"{"chainId": 1, "validators": ["0x0101010101010101010101010101010101010101010101010101010101010101", "0x0202020202020202020202020202020202020202020202020202020202020202"]}"#,
+    )
+    .unwrap();
+    let set = <solo_abi::chain::ValidatorSet as Decode>::from_bytes(&explicit.validators).unwrap();
+    assert_eq!(set.validators.0.len(), 2);
+    assert_eq!(set.validators.0[1].id, [2; 32]);
     let defaults = parse_genesis(r#"{"chainId": 1}"#).unwrap();
     let params = GenesisParams::from_bytes(&defaults.params).unwrap();
     assert_eq!((params.slot_ms, params.max_txs), (400, 64));
@@ -92,6 +106,10 @@ fn genesis_parsing() {
             r#"{"chainId": 1, "maxTxs": 5000000000}"#,
             "maxTxs too large",
         ),
+        (r#"{"chainId": 1, "validators": [5]}"#, "must be strings"),
+        (r#"{"chainId": 1, "validators": ["zz"]}"#, "0x hex"),
+        (r#"{"chainId": 1, "validators": ["0x01"]}"#, "32 bytes"),
+        (r#"{"chainId": 1, "validators": {}}"#, "must be an array"),
     ];
     for (text, expected) in cases {
         let message = parse_genesis(text).unwrap_err();

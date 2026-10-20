@@ -7,7 +7,7 @@ A framework for EVM-compatible solochains.
 - The kernel, including consensus, is upgraded by governance. The host is upgraded by releases behind feature gates.
 - Type 2 Ethereum compatibility: standard EVM bytecode, exact gas, full RPC.
 
-Status: spec v0 written; a single-node development chain runs Ethereum legacy transfers end to end, from `eth_sendRawTransaction` to receipts, on the reference kernel. See `spec/README.md`.
+Status: spec v0 written; the reference kernel runs Simplex BFT consensus (spec 08) across several validators in an in-process network simulation, and a single-validator development chain serves Ethereum legacy transfers end to end, from `eth_sendRawTransaction` to receipts. See `spec/README.md`.
 
 ## Try it
 
@@ -38,7 +38,7 @@ cargo llvm-cov --workspace --fail-under-lines 100
 - `crates/solo-host` — module cache, storage overlays, the host ABI and the executor that runs modules.
 - `crates/solo-abi` — the canonical codec and the types shared by host and kernel (spec 06 and the reference chain records).
 - `crates/solo-rlp` — Ethereum RLP.
-- `crates/solo-node` — the node host: privileged functions, the driver loop, mempool, queries.
+- `crates/solo-node` — the node host: privileged functions (including `sign`), the driver loop, mempool, queries, and `Sim`, an in-process network of nodes with a virtual clock.
 - `crates/solo-rpc` — Ethereum JSON-RPC over a node, with a minimal HTTP server.
 - `crates/solo-cli` — the `solo` command (`solo dev`).
 - `guest/` — separate workspace for programs that run on the VM: the `solo-guest` runtime, `hello`, and the reference `kernel`.

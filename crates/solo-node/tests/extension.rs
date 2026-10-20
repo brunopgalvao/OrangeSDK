@@ -191,44 +191,157 @@ fn persistence() {
 }
 
 #[test]
-fn network_stubs_record_and_succeed() {
+fn network_functions_queue_outbound_messages() {
+    use solo_node::Outbound;
     let (mut exec, services) = setup();
-    for (name, body) in [
+    let cases: Vec<(&str, Vec<Instruction>, u64)> = vec![
         (
             "net_send",
-            vec![li(Reg::A0, 0x1_0000), li(Reg::A1, 0x1_0000), li(Reg::A2, 3)],
+            vec![
+                li(Reg::A0, 0x1_0000),
+                li(Reg::A1, 0x1_0000),
+                li(Reg::A2, 3),
+                li(Reg::A3, 7),
+            ],
+            0,
         ),
         (
             "net_broadcast",
             vec![li(Reg::A0, 1), li(Reg::A1, 0x1_0000), li(Reg::A2, 3)],
+            0,
         ),
         (
             "net_disseminate",
             vec![li(Reg::A0, 0x1_0000), li(Reg::A1, 0x1_0000), li(Reg::A2, 3)],
+            0,
         ),
         (
             "net_request",
             vec![li(Reg::A0, 0x1_0000), li(Reg::A1, 0x1_0000), li(Reg::A2, 3)],
+            1,
+        ),
+        (
+            "net_request",
+            vec![li(Reg::A0, 0x1_0000), li(Reg::A1, 0x1_0000), li(Reg::A2, 3)],
+            2,
         ),
         (
             "net_respond",
             vec![li(Reg::A0, 9), li(Reg::A1, 0x1_0000), li(Reg::A2, 3)],
+            0,
         ),
         (
             "net_peer_score",
             vec![li(Reg::A0, 0x1_0000), li(Reg::A1, -5)],
+            0,
         ),
-    ] {
+    ];
+    for (name, body, expected) in cases {
         let mut body = body;
         body.push(Instruction::Ecall { import: 1 });
         let rodata = [0xABu8; 64];
         let (status, a0, _) = run(&mut exec, &module(name, &body, &rodata));
-        assert_eq!((status, a0), (Termination::Halt, 0), "{name}");
+        assert_eq!((status, a0), (Termination::Halt, expected), "{name}");
     }
-    let log = services.borrow().network.clone();
-    assert_eq!(log.len(), 6);
-    assert_eq!(log[0], ("net_send", vec![0xAB; 3]));
-    assert_eq!(log[5], ("net_peer_score", vec![]));
+    let queued = std::mem::take(&mut services.borrow_mut().outbound);
+    assert_eq!(
+        queued,
+        vec![
+            Outbound::Send {
+                peer: [0xAB; 32],
+                topic: 7,
+                payload: vec![0xAB; 3]
+            },
+            Outbound::Broadcast {
+                topic: 1,
+                payload: vec![0xAB; 3]
+            },
+            Outbound::Disseminate {
+                blob_id: [0xAB; 32],
+                payload: vec![0xAB; 3]
+            },
+            Outbound::Request {
+                peer: [0xAB; 32],
+                request_id: 1,
+                payload: vec![0xAB; 3]
+            },
+            Outbound::Request {
+                peer: [0xAB; 32],
+                request_id: 2,
+                payload: vec![0xAB; 3]
+            },
+            Outbound::Respond {
+                request_id: 9,
+                payload: vec![0xAB; 3]
+            },
+            Outbound::PeerScore {
+                peer: [0xAB; 32],
+                delta: -5
+            },
+        ]
+    );
+    // A peer id that is not readable faults.
+    let body = vec![
+        li(Reg::A0, 0xFFFF_FFF0),
+        li(Reg::A1, 0x1_0000),
+        li(Reg::A2, 3),
+        Instruction::Ecall { import: 1 },
+    ];
+    let (status, _, _) = run(&mut exec, &module("net_send", &body, &[0xAB; 64]));
+    assert_eq!(
+        status,
+        Termination::HostError(HostStatus::MemoryFault.code())
+    );
+}
+
+#[test]
+fn sign_uses_the_node_key() {
+    use k256::ecdsa::SigningKey;
+    let (mut exec, services) = setup();
+    let key = SigningKey::from_slice(&[7u8; 32]).unwrap();
+    // a0 role, a1 msg, a2 len, a3 dst, a4 cap.
+    let body = |role: i64, len: i64, cap: i64| {
+        vec![
+            li(Reg::A0, role),
+            li(Reg::A1, 0x1_0000),
+            li(Reg::A2, len),
+            li(Reg::A3, BUF),
+            li(Reg::A4, cap),
+            Instruction::Ecall { import: 1 },
+        ]
+    };
+    let digest = [0x5Au8; 32];
+    // No key: status 0, nothing written.
+    let (status, a0, _) = run(&mut exec, &module("sign", &body(0, 32, 65), &digest));
+    assert_eq!((status, a0), (Termination::Halt, 0));
+    services.borrow_mut().key = Some(key.clone());
+    let (status, a0, _) = run(&mut exec, &module("sign", &body(0, 32, 65), &digest));
+    assert_eq!((status, a0), (Termination::Halt, 65));
+    // Wrong role, short message, small buffer: status 0.
+    for (role, len, cap) in [(1, 32, 65), (0, 31, 65), (0, 32, 64)] {
+        let (status, a0, _) = run(&mut exec, &module("sign", &body(role, len, cap), &digest));
+        assert_eq!((status, a0), (Termination::Halt, 0), "{role} {len} {cap}");
+    }
+    // The signature recovers to the key.
+    let expected = solo_node::sign_recoverable(&key, &digest).unwrap();
+    let recovered = k256::ecdsa::VerifyingKey::recover_from_prehash(
+        &digest,
+        &k256::ecdsa::Signature::from_slice(&expected[..64]).unwrap(),
+        k256::ecdsa::RecoveryId::from_byte(expected[64]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(&recovered, key.verifying_key());
+    let id = solo_node::validator_id(&key);
+    let point = key.verifying_key().to_encoded_point(false);
+    assert_eq!(id, solo_host::hash::keccak256(&point.as_bytes()[1..]));
+    // An unwritable destination faults.
+    let mut bad = body(0, 32, 65);
+    bad[3] = li(Reg::A3, 0xFFFF_FFF0);
+    let (status, _, _) = run(&mut exec, &module("sign", &bad, &digest));
+    assert_eq!(
+        status,
+        Termination::HostError(HostStatus::MemoryFault.code())
+    );
 }
 
 #[test]

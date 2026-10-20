@@ -89,6 +89,11 @@ fn strip(b: &[u8]) -> &[u8] {
     &b[skip..]
 }
 
+/// The node's consensus key; the single validator.
+pub fn node_key() -> SigningKey {
+    SigningKey::from_slice(&[0x42; 32]).unwrap()
+}
+
 pub fn genesis(alice: &Wallet) -> Genesis {
     let params = GenesisParams {
         slot_ms: SLOT_MS,
@@ -103,12 +108,17 @@ pub fn genesis(alice: &Wallet) -> Genesis {
         fee_schedule: vec![],
         modules: Seq(vec![]),
         params: params.to_bytes(),
-        validators: vec![],
+        validators: solo_node::Sim::validator_set(&[node_key()]).to_bytes(),
     }
 }
 
 pub fn node(alice: &Wallet) -> Node {
-    let mut node = Node::new(&kernel_module(), &genesis(alice), 1_000).unwrap();
+    let config = solo_node::NodeConfig {
+        now_ms: 1_000,
+        key: Some(node_key()),
+        ..solo_node::NodeConfig::default()
+    };
+    let mut node = Node::open(&kernel_module(), &genesis(alice), config).unwrap();
     node.start(None).unwrap();
     node
 }

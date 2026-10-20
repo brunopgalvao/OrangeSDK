@@ -94,6 +94,10 @@ pub mod host {
         pub fn __solo_import_secp256k1_recover(msg: *const u8, sig: *const u8, dst: *mut u8) -> u64;
         pub fn __solo_import_hash_keccak256(src: *const u8, len: u32, dst: *mut u8) -> u64;
         pub fn __solo_import_hash_sha256(src: *const u8, len: u32, dst: *mut u8) -> u64;
+        pub fn __solo_import_sign(key_role: u64, msg: *const u8, msg_len: u32, dst: *mut u8, cap: u32) -> u64;
+        pub fn __solo_import_time_now() -> u64;
+        pub fn __solo_import_persist_set(key: *const u8, key_len: u32, val: *const u8, val_len: u32) -> u64;
+        pub fn __solo_import_persist_get(key: *const u8, key_len: u32, dst: *mut u8, cap: u32) -> u64;
         pub fn __solo_import_log_emit(level: u32, msg: *const u8, len: u32) -> u64;
         pub fn __solo_import_metric_emit(name: *const u8, name_len: u32, value: i64, kind: u32) -> u64;
     }

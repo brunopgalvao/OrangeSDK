@@ -128,6 +128,7 @@ pub fn init(genesis: &Genesis) {
     set(keys::CHAIN_ID, &genesis.chain_id);
     let params = GenesisParams::from_bytes(&genesis.params).unwrap_or_else(|_| solo_guest::trap());
     set(b"meta/params", &params);
+    set_raw(b"meta/validators", &genesis.validators);
     for allocation in &params.allocations.0 {
         set_account(&allocation.address, &Account { balance: allocation.balance, nonce: 0 });
     }

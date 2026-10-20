@@ -7,6 +7,8 @@
 
 pub mod extension;
 pub mod node;
+pub mod sim;
 
-pub use extension::{NodeExtension, NodeServices};
-pub use node::{Node, NodeError, SubmitError};
+pub use extension::{NodeExtension, NodeServices, Outbound, sign_recoverable, validator_id};
+pub use node::{Node, NodeConfig, NodeError, SubmitError};
+pub use sim::Sim;

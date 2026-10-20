@@ -4,7 +4,9 @@
 //! [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>]` runs a
 //! single-node development chain with Ethereum JSON-RPC. The genesis file is
 //! JSON: `{"chainId": 1337, "slotMs": 400, "maxTxs": 64,
-//! "alloc": {"0x<address>": "<wei>"}}`.
+//! "alloc": {"0x<address>": "<wei>"}, "validators": ["0x<32-byte id>"]}`.
+//! Without `validators` the dev node is the only validator, signing with
+//! [`DEV_KEY_SEED`].
 
 #![forbid(unsafe_code)]
 
@@ -12,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use solo_abi::Encode;
-use solo_abi::chain::{Allocation, GenesisParams};
+use solo_abi::chain::{Allocation, GenesisParams, Validator, ValidatorSet};
 use solo_abi::codec::Seq;
 use solo_abi::types::Genesis;
 
@@ -36,6 +38,18 @@ impl From<solo_node::NodeError> for CliError {
     fn from(e: solo_node::NodeError) -> CliError {
         CliError(e.to_string())
     }
+}
+
+/// Seed of the development node's consensus key.
+pub const DEV_KEY_SEED: [u8; 32] = [0x42; 32];
+
+/// The development node's consensus key.
+///
+/// # Panics
+/// Never: the seed is a valid scalar.
+#[must_use]
+pub fn dev_key() -> k256::ecdsa::SigningKey {
+    k256::ecdsa::SigningKey::from_slice(&DEV_KEY_SEED).expect("valid seed")
 }
 
 /// Where the JSON-RPC server listens unless `--rpc` says otherwise.
@@ -88,12 +102,37 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
             .ok_or("genesis: maxTxs too large")?,
         allocations: Seq(allocations),
     };
+    let mut validators = Vec::new();
+    match v.get("validators") {
+        None => validators.push(Validator {
+            id: solo_node::validator_id(&dev_key()),
+            weight: 1,
+        }),
+        Some(Value::Array(ids)) => {
+            for id in ids {
+                let text = id
+                    .as_str()
+                    .ok_or("genesis: validator ids must be strings")?;
+                let bytes = solo_rpc::methods::parse_hex(text)
+                    .ok()
+                    .ok_or("genesis: validator id must be 0x hex")?;
+                let id = <[u8; 32]>::try_from(bytes)
+                    .ok()
+                    .ok_or("genesis: validator id must be 32 bytes")?;
+                validators.push(Validator { id, weight: 1 });
+            }
+        }
+        Some(_) => return Err("genesis: validators must be an array".to_owned()),
+    }
     Ok(Genesis {
         chain_id,
         fee_schedule: vec![],
         modules: Seq(vec![]),
         params: params.to_bytes(),
-        validators: vec![],
+        validators: ValidatorSet {
+            validators: Seq(validators),
+        }
+        .to_bytes(),
     })
 }
 
@@ -186,11 +225,19 @@ fn run_inner(
     let kernel_gas = parse_number(args, "--kernel-gas")?;
     let start = Instant::now();
     let epoch = unix_ms();
-    let mut node = solo_node::Node::new(&kernel, &genesis, epoch)?;
+    let mut node = solo_node::Node::open(
+        &kernel,
+        &genesis,
+        solo_node::NodeConfig {
+            now_ms: epoch,
+            key: Some(dev_key()),
+            kernel_gas: kernel_gas.map_or(solo_node::node::KERNEL_GAS, |gas| {
+                i64::try_from(gas).unwrap_or(i64::MAX)
+            }),
+            ..solo_node::NodeConfig::default()
+        },
+    )?;
     let chain_id = node.chain_id().unwrap_or(0);
-    if let Some(gas) = kernel_gas {
-        node.kernel_gas = i64::try_from(gas).unwrap_or(i64::MAX);
-    }
     node.start(None)?;
     let mut rpc = solo_rpc::Rpc::new(node);
     let listener = match solo_rpc::http::bind(rpc_addr) {
@@ -199,7 +246,10 @@ fn run_inner(
     };
     let bound = listener.local_addr().ok();
     let bound = bound.map_or(rpc_addr.to_owned(), |a| a.to_string());
-    eprintln!("solo dev node: chain id {chain_id}, JSON-RPC on http://{bound}");
+    let validator = solo_rpc::methods::data(&solo_node::validator_id(&dev_key()));
+    eprintln!(
+        "solo dev node: chain id {chain_id}, validator {validator}, JSON-RPC on http://{bound}"
+    );
     let mut last_tick = Instant::now();
     let blocks_seen = std::cell::Cell::new(0u64);
     solo_rpc::http::serve(

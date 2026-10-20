@@ -16,6 +16,7 @@ solo-node = { path = "../solo-node" }
 solo-recompile = { path = "../solo-recompile" }
 solo-rpc = { path = "../solo-rpc" }
 serde_json = "1"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
 [lints]
 workspace = true
