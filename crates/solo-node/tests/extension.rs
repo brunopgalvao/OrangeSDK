@@ -574,6 +574,30 @@ fn storage_proof_costs() {
 }
 
 #[test]
+fn storage_commit_costs() {
+    // A flat 10 000, however many entries the state holds.
+    let (mut exec, _) = setup();
+    for i in 0u8..50 {
+        exec.state_mut().set(&[i], &[i]);
+    }
+    for (gas, left) in [(10_000, Some(0)), (12_345, Some(2_345)), (9_999, None)] {
+        let layout = ModuleBuilder::new().layout;
+        let mut mem = solo_vm::memory::Memory::new(layout, &[], &[]);
+        let mut regs = [0u64; Reg::COUNT];
+        regs[Reg::A0.index()] = 0xFFFC_0000;
+        let mut gas = gas;
+        let mut ctx = solo_vm::host::HostContext {
+            regs: &mut regs,
+            memory: &mut mem,
+            gas: &mut gas,
+        };
+        let handle = solo_node::extension::Handle::StorageCommit as u32;
+        let r = solo_vm::host::Host::call(&mut exec, handle, &mut ctx);
+        assert_eq!(r.ok().map(|()| gas), left);
+    }
+}
+
+#[test]
 fn unknown_handle_is_unavailable() {
     let (mut exec, _) = setup();
     let layout = ModuleBuilder::new().layout;
