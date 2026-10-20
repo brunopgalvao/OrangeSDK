@@ -13,17 +13,21 @@ contract MessageRecipient is IEthereumMessageReceiver {
     address public lastSender;
     bytes public lastPayload;
     bool public failing;
+    /// The gas left when the last message arrived.
+    uint256 public lastGas;
 
     function setFailing(bool value) external {
         failing = value;
     }
 
     function onEthereumMessage(uint64 nonce, address sender, bytes calldata payload) external {
+        uint256 gas = gasleft();
         require(msg.sender == INBOX, "not the inbox");
         require(!failing, "failing");
         count += 1;
         lastNonce = nonce;
         lastSender = sender;
         lastPayload = payload;
+        lastGas = gas;
     }
 }

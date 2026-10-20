@@ -2,7 +2,7 @@
 //! `EthereumOutbox`, run on revm as Ethereum runs it, stores exactly the
 //! message hash the inbox proves, at the slot it proves it.
 
-use solo_ethlc::abi::{address_word, word};
+use solo_ethlc::abi::{self, word};
 use solo_ethlc::inbox::{self, Message};
 use solo_ethlc::testing::{Evm, Native, hex, unhex};
 use solo_ethlc::{Crypto, Hash};
@@ -36,16 +36,6 @@ fn fixtures_match_their_sources() {
     }
 }
 
-fn send_call(recipient: &[u8; 20], payload: &[u8]) -> Vec<u8> {
-    let mut data = vec![0xc8, 0x9a, 0xcc, 0x86];
-    data.extend_from_slice(&address_word(recipient));
-    data.extend_from_slice(&word(64));
-    data.extend_from_slice(&word(payload.len() as u64));
-    data.extend_from_slice(payload);
-    data.resize(4 + 96 + payload.len().div_ceil(32) * 32, 0);
-    data
-}
-
 #[test]
 #[allow(clippy::too_many_lines)]
 fn the_outbox_stores_the_hash_the_inbox_proves() {
@@ -58,27 +48,27 @@ fn the_outbox_stores_the_hash_the_inbox_proves() {
     init.extend_from_slice(&word(7));
     let outbox = evm.deploy(deployer, init).unwrap();
     let payloads: [&[u8]; 2] = [b"hello solo", &[0xAB; 100]];
-    for (nonce, payload) in payloads.iter().enumerate() {
-        let out = evm
-            .call(sender, outbox, send_call(&recipient, payload))
-            .unwrap();
-        assert_eq!(out, word(nonce as u64));
-    }
-    // A bad call reverts.
-    assert!(
-        evm.call(sender, outbox, vec![0xc8, 0x9a, 0xcc, 0x86])
-            .is_err()
-    );
-    assert_eq!(evm.storage(&outbox, &word(1)), word(2), "nextNonce");
-    let state = evm.state();
-    let root = state.root();
-    for (nonce, payload) in payloads.iter().enumerate() {
-        let message = Message {
+    let messages: Vec<Message> = payloads
+        .iter()
+        .enumerate()
+        .map(|(nonce, payload)| Message {
             nonce: nonce as u64,
             sender,
             recipient,
+            gas_limit: 100_000 + nonce as u64,
             payload: payload.to_vec(),
-        };
+        })
+        .collect();
+    for message in &messages {
+        let out = evm.call(sender, outbox, message.send_call()).unwrap();
+        assert_eq!(out, word(message.nonce));
+    }
+    // A bad call reverts.
+    assert!(evm.call(sender, outbox, abi::SEND.to_vec()).is_err());
+    assert_eq!(evm.storage(&outbox, &word(1)), word(2), "nextNonce");
+    let state = evm.state();
+    let root = state.root();
+    for message in &messages {
         let slot = inbox::slot(&c, message.nonce);
         assert_eq!(evm.storage(&outbox, &slot), message.hash(&c, 7));
         let (account_proof, storage_proof) = state.proof(&outbox, &slot);
@@ -88,7 +78,7 @@ fn the_outbox_stores_the_hash_the_inbox_proves() {
                 &root,
                 &outbox,
                 7,
-                &message,
+                message,
                 &account_proof,
                 &storage_proof
             ),
@@ -101,7 +91,7 @@ fn the_outbox_stores_the_hash_the_inbox_proves() {
                 &root,
                 &outbox,
                 8,
-                &message,
+                message,
                 &account_proof,
                 &storage_proof
             )
@@ -127,6 +117,22 @@ fn the_outbox_stores_the_hash_the_inbox_proves() {
             sender: recipient,
             ..message.clone()
         };
+        let starved = Message {
+            gas_limit: 21_000,
+            ..message.clone()
+        };
+        assert!(
+            inbox::verify(
+                &c,
+                &root,
+                &outbox,
+                7,
+                &starved,
+                &account_proof,
+                &storage_proof
+            )
+            .is_err()
+        );
         assert!(
             inbox::verify(
                 &c,
@@ -146,7 +152,7 @@ fn the_outbox_stores_the_hash_the_inbox_proves() {
                 &root,
                 &deployer,
                 7,
-                &message,
+                message,
                 &account_proof,
                 &storage_proof
             )
@@ -158,6 +164,7 @@ fn the_outbox_stores_the_hash_the_inbox_proves() {
         nonce: 2,
         sender,
         recipient,
+        gas_limit: 0,
         payload: vec![],
     };
     let slot: Hash = inbox::slot(&c, 2);

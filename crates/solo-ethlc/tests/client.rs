@@ -74,19 +74,15 @@ fn outbox() -> Outbox {
         .into_iter()
         .enumerate()
     {
-        let mut data = vec![0xc8, 0x9a, 0xcc, 0x86];
-        data.extend_from_slice(&abi::address_word(&[0x7E; 20]));
-        data.extend_from_slice(&word(64));
-        data.extend_from_slice(&word(payload.len() as u64));
-        data.extend_from_slice(&payload);
-        data.resize(100 + payload.len().div_ceil(32) * 32, 0);
-        evm.call([0x5E; 20], address, data).unwrap();
-        messages.push(Message {
+        let message = Message {
             nonce: nonce as u64,
             sender: [0x5E; 20],
             recipient: [0x7E; 20],
+            gas_limit: 60_000,
             payload,
-        });
+        };
+        evm.call([0x5E; 20], address, message.send_call()).unwrap();
+        messages.push(message);
     }
     Outbox {
         address,
@@ -394,6 +390,7 @@ fn an_update_from_before_the_first_fork_is_refused() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn light_client_governance() {
     let c = Native;
     let chain = Chain::minimal(32);
@@ -422,6 +419,10 @@ fn light_client_governance() {
     );
     assert_eq!(client::call(&c, &mut store, &gov(0), &set), Ok(vec![]));
     assert_eq!(client::query(&store, &abi::DELAY), Ok(word(5).to_vec()));
+    let root_of = |store: &Map, block: u64| {
+        client::query(store, &client::u64_call(abi::EXECUTION_ROOT, block)).unwrap()[..32].to_vec()
+    };
+    assert_eq!(root_of(&store, 8), [3; 32]);
     // A new checkpoint replaces the client's state; its root waits out the delay.
     let fresh = chain.bootstrap(200, [0xEE; 32]);
     let checkpoint = abi::encode_bytes_call(abi::SET_CHECKPOINT, &fresh.encode());
@@ -465,7 +466,26 @@ fn light_client_governance() {
     );
     let root: client::ExecutionRoot =
         solo_abi::Decode::from_bytes(&store.get(&keys::root(200)).unwrap()).unwrap();
-    assert_eq!(root.usable_at, 3005);
+    assert_eq!((root.usable_at, root.epoch), (3005, 1));
+    assert_eq!(root_of(&store, 200), [0xEE; 32]);
+    // Every root stored before the checkpoint is revoked: one a dishonest
+    // committee got accepted can no longer prove messages (spec 18 §5.1).
+    assert!(store.get(&keys::root(8)).is_some());
+    assert_eq!(root_of(&store, 8), [0; 32]);
+    // A second checkpoint revokes the first one's roots in turn.
+    let again = chain.bootstrap(208, [0xDD; 32]);
+    assert_eq!(
+        client::call(
+            &c,
+            &mut store,
+            &gov(4000),
+            &abi::encode_bytes_call(abi::SET_CHECKPOINT, &again.encode())
+        ),
+        Ok(vec![])
+    );
+    assert_eq!(finalized(&store).epoch, 2);
+    assert_eq!(root_of(&store, 200), [0; 32]);
+    assert_eq!(root_of(&store, 208), [0xDD; 32]);
     // Without a governance account nobody governs.
     let mut ungoverned = Map::default();
     client::genesis(
@@ -552,6 +572,21 @@ fn the_verifier_delivers_each_message_once() {
     assert_eq!(
         consume(&mut store, &forged, inbox_at(500)),
         Err(encode(abi::BAD_PROOF, &[]))
+    );
+    // A relayer cannot change the gas the sender gave the recipient.
+    let mut starved = d0.clone();
+    starved.message.gas_limit = 21_000;
+    assert_eq!(
+        consume(&mut store, &starved, inbox_at(500)),
+        Err(encode(abi::BAD_PROOF, &[]))
+    );
+    // Only the canonical encoding counts (spec 18 §5): trailing bytes revert
+    // with empty data, before anything else is checked.
+    let mut trailing = d0.encode(abi::CONSUME);
+    trailing.extend_from_slice(&[0; 32]);
+    assert_eq!(
+        verifier::call(&c, &mut store, &inbox_at(500), &trailing),
+        Err(vec![])
     );
     let mut wrong_root = d0.clone();
     wrong_root.anchor = [9; 32];
@@ -764,6 +799,7 @@ fn admission_checks() {
             nonce: 0,
             sender: [1; 20],
             recipient: [2; 20],
+            gas_limit: 0,
             payload: vec![],
         },
         account_proof: vec![],
@@ -773,6 +809,22 @@ fn admission_checks() {
     assert_eq!(
         client::admit(&light, &messages, &INBOX_ADDRESS, 0, &deliver),
         Ok(())
+    );
+    // Proof elements whose offsets all point at one element are refused
+    // before they are copied (spec 18 §7).
+    let mut aliased = Delivery {
+        account_proof: vec![vec![7; 64]],
+        ..d.clone()
+    }
+    .encode(abi::DELIVER);
+    let account_at = 4 + 8 * 32 + 32;
+    aliased[account_at + 31] = 2;
+    aliased[account_at + 63] = 64;
+    aliased.splice(account_at + 64..account_at + 64, word(64));
+    aliased[4 + 7 * 32 + 31] += 32;
+    assert_eq!(
+        client::admit(&light, &messages, &INBOX_ADDRESS, 0, &aliased),
+        Err(reason::BRIDGE_CALL)
     );
     assert_eq!(
         client::admit(

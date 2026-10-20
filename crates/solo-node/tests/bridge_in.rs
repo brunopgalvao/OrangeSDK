@@ -34,6 +34,8 @@ const CONTRACTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contracts/fi
 const RECIPIENT: [u8; 20] = [0x7E; 20];
 const UPDATE_GAS: u64 = 3_000_000;
 const DELIVER_GAS: u64 = 1_000_000;
+/// The gas each message gives its recipient.
+const MESSAGE_GAS: u64 = 300_000;
 
 fn module(elf: &[u8]) -> Vec<u8> {
     solo_recompile::recompile(
@@ -95,22 +97,18 @@ fn ethereum() -> Ethereum {
         .into_iter()
         .enumerate()
     {
-        let mut data = vec![0xc8, 0x9a, 0xcc, 0x86];
-        data.extend_from_slice(&abi::address_word(&RECIPIENT));
-        data.extend_from_slice(&word(64));
-        data.extend_from_slice(&word(payload.len() as u64));
-        data.extend_from_slice(&payload);
-        data.resize(100 + payload.len().div_ceil(32) * 32, 0);
-        assert_eq!(
-            evm.call([0x5E; 20], outbox, data).unwrap(),
-            word(nonce as u64)
-        );
-        messages.push(Message {
+        let message = Message {
             nonce: nonce as u64,
             sender: [0x5E; 20],
             recipient: RECIPIENT,
+            gas_limit: MESSAGE_GAS,
             payload,
-        });
+        };
+        assert_eq!(
+            evm.call([0x5E; 20], outbox, message.send_call()).unwrap(),
+            word(nonce as u64)
+        );
+        messages.push(message);
     }
     Ethereum {
         outbox,
@@ -143,11 +141,15 @@ fn send(sim: &mut Sim, raw: &[u8]) -> Receipt {
 }
 
 fn call(node: &mut Node, to: [u8; 20], data: &[u8]) -> CallResult {
+    call_with(node, to, data, 5_000_000)
+}
+
+fn call_with(node: &mut Node, to: [u8; 20], data: &[u8], gas: u64) -> CallResult {
     node.call(&CallRequest {
         from: alice().address,
         to: Some(to),
         data: data.to_vec(),
-        gas: 5_000_000,
+        gas,
         ..CallRequest::default()
     })
     .unwrap()
@@ -212,6 +214,9 @@ fn messages_from_ethereum_reach_their_recipient_once() {
         now_ms: 10_000,
         ..NodeConfig::default()
     };
+    // The deployer, the sender and the outbox: the state spec 18 §8's
+    // deliveries prove against.
+    assert_eq!(eth.state.accounts.len(), 3);
     let mut sim = Sim::new(v1(), &genesis(bridge, 2), &keys(1), 1, &template, 30).unwrap();
     let mut relayer = Sender {
         wallet: alice(),
@@ -326,7 +331,7 @@ fn messages_from_ethereum_reach_their_recipient_once() {
     .output;
     let usable_at = u64::from_be_bytes(root[120..128].try_into().unwrap());
 
-    // An unknown block, and a message the outbox never stored, fail in the inbox.
+    // An unknown block fails in the inbox.
     let unknown = delivery(&eth, 0, 99);
     assert_eq!(
         call(&mut sim.nodes[0], INBOX_ADDRESS, &unknown).output,
@@ -349,26 +354,50 @@ fn messages_from_ethereum_reach_their_recipient_once() {
         abi::encode(abi::TOO_EARLY, &[word(usable_at)])
     );
     assert!(sim.run_until(20_000, |s| head_time(s) > usable_at).unwrap());
-    let mut forged = Delivery {
-        anchor: word(16),
-        message: eth.messages[0].clone(),
-        account_proof: vec![],
-        storage_proof: vec![],
-    };
-    forged.message.payload = b"forged".to_vec();
-    let forged = forged.encode(abi::DELIVER);
     assert_eq!(
-        call(&mut sim.nodes[0], INBOX_ADDRESS, &forged).output,
-        abi::encode(abi::BAD_PROOF, &[])
+        send(&mut sim, &relayer.tx(INBOX_ADDRESS, DELIVER_GAS, &unknown)).status,
+        0
     );
+    // A message the outbox never stored: the real proofs of message 0,
+    // with another payload or less gas for the recipient, prove nothing.
+    let changes: [fn(&mut Message); 2] =
+        [|m| m.payload = b"forged".to_vec(), |m| m.gas_limit = 21_000];
+    for change in changes {
+        let mut forged = Delivery::decode(&d0).unwrap();
+        change(&mut forged.message);
+        let forged = forged.encode(abi::DELIVER);
+        assert_eq!(
+            call(&mut sim.nodes[0], INBOX_ADDRESS, &forged).output,
+            abi::encode(abi::BAD_PROOF, &[])
+        );
+        assert_eq!(
+            send(&mut sim, &relayer.tx(INBOX_ADDRESS, DELIVER_GAS, &forged)).status,
+            0
+        );
+    }
+    // A relayer that leaves less than the message's gas for the recipient
+    // gets the whole delivery undone, in a call and in a block.
+    assert_eq!(
+        call_with(&mut sim.nodes[0], INBOX_ADDRESS, &d0, MESSAGE_GAS).output,
+        abi::encode(abi::INSUFFICIENT_GAS, &[word(MESSAGE_GAS)])
+    );
+    assert_eq!(
+        send(&mut sim, &relayer.tx(INBOX_ADDRESS, MESSAGE_GAS, &d0)).status,
+        0
+    );
+    assert_eq!(count(&mut sim.nodes[0]), 0);
 
     // Delivered: the recipient sees the message, once.
     let delivered = send(&mut sim, &relayer.tx(INBOX_ADDRESS, DELIVER_GAS, &d0));
     assert_eq!(
         (delivered.status, delivered.gas_used, applied.gas_used),
-        (1, 134_630, 161_438)
+        (1, 157_895, 161_738)
     );
     assert_eq!(count(&mut sim.nodes[0]), 1);
+    // The recipient had the message's gas, less its own dispatch.
+    let gas = call(&mut sim.nodes[0], RECIPIENT, &[0xdc, 0x5d, 0x3a, 0x17]).output;
+    let gas = u64::from_be_bytes(gas[24..32].try_into().unwrap());
+    assert!((MESSAGE_GAS - 1_000..MESSAGE_GAS).contains(&gas), "{gas}");
     let payload = call(&mut sim.nodes[0], RECIPIENT, &[0x4c, 0xc2, 0xaa, 0x3c]).output;
     assert_eq!(&payload[64..74], b"hello solo");
     let sender = call(&mut sim.nodes[0], RECIPIENT, &[0x25, 0x6f, 0xec, 0x88]).output;
@@ -607,5 +636,5 @@ fn real_mainnet_updates_through_the_kernel() {
     );
     // The gas spec 18 §8 states: a period's update with its 512 keys, and a
     // finality update.
-    assert_eq!((first.gas_used, second.gas_used), (1_326_164, 342_477));
+    assert_eq!((first.gas_used, second.gas_used), (1_314_289, 332_460));
 }

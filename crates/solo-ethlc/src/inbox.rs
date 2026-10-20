@@ -22,12 +22,14 @@ pub struct Message {
     pub sender: Address,
     /// The contract on Solo it is for.
     pub recipient: Address,
+    /// The gas the recipient gets to handle it, which the sender chose.
+    pub gas_limit: u64,
     /// The payload.
     pub payload: Vec<u8>,
 }
 
 impl Message {
-    /// `keccak256(abi.encode(soloChainId, nonce, sender, recipient, payload))`,
+    /// `keccak256(abi.encode(soloChainId, nonce, sender, recipient, gasLimit, payload))`,
     /// the value the outbox stores.
     #[must_use]
     pub fn hash(&self, c: &dyn Crypto, chain_id: u64) -> Hash {
@@ -37,14 +39,33 @@ impl Message {
             word(self.nonce),
             address_word(&self.sender),
             address_word(&self.recipient),
-            word(5 * 32),
+            word(self.gas_limit),
+            word(6 * 32),
             word(self.payload.len() as u64),
         ] {
             data.extend_from_slice(&w);
         }
         data.extend_from_slice(&self.payload);
-        data.resize(6 * 32 + self.payload.len().div_ceil(32) * 32, 0);
+        data.resize(7 * 32 + self.payload.len().div_ceil(32) * 32, 0);
         c.keccak256(&data)
+    }
+
+    /// The outbox call that sends it: `send(recipient, gasLimit, payload)`,
+    /// made on Ethereum by `sender`.
+    #[must_use]
+    pub fn send_call(&self) -> Vec<u8> {
+        let mut out = crate::abi::encode(
+            crate::abi::SEND,
+            &[
+                address_word(&self.recipient),
+                word(self.gas_limit),
+                word(3 * 32),
+                word(self.payload.len() as u64),
+            ],
+        );
+        out.extend_from_slice(&self.payload);
+        out.resize(4 + 4 * 32 + self.payload.len().div_ceil(32) * 32, 0);
+        out
     }
 }
 

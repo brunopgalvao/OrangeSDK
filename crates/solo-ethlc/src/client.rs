@@ -73,6 +73,9 @@ record! {
         block_hash: Hash,
         /// Its execution state root.
         state_root: Hash,
+        /// The checkpoint epoch: how many checkpoints governance installed
+        /// after genesis's. Only roots of this epoch are served.
+        epoch: u64,
     }
 }
 
@@ -87,6 +90,9 @@ record! {
         slot: u64,
         /// The Solo timestamp, in seconds, from which it may prove messages.
         usable_at: u64,
+        /// The checkpoint epoch it was stored in; a root of an older epoch
+        /// is treated as absent (spec 18 §5.1).
+        epoch: u64,
     }
 }
 
@@ -134,14 +140,21 @@ fn rejected(r: Rejection) -> Vec<u8> {
 }
 
 /// Stores `header` as the finalized header and its execution state root,
-/// usable from `usable_at`.
-fn finalize(c: &dyn Crypto, store: &mut dyn Storage, header: &LightClientHeader, usable_at: u64) {
+/// usable from `usable_at`, in checkpoint epoch `epoch`.
+fn finalize(
+    c: &dyn Crypto,
+    store: &mut dyn Storage,
+    header: &LightClientHeader,
+    usable_at: u64,
+    epoch: u64,
+) {
     let e = &header.execution;
     let root = ExecutionRoot {
         state_root: e.state_root,
         block_hash: e.block_hash,
         slot: header.beacon.slot,
         usable_at,
+        epoch,
     };
     put(store, &keys::root(e.block_number), &root);
     let f = Finalized {
@@ -150,12 +163,15 @@ fn finalize(c: &dyn Crypto, store: &mut dyn Storage, header: &LightClientHeader,
         block_number: e.block_number,
         block_hash: e.block_hash,
         state_root: e.state_root,
+        epoch,
     };
     put(store, keys::FINALIZED, &f);
 }
 
 /// Installs a checked checkpoint: its header becomes the finalized one and
-/// its committee the current one; any committee held before is dropped.
+/// its committee the current one; any committee held before is dropped,
+/// and the checkpoint epoch moves on, which revokes every root stored
+/// before (genesis installs epoch 0).
 fn install(
     c: &dyn Crypto,
     store: &mut dyn Storage,
@@ -163,14 +179,16 @@ fn install(
     b: &Bootstrap,
     usable_at: u64,
 ) {
+    let mut epoch = 0;
     if let Some(old) = get::<Finalized>(store, keys::FINALIZED) {
         let p = sync::period(cfg, old.slot);
         store.set(&keys::committee(p), None);
         store.set(&keys::committee(p + 1), None);
+        epoch = old.epoch + 1;
     }
     let p = sync::period(cfg, b.header.beacon.slot);
     store.set(&keys::committee(p), Some(&b.current_sync_committee.pubkeys));
-    finalize(c, store, &b.header, usable_at);
+    finalize(c, store, &b.header, usable_at, epoch);
 }
 
 /// Genesis in the light client's namespace (spec 18 §4.1): the
@@ -204,15 +222,17 @@ pub fn genesis(
     Ok(())
 }
 
-/// The light client's state as the sync protocol reads it.
-fn state(store: &dyn Storage, cfg: &LightClientConfig) -> Option<State> {
+/// The light client's state as the sync protocol reads it, and the
+/// checkpoint epoch.
+fn state(store: &dyn Storage, cfg: &LightClientConfig) -> Option<(State, u64)> {
     let finalized: Finalized = get(store, keys::FINALIZED)?;
     let p = sync::period(cfg, finalized.slot);
-    Some(State {
+    let state = State {
         finalized_slot: finalized.slot,
         current: store.get(&keys::committee(p))?,
         next: store.get(&keys::committee(p + 1)),
-    })
+    };
+    Some((state, finalized.epoch))
 }
 
 fn decode_update(cfg: &LightClientConfig, data: &[u8]) -> Result<Update, Rejection> {
@@ -235,7 +255,7 @@ fn submit(
 ) -> Result<Vec<u8>, Rejection> {
     let light = &cfg.light;
     let update = decode_update(light, data)?;
-    let state = state(store, light).ok_or(Rejection::Malformed)?;
+    let (state, epoch) = state(store, light).ok_or(Rejection::Malformed)?;
     let applied = sync::process(c, light, &state, &update)?;
     if applied.rotate {
         store.set(
@@ -252,6 +272,7 @@ fn submit(
             store,
             &update.finalized,
             ctx.timestamp.saturating_add(cfg.delay),
+            epoch,
         );
     }
     Ok(Vec::new())
@@ -327,8 +348,12 @@ pub fn query(store: &dyn Storage, data: &[u8]) -> Result<Vec<u8>, Vec<u8>> {
             f.state_root,
         ]))
     } else if selector == abi::EXECUTION_ROOT && data.len() == 36 {
-        let r: ExecutionRoot =
-            get(store, &keys::root(arg(data, 0).ok_or_else(Vec::new)?)).unwrap_or_default();
+        let epoch = get::<Finalized>(store, keys::FINALIZED)
+            .unwrap_or_default()
+            .epoch;
+        let r = get::<ExecutionRoot>(store, &keys::root(arg(data, 0).ok_or_else(Vec::new)?))
+            .filter(|r| r.epoch == epoch)
+            .unwrap_or_default();
         Ok(words(&[
             r.state_root,
             r.block_hash,
@@ -372,7 +397,7 @@ pub fn admit(
         let update = decode_update(light_cfg, data)
             .ok()
             .ok_or(reason::BRIDGE_UPDATE)?;
-        let state = state(light, light_cfg).ok_or(reason::BRIDGE_UPDATE)?;
+        let (state, _) = state(light, light_cfg).ok_or(reason::BRIDGE_UPDATE)?;
         return sync::precheck(light_cfg, &state, &update)
             .ok()
             .ok_or(reason::BRIDGE_UPDATE);
@@ -380,7 +405,7 @@ pub fn admit(
     if *to != INBOX_ADDRESS {
         return Ok(());
     }
-    let delivery = Delivery::decode_canonical(data)
+    let delivery = Delivery::decode(data)
         .filter(|_| data[..4] == abi::DELIVER)
         .ok_or(reason::BRIDGE_CALL)?;
     verifier::admit(messages, delivery.message.nonce)

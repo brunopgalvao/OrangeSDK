@@ -26,6 +26,7 @@ interface IMessageVerifier {
         uint64 nonce,
         address sender,
         address recipient,
+        uint64 gasLimit,
         bytes calldata payload,
         bytes[] calldata accountProof,
         bytes[] calldata storageProof

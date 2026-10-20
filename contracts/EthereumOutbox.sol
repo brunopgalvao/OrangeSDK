@@ -13,9 +13,15 @@ contract EthereumOutbox {
     /// The chain id of the Solo chain the messages are for.
     uint64 public immutable soloChainId;
 
-    /// Message `nonce` from `sender` to `recipient` on Solo.
+    /// Message `nonce` from `sender` to `recipient` on Solo, which gets
+    /// `gasLimit` gas to handle it.
     event MessageSent(
-        uint64 indexed nonce, address indexed sender, address indexed recipient, bytes payload, bytes32 messageHash
+        uint64 indexed nonce,
+        address indexed sender,
+        address indexed recipient,
+        uint64 gasLimit,
+        bytes payload,
+        bytes32 messageHash
     );
 
     constructor(uint64 chainId) {
@@ -23,11 +29,12 @@ contract EthereumOutbox {
     }
 
     /// Sends `payload` to `recipient` on Solo, where the inbox calls
-    /// `recipient.onEthereumMessage(nonce, msg.sender, payload)` once.
-    function send(address recipient, bytes calldata payload) external returns (uint64 nonce) {
+    /// `recipient.onEthereumMessage(nonce, msg.sender, payload)` once, with
+    /// exactly `gasLimit` gas: no relayer can deliver the message with less.
+    function send(address recipient, uint64 gasLimit, bytes calldata payload) external returns (uint64 nonce) {
         nonce = nextNonce++;
-        bytes32 messageHash = keccak256(abi.encode(soloChainId, nonce, msg.sender, recipient, payload));
+        bytes32 messageHash = keccak256(abi.encode(soloChainId, nonce, msg.sender, recipient, gasLimit, payload));
         messages[nonce] = messageHash;
-        emit MessageSent(nonce, msg.sender, recipient, payload, messageHash);
+        emit MessageSent(nonce, msg.sender, recipient, gasLimit, payload, messageHash);
     }
 }

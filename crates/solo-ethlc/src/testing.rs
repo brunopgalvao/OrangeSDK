@@ -546,6 +546,7 @@ mod tests {
             nonce: 0,
             sender: [1; 20],
             recipient: [2; 20],
+            gas_limit: 0,
             payload: vec![],
         };
         assert!(

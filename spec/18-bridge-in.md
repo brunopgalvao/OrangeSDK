@@ -18,6 +18,7 @@ The code is `solo-ethlc` (the protocol, the proofs and both modules' logic over 
 ## 2. Trust and limits
 
 - **Sync committees.** The light client accepts what a supermajority of the current (or, across a period boundary, next) sync committee signs. A dishonest supermajority of 512 randomly sampled validators can make it accept any header, as it can every Ethereum light client. Value that enters Solo through this bridge inherits that trust, which is why deliveries are delayed and rate limited (§6.3, §6.4) and can be paused (§6.4).
+- **Recovery.** A root accepted from a dishonest committee stays stored, at whatever execution block number the forged header named. Governance recovers in two steps: `pause` the verifier, then `setCheckpoint` with an honest checkpoint, which starts a new checkpoint epoch and so revokes every root stored before it, honest or not (§5.1); then `unpause`. Messages not yet delivered are proven again against roots of the new epoch, which hold the same outbox storage. Nonces a forged root already marked delivered stay delivered: the delay exists so that governance pauses before any is.
 - **Finality only.** Only finalized headers are stored, and an update is applied at once or refused: there is no optimistic header and no pending best update (§3.6).
 - **Liveness.** Each sync-committee period (256 epochs, about 27 hours on mainnet) the client must learn the next committee, from an update attested in the period. A client that misses a whole period can no longer verify any signature and stalls; governance then installs a new checkpoint (§5.1, `setCheckpoint`). Relayers keep the client live; anyone can relay.
 - **Ethereum forks.** The client is pinned to the Electra container formats, which Fulu keeps (§3.1). A later fork that changes the light-client containers or the generalized indices (Gloas, for instance) needs a new light-client module; until it is installed, by a kernel upgrade (spec 13), updates signed after the fork fail their signature check or do not decode, and the client stalls rather than accepting anything.
@@ -74,7 +75,7 @@ struct LightClientConfig { genesis_validators_root: [32], forks: vec<Fork>, sync
 
 The client's state is its *finalized header* (slot `F`), the committee of `period(F)` (*current*), and the committee of `period(F) + 1` (*next*) once known. A header is *valid* when its execution payload header is proven against `beacon.body_root` at `EXECUTION_PAYLOAD_GINDEX`.
 
-A *checkpoint* is a `LightClientBootstrap`. It is accepted if its header's slot is supported (`UnsupportedFork`), the header is valid (`BadExecutionBranch`), and `current_sync_committee` is proven against `header.beacon.state_root` at `CURRENT_SYNC_COMMITTEE_GINDEX` (`BadBootstrap`). Installing it makes its header the finalized header and its committee the current one, and drops every committee held before. A checkpoint is trusted as given: genesis names one, and governance may install another (§5.1). There is no trusted-block-root comparison because the checkpoint is the trusted input itself.
+A *checkpoint* is a `LightClientBootstrap`. It is accepted if its header's slot is supported (`UnsupportedFork`), the header is valid (`BadExecutionBranch`), and `current_sync_committee` is proven against `header.beacon.state_root` at `CURRENT_SYNC_COMMITTEE_GINDEX` (`BadBootstrap`). Installing it makes its header the finalized header and its committee the current one, and drops every committee held before. A checkpoint is trusted as given: genesis names one, and governance may install another (§5.1). The *checkpoint epoch* counts the checkpoints installed after genesis's (genesis's is epoch 0); installing one moves it on by one, and only roots stored in the current epoch are served (§5.1). There is no trusted-block-root comparison because the checkpoint is the trusted input itself.
 
 ### 3.5 Updates
 
@@ -95,7 +96,7 @@ Checks 1 to 6 need no hashing beyond the update's own decoding; admission runs t
 
 - If the next committee was unknown and `U` carries `C`, `C` becomes the next committee (of `period(A) + 1`).
 - If the next committee was known and `period(H) = p + 1`, the client moves to the next period: the next committee becomes current, the old current one is dropped, and `C`, if `U` carries it, becomes the next committee; otherwise the next committee is unknown.
-- If `H.slot > F`, `H` becomes the finalized header and its execution state root is stored (§4.2) with `usable_at` = the block's timestamp (seconds) plus the delay.
+- If `H.slot > F`, `H` becomes the finalized header and its execution state root is stored (§4.2) with `usable_at` = the block's timestamp (seconds) plus the delay, in the current checkpoint epoch.
 
 ### 3.6 Departures from Altair
 
@@ -155,15 +156,15 @@ Each native contract's state is its namespace (spec 16 §2.3): the stored key is
 | Namespace | Key | Value |
 |---|---|---|
 | light client | `config` | `{ light: LightClientConfig, governance: [20], delay: u64 }` |
-| light client | `finalized` | `{ slot: u64, beacon_root: [32], block_number: u64, block_hash: [32], state_root: [32] }` |
+| light client | `finalized` | `{ slot: u64, beacon_root: [32], block_number: u64, block_hash: [32], state_root: [32], epoch: u64 }` |
 | light client | `committee/` ‖ period (u64) | the committee's keys, `48 · N` bytes |
-| light client | `root/` ‖ execution block number (u64) | `{ state_root: [32], block_hash: [32], slot: u64, usable_at: u64 }` |
+| light client | `root/` ‖ execution block number (u64) | `{ state_root: [32], block_hash: [32], slot: u64, usable_at: u64, epoch: u64 }` |
 | verifier | `config` | `{ outbox: [20], chain_id: u64, governance: [20], window: u64, max_messages: u64 }` |
 | verifier | `delivered/` ‖ nonce (u64) | `[1]` |
 | verifier | `paused` | `[1]` while paused |
 | verifier | `window` | `{ start: u64, count: u64 }` |
 
-Roots are kept for every finalized block the client stores, so a proof made against a root stays usable after newer updates.
+Roots are kept for every finalized block the client stores, so a proof made against a root stays usable after newer updates. `epoch` is the checkpoint epoch (§3.4) of `finalized` and of the update that stored each root.
 
 ### 4.3 Why modules
 
@@ -177,7 +178,7 @@ The inbox is EVM code because only EVM code can call another contract: a module 
 
 ## 5. Interfaces
 
-Calldata to the native contracts is the Solidity ABI of `contracts/IEthereumLightClient.sol` and `contracts/IMessageVerifier.sol`, and only its canonical encoding counts: no bytes after the arguments, zero high bytes in every word, the offset and padding Solidity writes. A call that is not one of the functions below, or whose words are not canonical, reverts with empty data, except that `submitUpdate`, `submitFinalityUpdate` and `setCheckpoint` revert `UpdateRejected(1)` for a `bytes` argument that is not. Value sent with a call stays with the contract.
+Calldata to the native contracts is the Solidity ABI of `contracts/IEthereumLightClient.sol` and `contracts/IMessageVerifier.sol`, and only its canonical encoding counts: no bytes after the arguments, zero high bytes in every word, the offset and padding Solidity writes. For a `bytes[]` that means element `i`'s offset is where element `i − 1`'s padded tail ends (the first's, just past the offsets), so no two elements share bytes; a decoder checks each offset before copying the element it points at, and decoding costs time and memory linear in the calldata. A call that is not one of the functions below, or whose words are not canonical, reverts with empty data, except that `submitUpdate`, `submitFinalityUpdate` and `setCheckpoint` revert `UpdateRejected(1)` for a `bytes` argument that is not. Value sent with a call stays with the contract.
 
 ### 5.1 The light client (EL)
 
@@ -185,10 +186,10 @@ Calldata to the native contracts is the Solidity ABI of `contracts/IEthereumLigh
 |---|---|---|---|
 | `submitUpdate(bytes update)` | `0xd1767a4a` | anyone | applies an SSZ `LightClientUpdate` (§3.5) or reverts `UpdateRejected(code)` |
 | `submitFinalityUpdate(bytes update)` | `0x7ce7590d` | anyone | the same for a `LightClientFinalityUpdate` |
-| `setCheckpoint(bytes bootstrap)` | `0xfa8d858d` | governance | installs the checkpoint (§3.4); its root is usable after the delay |
+| `setCheckpoint(bytes bootstrap)` | `0xfa8d858d` | governance | installs the checkpoint (§3.4) in a new checkpoint epoch, revoking every root stored before; its own root is usable after the delay |
 | `setDelay(uint64 delay)` | `0xc1073302` | governance | sets the delay of roots stored from then on |
 | `finalized()` | `0xb3f05b97` | view | `(uint64 slot, bytes32 beaconRoot, uint64 blockNumber, bytes32 blockHash, bytes32 stateRoot)` |
-| `executionRoot(uint64 blockNumber)` | `0xe4779daa` | view | `(bytes32 stateRoot, bytes32 blockHash, uint64 slot, uint64 usableAt)`, zeros if not held |
+| `executionRoot(uint64 blockNumber)` | `0xe4779daa` | view | `(bytes32 stateRoot, bytes32 blockHash, uint64 slot, uint64 usableAt)`, zeros if not held or stored in an earlier checkpoint epoch |
 | `delay()` | `0x6a42b8f8` | view | the delay in seconds |
 
 A governance function called by any other account, or with no governance account, reverts `NotGovernance()`. `module_query` (spec 16 §4.3) answers the views.
@@ -197,7 +198,7 @@ A governance function called by any other account, or with no governance account
 
 | Function | Selector | Who | Effect |
 |---|---|---|---|
-| `consume(bytes32 stateRoot, uint64 nonce, address sender, address recipient, bytes payload, bytes[] accountProof, bytes[] storageProof)` | `0x4f4ea293` | the inbox | §6.4 |
+| `consume(bytes32 stateRoot, uint64 nonce, address sender, address recipient, uint64 gasLimit, bytes payload, bytes[] accountProof, bytes[] storageProof)` | `0x56604c65` | the inbox | §6.4 |
 | `pause()` | `0x8456cb59` | governance | stops deliveries |
 | `unpause()` | `0x3f4ba83a` | governance | resumes them |
 | `setRateLimit(uint64 window, uint64 maxMessages)` | `0xe1e5cca4` | governance | sets the rate limit |
@@ -209,13 +210,13 @@ A governance function called by any other account, or with no governance account
 
 ### 6.1 The outbox
 
-`contracts/EthereumOutbox.sol` is deployed on Ethereum once per Solo chain with that chain's id. `send(address recipient, bytes payload)` (`0xc89acc86`) gives the message the next nonce (from 0), stores
+`contracts/EthereumOutbox.sol` is deployed on Ethereum once per Solo chain with that chain's id. `send(address recipient, uint64 gasLimit, bytes payload)` (`0xdd624a88`) gives the message the next nonce (from 0), stores
 
 ```
-messages[nonce] = keccak256(abi.encode(uint64 soloChainId, uint64 nonce, address sender, address recipient, bytes payload))
+messages[nonce] = keccak256(abi.encode(uint64 soloChainId, uint64 nonce, address sender, address recipient, uint64 gasLimit, bytes payload))
 ```
 
-with `sender = msg.sender`, and emits `MessageSent(nonce, sender, recipient, payload, messageHash)`. `messages` is a `mapping(uint64 => bytes32)` at storage slot 0, so message `n` is at slot `keccak256(uint256(n) ‖ uint256(0))`; `nextNonce` is slot 1. The chain id in the hash keeps a message for one Solo chain from being delivered on another.
+with `sender = msg.sender`, and emits `MessageSent(nonce, sender, recipient, gasLimit, payload, messageHash)`. `gasLimit` is the gas the recipient gets to handle the message (§6.5); the sender chooses it, and a message whose `gasLimit` no Solo block can provide is never delivered. `messages` is a `mapping(uint64 => bytes32)` at storage slot 0, so message `n` is at slot `keccak256(uint256(n) ‖ uint256(0))`; `nextNonce` is slot 1. The chain id in the hash keeps a message for one Solo chain from being delivered on another.
 
 ### 6.2 Proofs
 
@@ -227,14 +228,14 @@ The message is proven when the account proof of `keccak256(outbox)` against `sta
 
 ### 6.3 Delay
 
-A state root may prove messages from `usable_at`, the timestamp (seconds) of the block that stored it plus the light client's delay (§3.5). The delay leaves time to pause the inbox (§6.4) after an update that should not have been accepted, before any message proven by it is delivered.
+A state root may prove messages from `usable_at`, the timestamp (seconds) of the block that stored it plus the light client's delay (§3.5). The delay leaves time to pause the inbox (§6.4) after an update that should not have been accepted, before any message proven by it is delivered; a new checkpoint then revokes the root (§2, §5.1).
 
 ### 6.4 Consuming a message
 
 `consume` checks, in order:
 
 1. The caller is the inbox address. — `NotInbox()`
-2. The calldata decodes. — empty revert data
+2. The calldata is the canonical encoding (§5). — empty revert data
 3. Deliveries are not paused. — `Paused()`
 4. `delivered/` ‖ nonce is absent. — `AlreadyDelivered(nonce)`
 5. The rate limit: with the window record `(start, count)` (zeros if absent), if `timestamp ≥ start + window` a new window opens at `timestamp` with count 0; then `count < maxMessages`. — `RateLimited()`
@@ -244,14 +245,14 @@ It then increments the count, stores the window and marks the nonce delivered. T
 
 ### 6.5 The inbox
 
-`contracts/SoloInbox.sol` at the inbox address has no constructor, no immutables and no storage. `deliver(uint64 blockNumber, uint64 nonce, address sender, address recipient, bytes payload, bytes[] accountProof, bytes[] storageProof)` (`0x00e20986`):
+`contracts/SoloInbox.sol` at the inbox address has no constructor, no immutables and no storage. `deliver(uint64 blockNumber, uint64 nonce, address sender, address recipient, uint64 gasLimit, bytes payload, bytes[] accountProof, bytes[] storageProof)` (`0x9a288f33`):
 
 1. reads `executionRoot(blockNumber)` from the light client; a zero state root reverts `UnknownBlock(blockNumber)`, a block timestamp below `usableAt` reverts `TooEarly(usableAt)`;
 2. calls the verifier's `consume` with that state root and its own arguments, bubbling up any revert;
-3. calls `recipient.onEthereumMessage(nonce, sender, payload)` (`IEthereumMessageReceiver`, `0x64f7ddb0`) with the gas left (less the 1/64 the EVM keeps); if it reverts, `deliver` reverts `DeliveryFailed(reason)`, and if the recipient has no code, with empty data; either undoes step 2;
+3. calls `recipient.onEthereumMessage(nonce, sender, payload)` (`IEthereumMessageReceiver`, `0x64f7ddb0`) with exactly `gasLimit` gas: if the recipient has no code, `deliver` reverts with empty data; if less than `⌊(gasLimit + 5 000) · 64 / 63⌋` gas is left just before the call, it reverts `InsufficientGas(gasLimit)` (`0xc0a1813d`), so the EVM's 1/64 rule cannot cut the call short; if the recipient reverts, it reverts `DeliveryFailed(reason)`; each undoes step 2;
 4. emits `MessageDelivered(nonce, sender, recipient, blockNumber)`.
 
-A message is therefore delivered *exactly once*: never twice, because the verifier refuses a delivered nonce, and never half, because a recipient that fails undoes the whole delivery, which anyone may retry. A recipient authenticates a message by checking `msg.sender` is the inbox address and trusting `sender` as the Ethereum account that sent it.
+A message is therefore delivered *exactly once*: never twice, because the verifier refuses a delivered nonce, and never half, because a recipient that fails undoes the whole delivery, which anyone may retry. Because the gas is the sender's choice, proven with the message, a relayer cannot starve the recipient: a recipient that catches a failing inner call still had the gas the sender asked for. A recipient authenticates a message by checking `msg.sender` is the inbox address and trusting `sender` as the Ethereum account that sent it.
 
 ## 7. Admission
 
@@ -259,7 +260,7 @@ A message is therefore delivered *exactly once*: never twice, because the verifi
 
 | Code | Name | A transaction to … is refused when |
 |---|---|---|
-| 20 | `BRIDGE_CALL` | any of the three, on a chain without the bridge (the light client's `config` is absent) or carrying value; to the inbox, its calldata is not the canonical encoding of `deliver` |
+| 20 | `BRIDGE_CALL` | any of the three, on a chain without the bridge (the light client's `config` is absent) or carrying value; to the inbox, its calldata is not the canonical encoding of `deliver` (§5), which admission checks before copying any part of it |
 | 21 | `BRIDGE_UPDATE` | the light client, calling `submitUpdate` or `submitFinalityUpdate` with an update that does not decode or fails checks 1 to 6 of §3.5 against the current state |
 | 22 | `MESSAGE_DELIVERED` | the inbox, for a nonce the verifier has marked delivered |
 | 23 | `INBOX_PAUSED` | the inbox, while the verifier is paused |
@@ -268,20 +269,20 @@ Admission is a filter, not a rule of execution: a transaction that is included a
 
 ## 8. Gas
 
-Calls to the light client and the verifier are native calls, charged as spec 16 §6 says: the EVM's call costs, then `100 + ⌈VM gas / 20⌉` plus the write charges. The light client's VM gas is dominated by `bls12381_fast_aggregate_verify` (`125 000 + 5 500` per participating key, spec 05 §4.3), SSZ hashing (`hash_sha256`) and, once a period, the write of the next committee (`5 000 + 600 · ⌈(18 + 48 · N) / 32⌉` EVM gas, 466 400 for `N = 512`). Measured through the reference kernel on 2026-10-21 (`crates/solo-node/tests/bridge_in.rs`; transaction gas used, intrinsic and calldata costs included):
+Calls to the light client and the verifier are native calls, charged as spec 16 §6 says: the EVM's call costs, then `100 + ⌈VM gas / 20⌉` plus the write charges. The light client's VM gas is dominated by `bls12381_fast_aggregate_verify` (`125 000 + 5 500` per participating key, spec 05 §4.3, calibrated by `crates/solo-bls/tests/calibration.rs`), SSZ hashing (`hash_sha256`) and, once a period, the write of the next committee (`5 000 + 600 · ⌈(18 + 48 · N) / 32⌉` EVM gas, 466 400 for `N = 512`). Measured through the reference kernel on 2026-10-21 (`crates/solo-node/tests/bridge_in.rs`; transaction gas used, intrinsic and calldata costs included):
 
 | Transaction | Gas |
 |---|---|
-| `submitUpdate`, mainnet period 1888 update (512 members, carries the next committee) | 1 326 164 |
-| `submitFinalityUpdate`, mainnet, rotating into period 1889 | 342 477 |
-| `submitUpdate`, minimal preset (32 members, carries the next committee) | 161 438 |
-| `deliver` of a 10-byte message with a two-account state's proofs | 134 630 |
+| `submitUpdate`, mainnet period 1888 update (512 members, carries the next committee) | 1 314 289 |
+| `submitFinalityUpdate`, mainnet, rotating into period 1889 | 332 460 |
+| `submitUpdate`, minimal preset (32 members, carries the next committee) | 161 738 |
+| `deliver` of a 10-byte message with a three-account state's proofs, to the test recipient `MessageRecipient` | 157 895 |
 
 A mainnet `deliver` carries proofs of about 9 account-trie nodes and 7 storage-trie nodes (the WETH proof of §10 has 9 and 7), about 10 KiB of calldata.
 
 ## 9. Contracts and fixtures
 
-`contracts/` holds `EthereumOutbox.sol`, `SoloInbox.sol`, the two interfaces and the test recipient `test/MessageRecipient.sol`. `tools/build-contracts.sh` compiles them with solc 0.8.28 (`--optimize --optimize-runs 200 --metadata-hash none`) into `contracts/fixtures/` (`<Name>.bin`, `<Name>.runtime`, `<Name>.abi.json`) and records the SHA-256 of every source in `contracts/fixtures/sources.sha256`; a test fails when a source no longer matches its recorded hash, so stale fixtures cannot pass. The kernel embeds `SoloInbox.runtime`, so the guest is rebuilt (`tools/build-guest.sh`) after the contracts.
+`contracts/` holds `EthereumOutbox.sol`, `SoloInbox.sol`, the two interfaces and the test recipient `test/MessageRecipient.sol`. `tools/build-contracts.sh` compiles them with solc 0.8.28 (`--optimize --optimize-runs 200 --metadata-hash none`) into `contracts/fixtures/` (`<Name>.bin`, `<Name>.runtime`, `<Name>.abi.json`) and records the SHA-256 of every source in `contracts/fixtures/sources.sha256`; a test fails when a source no longer matches its recorded hash, so stale fixtures cannot pass. The kernel embeds `SoloInbox.runtime`, so the guest is rebuilt (`tools/build-guest.sh`) after the contracts. The guest build does not depend on where the repository is checked out (the script builds a copy at one fixed path), so the gas of §8 is the same from every checkout.
 
 ## 10. Test vectors
 

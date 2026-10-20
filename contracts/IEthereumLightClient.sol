@@ -14,7 +14,8 @@ interface IEthereumLightClient {
     function submitUpdate(bytes calldata update) external;
     /// Applies an SSZ `LightClientFinalityUpdate`. Anyone may submit one.
     function submitFinalityUpdate(bytes calldata update) external;
-    /// Governance: replaces the light client's state with a new SSZ `LightClientBootstrap`.
+    /// Governance: replaces the light client's state with a new SSZ `LightClientBootstrap`,
+    /// revoking every execution state root stored before.
     function setCheckpoint(bytes calldata bootstrap) external;
     /// Governance: sets the seconds between storing a state root and its first use.
     function setDelay(uint64 delay) external;
@@ -24,7 +25,8 @@ interface IEthereumLightClient {
         external
         view
         returns (uint64 slot, bytes32 beaconRoot, uint64 blockNumber, bytes32 blockHash, bytes32 stateRoot);
-    /// The execution state root of `blockNumber`, zero if not held, and when it becomes usable.
+    /// The execution state root of `blockNumber`, zero if not held or stored before the last
+    /// checkpoint, and when it becomes usable.
     function executionRoot(uint64 blockNumber)
         external
         view

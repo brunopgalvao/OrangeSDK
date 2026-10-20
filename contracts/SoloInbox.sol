@@ -28,6 +28,13 @@ contract SoloInbox {
     error TooEarly(uint64 usableAt);
     /// The recipient reverted; the delivery is undone and may be retried.
     error DeliveryFailed(bytes reason);
+    /// Too little gas is left to give the recipient the message's `gasLimit`;
+    /// the delivery is undone and may be retried with more.
+    error InsufficientGas(uint64 gasLimit);
+
+    /// Gas kept back, beyond the 1/64 the EVM withholds, for the work
+    /// between the check in `_call` and the call itself.
+    uint256 internal constant CALL_RESERVE = 5000;
 
     /// Delivers message `nonce` once the verifier accepts its proofs against
     /// the light client's state root of execution block `blockNumber`.
@@ -37,18 +44,35 @@ contract SoloInbox {
         uint64 nonce,
         address sender,
         address recipient,
+        uint64 gasLimit,
         bytes calldata payload,
         bytes[] calldata accountProof,
         bytes[] calldata storageProof
     ) external {
-        (bytes32 stateRoot,,, uint64 usableAt) = LIGHT_CLIENT.executionRoot(blockNumber);
+        VERIFIER.consume(
+            _stateRoot(blockNumber), nonce, sender, recipient, gasLimit, payload, accountProof, storageProof
+        );
+        _call(recipient, gasLimit, abi.encodeCall(IEthereumMessageReceiver.onEthereumMessage, (nonce, sender, payload)));
+        emit MessageDelivered(nonce, sender, recipient, blockNumber);
+    }
+
+    /// The light client's state root of execution block `blockNumber`, once
+    /// the delay has passed.
+    function _stateRoot(uint64 blockNumber) internal view returns (bytes32 stateRoot) {
+        uint64 usableAt;
+        (stateRoot,,, usableAt) = LIGHT_CLIENT.executionRoot(blockNumber);
         if (stateRoot == bytes32(0)) revert UnknownBlock(blockNumber);
         if (block.timestamp < usableAt) revert TooEarly(usableAt);
-        VERIFIER.consume(stateRoot, nonce, sender, recipient, payload, accountProof, storageProof);
-        try IEthereumMessageReceiver(recipient).onEthereumMessage(nonce, sender, payload) {}
-        catch (bytes memory reason) {
-            revert DeliveryFailed(reason);
-        }
-        emit MessageDelivered(nonce, sender, recipient, blockNumber);
+    }
+
+    /// Calls the recipient with exactly `gasLimit` gas, and reverts the whole
+    /// delivery if the recipient has no code (with empty data), if less gas
+    /// is left, or if the recipient reverts. The sender chose `gasLimit`, so
+    /// a relayer cannot starve the recipient's own calls.
+    function _call(address recipient, uint64 gasLimit, bytes memory data) internal {
+        if (recipient.code.length == 0) revert();
+        if (gasleft() < (uint256(gasLimit) + CALL_RESERVE) * 64 / 63) revert InsufficientGas(gasLimit);
+        (bool ok, bytes memory reason) = recipient.call{gas: gasLimit}(data);
+        if (!ok) revert DeliveryFailed(reason);
     }
 }
