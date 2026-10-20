@@ -56,7 +56,9 @@ fn u128_of(v: U256) -> u128 {
     u128::try_from(v).unwrap_or(u128::MAX)
 }
 
-/// Writes revm's changes to the kernel state, as revm's own `CacheDB` would.
+/// Writes revm's changes to the kernel state, as revm's own `CacheDB` would,
+/// plus the EIP-161 rule that `CacheDB` leaves to its user: a touched account
+/// left empty (no code, nonce or balance) is removed.
 fn commit(changes: impl IntoIterator<Item = (RAddress, RAccount)>) {
     for (address, account) in changes {
         if !account.is_touched() {
@@ -73,6 +75,13 @@ fn commit(changes: impl IntoIterator<Item = (RAddress, RAccount)>) {
             continue;
         }
         let info = &account.info;
+        if info.is_empty() {
+            // Only an account that never had code, nonce or storage can be empty after a
+            // transaction (a zero-value call, a zero fee to the beneficiary), so there is
+            // nothing else to remove.
+            state::delete(&state::account_key(&a));
+            continue;
+        }
         let code_hash = if info.code_hash == KECCAK_EMPTY { [0; 32] } else { info.code_hash.0 };
         if let Some(code) = &info.code
             && code_hash != [0; 32]
@@ -176,7 +185,10 @@ pub fn run(message: Message, block: BlockFields, commit_state: bool) -> Outcome 
         .modify_cfg_chained(|cfg| {
             cfg.set_spec_and_mainnet_gas_params(SpecId::OSAKA);
             cfg.chain_id = chain_id;
+            // A call query is a simulation: like geth's eth_call it skips the nonce
+            // and lets a contract be the caller (EIP-3607 applies to transactions).
             cfg.disable_nonce_check = skip_nonce;
+            cfg.disable_eip3607 = skip_nonce;
         })
         .with_block(block_env)
         .with_db(StateDb)
@@ -205,6 +217,12 @@ pub fn run(message: Message, block: BlockFields, commit_state: bool) -> Outcome 
     Outcome { status, gas_used, output, logs, contract }
 }
 
+/// The order of the secp256k1 group.
+const SECP256K1_ORDER: [u8; 32] = [
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+    0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
+];
+
 /// The host's native implementations of the precompiles it accelerates.
 #[derive(Debug)]
 struct HostCrypto;
@@ -221,6 +239,15 @@ impl Crypto for HostCrypto {
         let mut full = [0u8; 65];
         full[..64].copy_from_slice(sig);
         full[64] = recid;
+        // The host recovers low-s signatures only, the form EIP-2 requires of
+        // transactions. The precompile accepts either: (r, s) and (r, n - s) with the
+        // other parity name the same key, so a high s is mirrored, as revm itself does.
+        let n = U256::from_be_bytes(SECP256K1_ORDER);
+        let s = U256::from_be_slice(&sig[32..]);
+        if s > n >> 1 && s < n {
+            full[32..64].copy_from_slice(&(n - s).to_be_bytes::<32>());
+            full[64] ^= 1;
+        }
         let address = crate::tx::recover_address(msg, &full).ok_or(PrecompileHalt::Secp256k1RecoverFailed)?;
         let mut out = [0u8; 32];
         out[12..].copy_from_slice(&address);

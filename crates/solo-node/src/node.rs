@@ -626,4 +626,17 @@ impl Node {
     pub fn logs(&self) -> &[(u32, Vec<u8>)] {
         self.exec.logs()
     }
+
+    /// A raw value of the kernel's storage, by the key the kernel uses, for
+    /// tooling and tests that check the kernel's state layout.
+    #[must_use]
+    pub fn state_get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.exec.state().get(key)
+    }
+
+    /// Every raw entry of the kernel's storage under `prefix`, in key order.
+    #[must_use]
+    pub fn state_scan(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.exec.state().scan(prefix)
+    }
 }

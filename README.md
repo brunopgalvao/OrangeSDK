@@ -7,7 +7,7 @@ A framework for EVM-compatible solochains.
 - The kernel, including consensus, is upgraded by governance. The host is upgraded by releases behind feature gates.
 - Type 2 Ethereum compatibility: standard EVM bytecode, exact gas, full RPC.
 
-Status: spec v0 written; the reference kernel runs Simplex BFT consensus (spec 08) across validators connected over TCP (spec 09), with catch-up sync for nodes that fall behind. Ethereum legacy transfers work end to end, from `eth_sendRawTransaction` to receipts. See `spec/README.md`.
+Status: spec v0 written; the reference kernel runs Simplex BFT consensus (spec 08) across validators connected over TCP (spec 09), with catch-up sync for nodes that fall behind. It executes Ethereum transactions (legacy, EIP-2930, EIP-1559) on revm at the Osaka fork: contract creation, calls, storage, logs, reverts and precompiles are tested end to end through the node (`crates/solo-node/tests/evm.rs`). The JSON-RPC server still covers transfers only. See `spec/README.md`.
 
 ## Try it
 

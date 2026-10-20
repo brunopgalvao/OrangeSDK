@@ -542,14 +542,19 @@ fn secp256k1_recover_and_p256_verify() {
         }
     }
     assert_eq!(seen, [true, true], "both recovery ids exercised");
-    let _ = msg;
-    // Bad recovery id and an unrecoverable signature report InvalidArgument.
-    for (patch_at, value) in [(32 + 64, 9u8), (32, 0xFFu8)] {
-        let mut bad = ro.clone();
-        bad[patch_at] = value;
-        if patch_at == 32 {
-            bad[32..64].fill(0xFF);
-        }
+    // Bad recovery id and an unrecoverable signature report InvalidArgument, and so
+    // does the high-s twin of a valid signature, (r, n - s) with the other parity:
+    // only the low-s form is accepted (spec 05 §4.3).
+    let mut bad_id = ro.clone();
+    bad_id[32 + 64] = 9;
+    let mut unrecoverable = ro.clone();
+    unrecoverable[32..64].fill(0xFF);
+    let (sig, rid) = sk.sign_prehash_recoverable(&msg).unwrap();
+    let mut high_s = msg.to_vec();
+    high_s.extend_from_slice(&sig.r().to_bytes());
+    high_s.extend_from_slice(&(-*sig.s()).to_bytes());
+    high_s.push(rid.to_byte() ^ 1);
+    for bad in [bad_id, unrecoverable, high_s] {
         let mut body = vec![
             li(Reg::A0, 0x1_0000),
             li(Reg::A1, 0x1_0020),

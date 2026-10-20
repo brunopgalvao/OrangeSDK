@@ -538,6 +538,7 @@ name = "solo-node"
 version = "0.0.1"
 dependencies = [
  "k256",
+ "p256",
  "solo-abi",
  "solo-host",
  "solo-recompile",
