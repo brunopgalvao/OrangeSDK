@@ -10,7 +10,10 @@ use solo_abi::chain::consensus::{
     KEY_ROLE, KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE, TIMEOUT_SLOTS, TOPIC, identity_preimage, leader,
     propose_timer, quorum, signing_preimage, timeout_timer, timer_view,
 };
-use solo_abi::chain::{BlockHeader, Certificate, ConsensusMessage, GenesisParams, Proposal, Signature, SignedVote, SimplexState, ValidatorSet};
+use solo_abi::chain::{
+    BlockHeader, Certificate, ConsensusMessage, GenesisParams, Proposal, Signature, SignedVote, SimplexState, SyncRequest,
+    SyncResponse, ValidatorSet,
+};
 use solo_abi::codec::Seq;
 use solo_abi::types::{Block, Effect, Hash, Input, MigrateArgs};
 use solo_abi::{Decode, Encode};
@@ -45,6 +48,9 @@ fn key(prefix: &[u8], parts: &[&[u8]]) -> Vec<u8> {
     k
 }
 
+/// Most proposals one sync response carries, give or take one batch.
+const SYNC_BATCH: u64 = 16;
+
 /// One driver step's working set.
 struct Ctx {
     s: SimplexState,
@@ -52,6 +58,8 @@ struct Ctx {
     params: GenesisParams,
     validators: Vec<Hash>,
     effects: Vec<Effect>,
+    /// The peer the current input came from, if it came from one.
+    peer: Option<Hash>,
 }
 
 impl Ctx {
@@ -62,7 +70,7 @@ impl Ctx {
             .unwrap_or_default();
         let mut s = load();
         s.now_ms = persist::time_now();
-        Ctx { s, chain_id: state::chain_id(), params: state::params(), validators, effects: Vec::new() }
+        Ctx { s, chain_id: state::chain_id(), params: state::params(), validators, effects: Vec::new(), peer: None }
     }
 
     fn n(&self) -> usize {
@@ -127,6 +135,8 @@ impl Ctx {
             self.effects.push(Effect::CancelTimer { timer_id: propose_timer(self.s.view) });
         }
         self.s.view = view;
+        // A sync that never answered is retried on the next trigger.
+        self.s.sync_pending = false;
         self.s.voted = false;
         self.s.timed_out = false;
         self.s.proposing = false;
@@ -219,6 +229,9 @@ impl Ctx {
             return;
         }
         persist::set(&key(b"prop/", &[&hash]), &proposal);
+        if proposal.height > self.s.tip_height + 1 {
+            self.request_sync();
+        }
         let extends_tip = proposal.parent == self.s.tip_hash && proposal.height == self.s.tip_height + 1;
         if proposal.view == self.s.view && extends_tip && !self.s.voted && !self.s.timed_out {
             self.s.voted = true;
@@ -271,7 +284,10 @@ impl Ctx {
         if votes.0.len() < quorum(self.n()) {
             return;
         }
-        let Some(head) = Self::proposal(hash) else { return };
+        let Some(head) = Self::proposal(hash) else {
+            self.request_sync();
+            return;
+        };
         if head.height <= self.s.finalized_height {
             return;
         }
@@ -285,15 +301,122 @@ impl Ctx {
             chain.push(p);
         }
         if chain.last().map(|p| p.height) != Some(self.s.finalized_height + 1) {
+            self.request_sync();
             return;
         }
         let certificate = Certificate { kind: KIND_FINALIZE, view, hash: *hash, votes };
-        for p in chain.into_iter().rev() {
-            persist::set(&key(b"cert/", &[&p.height.to_le_bytes()]), &certificate);
+        self.adopt(chain.into_iter().rev().collect(), &certificate);
+    }
+
+    /// Records `chain` (consecutive, lowest first, extending the finalized
+    /// head) as finalized under `certificate` and asks the host to execute it.
+    fn adopt(&mut self, chain: Vec<Proposal>, certificate: &Certificate) {
+        for p in chain {
+            let hash = state::keccak256(&p.to_bytes());
+            persist::set(&key(b"prop/", &[&hash]), &p);
+            persist::set(&key(b"final/", &[&p.height.to_le_bytes()]), &hash);
+            persist::set(&key(b"cert/", &[&p.height.to_le_bytes()]), certificate);
+            self.s.finalized_height = p.height;
             let header = BlockHeader { height: p.height, parent_hash: p.parent, timestamp_ms: p.timestamp_ms, ..BlockHeader::default() };
             self.effects.push(Effect::ExecuteBlock { block: Block { header: header.to_bytes(), txs: p.txs, participation: Vec::new() } });
         }
-        self.s.finalized_height = head.height;
+    }
+
+    fn finalized_hash(&self) -> Hash {
+        if self.s.finalized_height == 0 {
+            return ZERO;
+        }
+        persist::get(&key(b"final/", &[&self.s.finalized_height.to_le_bytes()])).unwrap_or(ZERO)
+    }
+
+    /// Asks the peer of the current input for finalized blocks past ours.
+    fn request_sync(&mut self) {
+        let Some(peer) = self.peer else { return };
+        if self.s.sync_pending {
+            return;
+        }
+        self.s.sync_pending = true;
+        self.s.sync_request_id += 1;
+        self.s.sync_peer = peer;
+        let payload = SyncRequest { from_height: self.s.finalized_height + 1 }.to_bytes();
+        self.effects.push(Effect::Request { peer, request_id: self.s.sync_request_id, payload });
+    }
+
+    /// Serves finalized proposals from the requested height.
+    fn on_request(&mut self, request_id: u64, payload: &[u8]) {
+        let Ok(request) = SyncRequest::from_bytes(payload) else { return };
+        let fin = self.s.finalized_height;
+        let mut response = SyncResponse { finalized_height: fin, proposals: Seq(Vec::new()), certificate: None };
+        if request.from_height >= 1 && request.from_height <= fin {
+            let top = (request.from_height + SYNC_BATCH - 1).min(fin);
+            if let Some(certificate) = persist::get::<Certificate>(&key(b"cert/", &[&top.to_le_bytes()]))
+                && let Some(head) = Self::proposal(&certificate.hash)
+            {
+                let mut proposals = Vec::new();
+                for h in request.from_height..=head.height {
+                    let Some(p) = persist::get::<Hash>(&key(b"final/", &[&h.to_le_bytes()])).and_then(|x| Self::proposal(&x)) else {
+                        proposals.clear();
+                        break;
+                    };
+                    proposals.push(p);
+                }
+                if !proposals.is_empty() {
+                    response.proposals = Seq(proposals);
+                    response.certificate = Some(certificate);
+                }
+            }
+        }
+        self.effects.push(Effect::Respond { request_id, payload: response.to_bytes() });
+    }
+
+    /// Verifies and adopts a sync response; asks for more if the peer is further ahead.
+    fn on_response(&mut self, request_id: u64, payload: &[u8]) {
+        if !self.s.sync_pending || request_id != self.s.sync_request_id {
+            return;
+        }
+        self.s.sync_pending = false;
+        let Ok(response) = SyncResponse::from_bytes(payload) else { return };
+        let Some(certificate) = response.certificate else { return };
+        let proposals = response.proposals.0;
+        let Some(last) = proposals.last() else { return };
+        if certificate.kind != KIND_FINALIZE || state::keccak256(&last.to_bytes()) != certificate.hash {
+            return;
+        }
+        let mut signers: Vec<u32> = Vec::new();
+        for vote in &certificate.votes.0 {
+            if let Some(i) = self.verify(KIND_FINALIZE, certificate.view, &certificate.hash, &vote.signature)
+                && !signers.contains(&i)
+            {
+                signers.push(i);
+            }
+        }
+        if signers.len() < quorum(self.n()) {
+            return;
+        }
+        let mut parent = self.finalized_hash();
+        let mut height = self.s.finalized_height;
+        for p in &proposals {
+            if p.parent != parent || p.height != height + 1 {
+                return;
+            }
+            parent = state::keccak256(&p.to_bytes());
+            height = p.height;
+        }
+        let head = last.clone();
+        self.adopt(proposals, &certificate);
+        if head.height > self.s.tip_height {
+            self.s.tip_height = head.height;
+            self.s.tip_hash = certificate.hash;
+            self.s.tip_view = certificate.view;
+            self.s.tip_timestamp_ms = head.timestamp_ms;
+        }
+        if self.s.view <= certificate.view {
+            self.enter_view(certificate.view + 1);
+        }
+        if response.finalized_height > height {
+            self.peer = Some(self.s.sync_peer);
+            self.request_sync();
+        }
     }
 
     fn on_executed(&mut self, height: u64) {
@@ -314,6 +437,12 @@ pub fn step(input: &Input) -> Seq<Effect> {
                 c.s = restored;
             }
             c.s.now_ms = *now_ms;
+            // Chain state is the truth about what has been executed; a node that
+            // lost it syncs the rest instead of executing on the wrong parent.
+            let executed = state::height().unwrap_or(0);
+            if c.s.finalized_height > executed {
+                c.s.finalized_height = executed;
+            }
             if c.s.tip_height == 0 {
                 // Pace the first block one slot after start, like every later one.
                 c.s.tip_timestamp_ms = *now_ms;
@@ -324,11 +453,17 @@ pub fn step(input: &Input) -> Seq<Effect> {
         }
         Input::TimerFired { timer_id, now_ms } => c.on_timer(*timer_id, *now_ms),
         Input::MempoolContents { txs } => c.on_mempool(&txs.0),
-        Input::NetworkMessage { topic, payload, .. } if *topic == TOPIC => {
+        Input::NetworkMessage { peer, topic, payload } if *topic == TOPIC => {
+            c.peer = Some(*peer);
             if let Ok(m) = ConsensusMessage::from_bytes(payload) {
                 c.on_message(m);
             }
         }
+        Input::Request { peer, request_id, payload } => {
+            c.peer = Some(*peer);
+            c.on_request(*request_id, payload);
+        }
+        Input::Response { request_id, payload } => c.on_response(*request_id, payload),
         Input::BlockExecuted { height, .. } => c.on_executed(*height),
         _ => {}
     }

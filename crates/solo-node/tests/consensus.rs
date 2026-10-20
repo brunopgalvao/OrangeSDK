@@ -227,13 +227,17 @@ fn restarted_validator_rejoins() {
             .unwrap()
     );
     sim.revive(3, &kernel, &genesis).unwrap();
-    // The revived node keeps voting for views it can follow; the others keep finalizing.
+    // The revived node syncs the blocks it missed and then follows the chain again.
     let before = sim.nodes[0].finalized.len();
-    assert!(
-        sim.run_until(20 * SLOT_MS, |s| s.nodes[0].finalized.len() >= before + 4)
-            .unwrap()
-    );
-    assert_agreement(&sim, &[0, 1, 2]);
+    let caught_up = sim
+        .run_until(20 * SLOT_MS, |s| {
+            s.nodes[0].finalized.len() >= before + 4
+                && s.nodes[3].finalized_height().unwrap() + 1
+                    >= s.nodes[0].finalized_height().unwrap()
+        })
+        .unwrap();
+    assert!(caught_up, "{:?}", sim.finalized_heights().unwrap());
+    assert_agreement(&sim, &[0, 1, 2, 3]);
     assert!(sim.nodes[3].validator_id().is_some());
 }
 
@@ -294,8 +298,8 @@ fn simulator_delivery_rules() {
     sim.advance(20).unwrap();
     assert_eq!(
         sim.delivered,
-        delivered + 1,
-        "only the Send to a known peer"
+        delivered + 2,
+        "the Send and the Request to a known peer"
     );
     // Gossip to a crashed node is dropped; the other three still include the transaction.
     sim.crash(3);
@@ -362,4 +366,33 @@ fn simulator_surfaces_node_errors() {
         node.kernel_gas = 0;
     }
     assert!(sim.run_until(10 * SLOT_MS, |_| false).is_err());
+}
+
+#[test]
+fn a_node_offline_since_genesis_syncs_everything() {
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let funded = SigningKey::from_slice(&[1u8; 32]).unwrap();
+    let genesis = genesis(&keys, address(&funded));
+    let mut sim = Sim::new(&kernel, &genesis, &keys, 1, &at(1_000), 10).unwrap();
+    sim.crash(4);
+    // A transfer lands while the observer is away, so syncing must replay state, not just headers.
+    let to = address(&keys[3]);
+    let hash = sim.submit(0, &transfer(&funded, 0, to, ETHER)).unwrap();
+    assert!(
+        sim.run_until(60 * SLOT_MS, |s| s.nodes[0].finalized.len() >= 40)
+            .unwrap()
+    );
+    sim.revive(4, &kernel, &genesis).unwrap();
+    // More than one sync batch behind: the observer asks again until level.
+    let synced = sim
+        .run_until(20 * SLOT_MS, |s| {
+            s.nodes[4].finalized_height().unwrap() + 1 >= s.nodes[0].finalized_height().unwrap()
+        })
+        .unwrap();
+    assert!(synced, "{:?}", sim.finalized_heights().unwrap());
+    assert_agreement(&sim, &[0, 1, 2, 3, 4]);
+    let observer = &mut sim.nodes[4];
+    assert!(observer.receipt(&hash).unwrap().is_some());
+    assert_eq!(observer.account(&to).unwrap().balance, ETHER);
 }

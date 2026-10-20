@@ -379,11 +379,25 @@ fn restart_resumes_from_persisted_state() {
     assert_eq!(node.block_number().unwrap(), 1);
     let state = node.persisted_driver_state.clone().unwrap();
     assert_eq!(node.driver_state().unwrap(), state);
-    // A fresh node over the same genesis (state is in memory, so blocks are gone) resumes the
-    // driver at height 2; its slot is long overdue, so it proposes on start.
-    let mut fresh = node_at(&alice, 5_000, Some(state));
-    assert_eq!(fresh.executed.len(), 1);
-    assert_eq!(fresh.executed[0].0, 2, "continues at the next height");
+    // A fresh node over the same genesis keeps its node-local data but not its chain state
+    // (that is in memory). It resumes the driver in view 2, proposes height 2 at once since its
+    // slot is overdue, and finalizing it re-executes height 1 from its own stored proposal.
+    let config = NodeConfig {
+        now_ms: 5_000,
+        key: Some(node_key()),
+        persisted: node.persisted(),
+        ..NodeConfig::default()
+    };
+    let mut fresh = Node::open(&kernel_module(), &genesis(&alice), config).unwrap();
+    fresh.start(Some(state.clone())).unwrap();
+    let heights: Vec<u64> = fresh.executed.iter().map(|e| e.0).collect();
+    assert_eq!(heights, vec![1, 2], "rebuilds height 1, then continues");
+    assert_eq!(fresh.executed[0], node.executed[0], "the same block 1");
+    assert_eq!(fresh.account(&bob.address).unwrap().balance, ETHER);
+    // Without its node-local data a lone validator cannot rebuild, so it does not move.
+    let mut amnesiac = node_at(&alice, 5_000, Some(state));
+    amnesiac.tick(5_000 + 10 * SLOT_MS).unwrap();
+    assert!(amnesiac.executed.is_empty());
     assert_eq!(
         fresh.timers(),
         vec![
@@ -392,7 +406,7 @@ fn restart_resumes_from_persisted_state() {
         ]
     );
     fresh.tick(5_000 + SLOT_MS).unwrap();
-    assert_eq!(fresh.executed.len(), 2);
+    assert_eq!(fresh.executed.len(), 3);
     // Garbage persisted state is ignored and the driver starts from scratch.
     let mut again = node_at(&alice, 7_000, Some(vec![1, 2, 3]));
     again.tick(7_000 + SLOT_MS).unwrap();

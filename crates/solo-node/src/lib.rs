@@ -6,9 +6,11 @@
 #![forbid(unsafe_code)]
 
 pub mod extension;
+pub mod net;
 pub mod node;
 pub mod sim;
 
 pub use extension::{NodeExtension, NodeServices, Outbound, sign_recoverable, validator_id};
+pub use net::Transport;
 pub use node::{Node, NodeConfig, NodeError, SubmitError};
 pub use sim::Sim;

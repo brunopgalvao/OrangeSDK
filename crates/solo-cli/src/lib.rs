@@ -56,7 +56,13 @@ pub fn dev_key() -> k256::ecdsa::SigningKey {
 pub const DEFAULT_RPC: &str = "127.0.0.1:8545";
 
 /// Usage line printed on a command-line mistake.
-pub const USAGE: &str = "usage: solo dev --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>]";
+pub const USAGE: &str = "usage:
+  solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>]
+  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex>] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>]
+  solo key  <64 hex>";
+
+/// Where `solo node` listens for peers unless `--listen` says otherwise.
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:30333";
 
 /// Parses a genesis JSON document.
 ///
@@ -136,6 +142,44 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
     })
 }
 
+/// Parses a 32-byte secp256k1 secret key from hex, with or without `0x`.
+///
+/// # Errors
+/// A message if it is not 32 bytes of hex or not a valid scalar.
+pub fn parse_key(text: &str) -> Result<k256::ecdsa::SigningKey, String> {
+    let hex = if text.starts_with("0x") {
+        text.to_owned()
+    } else {
+        format!("0x{text}")
+    };
+    let bytes = solo_rpc::methods::parse_hex(&hex)
+        .ok()
+        .ok_or("key: expected 64 hex digits")?;
+    k256::ecdsa::SigningKey::from_slice(&bytes)
+        .ok()
+        .ok_or_else(|| "key: not a valid secp256k1 secret key".to_owned())
+}
+
+/// What `solo key` prints: the validator id for genesis and the Ethereum address.
+#[must_use]
+pub fn describe_key(key: &k256::ecdsa::SigningKey) -> String {
+    let id = solo_node::validator_id(key);
+    format!(
+        "validator {}\naddress   {}",
+        solo_rpc::methods::data(&id),
+        solo_rpc::methods::data(&id[12..])
+    )
+}
+
+/// Every value following an occurrence of `name` in `args`.
+#[must_use]
+pub fn args_all(args: &[String], name: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|w| w[0] == name)
+        .map(|w| w[1].clone())
+        .collect()
+}
+
 /// The value following `name` in `args`, if any.
 #[must_use]
 pub fn arg(args: &[String], name: &str) -> Option<String> {
@@ -197,19 +241,44 @@ pub fn run(args: &[String]) -> Result<(), String> {
 /// As [`run`].
 pub fn run_until(
     args: &[String],
-    keep_going: impl FnMut(&solo_rpc::Rpc) -> bool,
+    mut keep_going: impl FnMut(&solo_rpc::Rpc) -> bool,
 ) -> Result<(), String> {
-    match run_inner(args, keep_going) {
+    match run_inner(args, &mut keep_going) {
         Ok(()) => Ok(()),
         Err(CliError(message)) => Err(message),
     }
 }
 
+/// Prints a node error; the node keeps running (spec 06 §6 has the host
+/// restart the driver, which a later host increment does).
+fn report(result: Result<(), solo_node::NodeError>) {
+    if let Err(e) = result {
+        eprintln!("node error: {e}");
+    }
+}
+
+fn parse_peers(args: &[String]) -> Result<Vec<std::net::SocketAddr>, String> {
+    args_all(args, "--peer")
+        .into_iter()
+        .map(|peer| {
+            peer.parse()
+                .ok()
+                .ok_or_else(|| format!("--peer {peer}: expected ip:port"))
+        })
+        .collect()
+}
+
 fn run_inner(
     args: &[String],
-    mut keep_going: impl FnMut(&solo_rpc::Rpc) -> bool,
+    keep_going: &mut dyn FnMut(&solo_rpc::Rpc) -> bool,
 ) -> Result<(), CliError> {
-    if args.get(1).map(String::as_str) != Some("dev") {
+    let command = args.get(1).map_or("", String::as_str);
+    if command == "key" {
+        let key = parse_key(args.get(2).ok_or("key: expected 64 hex digits")?)?;
+        println!("{}", describe_key(&key));
+        return Ok(());
+    }
+    if command != "dev" && command != "node" {
         return Err(USAGE.into());
     }
     let kernel = load_kernel(&arg(args, "--kernel").ok_or("--kernel is required")?)?;
@@ -223,6 +292,12 @@ fn run_inner(
     let rpc_addr = rpc_arg.as_deref().unwrap_or(DEFAULT_RPC);
     let max_blocks = parse_number(args, "--blocks")?;
     let kernel_gas = parse_number(args, "--kernel-gas")?;
+    let key = if command == "dev" {
+        Some(dev_key())
+    } else {
+        arg(args, "--key").map(|k| parse_key(&k)).transpose()?
+    };
+    let peers = parse_peers(args)?;
     let start = Instant::now();
     let epoch = unix_ms();
     let mut node = solo_node::Node::open(
@@ -230,7 +305,7 @@ fn run_inner(
         &genesis,
         solo_node::NodeConfig {
             now_ms: epoch,
-            key: Some(dev_key()),
+            key: key.clone(),
             kernel_gas: kernel_gas.map_or(solo_node::node::KERNEL_GAS, |gas| {
                 i64::try_from(gas).unwrap_or(i64::MAX)
             }),
@@ -239,6 +314,22 @@ fn run_inner(
     )?;
     let chain_id = node.chain_id().unwrap_or(0);
     node.start(None)?;
+    let mut transport = None;
+    if command == "node" {
+        let listen_arg = arg(args, "--listen");
+        let listen = listen_arg.as_deref().unwrap_or(DEFAULT_LISTEN);
+        // An observer still needs an identity for its peers; a hash of its address will do.
+        let id = node
+            .validator_id()
+            .unwrap_or_else(|| solo_host::hash::keccak256(listen.as_bytes()));
+        let t = match solo_node::Transport::bind(listen, id, chain_id, peers) {
+            Ok(t) => t,
+            Err(e) => return Err(format!("{listen}: {e}").into()),
+        };
+        let bound = t.local_addr().map_or(listen.to_owned(), |a| a.to_string());
+        eprintln!("p2p listening on {bound}");
+        transport = Some(t);
+    }
     let mut rpc = solo_rpc::Rpc::new(node);
     let listener = match solo_rpc::http::bind(rpc_addr) {
         Ok(listener) => listener,
@@ -246,9 +337,11 @@ fn run_inner(
     };
     let bound = listener.local_addr().ok();
     let bound = bound.map_or(rpc_addr.to_owned(), |a| a.to_string());
-    let validator = solo_rpc::methods::data(&solo_node::validator_id(&dev_key()));
+    let validator = key.as_ref().map_or("none (observer)".to_owned(), |k| {
+        solo_rpc::methods::data(&solo_node::validator_id(k))
+    });
     eprintln!(
-        "solo dev node: chain id {chain_id}, validator {validator}, JSON-RPC on http://{bound}"
+        "solo {command} node: chain id {chain_id}, validator {validator}, JSON-RPC on http://{bound}"
     );
     let mut last_tick = Instant::now();
     let blocks_seen = std::cell::Cell::new(0u64);
@@ -256,14 +349,15 @@ fn run_inner(
         &listener,
         &mut rpc,
         |rpc| {
+            let now = epoch + u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if let Some(t) = transport.as_mut() {
+                report(t.poll(rpc.node_mut(), now));
+            }
             if last_tick.elapsed() < Duration::from_millis(20) {
                 return;
             }
             last_tick = Instant::now();
-            let now = epoch + u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            if let Err(e) = rpc.node_mut().tick(now) {
-                eprintln!("node error: {e}");
-            }
+            report(rpc.node_mut().tick(now));
             let executed = rpc.node_mut().executed.len();
             if executed as u64 > blocks_seen.get() {
                 blocks_seen.set(executed as u64);

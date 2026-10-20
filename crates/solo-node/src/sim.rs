@@ -3,24 +3,41 @@
 //! nodes that can be crashed and revived. The consensus tests and the
 //! conformance tooling drive drivers through this rather than sockets.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use k256::ecdsa::SigningKey;
 use solo_abi::chain::{Validator, ValidatorSet};
 use solo_abi::codec::Seq;
-use solo_abi::types::Genesis;
+use solo_abi::types::{Genesis, Input};
 
 use crate::extension::{Outbound, validator_id};
 use crate::node::{Node, NodeConfig, NodeError, SubmitError};
+
+/// What travels between two nodes.
+#[derive(Debug, Clone)]
+enum Wire {
+    Message {
+        from: [u8; 32],
+        topic: u16,
+        payload: Vec<u8>,
+    },
+    Request {
+        from: usize,
+        request_id: u64,
+        payload: Vec<u8>,
+    },
+    Response {
+        request_id: u64,
+        payload: Vec<u8>,
+    },
+}
 
 /// A message in flight.
 #[derive(Debug, Clone)]
 struct InFlight {
     due_ms: u64,
-    from: [u8; 32],
     to: usize,
-    topic: u16,
-    payload: Vec<u8>,
+    wire: Wire,
 }
 
 /// The simulated network.
@@ -37,6 +54,9 @@ pub struct Sim {
     gossip: VecDeque<(u64, usize, Vec<u8>)>,
     /// Messages delivered so far.
     pub delivered: u64,
+    /// Requests a node is serving: `(node, local id)` to `(requester, its id)`.
+    serving: BTreeMap<(usize, u64), (usize, u64)>,
+    next_local_id: u64,
 }
 
 impl Sim {
@@ -89,6 +109,8 @@ impl Sim {
             queue: VecDeque::new(),
             gossip: VecDeque::new(),
             delivered: 0,
+            serving: BTreeMap::new(),
+            next_local_id: 0,
         };
         sim.collect();
         Ok(sim)
@@ -158,7 +180,14 @@ impl Sim {
                     Outbound::Broadcast { topic, payload } => {
                         for to in 0..self.nodes.len() {
                             if to != i {
-                                self.enqueue(from, to, topic, payload.clone());
+                                self.enqueue(
+                                    to,
+                                    Wire::Message {
+                                        from,
+                                        topic,
+                                        payload: payload.clone(),
+                                    },
+                                );
                             }
                         }
                     }
@@ -167,14 +196,48 @@ impl Sim {
                         topic,
                         payload,
                     } => {
-                        if let Some(to) = self.ids.iter().position(|id| *id == peer) {
-                            self.enqueue(from, to, topic, payload);
+                        if let Some(to) = self.index_of(&peer) {
+                            self.enqueue(
+                                to,
+                                Wire::Message {
+                                    from,
+                                    topic,
+                                    payload,
+                                },
+                            );
                         }
                     }
-                    Outbound::Disseminate { .. }
-                    | Outbound::Request { .. }
-                    | Outbound::Respond { .. }
-                    | Outbound::PeerScore { .. } => {}
+                    Outbound::Request {
+                        peer,
+                        request_id,
+                        payload,
+                    } => {
+                        if let Some(to) = self.index_of(&peer) {
+                            self.enqueue(
+                                to,
+                                Wire::Request {
+                                    from: i,
+                                    request_id,
+                                    payload,
+                                },
+                            );
+                        }
+                    }
+                    Outbound::Respond {
+                        request_id,
+                        payload,
+                    } => {
+                        if let Some((to, their_id)) = self.serving.remove(&(i, request_id)) {
+                            self.enqueue(
+                                to,
+                                Wire::Response {
+                                    request_id: their_id,
+                                    payload,
+                                },
+                            );
+                        }
+                    }
+                    Outbound::Disseminate { .. } | Outbound::PeerScore { .. } => {}
                 }
             }
             for raw in self.nodes[i].take_tx_gossip() {
@@ -188,14 +251,52 @@ impl Sim {
         }
     }
 
-    fn enqueue(&mut self, from: [u8; 32], to: usize, topic: u16, payload: Vec<u8>) {
+    fn index_of(&self, peer: &[u8; 32]) -> Option<usize> {
+        self.ids.iter().position(|id| id == peer)
+    }
+
+    fn enqueue(&mut self, to: usize, wire: Wire) {
         self.queue.push_back(InFlight {
             due_ms: self.now_ms + self.latency_ms,
-            from,
             to,
-            topic,
-            payload,
+            wire,
         });
+    }
+
+    fn deliver(&mut self, to: usize, wire: Wire) -> Result<(), NodeError> {
+        let input = match wire {
+            Wire::Message {
+                from,
+                topic,
+                payload,
+            } => Input::NetworkMessage {
+                peer: from,
+                topic,
+                payload,
+            },
+            Wire::Request {
+                from,
+                request_id,
+                payload,
+            } => {
+                self.next_local_id += 1;
+                self.serving
+                    .insert((to, self.next_local_id), (from, request_id));
+                Input::Request {
+                    peer: self.ids[from],
+                    request_id: self.next_local_id,
+                    payload,
+                }
+            }
+            Wire::Response {
+                request_id,
+                payload,
+            } => Input::Response {
+                request_id,
+                payload,
+            },
+        };
+        self.nodes[to].step(input)
     }
 
     /// Advances the clock by `ms` in 10 ms steps, ticking nodes and
@@ -223,7 +324,7 @@ impl Sim {
             for m in due {
                 if self.alive[m.to] {
                     self.nodes[m.to].tick(self.now_ms)?;
-                    self.nodes[m.to].deliver(m.from, m.topic, m.payload)?;
+                    self.deliver(m.to, m.wire)?;
                     self.delivered += 1;
                 }
             }

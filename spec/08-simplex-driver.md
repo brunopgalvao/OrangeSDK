@@ -62,9 +62,15 @@ Votes for views below the current one are ignored, except finalize votes, which 
 
 Everything the driver keeps between steps is node-local (`persist_*`), never chain state: its `SimplexState` (view, tip, finalized height, flags, validator index, clock), proposals by hash, votes and finalize votes by `(view, hash)`, the notarized hash per view, and the certificate per finalized height. The host also receives the `SimplexState` as `PersistState` after every step and hands it back at `Started`, so a restarted node resumes in the view it left; a node whose persisted tables are gone still follows from its state record. Garbage `resumed_state` is ignored and the driver starts from view 1.
 
+## 7a. Catch-up
+
+A node that sees a valid proposal more than one height above its tip, or a finalize quorum for a proposal it cannot connect to its finalized head, sends the peer that delivered the message a `Request` with `SyncRequest { from_height: finalized + 1 }`, unless a sync request is already outstanding (an outstanding request is abandoned on entering a new view). The peer answers with `Respond` carrying `SyncResponse { finalized_height, proposals, certificate }`: consecutive finalized proposals starting at the requested height, ending at the head of the certificate that finalized `from_height + 15` (or its own finalized head if lower), and that certificate. The requester checks that the certificate is a quorum of finalize votes for the last proposal and that the proposals link to its finalized head, then executes them, finalizes them under that certificate, moves its tip and view forward if they are behind, and asks again while the responder reported a higher finalized height. Anything that fails a check is dropped.
+
+On `Started`, the driver lowers its finalized height to the height of the chain state, so a node that kept its driver record but lost its chain state syncs instead of executing on the wrong parent.
+
 ## 8. Properties and limits of this version
 
 - Safety: two conflicting proposals cannot both be notarized in one view (each honest validator votes at most once per view), and a finalized proposal is on every later honest tip because a validator that timed out in `v` never finalizes `v` while one that finalized never voted to skip it.
 - Liveness: after the network delivers within `slot_ms`, a view with an honest leader finalizes within about two message delays after the proposal; a faulty leader costs `3 × slot_ms`.
 - Finality for a block proposed in view `v` arrives in view `v` or `v + 1`; `latest`, `safe` and `finalized` coincide for RPC.
-- Not in this version: catch-up for a node that missed a notarized proposal (it follows again once a proposal extends a tip it knows), equivocation evidence and slashing, weighted voting, asynchronous execution with lag `k`, and transaction re-admission after a proposal that was not notarized.
+- Not in this version: equivocation evidence and slashing, weighted voting, asynchronous execution with lag `k`, and transaction re-admission after a proposal that was not notarized.

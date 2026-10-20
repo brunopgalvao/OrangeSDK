@@ -505,6 +505,7 @@ dependencies = [
  "k256",
  "serde_json",
  "solo-abi",
+ "solo-host",
  "solo-node",
  "solo-recompile",
  "solo-rpc",

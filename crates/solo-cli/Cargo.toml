@@ -13,10 +13,14 @@ path = "src/main.rs"
 [dependencies]
 solo-abi = { path = "../solo-abi" }
 solo-node = { path = "../solo-node" }
+solo-host = { path = "../solo-host" }
 solo-recompile = { path = "../solo-recompile" }
 solo-rpc = { path = "../solo-rpc" }
 serde_json = "1"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+
+[dev-dependencies]
+solo-rpc = { path = "../solo-rpc" }
 
 [lints]
 workspace = true

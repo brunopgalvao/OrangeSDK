@@ -158,8 +158,11 @@ pub mod keys {
     pub const CHAIN_ID: &[u8] = b"meta/chain_id";
     /// `meta/height` → u64, last executed height.
     pub const HEIGHT: &[u8] = b"meta/height";
-    /// `meta/finalized` → u64.
-    pub const FINALIZED: &[u8] = b"meta/finalized";
+    /// `local/finalized` → u64. Under [`LOCAL`], so outside the commitment:
+    /// when a node learns of finality differs between nodes.
+    pub const FINALIZED: &[u8] = b"local/finalized";
+    /// Prefix of kernel keys the state commitment skips.
+    pub const LOCAL: &[u8] = b"local/";
     /// `meta/last_hash` → Hash.
     pub const LAST_HASH: &[u8] = b"meta/last_hash";
     /// `acct/` + address → Account.
@@ -285,6 +288,33 @@ record! {
         me: Option<u32>,
         /// Last clock reading.
         now_ms: u64,
+        /// A sync request is outstanding.
+        sync_pending: bool,
+        /// Id of the outstanding sync request; ids increase per request.
+        sync_request_id: u64,
+        /// Peer the outstanding sync request went to.
+        sync_peer: Hash,
+    }
+}
+
+record! {
+    /// Asks a peer for finalized blocks from `from_height` on (spec 08 §7).
+    SyncRequest {
+        /// First height wanted.
+        from_height: u64,
+    }
+}
+
+record! {
+    /// A peer's finalized blocks: consecutive proposals from the requested
+    /// height and the finalize certificate of the last one.
+    SyncResponse {
+        /// The responder's finalized height, so the requester knows if more remain.
+        finalized_height: u64,
+        /// Consecutive finalized proposals, lowest first; empty if none.
+        proposals: Seq<Proposal>,
+        /// Finalize certificate whose hash is the last proposal's.
+        certificate: Option<Certificate>,
     }
 }
 
@@ -555,6 +585,12 @@ mod tests {
             view: 3,
             hash: [2; 32],
             votes: Seq(vec![vote.clone()]),
+        });
+        roundtrip(&SyncRequest { from_height: 4 });
+        roundtrip(&SyncResponse {
+            finalized_height: 9,
+            proposals: Seq(vec![Proposal::default()]),
+            certificate: Some(Certificate::default()),
         });
         roundtrip(&SimplexState {
             view: 4,

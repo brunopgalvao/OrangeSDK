@@ -111,11 +111,16 @@ impl NodeExtension {
 }
 
 /// The state commitment of version 0: `keccak256` over every visible
-/// `(key, value)` pair in key order, each length-prefixed. A placeholder
-/// for the binary trie; deterministic and cheap to verify by recomputation.
+/// `(key, value)` pair in key order, each length-prefixed, skipping keys
+/// under `local/` (node-local bookkeeping such as the finalized height). A
+/// placeholder for the binary trie; deterministic and cheap to verify by
+/// recomputation.
 pub fn commitment<S: Storage>(state: &Overlay<S>) -> [u8; 32] {
     let mut buf = Vec::new();
     for (k, v) in state.scan(&[]) {
+        if k.starts_with(solo_abi::chain::keys::LOCAL) {
+            continue;
+        }
         buf.extend_from_slice(&(k.len() as u64).to_le_bytes());
         buf.extend_from_slice(&k);
         buf.extend_from_slice(&(v.len() as u64).to_le_bytes());

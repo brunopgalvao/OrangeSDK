@@ -331,3 +331,149 @@ fn usage_exit_code() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("usage:"));
 }
+
+#[test]
+fn keys() {
+    let hex = "0101010101010101010101010101010101010101010101010101010101010101";
+    let key = solo_cli::parse_key(hex).unwrap();
+    assert_eq!(
+        solo_cli::parse_key(&format!("0x{hex}")).unwrap().to_bytes(),
+        key.to_bytes()
+    );
+    let text = solo_cli::describe_key(&key);
+    // The all-ones key is the README's funded account.
+    assert!(
+        text.ends_with("address   0x1a642f0e3c3af545e7acbd38b07251b3990914f1"),
+        "{text}"
+    );
+    assert!(text.starts_with("validator 0x"));
+    run(&args(&["key", hex])).unwrap();
+    assert!(run(&args(&["key"])).unwrap_err().contains("64 hex"));
+    assert!(run(&args(&["key", "xyz"])).unwrap_err().contains("64 hex"));
+    assert!(
+        run(&args(&["key", &"00".repeat(32)]))
+            .unwrap_err()
+            .contains("not a valid")
+    );
+    assert_eq!(
+        solo_cli::args_all(&args(&["--peer", "a", "x", "--peer", "b"]), "--peer"),
+        vec!["a".to_owned(), "b".to_owned()]
+    );
+}
+
+fn free_ports(n: usize) -> Vec<String> {
+    let listeners: Vec<std::net::TcpListener> = (0..n)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn node_command_runs_a_multi_validator_chain() {
+    let seeds: Vec<String> = (1..=4u8)
+        .map(|i| format!("{:02x}", 0x50 + i).repeat(32))
+        .collect();
+    let ids: Vec<String> = seeds
+        .iter()
+        .map(|s| {
+            solo_rpc::methods::data(&solo_node::validator_id(&solo_cli::parse_key(s).unwrap()))
+        })
+        .collect();
+    let genesis = genesis_file(
+        "multi.json",
+        &format!(
+            r#"{{"chainId": 1337, "slotMs": 400, "maxTxs": 4, "alloc": {{}}, "validators": ["{}"]}}"#,
+            ids.join("\", \"")
+        ),
+    );
+    let ports = free_ports(5);
+    // Every node runs until all five have three blocks, so none strands the others by leaving.
+    let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>> = std::sync::Arc::new(
+        (0..5)
+            .map(|_| std::sync::atomic::AtomicUsize::new(0))
+            .collect(),
+    );
+    let mut threads = Vec::new();
+    for i in 0..5 {
+        let mut list: Vec<String> = vec![
+            "node".into(),
+            "--kernel".into(),
+            KERNEL.into(),
+            "--genesis".into(),
+            genesis.clone(),
+            "--listen".into(),
+            ports[i].clone(),
+            "--rpc".into(),
+            "127.0.0.1:0".into(),
+        ];
+        if i < 4 {
+            list.extend(["--key".into(), seeds[i].clone()]);
+            for port in &ports[..i] {
+                list.extend(["--peer".into(), port.clone()]);
+            }
+        } else {
+            list.extend(["--peer".into(), ports[0].clone()]);
+        }
+        let argv = args(&list.iter().map(String::as_str).collect::<Vec<_>>());
+        let counts = std::sync::Arc::clone(&counts);
+        threads.push(std::thread::spawn(move || {
+            use std::sync::atomic::Ordering::SeqCst;
+            // Generous: an instrumented build under a parallel test load is slow.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+            run_until(&argv, |rpc| {
+                counts[i].store(rpc.node().executed.len(), SeqCst);
+                let all = counts.iter().all(|c| c.load(SeqCst) >= 3);
+                !all && std::time::Instant::now() < deadline
+            })
+            .unwrap();
+        }));
+    }
+    for t in threads {
+        t.join().unwrap();
+    }
+    let blocks: Vec<usize> = counts
+        .iter()
+        .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+        .collect();
+    assert!(blocks.iter().all(|b| *b >= 3), "{blocks:?}");
+}
+
+#[test]
+fn node_command_errors() {
+    let good = genesis_file("node-errors.json", GENESIS);
+    let base = [
+        "node",
+        "--kernel",
+        KERNEL,
+        "--genesis",
+        &good,
+        "--rpc",
+        "127.0.0.1:0",
+    ];
+    let with = |extra: &[&str]| {
+        let mut list = base.to_vec();
+        list.extend_from_slice(extra);
+        run(&args(&list))
+    };
+    assert!(
+        with(&["--peer", "nowhere"])
+            .unwrap_err()
+            .contains("expected ip:port")
+    );
+    assert!(with(&["--key", "zz"]).unwrap_err().contains("64 hex"));
+    assert!(
+        with(&["--listen", "nope"])
+            .unwrap_err()
+            .starts_with("nope: ")
+    );
+    // An observer with the default listen address stops on request like any node.
+    let mut iterations = 0;
+    run_until(&args(&base), |_| {
+        iterations += 1;
+        iterations < 5
+    })
+    .unwrap();
+}
