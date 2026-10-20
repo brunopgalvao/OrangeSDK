@@ -43,12 +43,13 @@ cargo llvm-cov --workspace --fail-under-lines 100
 
 ## Layout
 
-- `spec/` — normative specification (machine model, instruction set, module format, gas, host ABI, driver interface, conformance).
+- `spec/` — normative specification (machine model, instruction set, module format, gas, host ABI, driver interface, conformance, consensus, transport, state commitment).
 - `crates/solo-vm` — reference interpreter, `no_std`-capable, the oracle for every other backend.
 - `crates/solo-recompile` — turns a linked RV64 ELF into a Solo module.
 - `crates/solo-host` — module cache, storage overlays, the host ABI and the executor that runs modules.
 - `crates/solo-abi` — the canonical codec and the types shared by host and kernel (spec 06 and the reference chain records).
 - `crates/solo-rlp` — Ethereum RLP.
+- `crates/solo-trie` — the binary Merkle trie of the state commitment (spec 10), with inclusion and exclusion proofs, `no_std`.
 - `crates/solo-node` — the node host: privileged functions (including `sign`), the driver loop, mempool, queries, the TCP transport, and `Sim`, an in-process network of nodes with a virtual clock.
 - `crates/solo-rpc` — Ethereum JSON-RPC over a node, with a minimal HTTP server.
 - `crates/solo-cli` — the `solo` command (`solo dev`, `solo node`, `solo key`).

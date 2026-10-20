@@ -12,5 +12,5 @@ pub mod sim;
 
 pub use extension::{NodeExtension, NodeServices, Outbound, sign_recoverable, validator_id};
 pub use net::Transport;
-pub use node::{Node, NodeConfig, NodeError, SubmitError};
+pub use node::{Node, NodeConfig, NodeError, PROOF_HISTORY, SubmitError};
 pub use sim::Sim;

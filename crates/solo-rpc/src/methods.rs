@@ -57,7 +57,7 @@ pub fn reason_text(code: u32) -> &'static str {
         reason::BAD_NONCE => "nonce too low or too high",
         reason::INSUFFICIENT_FUNDS => "insufficient funds for value and gas",
         reason::GAS_TOO_LOW => "intrinsic gas too low",
-        reason::UNSUPPORTED => "contract creation and calldata are not supported yet",
+        reason::UNSUPPORTED => "transaction type not supported",
         _ => "rejected",
     }
 }

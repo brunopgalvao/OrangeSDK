@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 solo-abi = { path = "../solo-abi" }
 solo-host = { path = "../solo-host" }
+solo-trie = { path = "../solo-trie" }
 solo-vm = { path = "../solo-vm" }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 

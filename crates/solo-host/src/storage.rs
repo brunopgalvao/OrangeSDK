@@ -5,13 +5,56 @@
 //! never see each other's keys. Writes go into an overlay layer per call
 //! frame; a frame that halts normally has its layer merged into the one
 //! below, any other termination discards it.
+//!
+//! The state commitment (spec 10) is the root of a [`Trie`] over the
+//! committed entries: every visible key except those under [`LOCAL_PREFIX`].
+//! A store supplies the trie of its own entries through
+//! [`Storage::state_trie`], and [`MemStorage`] keeps one current on every
+//! write. Each overlay layer builds the trie of everything visible through
+//! it the first time a root or proof needs it, then keeps it and brings it up
+//! to date with only the keys written since. So the hashing behind a root or
+//! a proof is O(depth) per key written since the last one: never a pass over
+//! the state, and never every pending write again. A layer merged into the
+//! base hands its trie over rather than having its writes hashed twice.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-/// Maximum key length in bytes (spec 05 §4.2).
+use solo_trie::{Hash, HashFn, Trie};
+
+/// Maximum key length in bytes an instance names (spec 05 §4.2).
 pub const MAX_KEY_LEN: usize = 64;
+/// Maximum key length in bytes the store holds: an instance's key behind a
+/// sandboxed instance's 32-byte namespace (spec 05 §4.2, spec 10 §2).
+pub const MAX_STORED_KEY_LEN: usize = 32 + MAX_KEY_LEN;
 /// Maximum value length in bytes (spec 05 §4.2).
 pub const MAX_VALUE_LEN: usize = 65_536;
+
+/// Keys under this prefix are node-local bookkeeping, outside the state
+/// commitment (spec 05 §4.3, spec 10 §2).
+pub const LOCAL_PREFIX: &[u8] = b"local/";
+
+/// Whether `key` is part of the state commitment (spec 10 §2).
+#[must_use]
+pub fn committed(key: &[u8]) -> bool {
+    !key.starts_with(LOCAL_PREFIX)
+}
+
+/// The writes of one overlay layer, by key: the new value, or `None` for a
+/// deletion.
+pub type Writes = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+
+/// Applies one write to `trie`, unless the key is outside the commitment.
+fn apply(trie: &mut Trie, key: &[u8], value: Option<&[u8]>) {
+    if !committed(key) {
+        return;
+    }
+    match value {
+        Some(value) => trie.insert(key, value),
+        None => {
+            trie.remove(key);
+        }
+    }
+}
 
 /// The base store beneath the overlays.
 pub trait Storage {
@@ -23,15 +66,55 @@ pub trait Storage {
     fn delete(&mut self, key: &[u8]) -> bool;
     /// All entries whose key starts with `prefix`, in bytewise key order.
     fn scan(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)>;
+
+    /// The state trie (spec 10) of this store's committed entries. This
+    /// default builds it from a full scan; a store that maintains its trie as
+    /// it is written overrides it.
+    fn state_trie(&self) -> Trie {
+        let mut trie = Trie::new();
+        for (key, value) in self.scan(&[]) {
+            apply(&mut trie, &key, Some(&value));
+        }
+        trie
+    }
+
+    /// Applies the writes of the bottom overlay layer when it merges, given
+    /// `trie`, the overlay's state trie of this store with the writes
+    /// applied. This default writes them one by one and drops `trie`; a
+    /// store that maintains its trie adopts `trie` instead of hashing the
+    /// writes again.
+    fn merge_layer(&mut self, writes: Writes, trie: Trie) {
+        drop(trie);
+        for (key, value) in writes {
+            match value {
+                Some(value) => self.set(&key, &value),
+                None => {
+                    self.delete(&key);
+                }
+            }
+        }
+    }
 }
 
-/// An in-memory store.
+/// An in-memory store that keeps the trie of its committed entries current.
 #[derive(Debug, Default, Clone)]
 pub struct MemStorage {
     map: BTreeMap<Vec<u8>, Vec<u8>>,
+    trie: Trie,
 }
 
 impl MemStorage {
+    /// An empty store whose trie hashes with `hash`, which must be
+    /// `keccak256` for the roots of spec 10: for a host with its own
+    /// implementation of it.
+    #[must_use]
+    pub fn with_hasher(hash: HashFn) -> MemStorage {
+        MemStorage {
+            map: BTreeMap::new(),
+            trie: Trie::with_hasher(hash),
+        }
+    }
+
     /// Number of keys.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -52,10 +135,15 @@ impl Storage for MemStorage {
 
     fn set(&mut self, key: &[u8], value: &[u8]) {
         self.map.insert(key.to_vec(), value.to_vec());
+        apply(&mut self.trie, key, Some(value));
     }
 
     fn delete(&mut self, key: &[u8]) -> bool {
-        self.map.remove(key).is_some()
+        let existed = self.map.remove(key).is_some();
+        if existed {
+            apply(&mut self.trie, key, None);
+        }
+        existed
     }
 
     fn scan(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -65,13 +153,70 @@ impl Storage for MemStorage {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
+
+    /// A copy-on-write clone of the maintained trie: O(1).
+    fn state_trie(&self) -> Trie {
+        self.trie.clone()
+    }
+
+    /// Writes the map and adopts `trie`, which already holds the writes.
+    fn merge_layer(&mut self, writes: Writes, trie: Trie) {
+        for (key, value) in writes {
+            match value {
+                Some(value) => {
+                    self.map.insert(key, value);
+                }
+                None => {
+                    self.map.remove(&key);
+                }
+            }
+        }
+        self.trie = trie;
+    }
 }
 
-/// A stack of write layers over a base store. `None` in a layer is a deletion.
+/// One overlay layer: its writes and, once a root or proof has needed it,
+/// the state trie of everything visible through it.
+#[derive(Debug, Default)]
+struct Layer {
+    writes: Writes,
+    /// The trie of the base with this layer and every one below applied, as
+    /// of the last time it was brought up to date; `None` until first needed.
+    trie: Option<Trie>,
+    /// Committed keys written in this layer since `trie` was brought up to
+    /// date, to apply before it is next used. Empty while `trie` is `None`.
+    stale: BTreeSet<Vec<u8>>,
+}
+
+impl Layer {
+    fn write(&mut self, key: &[u8], value: Option<Vec<u8>>) {
+        if self.trie.is_some() && committed(key) {
+            self.stale.insert(key.to_vec());
+        }
+        self.writes.insert(key.to_vec(), value);
+    }
+
+    /// Applies the stale keys to the trie, if built, and returns a clone of
+    /// it.
+    fn catch_up(&mut self) -> Option<Trie> {
+        let trie = self.trie.as_mut()?;
+        for key in std::mem::take(&mut self.stale) {
+            apply(trie, &key, self.writes[&key].as_deref());
+        }
+        Some(trie.clone())
+    }
+}
+
+/// A stack of write layers over a base store.
+///
+/// The layers that have built their trie are always the bottom ones: a
+/// layer is built from the one below, which is built first. Only the highest
+/// built layer can have stale keys, since a layer is written only while it
+/// is on top.
 #[derive(Debug)]
 pub struct Overlay<S: Storage> {
     base: S,
-    layers: Vec<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+    layers: Vec<Layer>,
 }
 
 impl<S: Storage> Overlay<S> {
@@ -102,21 +247,37 @@ impl<S: Storage> Overlay<S> {
 
     /// Opens a new layer.
     pub fn push(&mut self) {
-        self.layers.push(BTreeMap::new());
+        self.layers.push(Layer::default());
     }
 
     /// Merges the top layer into the one below, or into the base if it was the
     /// only layer. Does nothing with no layers.
     pub fn commit(&mut self) {
-        let Some(top) = self.layers.pop() else { return };
+        let Some(mut top) = self.layers.pop() else {
+            return;
+        };
         if let Some(below) = self.layers.last_mut() {
-            below.extend(top);
-        } else {
-            for (k, v) in top {
-                match v {
-                    Some(v) => self.base.set(&k, &v),
-                    None => {
-                        self.base.delete(&k);
+            if top.trie.is_some() {
+                // Built from `below`, which saw no writes since: it holds both.
+                below.trie = top.trie;
+                below.stale = top.stale;
+            } else if below.trie.is_some() {
+                below
+                    .stale
+                    .extend(top.writes.keys().filter(|k| committed(k)).cloned());
+            }
+            below.writes.extend(top.writes);
+            return;
+        }
+        match top.catch_up() {
+            Some(trie) => self.base.merge_layer(top.writes, trie),
+            None => {
+                for (k, v) in top.writes {
+                    match v {
+                        Some(v) => self.base.set(&k, &v),
+                        None => {
+                            self.base.delete(&k);
+                        }
                     }
                 }
             }
@@ -131,7 +292,7 @@ impl<S: Storage> Overlay<S> {
     /// Reads through the layers to the base.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         for layer in self.layers.iter().rev() {
-            if let Some(v) = layer.get(key) {
+            if let Some(v) = layer.writes.get(key) {
                 return v.clone();
             }
         }
@@ -141,9 +302,7 @@ impl<S: Storage> Overlay<S> {
     /// Writes into the top layer, or the base with no layers.
     pub fn set(&mut self, key: &[u8], value: &[u8]) {
         match self.layers.last_mut() {
-            Some(layer) => {
-                layer.insert(key.to_vec(), Some(value.to_vec()));
-            }
+            Some(layer) => layer.write(key, Some(value.to_vec())),
             None => self.base.set(key, value),
         }
     }
@@ -153,14 +312,42 @@ impl<S: Storage> Overlay<S> {
     pub fn delete(&mut self, key: &[u8]) -> bool {
         let existed = self.get(key).is_some();
         match self.layers.last_mut() {
-            Some(layer) => {
-                layer.insert(key.to_vec(), None);
-            }
+            Some(layer) => layer.write(key, None),
             None => {
                 self.base.delete(key);
             }
         }
         existed
+    }
+
+    /// The state trie of everything visible (spec 10 §2): the base store's
+    /// committed entries with every open layer applied.
+    ///
+    /// Brings the highest built layer's trie up to date, then builds each
+    /// layer above it from the one beneath, keeping every one. Once up to
+    /// date this is an O(1) copy-on-write clone; bringing it up to date
+    /// hashes only the keys written since the last call.
+    pub fn state_trie(&mut self) -> Trie {
+        let mut from = 0;
+        let mut built = None;
+        if let Some(i) = self.layers.iter().rposition(|l| l.trie.is_some()) {
+            built = self.layers[i].catch_up();
+            from = i + 1;
+        }
+        let mut trie = built.unwrap_or_else(|| self.base.state_trie());
+        for layer in &mut self.layers[from..] {
+            for (key, value) in &layer.writes {
+                apply(&mut trie, key, value.as_deref());
+            }
+            layer.trie = Some(trie.clone());
+        }
+        trie
+    }
+
+    /// The state commitment of everything visible (spec 10 §4): what
+    /// `storage_commit` returns.
+    pub fn commitment(&mut self) -> Hash {
+        self.state_trie().root()
     }
 
     /// Entries under `prefix` as visible through every layer, in key order.
@@ -173,6 +360,7 @@ impl<S: Storage> Overlay<S> {
             .collect();
         for layer in &self.layers {
             for (k, v) in layer
+                .writes
                 .range(prefix.to_vec()..)
                 .take_while(|(k, _)| k.starts_with(prefix))
             {
@@ -275,6 +463,112 @@ mod tests {
         assert_eq!(base.get(b"missing"), None);
     }
 
+    /// The root by definition: a fresh trie over the visible committed entries.
+    fn rebuilt(o: &Overlay<MemStorage>) -> [u8; 32] {
+        let mut t = Trie::new();
+        for (k, v) in o.scan(&[]) {
+            if committed(&k) {
+                t.insert(&k, &v);
+            }
+        }
+        t.root()
+    }
+
+    #[test]
+    fn commitment_covers_visible_committed_keys() {
+        let mut o = Overlay::new(MemStorage::default());
+        assert_eq!(o.commitment(), solo_trie::EMPTY);
+        o.set(b"a", b"1");
+        o.set(b"local/height", b"9");
+        let root = o.commitment();
+        let mut only_a = Trie::new();
+        only_a.insert(b"a", b"1");
+        assert_eq!(root, only_a.root());
+        // Local keys never move the root, written or deleted, in a layer or not.
+        o.push();
+        o.set(b"local/finalized", b"1");
+        assert!(o.delete(b"local/height"));
+        assert_eq!(o.commitment(), root);
+        // Pending writes count before they reach the base, and leave it alone.
+        o.set(b"b", b"2");
+        o.push();
+        assert!(o.delete(b"a"));
+        assert!(!o.delete(b"never"));
+        assert_eq!(o.commitment(), rebuilt(&o));
+        let mut only_b = Trie::new();
+        only_b.insert(b"b", b"2");
+        assert_eq!(o.commitment(), only_b.root());
+        assert_eq!(
+            o.state_trie()
+                .prove(b"b")
+                .verify(solo_trie::keccak256, &only_b.root(), b"b"),
+            Ok(Some(solo_trie::keccak256(b"2")))
+        );
+        assert_eq!(o.base().state_trie().root(), root);
+        o.commit();
+        o.commit();
+        assert_eq!(o.commitment(), only_b.root());
+        assert_eq!(o.base().state_trie().root(), only_b.root());
+        assert_eq!(o.base().get(b"local/height"), None);
+        // Deleting a base key that is absent changes nothing.
+        let mut base = o.into_base();
+        assert!(!base.delete(b"a"));
+        assert!(base.delete(b"local/finalized"));
+        assert_eq!(base.state_trie().root(), only_b.root());
+        // An empty value is present, not absent.
+        base.set(b"empty", b"");
+        assert_ne!(base.state_trie().root(), only_b.root());
+    }
+
+    #[test]
+    fn layer_tries_follow_every_path() {
+        let mut o = Overlay::new(MemStorage::default());
+        o.set(b"base", b"0");
+        // Built on first use, then kept up to date with what is written.
+        o.push();
+        o.set(b"a", b"1");
+        assert_eq!(o.commitment(), rebuilt(&o));
+        o.set(b"b", b"2");
+        assert!(o.delete(b"a"));
+        o.set(b"local/x", b"node");
+        // An unbuilt layer merged into a built one leaves its keys stale there.
+        o.push();
+        o.set(b"c", b"3");
+        o.set(b"local/y", b"node");
+        o.commit();
+        assert_eq!(o.commitment(), rebuilt(&o));
+        // A built layer merged into the one below hands its trie down.
+        o.push();
+        o.set(b"d", b"4");
+        assert_eq!(o.commitment(), rebuilt(&o));
+        o.commit();
+        assert_eq!(o.commitment(), rebuilt(&o));
+        // Two unbuilt layers merged, then built from the built one beneath,
+        // then discarded: the layer beneath is as it was.
+        let root = o.commitment();
+        o.push();
+        o.push();
+        o.set(b"e", b"5");
+        o.commit();
+        assert_eq!(o.commitment(), rebuilt(&o));
+        assert_ne!(o.commitment(), root);
+        o.discard();
+        assert_eq!(o.commitment(), root);
+        // A built bottom layer with stale keys merges into the base whole.
+        assert!(o.delete(b"base"));
+        o.commit();
+        assert_eq!(o.depth(), 0);
+        assert_eq!(o.base().state_trie().root(), rebuilt(&o));
+        assert_eq!(o.base().get(b"a"), None);
+        assert_eq!(o.base().get(b"base"), None);
+        assert_eq!(o.base().get(b"local/x"), Some(b"node".to_vec()));
+        let mut expected = Trie::new();
+        for (k, v) in [(b"b", b"2"), (b"c", b"3"), (b"d", b"4")] {
+            expected.insert(k, v);
+        }
+        assert_eq!(o.commitment(), expected.root());
+    }
+
     #[test]
     fn namespacing() {
         let ns = [7u8; 32];
@@ -284,5 +578,6 @@ mod tests {
         assert_eq!(&k[32..], b"key");
         let o = Overlay::new(MemStorage::default());
         assert!(format!("{o:?}").contains("Overlay"));
+        assert_eq!(MAX_STORED_KEY_LEN, namespaced(&ns, &[0; MAX_KEY_LEN]).len());
     }
 }

@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 solo-vm = { path = "../solo-vm" }
+solo-trie = { path = "../solo-trie" }
 tiny-keccak = { version = "2", features = ["keccak"] }
 sha2 = "0.10"
 blake2 = "0.10"
@@ -16,6 +17,7 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 
 [dev-dependencies]
 solo-recompile = { path = "../solo-recompile" }
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

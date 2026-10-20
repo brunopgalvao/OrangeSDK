@@ -1,9 +1,11 @@
-//! The privileged host functions a node supplies (spec 05 §4.2, §4.5–4.7).
+//! The privileged host functions a node supplies (spec 05 §4.2, §4.5–4.7),
+//! including the state commitment and proofs of spec 10.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use solo_host::storage::MAX_STORED_KEY_LEN;
 use solo_host::{Extension, Overlay, Storage};
 use solo_vm::host::{Capability, HostContext};
 use solo_vm::isa::Reg;
@@ -59,6 +61,11 @@ pub struct NodeServices {
     pub key: Option<k256::ecdsa::SigningKey>,
     /// Request ids handed out by `net_request`.
     pub next_request_id: u64,
+    /// The state trie behind each root `storage_commit` returned, in order:
+    /// O(1) copy-on-write clones, so the node can keep the trie a block
+    /// header commits to and prove against it later. The node clears this
+    /// before every kernel call.
+    pub commitments: Vec<solo_trie::Trie>,
 }
 
 /// Handles served by the extension; all above `EXTENSION_HANDLE_BASE`.
@@ -73,6 +80,7 @@ pub enum Handle {
     PersistSet = 104,
     PersistGet = 105,
     Sign = 106,
+    StorageProof = 107,
     NetSend = 110,
     NetBroadcast = 111,
     NetDisseminate = 112,
@@ -89,6 +97,7 @@ const FUNCTIONS: &[(&str, Handle)] = &[
     ("persist_set", Handle::PersistSet),
     ("persist_get", Handle::PersistGet),
     ("sign", Handle::Sign),
+    ("storage_proof", Handle::StorageProof),
     ("net_send", Handle::NetSend),
     ("net_broadcast", Handle::NetBroadcast),
     ("net_disseminate", Handle::NetDisseminate),
@@ -110,23 +119,11 @@ impl NodeExtension {
     }
 }
 
-/// The state commitment of version 0: `keccak256` over every visible
-/// `(key, value)` pair in key order, each length-prefixed, skipping keys
-/// under `local/` (node-local bookkeeping such as the finalized height). A
-/// placeholder for the binary trie; deterministic and cheap to verify by
-/// recomputation.
-pub fn commitment<S: Storage>(state: &Overlay<S>) -> [u8; 32] {
-    let mut buf = Vec::new();
-    for (k, v) in state.scan(&[]) {
-        if k.starts_with(solo_abi::chain::keys::LOCAL) {
-            continue;
-        }
-        buf.extend_from_slice(&(k.len() as u64).to_le_bytes());
-        buf.extend_from_slice(&k);
-        buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
-        buf.extend_from_slice(&v);
-    }
-    solo_host::hash::keccak256(&buf)
+/// The state commitment (spec 10): the root of the binary Merkle trie over
+/// every visible key except those under `local/` (node-local bookkeeping such
+/// as the finalized height). What `storage_commit` writes.
+pub fn commitment<S: Storage>(state: &mut Overlay<S>) -> [u8; 32] {
+    state.commitment()
 }
 
 fn fault() -> Termination {
@@ -194,9 +191,24 @@ impl<S: Storage> Extension<S> for NodeExtension {
         match handle {
             h if h == Handle::StorageCommit as u32 => {
                 ctx.charge(10_000)?;
-                let root = commitment(state);
-                ctx.memory.write(a0, &root).map_err(|_| fault())?;
+                let trie = state.state_trie();
+                ctx.memory.write(a0, &trie.root()).map_err(|_| fault())?;
+                services.commitments.push(trie);
                 ctx.set(Reg::A0, 0);
+            }
+            h if h == Handle::StorageProof as u32 => {
+                ctx.charge(2_000)?;
+                // Any stored key, a sandboxed one with its namespace included.
+                if a1 == 0 || a1 as usize > MAX_STORED_KEY_LEN {
+                    ctx.set(Reg::A0, 0);
+                } else {
+                    let key = read(ctx, a0, a1)?;
+                    let proof = state.state_trie().prove(&key).encode();
+                    let n = proof.len().min(a3 as usize);
+                    ctx.memory.write(a2, &proof[..n]).map_err(|_| fault())?;
+                    ctx.charge(per_32(u32::try_from(n).expect("bounded by cap")))?;
+                    ctx.set(Reg::A0, proof.len() as u64);
+                }
             }
             h if h == Handle::TimeNow as u32 => {
                 ctx.charge(10)?;
