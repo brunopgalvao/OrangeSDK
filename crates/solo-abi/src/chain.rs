@@ -80,6 +80,8 @@ record! {
         upgrades: UpgradeParams,
         /// Staking, epochs, slashing and threshold keys (spec 15).
         staking: crate::staking::StakingParams,
+        /// The Ethereum-to-Solo bridge (spec 18); disabled by default.
+        bridge_in: crate::bridge_in::BridgeInParams,
     }
 }
 
@@ -310,6 +312,18 @@ pub mod reason {
     /// A transaction to the outbox address whose calldata is not a `send`
     /// the outbox accepts (spec 17 §2.2).
     pub const OUTBOX_MESSAGE: u32 = 14;
+    /// A transaction to the light-client or inbox address of spec 18 on a
+    /// chain without the bridge, or carrying value, or, to the inbox,
+    /// calldata that is not a canonical `deliver` call (spec 18 §7). Codes
+    /// 15 to 19 are left to other system addresses.
+    pub const BRIDGE_CALL: u32 = 20;
+    /// A light-client update that does not decode or would not advance the
+    /// light client (spec 18 §7).
+    pub const BRIDGE_UPDATE: u32 = 21;
+    /// An inbox delivery of a message already delivered (spec 18 §7).
+    pub const MESSAGE_DELIVERED: u32 = 22;
+    /// An inbox delivery while the inbox is paused (spec 18 §7).
+    pub const INBOX_PAUSED: u32 = 23;
 }
 
 /// Storage key prefixes of the reference kernel.
@@ -866,6 +880,10 @@ mod tests {
             staking: crate::staking::StakingParams {
                 epoch_blocks: 24,
                 ..crate::staking::StakingParams::default()
+            },
+            bridge_in: crate::bridge_in::BridgeInParams {
+                outbox: [5; 20],
+                ..crate::bridge_in::BridgeInParams::default()
             },
         });
         roundtrip(&BlockHeader {

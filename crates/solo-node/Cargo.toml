@@ -22,6 +22,7 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 proptest = { version = "1", default-features = false, features = ["std"] }
 solo-recompile = { path = "../solo-recompile" }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+solo-ethlc = { path = "../solo-ethlc", features = ["testing"] }
 
 [lints]
 workspace = true

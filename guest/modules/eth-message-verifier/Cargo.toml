@@ -1,0 +1,17 @@
+[package]
+name = "eth-message-verifier"
+description = "The message-verifier module of spec 18: the native contract behind the verifier address"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "eth-message-verifier"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+solo-guest = { path = "../../solo-guest" }
+solo-module = { path = "../../solo-module" }
+solo-ethlc = { path = "../../../crates/solo-ethlc" }

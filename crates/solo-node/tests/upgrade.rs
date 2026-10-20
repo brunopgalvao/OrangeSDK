@@ -530,9 +530,9 @@ fn four_validators_switch_together_and_a_crashed_one_catches_up() {
         );
         nonce += 1;
     }
-    // Every validator's host signalled the gate it supports, epoch after epoch: it locked in.
+    // Every validator's host signalled the gates it supports, epoch after epoch: they locked in.
     let book = sim.nodes[0].upgrade_status().unwrap().gates;
-    assert_eq!(book.locked_in(), 1 << gate::SECP256K1_VERIFY, "{book:?}");
+    assert_eq!(book.locked_in(), solo_node::upgrade::SUPPORTED, "{book:?}");
     let locked = book.record(gate::SECP256K1_VERIFY).cloned().unwrap();
     assert_eq!(locked.activation_height % 4, 1);
     // Activate at a height whose catch-up batch (16 blocks, spec 08) also carries the next blocks.

@@ -11,6 +11,8 @@
 //! - [`certificate`]: the versioned finality certificate and the bytes it signs.
 //! - [`evm`]: the inputs an Ethereum contract passes to the EIP-2537 precompiles.
 //! - [`host`]: the byte-level semantics of the `bls12381_*` host functions.
+//! - [`eth`]: Ethereum consensus-layer signatures (keys in G1, signatures in
+//!   G2) and the fast aggregate verification sync committees need.
 //!
 //! `no_std` with `alloc`, so the kernel can link the same code.
 
@@ -21,6 +23,7 @@ extern crate alloc;
 
 pub mod certificate;
 pub mod dkg;
+pub mod eth;
 pub mod evm;
 pub mod hash;
 pub mod host;

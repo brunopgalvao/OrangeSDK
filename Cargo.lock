@@ -2827,6 +2827,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "solo-ethlc"
+version = "0.0.1"
+dependencies = [
+ "revm",
+ "serde_json",
+ "sha2 0.10.9",
+ "solo-abi",
+ "solo-bls",
+ "solo-ethlc",
+ "solo-rlp",
+ "tiny-keccak",
+]
+
+[[package]]
 name = "solo-host"
 version = "0.0.1"
 dependencies = [
@@ -2876,6 +2890,7 @@ dependencies = [
  "solo-abi",
  "solo-bls",
  "solo-eth",
+ "solo-ethlc",
  "solo-host",
  "solo-metrics",
  "solo-recompile",

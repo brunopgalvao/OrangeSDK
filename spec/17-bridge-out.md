@@ -175,7 +175,7 @@ Of `verify`, 115 791 is precompiles: 114 275 of BLS (12 §2), 516 of SHA-256 and
 
 ## 9. Contracts and their fixtures
 
-The Solidity sources are in `contracts/` (test contracts in `contracts/test/`). `tools/build-contracts.sh` compiles them with solc 0.8.28 and writes `contracts/build/`: each contract's init code (`.bin`), runtime code (`.bin-runtime`) and ABI (`.abi`), and `SOURCES`, the sha256 of every source. The tests run the committed fixtures and fail when a source's hash differs from `SOURCES` or a source is missing from it, so a contract change without rebuilt fixtures cannot pass. CI does not need solc.
+The Solidity sources are in `contracts/` (test contracts in `contracts/test/`). The directory also holds spec 18's contracts (`EthereumOutbox`, deployed on Ethereum, and `EthereumInbox`, deployed on Solo), built and checked the same way. `tools/build-contracts.sh` compiles them with solc 0.8.28 and writes `contracts/build/`: each contract's init code (`.bin`), runtime code (`.bin-runtime`) and ABI (`.abi`), and `SOURCES`, the sha256 of every source. The tests run the committed fixtures and fail when a source's hash differs from `SOURCES` or a source is missing from it, so a contract change without rebuilt fixtures cannot pass. CI does not need solc.
 
 ## 10. Limits of this version
 

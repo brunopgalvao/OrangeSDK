@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+mod bridge;
 mod dkg;
 mod driver;
 mod evm;
@@ -36,6 +37,7 @@ solo_guest::solo_export!(kernel_init, |input: &[u8]| -> Vec<u8> {
     state::init(&genesis);
     staking::init(&genesis);
     modules::init(&genesis);
+    bridge::init(&genesis);
     Vec::new()
 });
 

@@ -164,8 +164,9 @@ pub fn slot_key(address: &Address, slot: &Hash) -> Vec<u8> {
 }
 
 /// Applies genesis: chain id, parameters, and the allocated accounts with
-/// their code and storage. The stored parameters leave the allocations out:
-/// the driver reads them on every step and the accounts already hold them.
+/// their code and storage. The stored parameters leave the allocations and
+/// the bridge out: the driver reads them on every step, the accounts already
+/// hold the allocations, and the bridge's namespace its state (spec 18 §4.1).
 ///
 /// Traps on an account with storage but neither code nor nonce. revm leaves
 /// out EIP-7610, so a CREATE could land on such an account and its slots would
@@ -175,6 +176,7 @@ pub fn init(genesis: &Genesis) {
     set(keys::CHAIN_ID, &genesis.chain_id);
     let mut params = GenesisParams::from_bytes(&genesis.params).unwrap_or_else(|_| solo_guest::trap());
     let allocations = core::mem::take(&mut params.allocations.0);
+    params.bridge_in = solo_abi::bridge_in::BridgeInParams::default();
     set(b"meta/params", &params);
     set_raw(b"meta/validators", &genesis.validators);
     for allocation in &allocations {

@@ -158,15 +158,15 @@ pub fn resolve(name: &str, capability: Capability) -> Option<u32> {
         .map(|f| f.handle)
 }
 
-const fn per_32(bytes: u32) -> u64 {
+pub(crate) const fn per_32(bytes: u32) -> u64 {
     bytes.div_ceil(32) as u64
 }
 
-fn fault() -> Termination {
+pub(crate) fn fault() -> Termination {
     Termination::HostError(HostStatus::MemoryFault.code())
 }
 
-fn read(ctx: &HostContext<'_>, ptr: u32, len: u32) -> Result<Vec<u8>, Termination> {
+pub(crate) fn read(ctx: &HostContext<'_>, ptr: u32, len: u32) -> Result<Vec<u8>, Termination> {
     ctx.memory
         .read(ptr, len)
         .map(<[u8]>::to_vec)

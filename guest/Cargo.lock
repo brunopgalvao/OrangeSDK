@@ -558,6 +558,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
+name = "eth-light-client"
+version = "0.0.1"
+dependencies = [
+ "solo-ethlc",
+ "solo-guest",
+ "solo-module",
+]
+
+[[package]]
+name = "eth-message-verifier"
+version = "0.0.1"
+dependencies = [
+ "solo-ethlc",
+ "solo-guest",
+ "solo-module",
+]
+
+[[package]]
 name = "evm-conformance"
 version = "0.0.1"
 dependencies = [
@@ -714,6 +732,7 @@ dependencies = [
  "revm",
  "solo-abi",
  "solo-eth",
+ "solo-ethlc",
  "solo-guest",
  "solo-rlp",
  "solo-upgrade",
@@ -1273,6 +1292,14 @@ version = "0.0.1"
 name = "solo-eth"
 version = "0.0.1"
 dependencies = [
+ "solo-rlp",
+]
+
+[[package]]
+name = "solo-ethlc"
+version = "0.0.1"
+dependencies = [
+ "solo-abi",
  "solo-rlp",
 ]
 

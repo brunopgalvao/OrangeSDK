@@ -93,6 +93,14 @@ fn encodings() {
             "not a valid system action (upgrade or module install)",
         ),
         (reason::STAKING_ACTION, "not a valid staking action"),
+        (reason::OUTBOX_MESSAGE, "not a valid outbox message"),
+        (reason::BRIDGE_CALL, "not a valid bridge call"),
+        (
+            reason::BRIDGE_UPDATE,
+            "light client update does not advance the light client",
+        ),
+        (reason::MESSAGE_DELIVERED, "message already delivered"),
+        (reason::INBOX_PAUSED, "inbox paused"),
         (99, "rejected"),
     ];
     for (code, text) in texts {

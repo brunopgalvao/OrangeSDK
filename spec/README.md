@@ -23,6 +23,7 @@ This directory is normative. An implementation that disagrees with it is wrong; 
 | 15 | [Staking, epochs, slashing and the threshold key](15-staking.md) — the staking address, epochs and validator sets, slashing, the DKG runs, their messages in blocks, key-set adoption, the host's threshold keystore | draft |
 | 16 | [Kernel modules and native contracts](16-modules.md) — the module interface, capabilities, genesis and governance installs, block hooks, native contracts called from the EVM (`0xEF02` designators), the native gas rate | draft |
 | 17 | [Bridge to Ethereum](17-bridge-out.md) — the outbox system address and its messages in state, the proposal anchor that certificates vouch for, the Ethereum light client and inbox with delay, rate limits, guardian and owner, relaying, the `finality_proof` query and the `solo_getFinalityProof` and `solo_getOutboxProof` RPC methods | draft |
+| 18 | [Ethereum to Solo](18-bridge-in.md) — the sync-committee light client of Ethereum, the outbox on Ethereum, message proofs, the message verifier and the inbox, delay, rate limit and pause, admission | draft |
 
 ## Conventions
 

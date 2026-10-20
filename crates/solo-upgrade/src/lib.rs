@@ -122,6 +122,9 @@ pub mod keys {
 pub mod gate {
     /// The `secp256k1_verify` host function (spec 05 §4.3).
     pub const SECP256K1_VERIFY: u8 = 0;
+    /// The `bls12381_fast_aggregate_verify` host function (spec 05 §4.3),
+    /// which the Ethereum light client of spec 18 needs.
+    pub const BLS12381_FAST_AGGREGATE_VERIFY: u8 = 1;
 }
 
 #[cfg(test)]

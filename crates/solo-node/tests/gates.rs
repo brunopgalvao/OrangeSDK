@@ -13,7 +13,9 @@ use k256::ecdsa::SigningKey;
 use solo_abi::types::Genesis;
 use solo_host::hash::keccak256;
 use solo_host::{Executor, Flags, MemStorage, ModuleCache};
-use solo_node::upgrade::{GATED, SECP256K1_VERIFY, SUPPORTED, gated, signal_tx};
+use solo_node::upgrade::{
+    BLS12381_FAST_AGGREGATE_VERIFY, GATED, SECP256K1_VERIFY, SUPPORTED, gated, signal_tx,
+};
 use solo_node::{GatedExtension, Node, NodeConfig, NodeExtension, NodeServices};
 use solo_upgrade::{Action, gate};
 use solo_vm::builder::ModuleBuilder;
@@ -106,13 +108,30 @@ fn negate(s: &[u8]) -> Vec<u8> {
 
 #[test]
 fn the_gated_function_resolves_only_while_its_gate_is_active() {
-    assert_eq!(GATED.len(), 1);
+    assert_eq!(GATED.len(), 2);
     for f in GATED {
         assert_eq!(SUPPORTED >> f.gate & 1, 1, "{f:?}");
     }
+    assert_eq!(SUPPORTED, 0b11);
     assert_eq!(
         (GATED[0].name, GATED[0].handle, SECP256K1_VERIFY),
         ("secp256k1_verify", 200, 200)
+    );
+    assert_eq!(
+        (GATED[1].name, GATED[1].gate, GATED[1].handle),
+        (
+            "bls12381_fast_aggregate_verify",
+            1,
+            BLS12381_FAST_AGGREGATE_VERIFY
+        )
+    );
+    assert_eq!(
+        gated("bls12381_fast_aggregate_verify", Capability::Sandboxed, 1),
+        None
+    );
+    assert_eq!(
+        gated("bls12381_fast_aggregate_verify", Capability::Sandboxed, 2),
+        Some(201)
     );
     assert_eq!(
         gated("secp256k1_verify", Capability::Sandboxed, 1),
@@ -132,6 +151,54 @@ fn the_gated_function_resolves_only_while_its_gate_is_active() {
     assert_eq!(
         run(&mut exec, &time, Capability::Privileged),
         (Termination::Halt, 77)
+    );
+}
+
+#[test]
+fn the_node_serves_bls12381_fast_aggregate_verify_behind_gate_1() {
+    use solo_bls::curve::{G1Affine, G2Affine, G2Projective, Scalar};
+    let secret = Scalar::from(77u64);
+    let key = G1Affine::from(G1Affine::generator() * secret).to_compressed();
+    let msg = [0x33u8; 32];
+    let h = G2Projective::from(solo_bls::hash::to_g2(&msg, solo_bls::eth::DST));
+    let sig = G2Affine::from(h * secret).to_compressed();
+    let base = 0x1_0000;
+    let module = |sig: &[u8]| {
+        let rodata = [&key[..], &msg, sig].concat();
+        let mut b = ModuleBuilder::new().rodata(&rodata);
+        b.import("output_write");
+        b.import("bls12381_fast_aggregate_verify");
+        b.block(&[
+            li(Reg::A0, base),
+            li(Reg::A1, 1),
+            li(Reg::A2, base + 48),
+            li(Reg::A3, 32),
+            li(Reg::A4, base + 80),
+            Instruction::Ecall { import: 1 },
+            li(Reg::A7, BUF),
+            Instruction::Store {
+                width: StoreWidth::D,
+                rs1: Reg::A7,
+                rs2: Reg::A0,
+                off: 0,
+            },
+            li(Reg::A0, BUF),
+            li(Reg::A1, 8),
+            Instruction::Ecall { import: 0 },
+            Instruction::Halt,
+        ]);
+        b.export("main", 0).build()
+    };
+    let (mut exec, gates) = executor(1);
+    assert!(exec.load(&module(&sig), Capability::Sandboxed).is_err());
+    gates.set(0b10);
+    assert_eq!(
+        run(&mut exec, &module(&sig), Capability::Sandboxed),
+        (Termination::Halt, 0)
+    );
+    assert_eq!(
+        run(&mut exec, &module(&[0xFF; 96]), Capability::Sandboxed),
+        (Termination::Halt, 1)
     );
 }
 
@@ -247,8 +314,9 @@ fn a_validator_signals_and_its_gate_activates_an_epoch_after_locking_in() {
     run_until(&mut node, 10, &mut |n| {
         n.block_number().unwrap() + 1 >= record.activation_height
     });
-    assert_eq!(node.upgrades().active(), 1 << gate::SECP256K1_VERIFY);
+    assert_eq!(node.upgrades().active(), SUPPORTED);
     assert!(node.resolves("secp256k1_verify", Capability::Privileged));
+    assert!(node.resolves("bls12381_fast_aggregate_verify", Capability::Sandboxed));
     assert!(node.resolves("secp256k1_verify", Capability::Sandboxed));
     assert_eq!(node.upgrades().missing_gates(), 0);
     assert!(
@@ -285,15 +353,12 @@ fn a_validator_signals_and_its_gate_activates_an_epoch_after_locking_in() {
     run_until(&mut node, 10, &mut |n| signal_features(n) == Some(0));
     assert_eq!(node.upgrades().active(), 0);
     assert!(!node.resolves("secp256k1_verify", Capability::Privileged));
-    assert_eq!(node.upgrades().missing_gates(), 1 << gate::SECP256K1_VERIFY);
+    assert_eq!(node.upgrades().missing_gates(), SUPPORTED);
     // The operator hears of it through /metrics and /status (spec 13 §7.2).
     let text = node.metrics_text();
-    assert!(text.contains("\nsolo_upgrade_missing_gates 1\n"), "{text}");
+    assert!(text.contains("\nsolo_upgrade_missing_gates 2\n"), "{text}");
     assert!(text.contains("\nsolo_upgrade_blocked 0\n"), "{text}");
-    assert_eq!(
-        node.status().unwrap().missing_gates,
-        1 << gate::SECP256K1_VERIFY
-    );
+    assert_eq!(node.status().unwrap().missing_gates, SUPPORTED);
     // Locked in stays locked in.
     let gates = node.upgrade_status().unwrap().gates;
     assert_eq!(gates.record(gate::SECP256K1_VERIFY), Some(&record));

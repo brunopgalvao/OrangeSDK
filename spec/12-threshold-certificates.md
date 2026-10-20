@@ -239,7 +239,7 @@ The implementation also passes the RFC 9380 vectors of Appendices J.9.1 (`BLS123
 
 - The reference kernel's DKG (15 §6) carries messages in blocks, ends phases at fixed heights and adopts a key set only when more than two thirds of the stake confirm the same public outcome, which is how it checks that every participant derived the same key set. Partial signatures ride on finalize votes and are combined in the host's keystore (05 §4.3), natively, rather than in the interpreter.
 - The threshold counts shareholders, not stake (15 §9).
-- `bls12381_verify` covers this scheme only. Verifying the Ethereum consensus layer's signatures (keys in G1, signatures in G2) for the sync-committee light client of ADR 0013 needs its own host function.
+- `bls12381_verify` covers this scheme only. The Ethereum consensus layer's signatures (keys in G1, signatures in G2), which the sync-committee light client of spec 18 checks, have their own host function, `bls12381_fast_aggregate_verify`, behind feature gate 1 (05 §4.3).
 - The DKG is synchronous; a run whose messages are not delivered to everyone alike can end with different outputs at different participants. In the reference kernel every participant reads the same messages from chain state, and a key set is adopted only once more than two thirds of the stake confirm it.
 
 ## Appendix A. Reference verifier (informative)
