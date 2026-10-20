@@ -121,7 +121,14 @@ mod tests {
         assert_eq!(ctx.regions[RO], Region::default());
         assert!(format!("{ctx:?}").contains("exit_pc"));
         assert_eq!(
-            [EXIT_HALT, EXIT_TRAP, EXIT_FAULT, EXIT_INVALID_JUMP, EXIT_OUT_OF_GAS, EXIT_SITE],
+            [
+                EXIT_HALT,
+                EXIT_TRAP,
+                EXIT_FAULT,
+                EXIT_INVALID_JUMP,
+                EXIT_OUT_OF_GAS,
+                EXIT_SITE
+            ],
             [0, 1, 2, 3, 4, 5]
         );
     }

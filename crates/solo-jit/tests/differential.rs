@@ -8,6 +8,12 @@
 //! with every kind of operand register, so that each lowering path is
 //! exercised on every run whatever the random seed.
 
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
+
 mod support;
 
 use proptest::prelude::*;
@@ -31,12 +37,14 @@ const A5: Reg = Reg::A5;
 
 /// Rodata, data and bss sizes that leave every region end mid-page.
 const RO: &[u8] = &[0x81; 37];
-const DATA: &[u8] = &[0x7F, 0x01, 0xFF, 0x80, 0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+const DATA: &[u8] = &[
+    0x7F, 0x01, 0xFF, 0x80, 0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60,
+];
 const BSS: u32 = 13;
 
 /// A builder with the layout every generated module uses: rodata at
-/// 0x1_0000, data and bss at 0x2_0000, heap at 0x3_0000 (1 MiB max), stack
-/// 0xFFFD_E000..0xFFFE_0000 (8 KiB), and every test import.
+/// `0x1_0000`, data and bss at `0x2_0000`, heap at `0x3_0000` (1 MiB max),
+/// stack `0xFFFD_E000..0xFFFE_0000` (8 KiB), and every test import.
 fn base() -> ModuleBuilder {
     let mut b = ModuleBuilder::new().rodata(RO).data(DATA);
     b.layout.bss_size = BSS;
@@ -285,7 +293,12 @@ fn terminator(cur: usize, n: usize) -> impl Strategy<Value = Vec<Instruction>> {
         options.push((2, Just(vec![]).boxed()));
         options.push((
             4,
-            (prop::sample::select(CONDS.to_vec()), reg(), reg(), target.clone())
+            (
+                prop::sample::select(CONDS.to_vec()),
+                reg(),
+                reg(),
+                target.clone(),
+            )
                 .prop_map(|(cond, rs1, rs2, block)| {
                     vec![Instruction::Branch {
                         cond,
@@ -360,7 +373,10 @@ impl Case {
             // A generated block may be empty (fall-through only); give it one
             // instruction so the layout stays one block per item.
             if code.is_empty() {
-                b.block(&[Instruction::Li { rd: Reg::ZERO, imm: 0 }]);
+                b.block(&[Instruction::Li {
+                    rd: Reg::ZERO,
+                    imm: 0,
+                }]);
             } else {
                 b.block(code);
             }
@@ -375,10 +391,7 @@ fn case() -> impl Strategy<Value = Case> {
             (
                 (0..n).map(|i| block(i, n)).collect::<Vec<_>>(),
                 0..u32::try_from(n).unwrap(),
-                prop::collection::vec(
-                    prop_oneof![any::<u64>(), prop::sample::select(ANCHORS)],
-                    6,
-                ),
+                prop::collection::vec(prop_oneof![any::<u64>(), prop::sample::select(ANCHORS)], 6),
                 prop_oneof![0i64..400, 400i64..4000, Just(1_000_000)],
             )
         })
@@ -583,7 +596,10 @@ fn loads_and_stores_at_every_boundary() {
                 );
                 let p = program(&b);
                 let base = 0x2_0004i64.wrapping_sub(off) as u64;
-                same_all(&p, &[vec![base], vec![0xFFFD_FFF8u64.wrapping_sub(off as u64)]]);
+                same_all(
+                    &p,
+                    &[vec![base], vec![0xFFFD_FFF8u64.wrapping_sub(off as u64)]],
+                );
             }
             let b = with_sources(
                 rs1,
@@ -654,7 +670,10 @@ fn branches_forward_and_backward() {
         ]);
         b.block(&[Instruction::Halt]);
         let p = program(&b.export("main", 0));
-        same_all(&p, &[vec![10, 1], vec![10, 3], vec![u64::MAX, 1], vec![0, 0]]);
+        same_all(
+            &p,
+            &[vec![10, 1], vec![10, 3], vec![u64::MAX, 1], vec![0, 0]],
+        );
     }
 }
 

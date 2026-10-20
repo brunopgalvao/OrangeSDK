@@ -508,7 +508,11 @@ impl Module {
         }
         let unique = |list: &mut dyn Iterator<Item = &str>| {
             let mut seen = alloc::collections::BTreeSet::new();
-            list.fold(true, |all, n| seen.insert(n) && all)
+            let mut all = true;
+            for n in list {
+                all &= seen.insert(n);
+            }
+            all
         };
         if !unique(&mut self.imports.iter().map(String::as_str))
             || !unique(&mut self.exports.iter().map(|(n, _)| n.as_str()))
@@ -531,7 +535,9 @@ impl Module {
             let last = block.len() - 1;
             for (i, ins) in block.iter().enumerate() {
                 if let Instruction::AluImm { op, imm, .. } = ins
-                    && op.shift_limit().is_some_and(|limit| !(0..=limit).contains(imm))
+                    && op
+                        .shift_limit()
+                        .is_some_and(|limit| !(0..=limit).contains(imm))
                 {
                     let mut before = Vec::new();
                     for earlier in &block[..i] {
@@ -970,6 +976,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn validate_rechecks_modules_built_in_memory() {
         let mut b = ModuleBuilder::new().rodata(&[1]).data(&[2]);
         b.import("ok");
@@ -1002,8 +1009,14 @@ mod tests {
         );
         check(&|m| m.rodata.push(0), ValidationError::DataSizeMismatch);
         check(&|m| m.data.clear(), ValidationError::DataSizeMismatch);
-        check(&|m| m.imports[0] = "bad-name".to_string(), ValidationError::BadName);
-        check(&|m| m.exports[0].0 = String::new(), ValidationError::BadName);
+        check(
+            &|m| m.imports[0] = "bad-name".to_string(),
+            ValidationError::BadName,
+        );
+        check(
+            &|m| m.exports[0].0 = String::new(),
+            ValidationError::BadName,
+        );
         check(
             &|m| m.imports.push("ok".to_string()),
             ValidationError::DuplicateName,
@@ -1021,7 +1034,10 @@ mod tests {
         check(&|m| m.blocks.clear(), ValidationError::BlockCount);
         check(&|m| m.blocks.insert(1, vec![]), ValidationError::BlockCount);
         check(
-            &|m| m.blocks.resize(MAX_BLOCKS as usize + 1, vec![Instruction::Halt]),
+            &|m| {
+                m.blocks
+                    .resize(MAX_BLOCKS as usize + 1, vec![Instruction::Halt]);
+            },
             ValidationError::BlockCount,
         );
         check(
@@ -1032,7 +1048,13 @@ mod tests {
                     rs1: Reg::A0,
                     imm: 32,
                 };
-                m.blocks[1].insert(0, Instruction::Li { rd: Reg::A1, imm: 300 });
+                m.blocks[1].insert(
+                    0,
+                    Instruction::Li {
+                        rd: Reg::A1,
+                        imm: 300,
+                    },
+                );
             },
             ValidationError::Decode(
                 1,

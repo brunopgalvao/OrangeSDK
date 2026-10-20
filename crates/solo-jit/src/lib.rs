@@ -1,7 +1,7 @@
 //! Native code backend for the Solo VM.
 //!
 //! [`Compiled::new`] translates a validated [`Program`] ahead of time into
-//! machine code for the host (AArch64 on Apple silicon, x86-64 on Unix);
+//! machine code for the host (`AArch64` on Apple silicon, x86-64 on Unix);
 //! [`Instance`] runs it in-process with the same interface as the reference
 //! interpreter's [`solo_vm::interp::Instance`]. Results are bit-exact with
 //! the interpreter: registers, memory, gas remaining, the termination status
@@ -28,6 +28,14 @@
 //! and callers keep using the interpreter.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
+// Without a native backend the code generator is compiled but never called.
+#![cfg_attr(
+    not(any(
+        all(target_arch = "aarch64", target_os = "macos"),
+        all(target_arch = "x86_64", unix)
+    )),
+    allow(dead_code, unused_imports)
+)]
 
 mod code;
 mod ctx;

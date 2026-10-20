@@ -1,4 +1,4 @@
-//! AArch64 code generation.
+//! `AArch64` code generation.
 //!
 //! Register use while native code runs:
 //!
@@ -74,7 +74,7 @@ struct Runtime {
 /// The emitter for this target.
 pub(crate) type Native = Arm64;
 
-/// The AArch64 emitter.
+/// The `AArch64` emitter.
 pub(crate) struct Arm64 {
     code: Vec<u8>,
     map: RegMap,
@@ -150,9 +150,9 @@ impl Arm64 {
         self.emit(base | imm12 << 10 | reg(n) << 5 | reg(d));
     }
 
-    /// Bitfield move: `base | immr << 16 | imms << 10 | n << 5 | d`.
-    fn bitfield(&mut self, base: u32, d: u8, n: u8, immr: u32, imms: u32) {
-        self.emit(base | immr << 16 | imms << 10 | reg(n) << 5 | reg(d));
+    /// Bitfield move: `base | rotate << 16 | top << 10 | n << 5 | d`.
+    fn bitfield(&mut self, base: u32, d: u8, n: u8, rotate: u32, top: u32) {
+        self.emit(base | rotate << 16 | top << 10 | reg(n) << 5 | reg(d));
     }
 
     /// `ldr xt, [xn, #off]`, `off` a multiple of 8.
@@ -421,21 +421,21 @@ impl Arm64 {
             }
             AluImmOp::Slli | AluImmOp::Srli | AluImmOp::Srai => {
                 let s = self.src(rs1, S1);
-                let (base, immr, imms) = match op {
+                let (base, rotate, top) = match op {
                     AluImmOp::Slli => (0xD340_0000, (64 - sh) & 63, 63 - sh),
                     AluImmOp::Srli => (0xD340_0000, sh, 63),
                     _ => (0x9340_0000, sh, 63),
                 };
-                self.bitfield(base, d, s, immr, imms);
+                self.bitfield(base, d, s, rotate, top);
             }
             AluImmOp::Slliw | AluImmOp::Srliw | AluImmOp::Sraiw => {
                 let s = self.src(rs1, S1);
-                let (base, immr, imms) = match op {
+                let (base, rotate, top) = match op {
                     AluImmOp::Slliw => (0x5300_0000, (32 - shw) & 31, 31 - shw),
                     AluImmOp::Srliw => (0x5300_0000, shw, 31),
                     _ => (0x1300_0000, shw, 31),
                 };
-                self.bitfield(base, d, s, immr, imms);
+                self.bitfield(base, d, s, rotate, top);
                 self.sxtw(d, d);
             }
         }

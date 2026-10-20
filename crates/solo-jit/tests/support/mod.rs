@@ -1,7 +1,11 @@
 //! Shared by the differential tests: a deterministic host, runners for both
 //! backends, and the comparison of everything spec 07 §4 compares.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 
 use solo_jit::{Compiled, Options};
 use solo_vm::builder::ModuleBuilder;

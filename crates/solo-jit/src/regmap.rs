@@ -68,9 +68,7 @@ fn operands(ins: &Instruction) -> [Reg; 3] {
         Instruction::Memcopy { dst, src, len } => [dst, src, len],
         Instruction::Memfill { dst, val, len } => [dst, val, len],
         Instruction::Alu { rd, rs1, rs2, .. } => [rd, rs1, rs2],
-        Instruction::Store { rs1, rs2, .. } | Instruction::Branch { rs1, rs2, .. } => {
-            [rs1, rs2, z]
-        }
+        Instruction::Store { rs1, rs2, .. } | Instruction::Branch { rs1, rs2, .. } => [rs1, rs2, z],
     }
 }
 

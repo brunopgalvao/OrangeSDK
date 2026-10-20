@@ -163,7 +163,9 @@ mod platform {
     }
 
     impl ExecMem {
-        /// Copies `code` in and makes it visible to instruction fetch.
+        /// Copies `code` in and makes it visible to instruction fetch. Never
+        /// fails here; the signature matches the other platforms.
+        #[allow(clippy::unnecessary_wraps)]
         pub(super) fn fill(&self, code: &[u8]) -> Result<(), CompileError> {
             // SAFETY: switches this thread's view of every MAP_JIT page to
             // writable; no code from this mapping runs on this thread yet.
