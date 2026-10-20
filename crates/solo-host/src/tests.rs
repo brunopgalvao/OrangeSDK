@@ -1053,3 +1053,103 @@ fn extensions_serve_high_handles() {
     );
     assert_eq!(exec.cache_mut().cost_table(), CostTable::V1);
 }
+
+#[test]
+fn native_backend_matches_the_interpreter() {
+    use crate::executor::Backend;
+    let elf = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../solo-recompile/tests/fixtures/hello.elf"
+    ))
+    .unwrap();
+    let input = solo_recompile::Input::load(&elf).unwrap();
+    let hello = solo_recompile::recompile(&input, &solo_recompile::Options::default()).unwrap();
+    let callee = callee();
+    let key = crate::storage::namespaced(&[0xCC; 32], b"c");
+    let run_all = |backend: Backend| {
+        let mut exec = executor();
+        exec.set_backend(backend);
+        let callee_hash = load(&mut exec, &callee, Capability::Sandboxed);
+        let mut ro = callee_hash.to_vec();
+        ro.extend_from_slice(&[0xCC; 32]);
+        ro.extend_from_slice(&[0x42, 0xFF]);
+        let mut results = vec![run(&mut exec, &hello, b"", 1_000_000)];
+        let mut positions = vec![exec.last_position()];
+        // Native code really ran wherever the target has a backend; a
+        // silent fallback would compare the interpreter with itself.
+        let expected = (backend == Backend::Native).then_some(solo_jit::SUPPORTED);
+        assert_eq!(exec.runs_natively(&keccak256(&hello)), expected);
+        // A nested call that commits, one whose callee traps, and a run out of gas.
+        for (code, gas) in [
+            (module(&imports(), &caller(50_000, 0, 64), &ro), 200_000),
+            (module(&imports(), &caller(50_000, 0, 65), &ro), 200_000),
+            (hello.clone(), 50),
+        ] {
+            results.push(run(&mut exec, &code, b"", gas));
+            positions.push(exec.last_position());
+        }
+        (
+            results,
+            positions,
+            exec.state().get(&key),
+            exec.logs().to_vec(),
+        )
+    };
+    let interpreted = run_all(Backend::Interpreter);
+    assert_eq!(interpreted.0[0].status, Termination::Halt);
+    assert_eq!(interpreted.0[3].status, Termination::OutOfGas);
+    assert_eq!(run_all(Backend::Native), interpreted);
+    assert_eq!(Backend::default(), Backend::Interpreter);
+}
+
+#[test]
+fn native_compile_outcomes_are_cached_and_bounded() {
+    use crate::executor::{Backend, NATIVE_CODE_BUDGET, NativeStats};
+    let hello = module(&imports(), &[li(Reg::A0, 7), Instruction::Halt], &[]);
+    let callee = callee();
+    let mut reference = executor();
+    let expected = run(&mut reference, &hello, b"", 10_000);
+
+    let mut exec = executor();
+    exec.set_backend(Backend::Native);
+    assert_eq!(exec.native_stats(), NativeStats::default());
+    let hash = load(&mut exec, &hello, Capability::Sandboxed);
+    assert_eq!(exec.runs_natively(&hash), None);
+    // No budget left: the program runs on the interpreter, and the failed
+    // compile is remembered rather than repeated on every call.
+    exec.set_native_code_budget(0);
+    for _ in 0..3 {
+        assert_eq!(run(&mut exec, &hello, b"", 10_000), expected);
+    }
+    assert_eq!(exec.runs_natively(&hash), Some(false));
+    assert_eq!(
+        exec.native_stats(),
+        NativeStats {
+            attempts: 1,
+            compiled: 0,
+            code_bytes: 0
+        }
+    );
+    // With room, another program compiles once and stays within budget;
+    // the earlier failure stays cached.
+    exec.set_native_code_budget(NATIVE_CODE_BUDGET);
+    let callee_hash = load(&mut exec, &callee, Capability::Sandboxed);
+    for _ in 0..2 {
+        exec.call(
+            &callee_hash,
+            NS,
+            &[1],
+            100_000,
+            Capability::Sandboxed,
+            Flags::default(),
+        );
+    }
+    let stats = exec.native_stats();
+    assert_eq!(stats.attempts, 2);
+    assert_eq!(stats.compiled, usize::from(solo_jit::SUPPORTED));
+    assert_eq!(stats.code_bytes > 0, solo_jit::SUPPORTED);
+    assert!(stats.code_bytes <= NATIVE_CODE_BUDGET);
+    assert_eq!(exec.runs_natively(&callee_hash), Some(solo_jit::SUPPORTED));
+    assert_eq!(exec.runs_natively(&hash), Some(false));
+    assert!(!format!("{stats:?}").is_empty());
+}

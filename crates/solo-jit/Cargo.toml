@@ -1,0 +1,25 @@
+[package]
+name = "solo-jit"
+description = "Native code backend for the Solo VM: compiles a validated program ahead of time and runs it in-process, bit-exact with the reference interpreter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+solo-vm = { path = "../solo-vm" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+solo-abi = { path = "../solo-abi" }
+solo-host = { path = "../solo-host" }
+solo-node = { path = "../solo-node" }
+solo-recompile = { path = "../solo-recompile" }
+solo-rlp = { path = "../solo-rlp" }
+
+[lints]
+workspace = true

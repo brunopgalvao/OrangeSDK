@@ -18,5 +18,8 @@ pub mod storage;
 mod tests;
 
 pub use cache::{LoadError, ModuleCache};
-pub use executor::{CallResult, EXTENSION_HANDLE_BASE, Executor, Extension, Flags};
+pub use executor::{
+    Backend, CallResult, EXTENSION_HANDLE_BASE, Executor, Extension, Flags, NATIVE_CODE_BUDGET,
+    NativeStats,
+};
 pub use storage::{MemStorage, Overlay, Storage, Writes};

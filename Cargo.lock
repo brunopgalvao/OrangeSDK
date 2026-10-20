@@ -849,10 +849,26 @@ dependencies = [
  "proptest",
  "sha2",
  "solo-bls",
+ "solo-jit",
  "solo-recompile",
  "solo-trie",
  "solo-vm",
  "tiny-keccak",
+]
+
+[[package]]
+name = "solo-jit"
+version = "0.0.1"
+dependencies = [
+ "k256",
+ "libc",
+ "proptest",
+ "solo-abi",
+ "solo-host",
+ "solo-node",
+ "solo-recompile",
+ "solo-rlp",
+ "solo-vm",
 ]
 
 [[package]]

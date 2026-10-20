@@ -481,6 +481,82 @@ impl Module {
             .find(|(n, _)| n == name)
             .map(|(_, b)| *b)
     }
+
+    /// Re-checks a module held in memory against the rules of spec 03 §7
+    /// that concern its content rather than its bytes: 5–8 (layout and data
+    /// sizes), 9 (name shape and uniqueness, not host resolution), 10, 11,
+    /// the shift ranges of 12, and 13–16. [`Module::parse`] already applies
+    /// all of them; this is for modules assembled or edited in memory before
+    /// a backend that relies on them, such as a native compiler, runs them.
+    ///
+    /// # Errors
+    /// The first rule violated, as a [`ValidationError`].
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        self.layout.validate()?;
+        if self.rodata.len() != self.layout.ro_size as usize
+            || self.data.len() != self.layout.data_size as usize
+        {
+            return Err(ValidationError::DataSizeMismatch);
+        }
+        let names = self
+            .imports
+            .iter()
+            .map(String::as_str)
+            .chain(self.exports.iter().map(|(n, _)| n.as_str()));
+        if names.clone().any(|n| !name_ok(n.as_bytes())) {
+            return Err(ValidationError::BadName);
+        }
+        let unique = |list: &mut dyn Iterator<Item = &str>| {
+            let mut seen = alloc::collections::BTreeSet::new();
+            let mut all = true;
+            for n in list {
+                all &= seen.insert(n);
+            }
+            all
+        };
+        if !unique(&mut self.imports.iter().map(String::as_str))
+            || !unique(&mut self.exports.iter().map(|(n, _)| n.as_str()))
+        {
+            return Err(ValidationError::DuplicateName);
+        }
+        if self.jump_table.is_empty()
+            || self.jump_table.len() > MAX_SLOTS as usize
+            || self.jump_table[0].is_some()
+        {
+            return Err(ValidationError::JumpTable);
+        }
+        if self.blocks.is_empty()
+            || self.blocks.len() > MAX_BLOCKS as usize
+            || self.blocks.iter().any(Vec::is_empty)
+        {
+            return Err(ValidationError::BlockCount);
+        }
+        for (index, block) in self.blocks.iter().enumerate() {
+            let last = block.len() - 1;
+            for (i, ins) in block.iter().enumerate() {
+                if let Instruction::AluImm { op, imm, .. } = ins
+                    && op
+                        .shift_limit()
+                        .is_some_and(|limit| !(0..=limit).contains(imm))
+                {
+                    let mut before = Vec::new();
+                    for earlier in &block[..i] {
+                        earlier.encode(&mut before);
+                    }
+                    let error = DecodeError {
+                        kind: crate::isa::DecodeErrorKind::ShiftOutOfRange,
+                        offset: before.len(),
+                    };
+                    let index = u32::try_from(index).unwrap_or(u32::MAX);
+                    return Err(ValidationError::Decode(index, error));
+                }
+                if ins.ends_block() && i != last {
+                    return Err(ValidationError::TerminatorNotLast);
+                }
+            }
+        }
+        check_operands(self)
+    }
 }
 
 /// A validated module with its per-block static costs under one cost table.
@@ -897,6 +973,128 @@ mod tests {
         reject(&bad, ValidationError::ImportOutOfRange);
         let bad = valid().export("x", 3);
         reject(&bad, ValidationError::ExportBlockOutOfRange);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn validate_rechecks_modules_built_in_memory() {
+        let mut b = ModuleBuilder::new().rodata(&[1]).data(&[2]);
+        b.import("ok");
+        let s = b.slot(1);
+        b.block(&[Instruction::Call {
+            rd: Reg::RA,
+            block: 1,
+            slot: s,
+        }]);
+        b.block(&[
+            Instruction::AluImm {
+                op: AluImmOp::Slli,
+                rd: Reg::A0,
+                rs1: Reg::A0,
+                imm: 63,
+            },
+            Instruction::Ecall { import: 0 },
+            Instruction::Halt,
+        ]);
+        let good = parse(&b.export("main", 0)).unwrap();
+        assert_eq!(good.validate(), Ok(()));
+        let check = |edit: &dyn Fn(&mut Module), expected: ValidationError| {
+            let mut m = good.clone();
+            edit(&mut m);
+            assert_eq!(m.validate(), Err(expected));
+        };
+        check(
+            &|m| m.layout.rw_base += 1,
+            ValidationError::Layout(LayoutError::Misaligned),
+        );
+        check(&|m| m.rodata.push(0), ValidationError::DataSizeMismatch);
+        check(&|m| m.data.clear(), ValidationError::DataSizeMismatch);
+        check(
+            &|m| m.imports[0] = "bad-name".to_string(),
+            ValidationError::BadName,
+        );
+        check(
+            &|m| m.exports[0].0 = String::new(),
+            ValidationError::BadName,
+        );
+        check(
+            &|m| m.imports.push("ok".to_string()),
+            ValidationError::DuplicateName,
+        );
+        check(
+            &|m| m.exports.push(("main".to_string(), 1)),
+            ValidationError::DuplicateName,
+        );
+        check(&|m| m.jump_table.clear(), ValidationError::JumpTable);
+        check(&|m| m.jump_table[0] = Some(0), ValidationError::JumpTable);
+        check(
+            &|m| m.jump_table.resize(MAX_SLOTS as usize + 1, None),
+            ValidationError::JumpTable,
+        );
+        check(&|m| m.blocks.clear(), ValidationError::BlockCount);
+        check(&|m| m.blocks.insert(1, vec![]), ValidationError::BlockCount);
+        check(
+            &|m| {
+                m.blocks
+                    .resize(MAX_BLOCKS as usize + 1, vec![Instruction::Halt]);
+            },
+            ValidationError::BlockCount,
+        );
+        check(
+            &|m| {
+                m.blocks[1][0] = Instruction::AluImm {
+                    op: AluImmOp::Slliw,
+                    rd: Reg::A0,
+                    rs1: Reg::A0,
+                    imm: 32,
+                };
+                m.blocks[1].insert(
+                    0,
+                    Instruction::Li {
+                        rd: Reg::A1,
+                        imm: 300,
+                    },
+                );
+            },
+            ValidationError::Decode(
+                1,
+                DecodeError {
+                    kind: DecodeErrorKind::ShiftOutOfRange,
+                    offset: 4,
+                },
+            ),
+        );
+        check(
+            &|m| {
+                m.blocks[1][0] = Instruction::AluImm {
+                    op: AluImmOp::Srai,
+                    rd: Reg::A0,
+                    rs1: Reg::A0,
+                    imm: -1,
+                };
+            },
+            ValidationError::Decode(
+                1,
+                DecodeError {
+                    kind: DecodeErrorKind::ShiftOutOfRange,
+                    offset: 0,
+                },
+            ),
+        );
+        check(
+            &|m| m.blocks[1].insert(0, Instruction::Trap),
+            ValidationError::TerminatorNotLast,
+        );
+        check(
+            &|m| m.blocks[1][1] = Instruction::Ecall { import: 7 },
+            ValidationError::ImportOutOfRange,
+        );
+        check(
+            &|m| {
+                m.blocks[1].pop();
+            },
+            ValidationError::FinalBlockFallsThrough,
+        );
     }
 
     #[test]
