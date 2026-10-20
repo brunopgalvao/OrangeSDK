@@ -19,6 +19,7 @@ This directory is normative. An implementation that disagrees with it is wrong; 
 | 11 | [Telemetry](11-telemetry.md) — metrics endpoint and names, emitted metrics, status document, alert and health semantics | draft |
 | 12 | [Threshold certificates](12-threshold-certificates.md) — threshold BLS over BLS12-381, the DKG and resharing, the finality certificate and its verification on Ethereum | draft |
 | 13 | [Kernel upgrades and feature gates](13-upgrades.md) — the upgrade address and its actions, the upgrade timeline, feature-gate signalling, lock-in and activation | draft |
+| 16 | [Kernel modules and native contracts](16-modules.md) — the module interface, capabilities, genesis and governance installs, block hooks, native contracts called from the EVM (`0xEF02` designators), the native gas rate | draft |
 
 ## Conventions
 

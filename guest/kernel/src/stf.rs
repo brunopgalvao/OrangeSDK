@@ -54,6 +54,7 @@ fn check(raw: &[u8]) -> Result<Signed, u32> {
     let s = decode_signed(raw, state::chain_id())?;
     well_formed(&s)?;
     crate::governance::admit(&s)?;
+    crate::modules::admit(&s)?;
     Ok(s)
 }
 
@@ -157,7 +158,11 @@ fn run_tx(raw: &[u8], chain_id: u64, block: BlockFields, index: u32, cumulative:
         nonce: Some(s.tx.nonce),
         access_list: s.tx.access_list.clone(),
     };
-    let outcome = crate::governance::run(&s, block.number, message, block);
+    let outcome = if s.tx.to == Some(solo_abi::modules::MODULE_ADDRESS) {
+        crate::modules::run(&s, block.number, message, block)
+    } else {
+        crate::governance::run(&s, block.number, message, block)
+    };
     if outcome.status == call_status::INVALID {
         return None;
     }
@@ -191,6 +196,7 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let height = template.height;
     let block = BlockFields { number: height, timestamp: template.timestamp_ms / 1000 };
     record_evidence(&args.block.participation);
+    crate::modules::begin_block(height, template.timestamp_ms);
     let mut receipts = Vec::new();
     let mut tx_hashes = Vec::new();
     let mut cumulative = 0u64;
@@ -211,6 +217,7 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
         tx_hashes.push(hash);
     }
     let receipts_root = state::keccak256(&receipt_hashes);
+    crate::modules::end_block(height, template.timestamp_ms);
     crate::governance::end_block(height);
     let state_root = state::commit();
     let header = BlockHeader {
@@ -315,6 +322,6 @@ pub fn query(args: &QueryArgs) -> QueryResult {
             Ok(first) => found(Some(Seq(state::evidence_from(first)))),
             Err(_) => bad_params(),
         },
-        _ => crate::governance::query(method, &args.params),
+        _ => crate::modules::query(method, &args.params).unwrap_or_else(|| crate::governance::query(method, &args.params)),
     }
 }

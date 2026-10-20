@@ -17,6 +17,7 @@ use solo_abi::codec::Seq;
 use solo_abi::types::{Address, Hash};
 use solo_guest::host;
 
+use crate::native::{HEAD_SLOT, NativeProvider};
 use crate::state;
 
 /// Base fee per gas, the constant the host's RPC reports too. Fixed in this
@@ -82,12 +83,25 @@ fn u128_of(v: U256) -> u128 {
 /// (`state::init`), only code writes storage, and creation sets the nonce to 1.
 /// revm creates only where there is neither code nor nonce, so it never creates
 /// over old slots, which is also why leaving out EIP-7610 is safe.
-fn commit(changes: impl IntoIterator<Item = (RAddress, RAccount)>) {
+///
+/// A native contract (spec 16 §5) keeps no EVM storage: its slot 0 holds the
+/// number of its latest standing batch of native writes, which are applied
+/// to its namespace here instead.
+fn commit(changes: impl IntoIterator<Item = (RAddress, RAccount)>, native: &NativeProvider) {
     for (address, account) in changes {
         if !account.is_touched() {
             continue;
         }
         let a = address.0.0;
+        if account.info.code.as_ref().is_some_and(|c| solo_abi::modules::designated(c.original_byte_slice()).is_some()) {
+            let head = account.storage.get(&HEAD_SLOT).map_or(0, |s| u64::try_from(s.present_value).unwrap_or(0));
+            let writes: Vec<_> = native.standing(head).into_iter().cloned().collect();
+            crate::modules::apply(Some(&solo_abi::modules::namespace(&a)), &writes);
+            let info = &account.info;
+            let code_hash = if info.code_hash == KECCAK_EMPTY { [0; 32] } else { info.code_hash.0 };
+            state::set_account(&a, &Account { balance: u128_of(info.balance), nonce: info.nonce, code_hash });
+            continue;
+        }
         if account.is_selfdestructed() {
             // Post-Cancun, only an account created in the same transaction self-destructs;
             // it had no slots before, so every slot it has is one this transaction touched.
@@ -215,7 +229,8 @@ pub fn run(message: Message, block: BlockFields, commit_state: bool) -> Outcome 
         })
         .with_block(block_env)
         .with_db(StateDb)
-        .build_mainnet();
+        .build_mainnet()
+        .with_precompiles(NativeProvider::new(SpecId::OSAKA, block, !commit_state));
     let Ok(result) = evm.transact(tx) else {
         return Outcome { status: call_status::INVALID, gas_used: 0, output: Vec::new(), logs: Vec::new(), contract: None };
     };
@@ -231,7 +246,7 @@ pub fn run(message: Message, block: BlockFields, commit_state: bool) -> Outcome 
         ExecutionResult::Halt { gas, logs, .. } => (call_status::HALT, gas.tx_gas_used(), Vec::new(), logs, None),
     };
     if commit_state {
-        commit(result.state);
+        commit(result.state, &evm.precompiles);
     }
     let logs = logs
         .into_iter()
