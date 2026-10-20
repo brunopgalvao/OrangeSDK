@@ -17,6 +17,7 @@ use solo_abi::codec::Seq;
 use solo_bridge::abi::{self, Value};
 use solo_bridge::{Error, SlotProof, message_hash, sent_messages, slot_proof};
 use solo_node::{Node, NodeConfig, SubmitError};
+use solo_trie::keccak256;
 use support::eth::init_code;
 use support::solo::{CHAIN_ID, address, create_address, genesis, kernel_module, key, tx};
 
@@ -235,7 +236,7 @@ fn accounts_and_contracts_send_messages_that_state_proofs_reach() {
     assert_eq!(result.output[31], 3);
     assert_eq!(chain.word(NONCE_SLOT)[31], 2);
     // The first message is still proven at its height while the node keeps that state;
-    // a height before it shows it absent, and a height the node never kept has no proof.
+    // a height before it shows it absent, and a height the node has not reached has no proof.
     let head = chain.node.block_number().unwrap();
     let later = slot_proof(&mut chain.node, 1, head).unwrap().unwrap();
     assert_eq!(later.message_hash, hash);
@@ -327,4 +328,20 @@ fn transactions_to_the_outbox_must_carry_an_acceptable_send() {
             .unwrap()[31],
         2
     );
+    // The empty outbox account is left out of state (spec 17 §2.3), its slots are not.
+    let head = chain.node.block_number().unwrap();
+    let root = chain
+        .node
+        .block_by_number(head)
+        .unwrap()
+        .unwrap()
+        .state_root;
+    let account_key = [b"acct/".as_slice(), &OUTBOX_ADDRESS].concat();
+    let account = chain.node.state_proof_at(head, &account_key).unwrap();
+    assert_eq!(account.verify(keccak256, &root, &account_key), Ok(None));
+    let slot = chain.node.state_proof_at(head, &message_key(2)).unwrap();
+    assert!(matches!(
+        slot.verify(keccak256, &root, &message_key(2)),
+        Ok(Some(_))
+    ));
 }

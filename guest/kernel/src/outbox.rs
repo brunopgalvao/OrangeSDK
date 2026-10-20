@@ -17,7 +17,7 @@ use revm::interpreter::{CallInputs, CallScheme, Gas, InstructionResult, Interpre
 use revm::primitives::{B256, Bytes, Log as RLog, U256};
 use revm::state::Account as RAccount;
 use solo_abi::bridge::{Message, NONCE_SLOT, OUTBOX_ADDRESS, SendCall, message_slot, send_gas};
-use solo_abi::chain::{Account, reason};
+use solo_abi::chain::reason;
 use solo_abi::types::Address;
 
 use crate::state;
@@ -74,19 +74,13 @@ pub fn call<CTX: ContextTr>(ctx: &mut CTX, inputs: &CallInputs) -> Result<Interp
     Ok(InterpreterResult::new(InstructionResult::Return, Bytes::from(message_slot(nonce).to_vec()), gas))
 }
 
-/// Commits the outbox account: its balance (the value of every `send`) and
-/// the slots it wrote. It has no code and no nonce, so the EIP-161 rule of
-/// `evm::commit` would delete it with its slots unwritten; the outbox keeps
-/// them whatever its balance (spec 17 §3).
+/// Commits the slots the outbox wrote. It has no code and no nonce, so the
+/// EIP-161 rule of `evm::commit` would delete it with its slots unwritten;
+/// the outbox keeps them whatever its balance, and `evm::commit` then writes
+/// or deletes the account itself by its balance (spec 17 §2.3).
 pub fn commit(address: &Address, account: &RAccount) -> bool {
     if *address != OUTBOX_ADDRESS {
         return false;
-    }
-    let info = &account.info;
-    if info.is_empty() {
-        state::delete(&state::account_key(address));
-    } else {
-        state::set_account(address, &Account { balance: u128::try_from(info.balance).unwrap_or(u128::MAX), nonce: info.nonce, code_hash: [0; 32] });
     }
     for (key, slot) in account.changed_storage_slots() {
         state::set_raw(&state::slot_key(address, &key.to_be_bytes::<32>()), &slot.present_value.to_be_bytes::<32>());
