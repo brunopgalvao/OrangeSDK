@@ -16,9 +16,9 @@ The long arc (vision, strategy, decisions, research) lives in the codex at `/Use
 
 ## Layout
 
-- `spec/` — the VM, module format, gas, host ABI, driver interface, reference consensus (08), transport (09) and state commitment (10) specifications.
+- `spec/` — the VM, module format, gas, host ABI, driver interface, reference consensus (08), transport (09), state commitment (10) and threshold certificates (12) specifications.
 - `crates/solo-vm` — reference interpreter, `no_std`-capable, the oracle for every other backend.
-- `crates/solo-recompile` — RV64 ELF to Solo module. `crates/solo-host` — executor and host ABI. `crates/solo-abi` — codec and shared types. `crates/solo-rlp` — RLP. `crates/solo-trie` — the binary Merkle trie of the state commitment (spec 10).
+- `crates/solo-recompile` — RV64 ELF to Solo module. `crates/solo-host` — executor and host ABI. `crates/solo-abi` — codec and shared types. `crates/solo-rlp` — RLP. `crates/solo-trie` — the binary Merkle trie of the state commitment (spec 10). `crates/solo-bls` — threshold BLS, DKG and resharing, finality certificates (spec 12).
 - `crates/solo-node` — node host (driver loop, mempool, queries) and `Sim`, the in-process multi-node network for consensus tests. `crates/solo-rpc` — Ethereum JSON-RPC. `crates/solo-cli` — the `solo` command.
 - `guest/` — separate RISC-V workspace: `solo-guest` runtime, `hello`, the reference `kernel`. Rebuild fixtures with `tools/build-guest.sh` after touching it.
 - `tools/` — build scripts; conformance runners and differential fuzz harnesses as they land.

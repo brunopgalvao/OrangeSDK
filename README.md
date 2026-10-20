@@ -81,6 +81,7 @@ cargo llvm-cov --workspace --fail-under-lines 100
 - `crates/solo-abi` — the canonical codec and the types shared by host and kernel (spec 06 and the reference chain records).
 - `crates/solo-rlp` — Ethereum RLP.
 - `crates/solo-trie` — the binary Merkle trie of the state commitment (spec 10), with inclusion and exclusion proofs, `no_std`.
+- `crates/solo-bls` — threshold BLS over BLS12-381: the DKG and resharing, finality certificates and their Ethereum verification inputs (spec 12), `no_std`.
 - `crates/solo-node` — the node host: privileged functions (including `sign`), the driver loop, mempool, queries, the TCP transport, and `Sim`, an in-process network of nodes with a virtual clock.
 - `crates/solo-rpc` — Ethereum JSON-RPC over a node, with a minimal HTTP server.
 - `crates/solo-cli` — the `solo` command (`solo dev`, `solo node`, `solo key`).

@@ -13,6 +13,8 @@ use crate::executor::{CallResult, Executor, Flags, MAX_DEPTH};
 use crate::hash::{blake2b256, keccak256, sha256};
 use crate::storage::MemStorage;
 
+mod bls;
+
 /// Writable scratch in the default layout's stack region.
 const BUF: i64 = 0xFFFC_0000;
 const NS: [u8; 32] = [0xAA; 32];

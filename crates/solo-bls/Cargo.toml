@@ -1,0 +1,31 @@
+[package]
+name = "solo-bls"
+description = "Threshold BLS12-381 signatures, a dealerless DKG with resharing, and the finality certificates of spec 12, no_std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+solo-abi = { path = "../solo-abi", default-features = false }
+bls12_381 = { version = "0.9", default-features = false, features = ["groups", "pairings", "alloc", "experimental", "zeroize"] }
+sha2 = { version = "0.10", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+zeroize = { version = "1", default-features = false }
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+# An independent BLS12-381 implementation, called the way revm's EIP-2537
+# precompiles call it: the oracle for the procedure an Ethereum contract
+# follows to verify a certificate (spec 12 §8).
+ark-bls12-381 = { version = "0.6", default-features = false, features = ["curve"] }
+ark-ec = { version = "0.6", default-features = false }
+ark-ff = { version = "0.6", default-features = false }
+ark-serialize = { version = "0.6", default-features = false }
+
+[lints]
+workspace = true

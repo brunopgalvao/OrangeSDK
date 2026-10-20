@@ -105,6 +105,16 @@ pub const FUNCTIONS: &[Function] = &[
         sandboxed: true,
     },
     Function {
+        name: "bls12381_verify",
+        handle: 25,
+        sandboxed: true,
+    },
+    Function {
+        name: "bls12381_pairing_check",
+        handle: 26,
+        sandboxed: true,
+    },
+    Function {
         name: "invoke",
         handle: 30,
         sandboxed: true,
@@ -236,6 +246,8 @@ pub fn dispatch<S: Storage>(
         22 => hash(ctx, 4, blake2b256)?,
         23 => secp256k1_recover(ctx)?,
         24 => p256_verify(ctx)?,
+        25 => bls12381_verify(ctx)?,
+        26 => bls12381_pairing_check(ctx)?,
         30 => invoke(host, ctx)?,
         31 => {
             ctx.charge(10)?;
@@ -449,6 +461,45 @@ fn p256_verify(ctx: &mut HostContext<'_>) -> Result<(), Termination> {
         .zip(Signature::from_slice(&sig).ok())
         .is_some_and(|(k, s)| k.verify_prehash(&msg, &s).is_ok());
     ctx.set(Reg::A0, u64::from(!valid));
+    Ok(())
+}
+
+/// `bls12381_verify` (spec 05 §4.3, spec 12 §3): a G1 signature over a
+/// message under a G2 key, hashed to the curve with a caller-chosen tag.
+fn bls12381_verify(ctx: &mut HostContext<'_>) -> Result<(), Termination> {
+    let (msg, msg_len, sig, key) = (
+        ctx.arg32(Reg::A0),
+        ctx.arg32(Reg::A1),
+        ctx.arg32(Reg::A2),
+        ctx.arg32(Reg::A3),
+    );
+    let (dst, dst_len) = (ctx.arg32(Reg::A4), ctx.arg32(Reg::A5));
+    ctx.charge(100_000 + 6 * per_32(msg_len))?;
+    let msg = read(ctx, msg, msg_len)?;
+    let sig: [u8; 48] = read(ctx, sig, 48)?.try_into().expect("48 bytes read");
+    let key: [u8; 96] = read(ctx, key, 96)?.try_into().expect("96 bytes read");
+    // The tag length is checked before the tag is read: gas does not cover
+    // the tag, so an out-of-range length must not make the host copy it.
+    let valid = dst_len != 0 && dst_len as usize <= solo_bls::host::MAX_DST_LENGTH && {
+        let dst = read(ctx, dst, dst_len)?;
+        solo_bls::host::verify(&msg, &dst, &sig, &key)
+    };
+    ctx.set(Reg::A0, u64::from(!valid));
+    Ok(())
+}
+
+/// `bls12381_pairing_check` (spec 05 §4.3): `count` pairs of a compressed
+/// G1 and a compressed G2 point.
+fn bls12381_pairing_check(ctx: &mut HostContext<'_>) -> Result<(), Termination> {
+    let (pairs, count) = (ctx.arg32(Reg::A0), ctx.arg32(Reg::A1));
+    ctx.charge(70_000 + 50_000 * u64::from(count))?;
+    let pair = solo_bls::host::PAIR_LENGTH as u64;
+    let len = u32::try_from(pair * u64::from(count))
+        .ok()
+        .ok_or_else(fault)?;
+    let data = read(ctx, pairs, len)?;
+    let holds = solo_bls::host::pairing_check(&data);
+    ctx.set(Reg::A0, u64::from(!holds));
     Ok(())
 }
 

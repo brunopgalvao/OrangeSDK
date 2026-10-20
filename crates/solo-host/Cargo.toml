@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 solo-vm = { path = "../solo-vm" }
 solo-trie = { path = "../solo-trie" }
+solo-bls = { path = "../solo-bls" }
 tiny-keccak = { version = "2", features = ["keccak"] }
 sha2 = "0.10"
 blake2 = "0.10"

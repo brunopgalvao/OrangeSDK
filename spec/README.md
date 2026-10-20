@@ -16,6 +16,7 @@ This directory is normative. An implementation that disagrees with it is wrong; 
 | 08 | [Simplex driver](08-simplex-driver.md) — the reference kernel's consensus: views, votes, view synchronization, certificates, equivocation evidence, persistence | draft |
 | 09 | [Peer-to-peer transport](09-p2p.md) — TCP framing, handshake, mapping between frames and driver inputs and effects | draft |
 | 10 | [State commitment](10-state-commitment.md) — the binary Merkle trie behind `storage_commit`, its proofs and their verification | draft |
+| 12 | [Threshold certificates](12-threshold-certificates.md) — threshold BLS over BLS12-381, the DKG and resharing, the finality certificate and its verification on Ethereum | draft |
 
 ## Conventions
 
