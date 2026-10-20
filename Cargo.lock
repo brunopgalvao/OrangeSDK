@@ -892,6 +892,7 @@ dependencies = [
  "solo-recompile",
  "solo-rlp",
  "solo-trie",
+ "solo-upgrade",
  "solo-vm",
 ]
 
@@ -931,6 +932,15 @@ name = "solo-trie"
 version = "0.0.1"
 dependencies = [
  "proptest",
+ "tiny-keccak",
+]
+
+[[package]]
+name = "solo-upgrade"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+ "solo-abi",
  "tiny-keccak",
 ]
 

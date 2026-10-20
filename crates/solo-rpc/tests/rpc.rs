@@ -88,6 +88,7 @@ fn encodings() {
         (reason::GAS_LIMIT_TOO_HIGH, "transaction gas limit too high"),
         (reason::INITCODE_TOO_LARGE, "max initcode size exceeded"),
         (reason::SENDER_NOT_EOA, "sender not an eoa"),
+        (reason::SYSTEM_ACTION, "not a valid upgrade action"),
         (99, "rejected"),
     ];
     for (code, text) in texts {

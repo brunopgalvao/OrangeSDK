@@ -101,6 +101,7 @@ fn genesis(alice: &Wallet) -> Genesis {
             balance: 100 * ETHER,
             ..Allocation::default()
         }]),
+        ..GenesisParams::default()
     };
     Genesis {
         chain_id: CHAIN_ID,
@@ -362,6 +363,7 @@ fn rejections() {
                     balance: ETHER + 21_000 * gp,
                     ..Allocation::default()
                 }]),
+                ..GenesisParams::default()
             };
             g.params = params.to_bytes();
             g

@@ -46,6 +46,7 @@ fn genesis() -> Genesis {
             slot_ms: SLOT_MS,
             max_txs: 8,
             allocations: Seq(vec![]),
+            ..GenesisParams::default()
         }
         .to_bytes(),
         validators: Sim::validator_set(&[key()]).to_bytes(),

@@ -696,6 +696,7 @@ dependencies = [
  "solo-eth",
  "solo-guest",
  "solo-rlp",
+ "solo-upgrade",
 ]
 
 [[package]]
@@ -1262,6 +1263,13 @@ version = "0.0.1"
 [[package]]
 name = "solo-rlp"
 version = "0.0.1"
+
+[[package]]
+name = "solo-upgrade"
+version = "0.0.1"
+dependencies = [
+ "solo-abi",
+]
 
 [[package]]
 name = "subtle"

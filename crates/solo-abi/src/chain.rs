@@ -76,6 +76,23 @@ record! {
         max_txs: u32,
         /// Initial accounts: balances and predeployed contracts.
         allocations: Seq<Allocation>,
+        /// Governed kernel upgrades and host feature gates (spec 13).
+        upgrades: UpgradeParams,
+    }
+}
+
+record! {
+    /// Genesis parameters of governed kernel upgrades and host feature gates
+    /// (spec 13), carried in `GenesisParams::upgrades`.
+    UpgradeParams {
+        /// The account allowed to stage, propose and cancel kernel upgrades;
+        /// zero disables kernel upgrades.
+        governance: Address,
+        /// Fewest blocks between the block that proposes an upgrade and its
+        /// activation height; a proposal is always at least one block ahead.
+        min_delay: u64,
+        /// Blocks per feature-gate epoch; zero disables feature-gate signalling.
+        epoch_blocks: u64,
     }
 }
 
@@ -279,6 +296,10 @@ pub mod reason {
     pub const INITCODE_TOO_LARGE: u32 = 10;
     /// The sender has code other than an EIP-7702 delegation designator (EIP-3607).
     pub const SENDER_NOT_EOA: u32 = 11;
+    /// A transaction to the upgrade system address that cannot run: value
+    /// attached, calldata that is not an action, or a sender the action does
+    /// not authorize (spec 13 §2).
+    pub const SYSTEM_ACTION: u32 = 12;
 }
 
 /// Storage key prefixes of the reference kernel.
@@ -776,6 +797,11 @@ mod tests {
                     value: [2; 32],
                 }]),
             }]),
+            upgrades: UpgradeParams {
+                governance: [2; 20],
+                min_delay: 10,
+                epoch_blocks: 100,
+            },
         });
         roundtrip(&BlockHeader {
             height: 1,
@@ -842,7 +868,7 @@ mod tests {
         });
         assert_eq!(TRANSFER_GAS, 21_000);
         assert_eq!(query::ACCOUNT, "account");
-        assert_eq!(reason::BAD_NONCE, 4);
+        assert_eq!((reason::BAD_NONCE, reason::SYSTEM_ACTION), (4, 12));
         assert_eq!(keys::ACCOUNT, b"acct/");
         assert!(alloc::format!("{:?}", Account::default()).contains("Account"));
         for name in [

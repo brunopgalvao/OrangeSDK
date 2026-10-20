@@ -287,6 +287,7 @@ fn genesis(validators: &[SigningKey], allocations: Vec<Allocation>) -> Genesis {
         slot_ms: SLOT_MS,
         max_txs: 16,
         allocations: Seq(allocations),
+        ..GenesisParams::default()
     };
     Genesis {
         chain_id: CHAIN_ID,

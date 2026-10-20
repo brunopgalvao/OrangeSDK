@@ -9,7 +9,9 @@
 //! contract: `{"balance": "<wei>", "nonce": "0x1", "code": "0x<bytecode>",
 //! "storage": {"0x<slot>": "0x<value>"}}`, every field optional. Without
 //! `validators` the dev node is the only validator, signing with
-//! [`DEV_KEY_SEED`].
+//! [`DEV_KEY_SEED`]. Governed upgrades and feature gates (spec 13) are off
+//! unless the file names a `"governance"` address (with an optional
+//! `"upgradeDelay"` in blocks) or a non-zero `"epochBlocks"`.
 
 #![forbid(unsafe_code)]
 
@@ -21,7 +23,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use solo_abi::Encode;
-use solo_abi::chain::{Allocation, GenesisParams, StorageSlot, Validator, ValidatorSet};
+use solo_abi::chain::{
+    Allocation, GenesisParams, StorageSlot, UpgradeParams, Validator, ValidatorSet,
+};
 use solo_abi::codec::Seq;
 use solo_abi::types::Genesis;
 
@@ -104,6 +108,7 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
             .ok()
             .ok_or("genesis: maxTxs too large")?,
         allocations: Seq(allocations),
+        upgrades: parse_upgrades(&v)?,
     };
     let mut validators = Vec::new();
     match v.get("validators") {
@@ -231,6 +236,30 @@ fn parse_word(text: Option<&str>) -> Result<[u8; 32], String> {
     let mut word = [0u8; 32];
     word[32 - bytes.len()..].copy_from_slice(&bytes);
     Ok(word)
+}
+
+/// The upgrade parameters of a genesis document: `governance`, `upgradeDelay`
+/// and `epochBlocks`, each optional.
+fn parse_upgrades(v: &Value) -> Result<UpgradeParams, String> {
+    let governance = match v.get("governance") {
+        None => [0; 20],
+        Some(text) => text
+            .as_str()
+            .and_then(|t| solo_rpc::methods::parse_hex(t).ok())
+            .and_then(|b| <[u8; 20]>::try_from(b).ok())
+            .ok_or("genesis: governance must be a 0x address")?,
+    };
+    let number = |name: &str| match v.get(name) {
+        None => Ok(0),
+        Some(n) => n
+            .as_u64()
+            .ok_or(format!("genesis: {name} must be a non-negative integer")),
+    };
+    Ok(UpgradeParams {
+        governance,
+        min_delay: number("upgradeDelay")?,
+        epoch_blocks: number("epochBlocks")?,
+    })
 }
 
 /// Parses a 32-byte secp256k1 secret key from hex, with or without `0x`.

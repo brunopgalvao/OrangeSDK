@@ -103,6 +103,7 @@ fn node(alice: &Wallet) -> Node {
             balance: 100 * ETHER,
             ..Allocation::default()
         }]),
+        ..GenesisParams::default()
     };
     let genesis = Genesis {
         chain_id: CHAIN_ID,

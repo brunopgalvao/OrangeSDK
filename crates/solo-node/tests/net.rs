@@ -84,6 +84,7 @@ fn genesis(keys: &[SigningKey]) -> Genesis {
             balance: 1_000_000,
             ..Allocation::default()
         }]),
+        ..GenesisParams::default()
     };
     Genesis {
         chain_id: CHAIN_ID,

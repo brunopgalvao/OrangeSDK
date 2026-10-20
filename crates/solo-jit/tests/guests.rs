@@ -155,6 +155,7 @@ fn genesis() -> Genesis {
             balance: 1_000_000_000_000_000_000_000,
             ..Allocation::default()
         }]),
+        ..GenesisParams::default()
     };
     let validator = SigningKey::from_slice(&[0x42; 32]).unwrap();
     Genesis {

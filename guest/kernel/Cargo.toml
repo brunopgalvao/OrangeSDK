@@ -11,9 +11,14 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+# Builds the next kernel version, which the upgrade tests switch a running chain to.
+upgrade-test = []
+
 [dependencies]
 solo-guest = { path = "../solo-guest" }
 solo-abi = { path = "../../crates/solo-abi", default-features = false }
 solo-rlp = { path = "../../crates/solo-rlp", default-features = false }
 solo-eth = { path = "../../crates/solo-eth", default-features = false }
+solo-upgrade = { path = "../../crates/solo-upgrade", default-features = false }
 revm = { version = "43.0.3", default-features = false, features = ["optional_eip3607"] }

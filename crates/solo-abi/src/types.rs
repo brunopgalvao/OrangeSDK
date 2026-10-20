@@ -639,6 +639,8 @@ pub mod exports {
     pub const DRIVER_STATE: &str = "kernel_driver_state";
     /// `kernel_migrate(MigrateArgs)`.
     pub const MIGRATE: &str = "kernel_migrate";
+    /// `kernel_version() -> u32`: the kernel's version (spec 06 §7.1).
+    pub const VERSION: &str = "kernel_version";
     /// `kernel_stf_validate_tx(ValidateArgs) -> ValidateResult`.
     pub const VALIDATE_TX: &str = "kernel_stf_validate_tx";
     /// `kernel_stf_build_block(BuildArgs) -> Block`.
@@ -893,6 +895,7 @@ mod tests {
         assert!(exports::DRIVER_STEP.starts_with("kernel_driver"));
         assert!(exports::DRIVER_STATE.starts_with("kernel_driver"));
         assert!(exports::MIGRATE.starts_with("kernel_"));
+        assert_eq!(exports::VERSION, "kernel_version");
         for e in [
             exports::VALIDATE_TX,
             exports::BUILD_BLOCK,

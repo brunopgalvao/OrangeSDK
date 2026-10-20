@@ -1,0 +1,21 @@
+[package]
+name = "solo-upgrade"
+description = "Governed kernel upgrades and host feature gates (spec 13): the system-address actions, their records, and the gate state machine, no_std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+solo-abi = { path = "../solo-abi", default-features = false }
+
+[dev-dependencies]
+tiny-keccak = { version = "2", features = ["keccak"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

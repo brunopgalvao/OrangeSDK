@@ -261,6 +261,7 @@ pub fn genesis_funding(wallets: &[&Wallet]) -> Genesis {
                 ..Allocation::default()
             })
             .collect()),
+        ..GenesisParams::default()
     };
     Genesis {
         chain_id: CHAIN_ID,

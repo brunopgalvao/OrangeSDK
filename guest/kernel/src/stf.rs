@@ -53,6 +53,7 @@ fn admissible(s: &Signed, account: &Account) -> Result<(), u32> {
 fn check(raw: &[u8]) -> Result<Signed, u32> {
     let s = decode_signed(raw, state::chain_id())?;
     well_formed(&s)?;
+    crate::governance::admit(&s)?;
     Ok(s)
 }
 
@@ -156,7 +157,7 @@ fn run_tx(raw: &[u8], chain_id: u64, block: BlockFields, index: u32, cumulative:
         nonce: Some(s.tx.nonce),
         access_list: s.tx.access_list.clone(),
     };
-    let outcome = evm::run(message, block, true);
+    let outcome = crate::governance::run(&s, block.number, message, block);
     if outcome.status == call_status::INVALID {
         return None;
     }
@@ -210,6 +211,7 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
         tx_hashes.push(hash);
     }
     let receipts_root = state::keccak256(&receipt_hashes);
+    crate::governance::end_block(height);
     let state_root = state::commit();
     let header = BlockHeader {
         height,
@@ -313,6 +315,6 @@ pub fn query(args: &QueryArgs) -> QueryResult {
             Ok(first) => found(Some(Seq(state::evidence_from(first)))),
             Err(_) => bad_params(),
         },
-        _ => QueryResult { status: 3, body: Vec::new() },
+        _ => crate::governance::query(method, &args.params),
     }
 }
