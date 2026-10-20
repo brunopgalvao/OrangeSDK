@@ -118,7 +118,7 @@ A loader MUST check every rule below and reject the module on the first failure.
 
 ### 7.5 Code
 11. `1 ≤ block_count ≤ 2^24`; every `byte_length > 0`.
-12. Every instruction decodes per 02 §2 with a listed opcode, canonical LEB128 operands, register bytes with no disallowed high bits, shift immediates in range, and the block's bytes are exactly consumed.
+12. Every instruction decodes per 02 §2 with a listed opcode, canonical LEB128 operands, register bytes with bits 5–7 clear, shift immediates in range, and the block's bytes are exactly consumed.
 13. Only the last instruction of a block ends the block; the last block ends with a no-fallthrough instruction.
 14. Every `u:block` operand `< block_count`. Every `u:slot` operand names a non-empty slot. Every `call` and `call_indirect` slot names block index (current block + 1).
 15. Every `u:import` operand `< import_count`.
@@ -131,7 +131,7 @@ A module passing all checks is *valid for this spec minor and this cost-table ve
 
 ## 8. The recompiler
 
-The recompiler turns a standard RV64 ELF, produced by a stock toolchain for the `riscv64imac` target with soft-float and the E register subset (or with registers 16–31 provably unused), into a valid module. Its behaviour is normative where it affects semantics:
+The recompiler turns a standard RV64 ELF, produced by a stock toolchain for the `riscv64imac` target with soft-float and linked with `--emit-relocs` so that every code-address constant is identifiable, into a valid module. Its behaviour is normative where it affects semantics:
 
 1. **Block discovery.** Every instruction that is the target of any direct branch or jump, the instruction after every `jal`/`jalr`, every function entry, and every address-taken location starts a block. Blocks are emitted in address order.
 2. **Constants.** `lui`, `auipc`, and `addi` chains forming a constant or an address of a data symbol fold into `li` with the absolute address. Addresses of code symbols fold into `li` of the symbol's slot address.
@@ -141,7 +141,7 @@ The recompiler turns a standard RV64 ELF, produced by a stock toolchain for the 
 6. **Memory intrinsics.** Calls to `memcpy`, `memmove`, and `memset` with the standard signature MAY be replaced by `memcopy` and `memfill`.
 7. **Removed.** `fence`, `fence.i`, and `nop`-equivalents are deleted. `ebreak`, `unimp`, and any illegal instruction become `trap`. Compressed instructions are expanded first.
 8. **Atomics.** `amo<op>.{w,d}` becomes load, op, store on the same address; `lr` becomes a load and `sc` becomes a store that writes 0 (success) to its destination.
-9. **Rejected.** Floating-point instructions, CSR access, privileged instructions, any use of registers 16–31, and any ELF relocation the recompiler cannot resolve statically make the input unconvertible.
+9. **Rejected.** Floating-point instructions, CSR access, privileged instructions, and any ELF relocation the recompiler cannot resolve statically make the input unconvertible.
 10. **Layout.** `rodata`, `data`, and `bss` are placed per §3.1 with `ro_base = 0x10000` unless the linker script says otherwise; the recompiler rejects a layout violating §7.2.
 
 Two conforming recompilers given the same ELF MUST produce byte-identical modules. The recompiler is therefore part of the conformance suite (07).

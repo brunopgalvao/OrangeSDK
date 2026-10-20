@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 
 use crate::leb128::{LebError, read_sleb, read_uleb, write_sleb, write_uleb};
 
-/// A register index in `0..16` (spec 01 §2).
+/// A register index in `0..32` (spec 01 §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Reg(u8);
 
@@ -32,11 +32,21 @@ impl Reg {
     pub const A4: Reg = Reg(14);
     /// Sixth argument register.
     pub const A5: Reg = Reg(15);
+    /// Seventh argument register.
+    pub const A6: Reg = Reg(16);
+    /// Eighth argument register.
+    pub const A7: Reg = Reg(17);
+    /// Number of registers.
+    pub const COUNT: usize = 32;
 
     /// Builds a register from its index, or `None` if out of range.
     #[must_use]
     pub const fn new(index: u8) -> Option<Reg> {
-        if index < 16 { Some(Reg(index)) } else { None }
+        if (index as usize) < Self::COUNT {
+            Some(Reg(index))
+        } else {
+            None
+        }
     }
 
     /// The register's index.
@@ -45,8 +55,10 @@ impl Reg {
         self.0 as usize
     }
 
-    const fn from_nibble(n: u8) -> Reg {
-        Reg(n & 0x0F)
+    /// The operand byte.
+    #[must_use]
+    pub const fn byte(self) -> u8 {
+        self.0
     }
 }
 
@@ -497,7 +509,7 @@ pub enum DecodeErrorKind {
     Truncated,
     /// Not an opcode of this spec version.
     UnknownOpcode(u8),
-    /// A single-register byte with its high nibble set.
+    /// A register byte with any of bits 5–7 set.
     RegisterHighBits,
     /// A malformed LEB128 operand.
     Leb(LebError),
@@ -529,20 +541,12 @@ impl Cursor<'_> {
         Ok(b)
     }
 
-    fn reg_pair(&mut self) -> Result<(Reg, Reg), DecodeError> {
+    fn reg(&mut self) -> Result<Reg, DecodeError> {
         let b = self.byte()?;
-        Ok((Reg::from_nibble(b), Reg::from_nibble(b >> 4)))
-    }
-
-    fn reg_single(&mut self) -> Result<Reg, DecodeError> {
-        let b = self.byte()?;
-        if b & 0xF0 != 0 {
-            return Err(DecodeError {
-                kind: DecodeErrorKind::RegisterHighBits,
-                offset: self.pos - 1,
-            });
-        }
-        Ok(Reg::from_nibble(b))
+        Reg::new(b).ok_or(DecodeError {
+            kind: DecodeErrorKind::RegisterHighBits,
+            offset: self.pos - 1,
+        })
     }
 
     fn uleb(&mut self) -> Result<u32, DecodeError> {
@@ -629,33 +633,24 @@ impl Instruction {
         match *self {
             Instruction::Trap | Instruction::Halt => {}
             Instruction::Ecall { import } => write_uleb(import, out),
-            Instruction::Sbrk { rd, rs1 } => out.push(pack(rd, rs1)),
-            Instruction::Memcopy { dst, src, len } => {
-                out.push(pack(dst, src));
-                out.push(len.0);
-            }
-            Instruction::Memfill { dst, val, len } => {
-                out.push(pack(dst, val));
-                out.push(len.0);
-            }
+            Instruction::Sbrk { rd, rs1 } => out.extend_from_slice(&[rd.0, rs1.0]),
+            Instruction::Memcopy { dst, src, len } => out.extend_from_slice(&[dst.0, src.0, len.0]),
+            Instruction::Memfill { dst, val, len } => out.extend_from_slice(&[dst.0, val.0, len.0]),
             Instruction::Li { rd, imm } => {
                 out.push(rd.0);
                 write_sleb(imm, out);
             }
             Instruction::AluImm { rd, rs1, imm, .. } => {
-                out.push(pack(rd, rs1));
+                out.extend_from_slice(&[rd.0, rs1.0]);
                 write_sleb(imm, out);
             }
-            Instruction::Alu { rd, rs1, rs2, .. } => {
-                out.push(pack(rd, rs1));
-                out.push(rs2.0);
-            }
+            Instruction::Alu { rd, rs1, rs2, .. } => out.extend_from_slice(&[rd.0, rs1.0, rs2.0]),
             Instruction::Load { rd, rs1, off, .. } => {
-                out.push(pack(rd, rs1));
+                out.extend_from_slice(&[rd.0, rs1.0]);
                 write_sleb(off, out);
             }
             Instruction::Store { rs1, rs2, off, .. } => {
-                out.push(pack(rs1, rs2));
+                out.extend_from_slice(&[rs1.0, rs2.0]);
                 write_sleb(off, out);
             }
             Instruction::Jump { block } => write_uleb(block, out),
@@ -669,14 +664,14 @@ impl Instruction {
                 write_sleb(off, out);
             }
             Instruction::CallIndirect { rd, rs1, off, slot } => {
-                out.push(pack(rd, rs1));
+                out.extend_from_slice(&[rd.0, rs1.0]);
                 write_sleb(off, out);
                 write_uleb(slot, out);
             }
             Instruction::Branch {
                 rs1, rs2, block, ..
             } => {
-                out.push(pack(rs1, rs2));
+                out.extend_from_slice(&[rs1.0, rs2.0]);
                 write_uleb(block, out);
             }
         }
@@ -695,43 +690,40 @@ impl Instruction {
             opcode::TRAP => Instruction::Trap,
             opcode::HALT => Instruction::Halt,
             opcode::ECALL => Instruction::Ecall { import: c.uleb()? },
-            opcode::SBRK => {
-                let (rd, rs1) = c.reg_pair()?;
-                Instruction::Sbrk { rd, rs1 }
-            }
-            opcode::MEMCOPY => {
-                let (dst, src) = c.reg_pair()?;
-                let len = c.reg_single()?;
-                Instruction::Memcopy { dst, src, len }
-            }
-            opcode::MEMFILL => {
-                let (dst, val) = c.reg_pair()?;
-                let len = c.reg_single()?;
-                Instruction::Memfill { dst, val, len }
-            }
-            opcode::LI => {
-                let rd = c.reg_single()?;
-                let imm = c.sleb()?;
-                Instruction::Li { rd, imm }
-            }
+            opcode::SBRK => Instruction::Sbrk {
+                rd: c.reg()?,
+                rs1: c.reg()?,
+            },
+            opcode::MEMCOPY => Instruction::Memcopy {
+                dst: c.reg()?,
+                src: c.reg()?,
+                len: c.reg()?,
+            },
+            opcode::MEMFILL => Instruction::Memfill {
+                dst: c.reg()?,
+                val: c.reg()?,
+                len: c.reg()?,
+            },
+            opcode::LI => Instruction::Li {
+                rd: c.reg()?,
+                imm: c.sleb()?,
+            },
             opcode::JUMP => Instruction::Jump { block: c.uleb()? },
-            opcode::CALL => {
-                let rd = c.reg_single()?;
-                let block = c.uleb()?;
-                let slot = c.uleb()?;
-                Instruction::Call { rd, block, slot }
-            }
-            opcode::JUMP_INDIRECT => {
-                let rs1 = c.reg_single()?;
-                let off = c.sleb()?;
-                Instruction::JumpIndirect { rs1, off }
-            }
-            opcode::CALL_INDIRECT => {
-                let (rd, rs1) = c.reg_pair()?;
-                let off = c.sleb()?;
-                let slot = c.uleb()?;
-                Instruction::CallIndirect { rd, rs1, off, slot }
-            }
+            opcode::CALL => Instruction::Call {
+                rd: c.reg()?,
+                block: c.uleb()?,
+                slot: c.uleb()?,
+            },
+            opcode::JUMP_INDIRECT => Instruction::JumpIndirect {
+                rs1: c.reg()?,
+                off: c.sleb()?,
+            },
+            opcode::CALL_INDIRECT => Instruction::CallIndirect {
+                rd: c.reg()?,
+                rs1: c.reg()?,
+                off: c.sleb()?,
+                slot: c.uleb()?,
+            },
             _ => Self::decode_family(op, &mut c)?,
         };
         Ok((ins, c.pos))
@@ -739,7 +731,8 @@ impl Instruction {
 
     fn decode_family(op: u8, c: &mut Cursor<'_>) -> Result<Instruction, DecodeError> {
         if let Some(aop) = AluImmOp::from_opcode(op) {
-            let (rd, rs1) = c.reg_pair()?;
+            let rd = c.reg()?;
+            let rs1 = c.reg()?;
             let imm_offset = c.pos;
             let imm = c.sleb()?;
             if let Some(limit) = aop.shift_limit()
@@ -758,43 +751,35 @@ impl Instruction {
             });
         }
         if let Some(aop) = AluOp::from_opcode(op) {
-            let (rd, rs1) = c.reg_pair()?;
-            let rs2 = c.reg_single()?;
             return Ok(Instruction::Alu {
                 op: aop,
-                rd,
-                rs1,
-                rs2,
+                rd: c.reg()?,
+                rs1: c.reg()?,
+                rs2: c.reg()?,
             });
         }
         if let Some(width) = LoadWidth::from_opcode(op) {
-            let (rd, rs1) = c.reg_pair()?;
-            let off = c.sleb()?;
             return Ok(Instruction::Load {
                 width,
-                rd,
-                rs1,
-                off,
+                rd: c.reg()?,
+                rs1: c.reg()?,
+                off: c.sleb()?,
             });
         }
         if let Some(width) = StoreWidth::from_opcode(op) {
-            let (rs1, rs2) = c.reg_pair()?;
-            let off = c.sleb()?;
             return Ok(Instruction::Store {
                 width,
-                rs1,
-                rs2,
-                off,
+                rs1: c.reg()?,
+                rs2: c.reg()?,
+                off: c.sleb()?,
             });
         }
         if let Some(cond) = Cond::from_opcode(op) {
-            let (rs1, rs2) = c.reg_pair()?;
-            let block = c.uleb()?;
             return Ok(Instruction::Branch {
                 cond,
-                rs1,
-                rs2,
-                block,
+                rs1: c.reg()?,
+                rs2: c.reg()?,
+                block: c.uleb()?,
             });
         }
         Err(DecodeError {
@@ -802,10 +787,6 @@ impl Instruction {
             offset: 0,
         })
     }
-}
-
-const fn pack(low: Reg, high: Reg) -> u8 {
-    low.0 | (high.0 << 4)
 }
 
 #[cfg(test)]
@@ -826,7 +807,7 @@ pub(crate) mod tests {
             Instruction::Ecall { import: 300 },
             Instruction::Sbrk {
                 rd: r(10),
-                rs1: r(11),
+                rs1: r(31),
             },
             Instruction::Memcopy {
                 dst: r(10),
@@ -903,7 +884,11 @@ pub(crate) mod tests {
     #[test]
     fn registers() {
         assert_eq!(Reg::new(15), Some(Reg::A5));
-        assert_eq!(Reg::new(16), None);
+        assert_eq!(Reg::new(16), Some(Reg::A6));
+        assert_eq!(Reg::new(17), Some(Reg::A7));
+        assert_eq!(Reg::new(31).map(Reg::byte), Some(31));
+        assert_eq!(Reg::new(32), None);
+        assert_eq!(Reg::COUNT, 32);
         assert_eq!(Reg::ZERO.index(), 0);
         assert_eq!(Reg::RA.index(), 1);
         assert_eq!(Reg::SP.index(), 2);
@@ -983,32 +968,40 @@ pub(crate) mod tests {
         assert_eq!(err(&[]).kind, DecodeErrorKind::Truncated);
         assert_eq!(err(&[opcode::SBRK]).kind, DecodeErrorKind::Truncated);
         assert_eq!(err(&[opcode::SBRK]).offset, 1);
+        assert_eq!(err(&[opcode::SBRK, 0x01]).offset, 2);
         assert_eq!(err(&[0x06]).kind, DecodeErrorKind::UnknownOpcode(0x06));
         assert_eq!(err(&[0x47]).kind, DecodeErrorKind::UnknownOpcode(0x47));
         assert_eq!(err(&[0x5E]).kind, DecodeErrorKind::UnknownOpcode(0x5E));
         assert_eq!(err(&[0xC0]).kind, DecodeErrorKind::UnknownOpcode(0xC0));
         assert_eq!(err(&[0xFF]).kind, DecodeErrorKind::UnknownOpcode(0xFF));
+        // Register bytes 32 and above are rejected wherever they appear.
         assert_eq!(
-            err(&[opcode::LI, 0x10, 0x00]).kind,
+            err(&[opcode::LI, 0x20, 0x00]).kind,
             DecodeErrorKind::RegisterHighBits
         );
-        assert_eq!(err(&[opcode::LI, 0x10, 0x00]).offset, 1);
+        assert_eq!(err(&[opcode::LI, 0x20, 0x00]).offset, 1);
         assert_eq!(
-            err(&[AluOp::Add.opcode(), 0x21, 0xF3]).kind,
+            err(&[AluOp::Add.opcode(), 0x01, 0x02, 0x23]).kind,
+            DecodeErrorKind::RegisterHighBits
+        );
+        assert_eq!(err(&[AluOp::Add.opcode(), 0x01, 0x02, 0x23]).offset, 3);
+        assert_eq!(err(&[AluOp::Add.opcode(), 0x01, 0x80, 0x03]).offset, 2);
+        assert_eq!(
+            err(&[opcode::MEMCOPY, 0x01, 0x02, 0x40]).kind,
             DecodeErrorKind::RegisterHighBits
         );
         assert_eq!(
-            err(&[opcode::MEMCOPY, 0x21, 0x13]).kind,
+            err(&[opcode::MEMFILL, 0xE1, 0x02, 0x03]).kind,
             DecodeErrorKind::RegisterHighBits
         );
         assert_eq!(
-            err(&[opcode::MEMFILL, 0x21, 0x13]).kind,
+            err(&[opcode::CALL_INDIRECT, 0x01, 0x3F, 0x00, 0x01]).kind,
             DecodeErrorKind::RegisterHighBits
         );
         // Non-canonical immediate.
-        let e = err(&[AluImmOp::Addi.opcode(), 0x21, 0x80, 0x00]);
+        let e = err(&[AluImmOp::Addi.opcode(), 0x01, 0x02, 0x80, 0x00]);
         assert_eq!(e.kind, DecodeErrorKind::Leb(LebError::NonCanonical));
-        assert_eq!(e.offset, 2);
+        assert_eq!(e.offset, 3);
         // Overflowing block index.
         let e = err(&[opcode::JUMP, 0x80, 0x80, 0x80, 0x80, 0x10]);
         assert_eq!(e.kind, DecodeErrorKind::Leb(LebError::Overflow));
@@ -1019,25 +1012,25 @@ pub(crate) mod tests {
         );
         // Shift out of range: slli 64, slliw 32, srai -1.
         assert_eq!(
-            err(&[AluImmOp::Slli.opcode(), 0x21, 0xC0, 0x00]).kind,
+            err(&[AluImmOp::Slli.opcode(), 0x01, 0x02, 0xC0, 0x00]).kind,
             DecodeErrorKind::ShiftOutOfRange
         );
         assert_eq!(
-            err(&[AluImmOp::Slliw.opcode(), 0x21, 0x20]).kind,
+            err(&[AluImmOp::Slliw.opcode(), 0x01, 0x02, 0x20]).kind,
             DecodeErrorKind::ShiftOutOfRange
         );
         assert_eq!(
-            err(&[AluImmOp::Srai.opcode(), 0x21, 0x7F]).kind,
+            err(&[AluImmOp::Srai.opcode(), 0x01, 0x02, 0x7F]).kind,
             DecodeErrorKind::ShiftOutOfRange
         );
-        assert_eq!(err(&[AluImmOp::Srai.opcode(), 0x21, 0x7F]).offset, 2);
-        // Boundary shifts decode.
-        assert!(Instruction::decode(&[AluImmOp::Slli.opcode(), 0x21, 0x3F]).is_ok());
-        assert!(Instruction::decode(&[AluImmOp::Sraiw.opcode(), 0x21, 0x1F]).is_ok());
+        assert_eq!(err(&[AluImmOp::Srai.opcode(), 0x01, 0x02, 0x7F]).offset, 3);
+        // Boundary shifts and the highest register decode.
+        assert!(Instruction::decode(&[AluImmOp::Slli.opcode(), 0x1F, 0x1F, 0x3F]).is_ok());
+        assert!(Instruction::decode(&[AluImmOp::Sraiw.opcode(), 0x01, 0x02, 0x1F]).is_ok());
     }
 
     fn reg_strategy() -> impl Strategy<Value = Reg> {
-        (0u8..16).prop_map(|i| Reg::new(i).unwrap())
+        (0u8..32).prop_map(|i| Reg::new(i).unwrap())
     }
 
     fn instruction_strategy() -> impl Strategy<Value = Instruction> {

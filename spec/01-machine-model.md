@@ -2,9 +2,11 @@
 
 ## 1. Overview
 
-A Solo *instance* executes one *module* (03) in isolation. It has sixteen 64-bit general registers, a 32-bit byte-addressed little-endian memory, a gas counter, and a program position. It communicates with the outside world only through *host calls* (05). Execution is deterministic: given the same module, the same initial register arguments, the same memory image, the same gas limit, and the same sequence of host-call results, every conforming implementation produces the same registers, memory, gas remaining, and termination status.
+A Solo *instance* executes one *module* (03) in isolation. It has thirty-two 64-bit general registers, a 32-bit byte-addressed little-endian memory, a gas counter, and a program position. It communicates with the outside world only through *host calls* (05). Execution is deterministic: given the same module, the same initial register arguments, the same memory image, the same gas limit, and the same sequence of host-call results, every conforming implementation produces the same registers, memory, gas remaining, and termination status.
 
 ## 2. Registers
+
+Thirty-two 64-bit general registers, numbered 0–31, with the standard RISC-V LP64 ABI roles as emitted by stock toolchains for `riscv64imac`:
 
 | Name | Index | Role under the standard ABI |
 |---|---|---|
@@ -15,10 +17,12 @@ A Solo *instance* executes one *module* (03) in isolation. It has sixteen 64-bit
 | `tp` | 4 | Thread pointer (unused; preserved) |
 | `t0`–`t2` | 5–7 | Temporaries |
 | `s0`/`fp`, `s1` | 8–9 | Saved registers |
-| `a0`–`a5` | 10–15 | Arguments and return values |
+| `a0`–`a7` | 10–17 | Arguments and return values |
+| `s2`–`s11` | 18–27 | Saved registers |
+| `t3`–`t6` | 28–31 | Temporaries |
 
 - Every register is 64 bits wide. There are no floating-point registers, no vector registers, and no control or status registers.
-- The ABI roles are those of the RISC-V RV64E ILP32E-style calling convention as emitted by stock toolchains for `riscv64imac` with the E register subset; the VM does not enforce them except where host calls (05) specify argument registers.
+- The VM does not enforce ABI roles except where host calls (05) specify argument registers (`a0`–`a5`) and result registers (`a0`, `a1`).
 - At instance start every register is 0 except those the host sets as entrypoint arguments (05 §3) and `sp`, which the host sets to the top of the stack region (§3.2).
 
 ## 3. Memory
@@ -94,7 +98,7 @@ An instance is instantiated with a *capability set* chosen by the host: `Privile
 
 | Limit | Value |
 |---|---|
-| Registers | 16 |
+| Registers | 32 |
 | Address space | 2^32 bytes |
 | Maximum module code size | 16 MiB |
 | Maximum basic blocks per module | 2^24 |

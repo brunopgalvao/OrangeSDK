@@ -21,8 +21,8 @@ pub enum Capability {
 
 /// Machine state handed to a host function for the duration of one call.
 pub struct HostContext<'a> {
-    /// All sixteen registers. Arguments are `a0`–`a5`; results go in `a0`, `a1`.
-    pub regs: &'a mut [u64; 16],
+    /// All thirty-two registers. Arguments are `a0`–`a5`; results go in `a0`, `a1`.
+    pub regs: &'a mut [u64; Reg::COUNT],
     /// The instance's memory.
     pub memory: &'a mut Memory,
     /// The instance's gas counter. The host debits per-unit costs here and
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn context_helpers() {
-        let mut regs = [0u64; 16];
+        let mut regs = [0u64; Reg::COUNT];
         regs[Reg::A0.index()] = 0x1_0000_002A;
         let rodata = [0u8; 16];
         let mut mem = Memory::new(small_layout(), &rodata, &[0; 8]);
@@ -134,7 +134,7 @@ mod tests {
         let mut h = NoHost;
         assert_eq!(h.resolve("anything", Capability::Privileged), None);
         assert_eq!(h.resolve("anything", Capability::Sandboxed), None);
-        let mut regs = [0u64; 16];
+        let mut regs = [0u64; Reg::COUNT];
         let mut mem = Memory::new(small_layout(), &[0; 16], &[0; 8]);
         let mut gas = 0;
         let mut ctx = HostContext {

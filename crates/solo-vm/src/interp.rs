@@ -45,7 +45,7 @@ enum Flow {
 /// One running (or finished) instance of a program.
 pub struct Instance<'p> {
     program: &'p Program,
-    regs: [u64; 16],
+    regs: [u64; Reg::COUNT],
     memory: Memory,
     gas: i64,
     imports: Vec<u32>,
@@ -98,7 +98,7 @@ impl<'p> Instance<'p> {
             })?;
             imports.push(handle);
         }
-        let mut regs = [0u64; 16];
+        let mut regs = [0u64; Reg::COUNT];
         for (i, a) in args.iter().take(6).enumerate() {
             regs[Reg::A0.index() + i] = *a;
         }
@@ -117,7 +117,7 @@ impl<'p> Instance<'p> {
 
     /// The registers.
     #[must_use]
-    pub const fn regs(&self) -> &[u64; 16] {
+    pub const fn regs(&self) -> &[u64; Reg::COUNT] {
         &self.regs
     }
 
@@ -532,12 +532,6 @@ mod tests {
         }
     }
 
-    impl From<crate::memory::MemoryFault> for Termination {
-        fn from(_: crate::memory::MemoryFault) -> Termination {
-            Termination::MemoryFault
-        }
-    }
-
     fn program(b: &ModuleBuilder) -> Program {
         let host = TestHost::default();
         let m = Module::parse(&b.build(), &|n| {
@@ -607,7 +601,10 @@ mod tests {
             Instance::new(&p, &host, Capability::Sandboxed, "main", &[], 10).err(),
             Some(InstanceError::UnresolvedImport(1))
         );
-        assert!(Instance::new(&p, &host, Capability::Privileged, "main", &[], 10).is_ok());
+        let mut host = TestHost::default();
+        let mut inst = Instance::new(&p, &host, Capability::Privileged, "main", &[], 100).unwrap();
+        assert_eq!(inst.run(&mut host), Termination::Halt);
+        assert_eq!(host.calls, vec![5]);
 
         let p = program(&single(&[]));
         let (t, inst) = run(&p, &[1, 2, 3, 4, 5, 6, 7], 10);
@@ -1241,6 +1238,10 @@ mod tests {
         let (t, inst) = run(&p, &[], 1000);
         assert_eq!(t, Termination::MemoryFault);
         assert_eq!(inst.gas(), 1000 - 1 - 10 - 1 - 8);
+        // The fill's dynamic charge itself can fail.
+        let (t, inst) = run(&p, &[], 12 + 7);
+        assert_eq!(t, Termination::OutOfGas);
+        assert_eq!(inst.gas(), -1);
     }
 
     #[test]

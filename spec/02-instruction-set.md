@@ -10,14 +10,13 @@ Instructions are byte sequences. Each begins with a one-byte opcode followed by 
 
 | Primitive | Encoding |
 |---|---|
-| `rA\|rB` | One byte. Register A in bits 0–3, register B in bits 4–7. |
-| `rA` | One byte. Register A in bits 0–3; bits 4–7 MUST be 0. |
+| `rA` | One byte. Register index in bits 0–4; bits 5–7 MUST be 0. |
 | `s:imm` | Canonical signed LEB128 (SLEB128), at most 10 bytes, value range `[-2^63, 2^63)`. |
 | `u:n` | Canonical unsigned LEB128 (ULEB128), at most 5 bytes, value range `[0, 2^32)`. |
 
-*Canonical* means the shortest encoding that represents the value: no continuation byte may be a redundant sign or zero extension. A non-canonical LEB128, a register byte with disallowed high bits, or an opcode not in §11 makes the module invalid (03 §7). Consequently every instruction has exactly one byte representation, and the code hash of a module identifies its program uniquely.
+*Canonical* means the shortest encoding that represents the value: no continuation byte may be a redundant sign or zero extension. A non-canonical LEB128, a register byte with any of bits 5–7 set, or an opcode not in §11 makes the module invalid (03 §7). Consequently every instruction has exactly one byte representation, and the code hash of a module identifies its program uniquely.
 
-Register indices are 0–15 as defined in 01 §2. Writing register 0 is permitted and has no effect; reading it yields 0.
+Register indices are 0–31 as defined in 01 §2. Writing register 0 is permitted and has no effect; reading it yields 0.
 
 ## 3. Notation
 
@@ -35,13 +34,13 @@ Register indices are 0–15 as defined in 01 §2. Writing register 0 is permitte
 | `0x00` | `trap` | — | Terminates with status `Trap`. Ends the block. No fallthrough. |
 | `0x01` | `halt` | — | Terminates with status `Halt`; `R[a0]`, `R[a1]` are the return values. Ends the block. No fallthrough. |
 | `0x02` | `ecall` | `u:import` | Calls host function number `import` of the module's import table (03 §5, 05). Arguments are `R[a0]`–`R[a5]`; results are written to `R[a0]` and `R[a1]`; all other registers are preserved. Charges dynamic gas per 05 before the call. If the host returns a terminating error the instance terminates with `HostError(code)`. Does not end the block. |
-| `0x03` | `sbrk` | `rd\|rs1` | Grows the heap. Let `n = addr(R[rs1])`, rounded up to a multiple of 4096. If `heap_size + n ≤ heap_max`: charges dynamic gas for `n / 4096` pages (04 §3), extends the heap by `n` zero bytes, and sets `R[rd]` to the previous heap end (`heap_base + old heap_size`). Otherwise sets `R[rd] = 0` and changes nothing. `sbrk` with `n = 0` returns the current heap end and charges nothing. |
-| `0x04` | `memcopy` | `rdst\|rsrc`, `rlen` | Copies `addr(R[rlen])` bytes from `addr(R[rsrc])` to `addr(R[rdst])`, as if through a temporary buffer (overlap is safe). Charges dynamic gas per byte (04 §3) before copying. Every source byte must be readable and every destination byte writable or the instruction traps `MemoryFault` with no bytes written. |
-| `0x05` | `memfill` | `rdst\|rval`, `rlen` | Writes the low 8 bits of `R[rval]` to `addr(R[rlen])` bytes starting at `addr(R[rdst])`. Gas and fault rules as `memcopy`. |
+| `0x03` | `sbrk` | `rd`, `rs1` | Grows the heap. Let `n = addr(R[rs1])`, rounded up to a multiple of 4096. If `heap_size + n ≤ heap_max`: charges dynamic gas for `n / 4096` pages (04 §3), extends the heap by `n` zero bytes, and sets `R[rd]` to the previous heap end (`heap_base + old heap_size`). Otherwise sets `R[rd] = 0` and changes nothing. `sbrk` with `n = 0` returns the current heap end and charges nothing. |
+| `0x04` | `memcopy` | `rdst`, `rsrc`, `rlen` | Copies `addr(R[rlen])` bytes from `addr(R[rsrc])` to `addr(R[rdst])`, as if through a temporary buffer (overlap is safe). Charges dynamic gas per byte (04 §3) before copying. Every source byte must be readable and every destination byte writable or the instruction traps `MemoryFault` with no bytes written. |
+| `0x05` | `memfill` | `rdst`, `rval`, `rlen` | Writes the low 8 bits of `R[rval]` to `addr(R[rlen])` bytes starting at `addr(R[rdst])`. Gas and fault rules as `memcopy`. |
 
 ## 5. Constants and register–immediate arithmetic
 
-Operands: `rd|rs1`, `s:imm` (for `li`: `rd`, `s:imm`).
+Operands: `rd`, `rs1`, `s:imm` (for `li`: `rd`, `s:imm`).
 
 | Opcode | Mnemonic | Semantics |
 |---|---|---|
@@ -64,7 +63,7 @@ For the shift-immediate forms the module is invalid if `imm` is outside `[0, 63]
 
 ## 6. Register–register arithmetic
 
-Operands: `rd|rs1`, `rs2`.
+Operands: `rd`, `rs1`, `rs2`.
 
 | Opcode | Mnemonic | Semantics |
 |---|---|---|
@@ -111,7 +110,7 @@ Division never traps. Exactly as RISC-V:
 
 ## 7. Loads
 
-Operands: `rd|rs1`, `s:off`. Effective address `a = addr(R[rs1] + off)`. Any alignment is permitted. A fault (01 §3.2) leaves `R[rd]` unchanged.
+Operands: `rd`, `rs1`, `s:off`. Effective address `a = addr(R[rs1] + off)`. Any alignment is permitted. A fault (01 §3.2) leaves `R[rd]` unchanged.
 
 | Opcode | Mnemonic | Semantics |
 |---|---|---|
@@ -125,7 +124,7 @@ Operands: `rd|rs1`, `s:off`. Effective address `a = addr(R[rs1] + off)`. Any ali
 
 ## 8. Stores
 
-Operands: `rs1|rs2`, `s:off`, where `rs1` is the base and `rs2` the value. Effective address `a = addr(R[rs1] + off)`.
+Operands: `rs1`, `rs2`, `s:off`, where `rs1` is the base and `rs2` the value. Effective address `a = addr(R[rs1] + off)`.
 
 | Opcode | Mnemonic | Semantics |
 |---|---|---|
@@ -143,13 +142,13 @@ Blocks are numbered from 0 in code-section order (03 §4). The *jump table* (03 
 | `0x50` | `jump` | `u:block` | Transfers control to `block`. Ends the block. No fallthrough. |
 | `0x51` | `call` | `rd`, `u:block`, `u:slot` | `R[rd] = 8 × slot`, then transfers control to `block`. `slot` MUST name the block that immediately follows this one in layout (03 §7). Ends the block. No fallthrough. |
 | `0x52` | `jump_indirect` | `rs1`, `s:off` | Let `v = addr(R[rs1] + off)`. If `v = 0`, or `v mod 8 ≠ 0`, or `v / 8 ≥ jump-table length`, or slot `v / 8` is empty, terminates with `InvalidJump`. Otherwise transfers control to the block in that slot. Ends the block. No fallthrough. `ret` is `jump_indirect ra, 0`. |
-| `0x53` | `call_indirect` | `rd\|rs1`, `s:off`, `u:slot` | `R[rd] = 8 × slot`, then as `jump_indirect rs1, off` using the value of `R[rs1]` read *before* `rd` is written (they may be the same register). Same continuation rule as `call`. Ends the block. No fallthrough. |
-| `0x58` | `beq` | `rs1\|rs2`, `u:block` | If `R[rs1] = R[rs2]` transfer to `block`, else fall through. Ends the block. |
-| `0x59` | `bne` | `rs1\|rs2`, `u:block` | If `R[rs1] ≠ R[rs2]` … |
-| `0x5A` | `blt` | `rs1\|rs2`, `u:block` | If signed `R[rs1] < R[rs2]` … |
-| `0x5B` | `bge` | `rs1\|rs2`, `u:block` | If signed `R[rs1] ≥ R[rs2]` … |
-| `0x5C` | `bltu` | `rs1\|rs2`, `u:block` | If unsigned `R[rs1] < R[rs2]` … |
-| `0x5D` | `bgeu` | `rs1\|rs2`, `u:block` | If unsigned `R[rs1] ≥ R[rs2]` … |
+| `0x53` | `call_indirect` | `rd`, `rs1`, `s:off`, `u:slot` | `R[rd] = 8 × slot`, then as `jump_indirect rs1, off` using the value of `R[rs1]` read *before* `rd` is written (they may be the same register). Same continuation rule as `call`. Ends the block. No fallthrough. |
+| `0x58` | `beq` | `rs1`, `rs2`, `u:block` | If `R[rs1] = R[rs2]` transfer to `block`, else fall through. Ends the block. |
+| `0x59` | `bne` | `rs1`, `rs2`, `u:block` | If `R[rs1] ≠ R[rs2]` … |
+| `0x5A` | `blt` | `rs1`, `rs2`, `u:block` | If signed `R[rs1] < R[rs2]` … |
+| `0x5B` | `bge` | `rs1`, `rs2`, `u:block` | If signed `R[rs1] ≥ R[rs2]` … |
+| `0x5C` | `bltu` | `rs1`, `rs2`, `u:block` | If unsigned `R[rs1] < R[rs2]` … |
+| `0x5D` | `bgeu` | `rs1`, `rs2`, `u:block` | If unsigned `R[rs1] ≥ R[rs2]` … |
 
 A branch to its own block, or any jump whose target is the current block, is legal and re-charges the block's static cost on re-entry (01 §5). Every `block` operand MUST be less than the block count, and every `slot` operand MUST be a non-empty jump-table slot; both are checked at load (03 §7).
 
