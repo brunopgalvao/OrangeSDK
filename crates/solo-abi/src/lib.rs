@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub mod chain;
 pub mod codec;
+pub mod modules;
 pub mod types;
 
 pub use codec::{Decode, DecodeError, Decoder, Encode, Encoder};
