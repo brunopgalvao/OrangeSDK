@@ -15,7 +15,7 @@ use solo_abi::codec::Seq;
 use solo_abi::staking::{StakingParams, ValidatorKey};
 use solo_abi::types::Genesis;
 use solo_node::keystore::encryption_key;
-use solo_node::{Node, NodeConfig, validator_id};
+use solo_node::{Node, NodeConfig, PROOF_HISTORY, validator_id};
 use solo_rpc::Rpc;
 use solo_rpc::methods::{data, parse_hex, parse_quantity};
 
@@ -69,6 +69,7 @@ fn quantity_of(v: &Value) -> u64 {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn a_relayer_gets_certificates_and_outbox_proofs() {
     let alice = Wallet::new(1);
     let mut rpc = Rpc::new(staking_node(&alice));
@@ -152,7 +153,7 @@ fn a_relayer_gets_certificates_and_outbox_proofs() {
     assert_eq!(slot["stateRoot"], proof["anchorRoot"]);
     assert_eq!(quantity_of(&slot["nonce"]), 1);
     assert!(!slot["siblings"].as_array().unwrap().is_empty());
-    // Before the message there is nothing to prove; a height the node no longer keeps has no proof.
+    // Before the message there is nothing to prove; a height the node has not reached has no proof.
     let (code, message) = err(&mut rpc, "solo_getOutboxProof", json!(["0x1", "0x1"]));
     assert_eq!(
         (code, message.as_str()),
@@ -168,4 +169,14 @@ fn a_relayer_gets_certificates_and_outbox_proofs() {
     );
     assert_eq!(err(&mut rpc, "solo_getOutboxProof", json!([])).0, -32602);
     assert_eq!(err(&mut rpc, "solo_getFinalityProof", json!([])).0, -32602);
+    // Nor has a height the node no longer keeps, once PROOF_HISTORY blocks have passed it.
+    tick(&mut rpc, PROOF_HISTORY as u64 + 1);
+    assert_eq!(
+        ok(
+            &mut rpc,
+            "solo_getOutboxProof",
+            json!(["0x1", format!("{anchor:#x}")])
+        ),
+        Value::Null
+    );
 }

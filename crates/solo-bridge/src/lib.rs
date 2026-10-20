@@ -343,7 +343,8 @@ pub fn submission_covering(node: &mut Node, height: u64) -> Result<Option<Submis
 }
 
 /// The proof of message `nonce`'s outbox slot against the state root of
-/// `height`; `None` if `node` no longer keeps that height's state.
+/// `height`; `None` if `node` does not hold that height's state (older than
+/// [`solo_node::PROOF_HISTORY`] blocks, or not executed yet).
 ///
 /// # Errors
 /// [`Error::NotCommitted`] if the message is not in that state,

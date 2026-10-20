@@ -50,7 +50,7 @@ The reference kernel serves the outbox from its precompile provider (16 §5.2), 
 
 The value of a send moves to the outbox's balance with the call, and nothing in this version moves it out. A revert of any frame enclosing the send, the transaction included, takes back the nonce, the slot and the log with everything else, exactly as for an `SSTORE` and a `LOG` at the same point; a call query (`eth_call`, gas estimation) runs the send and keeps nothing. Nonces are therefore consecutive from 1 over the messages that stand, in execution order.
 
-The outbox has no code and no nonce. When a transaction's changes are committed, the outbox account is written with its balance, or deleted if its balance is zero, and the slots it changed are written whatever its balance: the EIP-161 rule of the kernel's commit would otherwise delete an empty outbox account together with its writes. No creation can land on the outbox address, which no key or `CREATE2` salt reaches without a Keccak preimage.
+The outbox has no code and no nonce. When a transaction's changes are committed, the outbox account is written with its balance, or left out of state (deleted) if its balance is zero, and the slots it changed are written whatever its balance: the EIP-161 rule of the kernel's commit would otherwise delete an empty outbox account together with its writes. No creation can land on the outbox address, which no key or `CREATE2` salt reaches without a Keccak preimage.
 
 ### 2.4 Gas
 
@@ -125,7 +125,7 @@ and otherwise stores `stateRoots[anchor] = root`, sets `latestHeight = anchor` a
 
 ### 6.2 Delay and rate limits
 
-`delay` (seconds, at most `MAX_DELAY = 30 days`) is the time between proving a message and executing it; a change applies to messages proven after it. Deliveries are counted in fixed windows of `window` seconds (non-zero): a window starts at the first delivery at or after the end of the previous one, and a window delivers at most `maxMessagesPerWindow` messages and at most `maxValuePerWindow` value in total. A message that does not fit waits for a later window.
+`delay` (seconds, at most `MAX_DELAY = 30 days`) is the time between proving a message and executing it; a change applies to messages proven after it. Deliveries are counted in fixed windows of `window` seconds (non-zero): a window starts at the first delivery at or after the end of the previous one, and a window delivers at most `maxMessagesPerWindow` messages and at most `maxValuePerWindow` value in total. A message that does not fit waits for a later window, and its `execute` reverts with `RateLimited()`; that includes every message, of any value, while a limit lowered during a window sits below what the window has already delivered.
 
 ### 6.3 Roles and their limits
 
@@ -154,7 +154,7 @@ A relayer needs, from a Solo node: messages (the outbox's `MessageSent` logs, th
 | Method | Params | Result |
 |---|---|---|
 | `solo_getFinalityProof` | height (quantity) | `null` if the node stored no threshold certificate for it; otherwise `{height, blockHash, anchorHeight, anchorRoot, certificate, proposal, signature, calldata}`: the certified proposal's height and hash, its anchor, the certificate and proposal bytes, the signature in EIP-2537 encoding and the light client's `submit` calldata. A server error if the proposal has no anchor. |
-| `solo_getOutboxProof` | nonce, height (quantities) | `null` if the node no longer keeps that height's state; otherwise `{nonce, height, messageHash, stateRoot, siblings}`, the siblings root first. A server error, `the message is not committed at that height`, if the slot does not hold the message there. |
+| `solo_getOutboxProof` | nonce, height (quantities) | `null` if the node does not hold that height's state, because it is older than `PROOF_HISTORY` blocks or not yet executed; otherwise `{nonce, height, messageHash, stateRoot, siblings}`, the siblings root first. A server error, `the message is not committed at that height`, if the slot does not hold the message there. |
 
 **The library.** `crates/solo-bridge` does each step against a `solo_node::Node`: `finality_proof`, `submission_covering` (the certified proposal with the highest anchor at or after a height, among the heights the node can still prove against), `Submission` (decodes the certificate, checks the proposal against it, decompresses the signature into EIP-2537 encoding, builds `submit` calldata), `sent_messages` (messages from logs), `slot_proof` and `SlotProof` (checks the proof ends at the message's leaf, recomputes the root as the inbox does, builds `prove` calldata), `execute_calldata`, and the three contracts' constructor arguments.
 
@@ -169,7 +169,7 @@ Measured on revm 43 at Osaka by `crates/solo-bridge/tests/contracts.rs`, which p
 | `SoloLightClient.submit` of a 103-byte proposal (one 3-byte transaction in it), transaction | 206 741 |
 | `SoloInbox.prove`, 3 siblings, 4-byte payload, transaction | 83 746 |
 | `SoloInbox.prove`, 14 siblings (a state of 4 099 entries), transaction | 95 906 |
-| `SoloInbox.execute` delivering to the test `MessageRecipient`, transaction | 204 445 |
+| `SoloInbox.execute` delivering to the test `MessageRecipient`, transaction | 204 362 |
 
 Of `verify`, 115 791 is precompiles: 114 275 of BLS (12 §2), 516 of SHA-256 and 2 × 500 of MODEXP at the EIP-7883 price that Osaka charges. `submit` adds the proposal's calldata and hash and two new storage slots; it grows by 16 gas for each non-zero byte of the proposal (more under the EIP-7623 floor for a large one), so a relayer chooses a small certified proposal when it can. Each sibling adds about 1 100 gas to `prove`: a state of `n` random keys gives proofs of about `log2(n)` siblings (10 §4), some 30 for a chain of a billion entries. `execute` is mostly the recipient's own work; the test recipient writes seven new storage slots.
 
@@ -179,7 +179,8 @@ The Solidity sources are in `contracts/` (test contracts in `contracts/test/`). 
 
 ## 10. Limits of this version
 
-- The trust is spec 15 §9's: fewer than the threshold of shareholders, departed ones included, are faulty. There is no slashing for signing a false anchor or a conflicting proposal, so the delay, the guardian and the rate limits are what limit a forged certificate. Validator-set change is not yet capped per epoch, and unbonding is not yet tied to a trusting period: the group key never changes, so the light client has no trusting period of its own, and how long a departed shareholder stays able to sign is the resharing's business (15 §6).
+- **Former shareholders keep the power to forge, for ever.** The trust is spec 15 §9's: fewer than the threshold of shareholders, departed ones included, are faulty. Resharing keeps the group key (12 §6) and only asks previous shareholders to erase their old shares; nothing enforces it, and old shares still combine into valid signatures under the same key. The light client trusts that key with no expiry, so once the threshold of shareholders of any one sharing have left the set and unbonded, they can sign a proposal with any anchor root at any time, with no stake at risk: there is no slashing for signing a false anchor or a conflicting proposal under the threshold key. Only the delay, the guardian's veto and the rate limits (§6) bound what such a forged state root can deliver, so the guardian must watch every stored root against the chain.
+- **This version departs from codex ADR 0013.** ADR 0013 asks for validator-set change capped per epoch and unbonding longer than any trusting period. Neither is implemented, and the second cannot be met as designed: with a constant group key the light client has no trusting period. A per-epoch cap on turnover alone would not close the gap either, since departures add up over epochs. Closing it needs one of: stake kept slashable for threshold-signature misbehaviour for as long as old shares can sign (evidence of a partial over a proposal whose anchor contradicts executed state), or a group key that rotates or expires, so that the light client has a trusting period to set unbonding against; the latter needs a new certificate version and light client. Until then a deployment carries value across this bridge only within what its guardian, delay and rate limits can cover.
 - The value of a send stays with the outbox; a canonical token bridge that mints and redeems against it is not specified here. Messages from Ethereum to Solo are the other half of the bridge.
 - `submit` takes a whole proposal, transactions included; a block with large transactions or DKG dealings is costly to submit. A transaction or receipt root in the proposal, or certificates over executed headers, would shorten it, and need a new certificate version or a new proposal field.
 - A recipient that always reverts keeps its messages pending forever; nothing retires them.
