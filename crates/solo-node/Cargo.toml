@@ -16,6 +16,7 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 [dev-dependencies]
 solo-recompile = { path = "../solo-recompile" }
 solo-rlp = { path = "../solo-rlp" }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
 [lints]
 workspace = true

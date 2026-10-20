@@ -7,7 +7,7 @@ A framework for EVM-compatible solochains.
 - The kernel, including consensus, is upgraded by governance. The host is upgraded by releases behind feature gates.
 - Type 2 Ethereum compatibility: standard EVM bytecode, exact gas, full RPC.
 
-Status: spec v0 written; the reference kernel runs Simplex BFT consensus (spec 08) across validators connected over TCP (spec 09), with catch-up sync for nodes that fall behind. Ethereum legacy transfers work end to end, from `eth_sendRawTransaction` to receipts. See `spec/README.md`.
+Status: spec v0 written; the reference kernel runs Simplex BFT consensus (spec 08) across validators connected over TCP (spec 09), with catch-up sync for nodes that fall behind. It executes Ethereum transactions (legacy, EIP-2930, EIP-1559) on revm at the Osaka fork: contract creation, calls, storage, logs, reverts and precompiles are tested end to end through the node (`crates/solo-node/tests/evm.rs`). The JSON-RPC server still covers transfers only. See `spec/README.md`.
 
 ## Try it
 
@@ -19,7 +19,25 @@ cast chain-id --rpc-url http://127.0.0.1:8545
 cast balance 0x1a642f0e3c3af545e7acbd38b07251b3990914f1 --rpc-url http://127.0.0.1:8545
 ```
 
-The genesis address above is the account of the private key `0x01…01` (32 bytes of `0x01`), funded with one million ether. The kernel is a Rust guest compiled to RISC-V and recompiled to a Solo module on start; value transfers work, contracts arrive with the EVM interpreter.
+The genesis address above is the account of the private key `0x01…01` (32 bytes of `0x01`), funded with one million ether. The kernel is a Rust guest compiled to RISC-V and recompiled to a Solo module on start.
+
+An `alloc` entry is either a balance in wei (a decimal string, `0x` hex, or a JSON number) or a geth-style account, which is how a chain predeploys contracts at genesis:
+
+```json
+"alloc": {
+  "0x1a642f0e3c3af545e7acbd38b07251b3990914f1": "1000000000000000000000000",
+  "0x4200000000000000000000000000000000000001": {
+    "balance": "0x0",
+    "nonce": "0x1",
+    "code": "0x<runtime bytecode>",
+    "storage": {"0x00": "0x2a"}
+  }
+}
+```
+
+Every field of an account is optional. Storage keys and values are hex of at most 32 bytes, left-padded with zeros. The kernel stores the code under its `keccak256` hash and the non-zero slots under the account, exactly as if a transaction had deployed it. An account with storage needs code or a non-zero nonce: a contract creation could land on any other account, and the kernel does not apply EIP-7610, so it refuses such a genesis rather than let old slots show through a new contract. Code is run the way geth runs it: `0xef0100` followed by an address is an EIP-7702 delegation, and an account with that code, or none, can send transactions; any other code is legacy bytecode, even when it starts with `0xef`.
+
+The reference kernel's base fee is zero and its block beneficiary is the zero address, so every fee, `gas used × price paid`, is credited to `0x0000…0000`, where no one can spend it. The genesis block has no header and its hash is zero: block 1's parent hash, `BLOCKHASH(0)` and the RPC's block 0 all say so.
 
 Run a chain of several validators, each with its own key. `solo key` prints the validator id to list in the genesis file:
 

@@ -5,7 +5,10 @@
 //! single-node development chain with Ethereum JSON-RPC. The genesis file is
 //! JSON: `{"chainId": 1337, "slotMs": 400, "maxTxs": 64,
 //! "alloc": {"0x<address>": "<wei>"}, "validators": ["0x<32-byte id>"]}`.
-//! Without `validators` the dev node is the only validator, signing with
+//! An `alloc` entry is a balance, or a geth-style account that predeploys a
+//! contract: `{"balance": "<wei>", "nonce": "0x1", "code": "0x<bytecode>",
+//! "storage": {"0x<slot>": "0x<value>"}}`, every field optional. Without
+//! `validators` the dev node is the only validator, signing with
 //! [`DEV_KEY_SEED`].
 
 #![forbid(unsafe_code)]
@@ -14,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use solo_abi::Encode;
-use solo_abi::chain::{Allocation, GenesisParams, Validator, ValidatorSet};
+use solo_abi::chain::{Allocation, GenesisParams, StorageSlot, Validator, ValidatorSet};
 use solo_abi::codec::Seq;
 use solo_abi::types::Genesis;
 
@@ -80,25 +83,14 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
     let max_txs = v.get("maxTxs").and_then(Value::as_u64).unwrap_or(64);
     let mut allocations = Vec::new();
     if let Some(alloc) = v.get("alloc").and_then(Value::as_object) {
-        for (address, balance) in alloc {
+        for (address, entry) in alloc {
             let bytes = solo_rpc::methods::parse_hex(address)
                 .ok()
                 .ok_or("genesis: alloc address must be 0x hex")?;
             let address = <[u8; 20]>::try_from(bytes)
                 .ok()
                 .ok_or("genesis: alloc address must be 20 bytes")?;
-            let balance: u128 = match balance {
-                Value::String(s) => s
-                    .parse()
-                    .ok()
-                    .ok_or("genesis: balance must be a decimal string")?,
-                Value::Number(n) => n
-                    .as_u64()
-                    .ok_or("genesis: balance must be a non-negative integer")?
-                    .into(),
-                _ => return Err("genesis: balance must be a string or number".to_owned()),
-            };
-            allocations.push(Allocation { address, balance });
+            allocations.push(parse_account(address, entry)?);
         }
     }
     let params = GenesisParams {
@@ -140,6 +132,100 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
         }
         .to_bytes(),
     })
+}
+
+/// One `alloc` entry: a balance alone, or a geth-style account object
+/// `{"balance", "nonce", "code", "storage"}` for a predeploy.
+fn parse_account(address: [u8; 20], entry: &Value) -> Result<Allocation, String> {
+    let Value::Object(fields) = entry else {
+        return Ok(Allocation {
+            address,
+            balance: parse_balance(entry)?,
+            ..Allocation::default()
+        });
+    };
+    let balance = fields.get("balance").map_or(Ok(0), parse_balance)?;
+    let nonce = match fields.get("nonce") {
+        None => 0,
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .ok_or("genesis: nonce must be a non-negative integer")?,
+        Some(Value::String(s)) => parse_number_text(s)
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or("genesis: nonce must be a decimal or 0x hex string")?,
+        Some(_) => return Err("genesis: nonce must be a string or number".to_owned()),
+    };
+    let code = match fields.get("code") {
+        None => Vec::new(),
+        Some(code) => code
+            .as_str()
+            .and_then(|s| solo_rpc::methods::parse_hex(s).ok())
+            .ok_or("genesis: code must be 0x hex")?,
+    };
+    let mut storage = Vec::new();
+    match fields.get("storage") {
+        None => {}
+        Some(Value::Object(slots)) => {
+            for (key, value) in slots {
+                storage.push(StorageSlot {
+                    key: parse_word(Some(key))?,
+                    value: parse_word(value.as_str())?,
+                });
+            }
+        }
+        Some(_) => return Err("genesis: storage must be an object".to_owned()),
+    }
+    // A CREATE can land on an account with neither code nor nonce, and revm leaves
+    // out EIP-7610, so the reference kernel refuses storage on such an account.
+    if code.is_empty() && nonce == 0 && storage.iter().any(|slot| slot.value != [0; 32]) {
+        return Err("genesis: an account with storage needs code or a non-zero nonce".to_owned());
+    }
+    Ok(Allocation {
+        address,
+        balance,
+        nonce,
+        code,
+        storage: Seq(storage),
+    })
+}
+
+/// A balance: a decimal or `0x` hex string, or a JSON number.
+fn parse_balance(value: &Value) -> Result<u128, String> {
+    Ok(match value {
+        Value::String(s) => {
+            parse_number_text(s).ok_or("genesis: balance must be a decimal or 0x hex string")?
+        }
+        Value::Number(n) => n
+            .as_u64()
+            .ok_or("genesis: balance must be a non-negative integer")?
+            .into(),
+        _ => return Err("genesis: balance must be a string or number".to_owned()),
+    })
+}
+
+/// A number written in decimal or as `0x` hex.
+fn parse_number_text(text: &str) -> Option<u128> {
+    let (digits, radix) = match text.strip_prefix("0x") {
+        Some(hex) => (hex, 16),
+        None => (text, 10),
+    };
+    // `from_str_radix` alone would also take a leading `+`.
+    if digits.chars().all(|c| c.is_digit(radix)) {
+        u128::from_str_radix(digits, radix).ok()
+    } else {
+        None
+    }
+}
+
+/// A storage key or value: `0x` hex of at most 32 bytes, left-padded with zeros, as geth reads it.
+fn parse_word(text: Option<&str>) -> Result<[u8; 32], String> {
+    let bytes = text
+        .and_then(|s| solo_rpc::methods::parse_hex(s).ok())
+        .filter(|b| b.len() <= 32)
+        .ok_or("genesis: storage keys and values must be 0x hex of at most 32 bytes")?;
+    let mut word = [0u8; 32];
+    word[32 - bytes.len()..].copy_from_slice(&bytes);
+    Ok(word)
 }
 
 /// Parses a 32-byte secp256k1 secret key from hex, with or without `0x`.

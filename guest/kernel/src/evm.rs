@@ -12,7 +12,7 @@ use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address as RAddress, B256, Bytes, KECCAK_EMPTY, TxKind, U256};
 use revm::state::{Account as RAccount, AccountInfo};
 use revm::{Database, ExecuteEvm, MainBuilder, MainContext};
-use solo_abi::chain::{Account, BLOCK_GAS_LIMIT, Log, call_status, keys};
+use solo_abi::chain::{Account, BLOCK_GAS_LIMIT, Log, call_status};
 use solo_abi::codec::Seq;
 use solo_abi::types::{Address, Hash};
 use solo_guest::host;
@@ -21,14 +21,6 @@ use crate::state;
 
 /// Base fee per gas. Constant in this kernel version; fees go to the zero address.
 pub const BASE_FEE: u64 = 0;
-
-fn concat(prefix: &[u8], parts: &[&[u8]]) -> Vec<u8> {
-    let mut k = prefix.to_vec();
-    for p in parts {
-        k.extend_from_slice(p);
-    }
-    k
-}
 
 /// Kernel state seen through revm's `Database`.
 pub struct StateDb;
@@ -48,12 +40,11 @@ impl Database for StateDb {
         if code_hash == KECCAK_EMPTY {
             return Ok(Bytecode::default());
         }
-        Ok(state::get_raw(&concat(keys::CODE, &[&code_hash.0])).map_or_else(Bytecode::default, |code| Bytecode::new_raw(code.into())))
+        Ok(state::get_raw(&state::code_key(&code_hash.0)).map_or_else(Bytecode::default, bytecode))
     }
 
     fn storage(&mut self, address: RAddress, index: U256) -> Result<U256, Infallible> {
-        let key = concat(keys::SLOT, &[&address.0.0, &index.to_be_bytes::<32>()]);
-        Ok(state::get_raw(&key).map_or(U256::ZERO, |v| U256::from_be_slice(&v)))
+        Ok(state::get_raw(&state::slot_key(&address.0.0, &index.to_be_bytes::<32>())).map_or(U256::ZERO, |v| U256::from_be_slice(&v)))
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Infallible> {
@@ -61,11 +52,35 @@ impl Database for StateDb {
     }
 }
 
+/// Stored code as revm runs it. A delegation designator delegates; anything
+/// else is legacy code, including genesis code that starts with 0xEF01 but is
+/// no designator, which geth runs the same way (0xEF is an invalid opcode).
+/// revm's `Bytecode::new_raw` would panic on such code and trap the kernel.
+fn bytecode(code: Vec<u8>) -> Bytecode {
+    let code = Bytes::from(code);
+    Bytecode::new_raw_checked(code.clone()).unwrap_or_else(|_| Bytecode::new_legacy(code))
+}
+
+/// Whether `code` is an EIP-7702 delegation designator, `0xef0100 ‖ address`:
+/// the only code an account may have and still send transactions (EIP-3607).
+pub fn is_delegation(code: &[u8]) -> bool {
+    code.len() == 23 && code.starts_with(&[0xEF, 0x01, 0x00])
+}
+
 fn u128_of(v: U256) -> u128 {
     u128::try_from(v).unwrap_or(u128::MAX)
 }
 
-/// Writes revm's changes to the kernel state, as revm's own `CacheDB` would.
+/// Writes revm's changes to the kernel state, plus the EIP-161 rule that
+/// revm's `CacheDB` leaves to its user: a touched account left empty (no code,
+/// nonce or balance) is removed.
+///
+/// Unlike `CacheDB`, this never clears an account's old slots, because no
+/// account it creates, destroys or removes has any. Every account with storage
+/// has code or a non-zero nonce: genesis refuses storage on any other account
+/// (`state::init`), only code writes storage, and creation sets the nonce to 1.
+/// revm creates only where there is neither code nor nonce, so it never creates
+/// over old slots, which is also why leaving out EIP-7610 is safe.
 fn commit(changes: impl IntoIterator<Item = (RAddress, RAccount)>) {
     for (address, account) in changes {
         if !account.is_touched() {
@@ -73,25 +88,32 @@ fn commit(changes: impl IntoIterator<Item = (RAddress, RAccount)>) {
         }
         let a = address.0.0;
         if account.is_selfdestructed() {
-            // Post-Cancun, only an account created in the same transaction self-destructs,
-            // so every slot it has is among the ones this transaction touched.
+            // Post-Cancun, only an account created in the same transaction self-destructs;
+            // it had no slots before, so every slot it has is one this transaction touched.
             for key in account.storage.keys() {
-                state::delete(&concat(keys::SLOT, &[&a, &key.to_be_bytes::<32>()]));
+                state::delete(&state::slot_key(&a, &key.to_be_bytes::<32>()));
             }
             state::delete(&state::account_key(&a));
             continue;
         }
         let info = &account.info;
+        if info.is_empty() {
+            // An account with neither code nor nonce has no storage (see above), so the
+            // account key is all there is to remove: after a zero-value call, or a zero
+            // fee paid to the beneficiary.
+            state::delete(&state::account_key(&a));
+            continue;
+        }
         let code_hash = if info.code_hash == KECCAK_EMPTY { [0; 32] } else { info.code_hash.0 };
         if let Some(code) = &info.code
             && code_hash != [0; 32]
             && account.is_created()
         {
-            state::set_raw(&concat(keys::CODE, &[&code_hash]), code.original_byte_slice());
+            state::set_raw(&state::code_key(&code_hash), code.original_byte_slice());
         }
         state::set_account(&a, &Account { balance: u128_of(info.balance), nonce: info.nonce, code_hash });
         for (key, slot) in account.changed_storage_slots() {
-            let k = concat(keys::SLOT, &[&a, &key.to_be_bytes::<32>()]);
+            let k = state::slot_key(&a, &key.to_be_bytes::<32>());
             if slot.present_value.is_zero() {
                 state::delete(&k);
             } else {
@@ -185,7 +207,10 @@ pub fn run(message: Message, block: BlockFields, commit_state: bool) -> Outcome 
         .modify_cfg_chained(|cfg| {
             cfg.set_spec_and_mainnet_gas_params(SpecId::OSAKA);
             cfg.chain_id = chain_id;
+            // A call query is a simulation: like geth's eth_call it skips the nonce
+            // and lets a contract be the caller (EIP-3607 applies to transactions).
             cfg.disable_nonce_check = skip_nonce;
+            cfg.disable_eip3607 = skip_nonce;
         })
         .with_block(block_env)
         .with_db(StateDb)
@@ -214,6 +239,12 @@ pub fn run(message: Message, block: BlockFields, commit_state: bool) -> Outcome 
     Outcome { status, gas_used, output, logs, contract }
 }
 
+/// The order of the secp256k1 group.
+const SECP256K1_ORDER: [u8; 32] = [
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+    0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
+];
+
 /// The host's native implementations of the precompiles it accelerates.
 #[derive(Debug)]
 struct HostCrypto;
@@ -230,6 +261,15 @@ impl Crypto for HostCrypto {
         let mut full = [0u8; 65];
         full[..64].copy_from_slice(sig);
         full[64] = recid;
+        // The host recovers low-s signatures only, the form EIP-2 requires of
+        // transactions. The precompile accepts either: (r, s) and (r, n - s) with the
+        // other parity name the same key, so a high s is mirrored, as revm itself does.
+        let n = U256::from_be_bytes(SECP256K1_ORDER);
+        let s = U256::from_be_slice(&sig[32..]);
+        if s > n >> 1 && s < n {
+            full[32..64].copy_from_slice(&(n - s).to_be_bytes::<32>());
+            full[64] ^= 1;
+        }
         let address = crate::tx::recover_address(msg, &full).ok_or(PrecompileHalt::Secp256k1RecoverFailed)?;
         let mut out = [0u8; 32];
         out[12..].copy_from_slice(&address);
@@ -249,14 +289,18 @@ fn install_host_crypto() {
 
 /// Contract code at `address`.
 pub fn code(address: &Address) -> Vec<u8> {
-    let account: Account = state::get(&state::account_key(address)).unwrap_or_default();
+    code_of(&state::account(address))
+}
+
+/// The code of `account`.
+pub fn code_of(account: &Account) -> Vec<u8> {
     if account.code_hash == [0; 32] {
         return Vec::new();
     }
-    state::get_raw(&concat(keys::CODE, &[&account.code_hash])).unwrap_or_default()
+    state::get_raw(&state::code_key(&account.code_hash)).unwrap_or_default()
 }
 
 /// Storage slot of `address`.
 pub fn storage(address: &Address, slot: &Hash) -> Hash {
-    state::get_raw(&concat(keys::SLOT, &[address, slot])).and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()).unwrap_or([0; 32])
+    state::get_raw(&state::slot_key(address, slot)).and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()).unwrap_or([0; 32])
 }

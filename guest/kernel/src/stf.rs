@@ -31,9 +31,16 @@ fn well_formed(s: &Signed) -> Result<(), u32> {
     Ok(())
 }
 
-/// The checks against the sender's account: next nonce and enough to pay the worst case.
+/// The checks against the sender's account: it may send (it has no code, or
+/// only a delegation designator: EIP-3607, EIP-7702), the nonce is its next
+/// one and still usable (EIP-2681), and it can pay the worst case. With
+/// `well_formed` these are the checks revm makes before it runs a transaction,
+/// so one that validates against a state also runs on it.
 fn admissible(s: &Signed, account: &Account) -> Result<(), u32> {
-    if s.tx.nonce != account.nonce {
+    if account.code_hash != [0; 32] && !evm::is_delegation(&evm::code_of(account)) {
+        return Err(reason::SENDER_NOT_EOA);
+    }
+    if s.tx.nonce != account.nonce || account.nonce == u64::MAX {
         return Err(reason::BAD_NONCE);
     }
     match s.tx.max_cost() {
@@ -93,10 +100,60 @@ fn failed(height: u64, index: u32, cumulative: u64) -> Receipt {
     Receipt { status: 0, height, index, cumulative_gas_used: cumulative, ..Receipt::default() }
 }
 
+/// Whether the transaction with this hash has run. Every transaction that runs
+/// uses at least the 21 000 base gas; the failed receipt of one that could not
+/// run records none.
+pub fn has_run(tx_hash: &Hash) -> bool {
+    state::receipt(tx_hash).is_some_and(|r| r.gas_used > 0)
+}
+
+/// Runs one transaction of `block` at `index`, after `cumulative` gas; `None`
+/// if it cannot run, in which case nothing changed.
+fn run_tx(raw: &[u8], chain_id: u64, block: BlockFields, index: u32, cumulative: u64) -> Option<Receipt> {
+    let s = decode_signed(raw, chain_id).ok()?;
+    if well_formed(&s).is_err() || cumulative + s.tx.gas_limit > BLOCK_GAS_LIMIT {
+        return None;
+    }
+    let message = Message {
+        tx_type: s.tx.tx_type,
+        caller: s.from,
+        to: s.tx.to,
+        value: s.tx.value,
+        data: s.tx.input.clone(),
+        gas_limit: s.tx.gas_limit,
+        gas_price: s.tx.gas_price,
+        priority_fee: s.tx.priority_fee,
+        nonce: Some(s.tx.nonce),
+        access_list: s.tx.access_list.clone(),
+    };
+    let outcome = evm::run(message, block, true);
+    if outcome.status == call_status::INVALID {
+        return None;
+    }
+    Some(Receipt {
+        status: u8::from(outcome.status == call_status::SUCCESS),
+        gas_used: outcome.gas_used,
+        from: s.from,
+        to: s.tx.to.unwrap_or([0; 20]),
+        value: s.tx.value,
+        height: block.number,
+        index,
+        cumulative_gas_used: cumulative + outcome.gas_used,
+        contract: outcome.contract,
+        logs: Seq(outcome.logs),
+        tx_type: s.tx.tx_type,
+        effective_gas_price: s.tx.effective_gas_price(u128::from(BASE_FEE)).unwrap_or(0),
+    })
+}
+
 /// `kernel_stf_execute_block`: runs every transaction in order through the
 /// EVM, writing a receipt for each, then the header with the state commitment.
-/// A transaction that cannot run (it should not have been included) gets a
-/// failed receipt and changes nothing.
+///
+/// A transaction that cannot run (it should not have been included) changes
+/// nothing. It gets a failed receipt, unless a receipt is already stored under
+/// its hash: then an earlier inclusion ran, or could not run either, and this
+/// block leaves it out, neither listing it nor touching that receipt. So a
+/// transaction that ran keeps its receipt, in the one block that lists it.
 pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let chain_id = state::chain_id();
     let template = BlockHeader::from_bytes(&args.block.header).unwrap_or_else(|_| solo_guest::trap());
@@ -106,47 +163,15 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let mut tx_hashes = Vec::new();
     let mut cumulative = 0u64;
     let mut receipt_hashes = Vec::new();
-    for (index, raw) in args.block.txs.0.iter().enumerate() {
-        let index = index as u32;
+    for raw in &args.block.txs.0 {
+        let index = receipts.len() as u32;
         let hash = state::keccak256(raw);
-        let receipt = match decode_signed(raw, chain_id) {
-            Ok(s) if well_formed(&s).is_ok() && cumulative + s.tx.gas_limit <= BLOCK_GAS_LIMIT => {
-                let price = s.tx.effective_gas_price(u128::from(BASE_FEE)).unwrap_or(0);
-                let message = Message {
-                    tx_type: s.tx.tx_type,
-                    caller: s.from,
-                    to: s.tx.to,
-                    value: s.tx.value,
-                    data: s.tx.input.clone(),
-                    gas_limit: s.tx.gas_limit,
-                    gas_price: s.tx.gas_price,
-                    priority_fee: s.tx.priority_fee,
-                    nonce: Some(s.tx.nonce),
-                    access_list: s.tx.access_list.clone(),
-                };
-                let outcome = evm::run(message, block, true);
-                if outcome.status == call_status::INVALID {
-                    failed(height, index, cumulative)
-                } else {
-                    cumulative += outcome.gas_used;
-                    Receipt {
-                        status: u8::from(outcome.status == call_status::SUCCESS),
-                        gas_used: outcome.gas_used,
-                        from: s.from,
-                        to: s.tx.to.unwrap_or([0; 20]),
-                        value: s.tx.value,
-                        height,
-                        index,
-                        cumulative_gas_used: cumulative,
-                        contract: outcome.contract,
-                        logs: Seq(outcome.logs),
-                        tx_type: s.tx.tx_type,
-                        effective_gas_price: price,
-                    }
-                }
-            }
-            _ => failed(height, index, cumulative),
+        let receipt = match run_tx(raw, chain_id, block, index, cumulative) {
+            Some(receipt) => receipt,
+            None if state::receipt(&hash).is_some() => continue,
+            None => failed(height, index, cumulative),
         };
+        cumulative = receipt.cumulative_gas_used;
         state::put_receipt(&hash, &receipt, raw);
         let encoded = receipt.to_bytes();
         receipt_hashes.extend_from_slice(&state::keccak256(&encoded));
@@ -168,7 +193,7 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     state::put_block(&header, &block_hash);
     ExecuteResult {
         state_root,
-        summary: ExecuteSummary { gas_used: cumulative, tx_count: args.block.txs.0.len() as u32, receipts_root, logs_bloom: Vec::new() },
+        summary: ExecuteSummary { gas_used: cumulative, tx_count: receipts.len() as u32, receipts_root, logs_bloom: Vec::new() },
         receipts: Seq(receipts),
     }
 }

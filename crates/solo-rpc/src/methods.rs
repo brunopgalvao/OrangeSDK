@@ -54,10 +54,14 @@ pub fn reason_text(code: u32) -> &'static str {
         reason::MALFORMED => "malformed transaction",
         reason::BAD_SIGNATURE => "invalid signature",
         reason::WRONG_CHAIN => "wrong chain id",
-        reason::BAD_NONCE => "nonce too low or too high",
+        reason::BAD_NONCE => "nonce too low, too high or at its maximum",
         reason::INSUFFICIENT_FUNDS => "insufficient funds for value and gas",
         reason::GAS_TOO_LOW => "intrinsic gas too low",
         reason::UNSUPPORTED => "transaction type not supported",
+        reason::FEE_TOO_LOW => "max fee per gas below the base fee or the priority fee",
+        reason::GAS_LIMIT_TOO_HIGH => "gas limit above the transaction or block cap",
+        reason::INITCODE_TOO_LARGE => "max initcode size exceeded",
+        reason::SENDER_NOT_EOA => "sender not an eoa",
         _ => "rejected",
     }
 }

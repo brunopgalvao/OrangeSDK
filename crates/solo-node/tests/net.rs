@@ -82,6 +82,7 @@ fn genesis(keys: &[SigningKey]) -> Genesis {
         allocations: Seq(vec![Allocation {
             address: address(&keys[0]),
             balance: 1_000_000,
+            ..Allocation::default()
         }]),
     };
     Genesis {

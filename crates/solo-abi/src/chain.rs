@@ -40,12 +40,30 @@ record! {
 }
 
 record! {
-    /// A genesis balance.
+    /// A genesis account: a balance and, for a predeploy, a nonce, code and storage.
     Allocation {
         /// Account.
         address: Address,
         /// Balance in wei.
         balance: u128,
+        /// Nonce.
+        nonce: u64,
+        /// Contract code; empty for an account without code.
+        code: Vec<u8>,
+        /// Storage slots; a zero value is the same as no entry. The reference
+        /// kernel refuses non-zero storage on an account with neither code nor
+        /// nonce, where a creation could land (it does not apply EIP-7610).
+        storage: Seq<StorageSlot>,
+    }
+}
+
+record! {
+    /// A storage slot set at genesis.
+    StorageSlot {
+        /// Slot, big-endian.
+        key: Hash,
+        /// Value, big-endian.
+        value: Hash,
     }
 }
 
@@ -56,7 +74,7 @@ record! {
         slot_ms: u64,
         /// Maximum transactions per block.
         max_txs: u32,
-        /// Initial balances.
+        /// Initial accounts: balances and predeployed contracts.
         allocations: Seq<Allocation>,
     }
 }
@@ -75,7 +93,9 @@ record! {
         state_root: Hash,
         /// Receipts root.
         receipts_root: Hash,
-        /// Transaction hashes in order.
+        /// Hashes of the transactions the block records, in order: each has its
+        /// receipt here. A transaction that cannot run and already has a
+        /// receipt from an earlier inclusion is left out.
         tx_hashes: Seq<Hash>,
         /// Gas used.
         gas_used: u64,
@@ -223,7 +243,8 @@ pub mod reason {
     pub const BAD_SIGNATURE: u32 = 2;
     /// Chain id mismatch.
     pub const WRONG_CHAIN: u32 = 3;
-    /// Nonce is not the account's next nonce.
+    /// Nonce is not the account's next nonce, or that nonce is 2^64 − 1, which
+    /// no transaction may carry (EIP-2681).
     pub const BAD_NONCE: u32 = 4;
     /// Balance below value plus the maximum fee.
     pub const INSUFFICIENT_FUNDS: u32 = 5;
@@ -237,6 +258,8 @@ pub mod reason {
     pub const GAS_LIMIT_TOO_HIGH: u32 = 9;
     /// Contract initcode above the EIP-3860 limit.
     pub const INITCODE_TOO_LARGE: u32 = 10;
+    /// The sender has code other than an EIP-7702 delegation designator (EIP-3607).
+    pub const SENDER_NOT_EOA: u32 = 11;
 }
 
 /// Storage key prefixes of the reference kernel.
@@ -587,6 +610,12 @@ mod tests {
             allocations: Seq(vec![Allocation {
                 address: [1; 20],
                 balance: 7,
+                nonce: 1,
+                code: vec![0x60, 0x00],
+                storage: Seq(vec![StorageSlot {
+                    key: [1; 32],
+                    value: [2; 32],
+                }]),
             }]),
         });
         roundtrip(&BlockHeader {

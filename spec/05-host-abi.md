@@ -82,6 +82,8 @@ Writes are buffered in a per-instance overlay and become visible to the instance
 
 The prefix `local/` is for node-local bookkeeping that must not affect the state commitment (the reference kernel keeps its finalized height there); `storage_commit` and `storage_proof` leave it out (§4.2, 10 §2). `sign` is the only function that touches node keys. It writes the signature to `dst` when `cap` allows and returns its length (65 for the recoverable secp256k1 signature of key role 0 over a 32-byte message); it returns 0 when the node has no key for the role, the message is not 32 bytes, or `cap` is too small. `key_role` is a small integer naming a key in the host keystore (consensus, preconfirmation, identity); the host signs with the node's own key and never exports it. Precompile-grade operations beyond this list (modexp, bn254, point evaluation) are kernel-level precompiles implemented in modules with native acceleration, not host functions.
 
+`secp256k1_recover` reads `sig` as `r ‖ s ‖ v` with `v` one of 0, 1, 27 or 28, and writes the recovered public key as 64 bytes (the uncompressed point without its `0x04` prefix). It returns `InvalidArgument` if `v` is anything else, if `r` or `s` is zero or not below the group order `n`, if `s > n/2`, or if no key recovers. Accepting only the low-s form, which EIP-2 requires of transactions, keeps every host agreeing on which signatures are valid. A caller that must also accept high-s signatures, such as the EVM `ecrecover` precompile, replaces `s` by `n − s` and flips the parity before calling.
+
 ### 4.4 Invoke
 
 | Name | Arguments | Result | Set | Cost |
