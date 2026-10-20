@@ -34,11 +34,16 @@ const ENTRY_KEY: &[u8] = b"simplex/entry";
 const TIP_KEY: &[u8] = b"simplex/tip";
 /// Evidence found here that chain state does not hold yet.
 const PENDING_EVIDENCE_KEY: &[u8] = b"simplex/evidence";
-/// Messages for views of an epoch this node has not entered yet, each the
-/// delivering peer followed by the payload.
+/// Messages for views of the epoch after this node's, each the delivering
+/// peer and the signer followed by the payload.
 const FUTURE_KEY: &[u8] = b"simplex/future";
 /// Most messages kept for a later epoch.
 const FUTURE_CAP: usize = 64;
+/// Most messages kept for a later epoch from one signer.
+const FUTURE_PER_SIGNER: usize = 4;
+/// Whether the outstanding sync request was sent for a message nobody
+/// known signed, so any verified trigger may replace it.
+const WEAK_SYNC_KEY: &[u8] = b"simplex/weak_sync";
 const ZERO: Hash = [0; 32];
 
 /// The persisted driver state.
@@ -278,10 +283,9 @@ impl Ctx {
         let future: Seq<Vec<u8>> = persist::get(FUTURE_KEY).unwrap_or_default();
         persist::set(FUTURE_KEY, &Seq::<Vec<u8>>(Vec::new()));
         let peer = self.peer;
-        for entry in future.0 {
-            let (from, payload) = entry.split_at(32);
-            self.peer = Some(from.try_into().expect("32 bytes"));
-            if let Ok(m) = ConsensusMessage::from_bytes(payload) {
+        for entry in future.0.iter().filter(|e| e.len() > 64) {
+            self.peer = Some(entry[..32].try_into().expect("32 bytes"));
+            if let Ok(m) = ConsensusMessage::from_bytes(&entry[64..]) {
                 self.on_message(m);
             }
         }
@@ -301,16 +305,44 @@ impl Ctx {
         }
     }
 
-    /// Keeps a message for an epoch this node has not entered, and asks the
-    /// peer that sent it for the blocks that lead there.
-    fn keep_for_later(&mut self, m: &ConsensusMessage) {
+    /// A message for an epoch this node has not entered, in a view of
+    /// `epoch`. Its set is not known yet, so the most this node can check is
+    /// that a registered validator that is not jailed signed it (for a
+    /// certificate, its first vote). Such a message is kept when `epoch` is
+    /// the next one, at most `FUTURE_PER_SIGNER` per signer, and its peer
+    /// is asked for the blocks that lead there. Any other one only asks,
+    /// and never in place of a request a verified message sent (spec 08 §3a).
+    fn keep_for_later(&mut self, m: &ConsensusMessage, epoch: u64) {
         let Some(peer) = self.peer else { return };
+        let Some(signer) = self.future_signer(m).filter(|id| staking::record(id).is_some_and(|r| !r.jailed)) else {
+            self.send_sync(true);
+            return;
+        };
         let mut future: Seq<Vec<u8>> = persist::get(FUTURE_KEY).unwrap_or_default();
-        if future.0.len() < FUTURE_CAP {
-            future.0.push([&peer[..], &m.to_bytes()].concat());
+        let held = future.0.iter().filter(|e| e.get(32..64) == Some(&signer[..])).count();
+        if epoch == self.epoch + 1 && future.0.len() < FUTURE_CAP && held < FUTURE_PER_SIGNER {
+            future.0.push([&peer[..], &signer[..], &m.to_bytes()].concat());
             persist::set(FUTURE_KEY, &future);
         }
         self.request_sync();
+    }
+
+    /// Who signed `m`: the proposer, the voter, or a certificate's first voter.
+    fn future_signer(&self, m: &ConsensusMessage) -> Option<Hash> {
+        match m {
+            ConsensusMessage::Propose { proposal, signature } => {
+                self.signer(KIND_PROPOSE, proposal.view, &state::keccak256(&proposal.to_bytes()), signature)
+            }
+            ConsensusMessage::Vote { view, hash, signature } => self.signer(KIND_VOTE, *view, hash, signature),
+            ConsensusMessage::Finalize { view, hash, signature } | ConsensusMessage::FinalizeShare { view, hash, signature, .. } => {
+                self.signer(KIND_FINALIZE, *view, hash, signature)
+            }
+            ConsensusMessage::Certificate { certificate, .. } => {
+                let first = certificate.votes.0.first()?;
+                self.signer(certificate.kind, certificate.view, &certificate.hash, &first.signature)
+            }
+            ConsensusMessage::Dkg { .. } => None,
+        }
     }
 
     /// Arms the current view's timers: the timeout, and the leader's proposal
@@ -441,8 +473,8 @@ impl Ctx {
             ConsensusMessage::Certificate { certificate, .. } => Some(certificate.view),
             ConsensusMessage::Dkg { .. } => None,
         };
-        if view.is_some_and(|v| self.view_epoch(v) > self.epoch) {
-            self.keep_for_later(&m);
+        if let Some(epoch) = view.map(|v| self.view_epoch(v)).filter(|e| *e > self.epoch) {
+            self.keep_for_later(&m, epoch);
             return;
         }
         match m {
@@ -484,7 +516,7 @@ impl Ctx {
             ConsensusMessage::Finalize { view, hash, signature } => self.on_finalize(view, hash, signature, None),
             ConsensusMessage::FinalizeShare { view, hash, signature, partial } => self.on_finalize(view, hash, signature, Some(partial)),
             ConsensusMessage::Certificate { certificate, proposal } => self.on_certificate(certificate, proposal),
-            ConsensusMessage::Dkg { envelope } => dkg::pool_add(envelope),
+            ConsensusMessage::Dkg { envelope } => dkg::pool_add(self.chain_id, envelope),
         }
     }
 
@@ -861,10 +893,19 @@ impl Ctx {
 
     /// Asks the peer of the current input for finalized blocks past ours.
     fn request_sync(&mut self) {
+        self.send_sync(false);
+    }
+
+    /// [`Ctx::request_sync`] for a message this node could verify (`weak`
+    /// false) or not. One request is outstanding at a time, but a verified
+    /// trigger replaces a request a weak one sent, so a peer that sends
+    /// unverifiable messages and never answers cannot hold up catch-up.
+    fn send_sync(&mut self, weak: bool) {
         let Some(peer) = self.peer else { return };
-        if self.s.sync_pending {
+        if self.s.sync_pending && (weak || !persist::get::<bool>(WEAK_SYNC_KEY).unwrap_or(false)) {
             return;
         }
+        persist::set(WEAK_SYNC_KEY, &weak);
         self.s.sync_pending = true;
         self.s.sync_request_id += 1;
         self.s.sync_peer = peer;
@@ -912,10 +953,11 @@ impl Ctx {
     }
 
     /// Verifies and adopts a sync response; asks for more if the peer is
-    /// further ahead. A threshold certificate that verifies under the group
-    /// key suffices; otherwise the finalize votes must verify against the
-    /// set of their view's epoch. Only votes this node verified for its
-    /// current epoch move its tip and view.
+    /// further ahead. The finalize votes must verify against the set of
+    /// their view's epoch, always: a threshold certificate counts
+    /// shareholders, not stake, so it never stands in for them (spec 08
+    /// §7a). One that also verifies under the group key is kept, for this
+    /// node to pass on. Only votes of its current epoch move its tip and view.
     fn on_response(&mut self, request_id: u64, payload: &[u8]) {
         if !self.s.sync_pending || request_id != self.s.sync_request_id {
             return;
@@ -928,12 +970,11 @@ impl Ctx {
         if certificate.kind != KIND_FINALIZE || state::keccak256(&last.to_bytes()) != certificate.hash {
             return;
         }
-        let by_threshold = !self.is_suffix(last) && dkg::certifies(self.chain_id, &response.threshold, last.height, &certificate.hash);
-        let current = self.view_epoch(certificate.view) == self.epoch;
-        let by_votes = (!by_threshold || current) && self.verified(KIND_FINALIZE, certificate.view, &certificate.hash, &certificate.votes.0);
-        if !(by_threshold || by_votes) {
+        if !self.verified(KIND_FINALIZE, certificate.view, &certificate.hash, &certificate.votes.0) {
             return;
         }
+        let threshold = !self.is_suffix(last) && dkg::certifies(self.chain_id, &response.threshold, last.height, &certificate.hash);
+        let current = self.view_epoch(certificate.view) == self.epoch;
         let mut parent = self.finalized_hash();
         let mut height = self.s.finalized_height;
         for p in &proposals {
@@ -944,10 +985,10 @@ impl Ctx {
             height = p.height;
         }
         let head = last.clone();
-        self.adopt(proposals, &certificate, by_threshold.then_some(response.threshold.as_slice()));
+        self.adopt(proposals, &certificate, threshold.then_some(response.threshold.as_slice()));
         // A finalized head from a later view than the tip's replaces it; a
         // tip from a later view already extends the head.
-        if by_votes && current {
+        if current {
             if certificate.view > self.s.tip_view {
                 self.set_tip(&certificate, &head);
             }
@@ -982,11 +1023,11 @@ impl Ctx {
         if self.params.staking.epoch_blocks == 0 || self.params.staking.dkg_phase_blocks == 0 {
             return;
         }
-        dkg::pool_prune(self.chain_id, executed);
+        dkg::pool_prune(executed);
         if let Some(me) = dkg::my_id(self.chain_id)
             && let Some(envelope) = dkg::duties(self.chain_id, &me, executed)
         {
-            dkg::pool_add(envelope.clone());
+            dkg::pool_add(self.chain_id, envelope.clone());
             self.broadcast(&ConsensusMessage::Dkg { envelope });
         }
     }

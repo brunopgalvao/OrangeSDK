@@ -25,7 +25,7 @@ struct StakingParams {
 
 With `epoch_blocks = 0` the genesis validator set is the only set, its weights are the ones `Genesis.validators` gives, transactions to the staking address cannot run, and no threshold key exists. Quorums are still weighed (08 §1).
 
-With `epoch_blocks = L > 0`, `kernel_init` registers every member of `Genesis.validators` as a validator (§3.4) with stake `weight × 10^9` wei, its account the last 20 bytes of its id, and its encryption key the `dkg_key` that `keys` lists for its id (none if absent). It credits the total genesis stake to the staking address's balance, stores the genesis set as the set of epoch 0, and, if `P > 0`, schedules epoch 0's DKG run (§6.1). `kernel_init` traps, so the chain never starts, when `4·P > L`, when the genesis set has more than 256 members, or when a listed `dkg_key` is not a valid encryption key (§3.2).
+With `epoch_blocks = L > 0`, `kernel_init` registers every member of `Genesis.validators` as a validator (§3.4) with stake `weight × 10^9` wei, its account the last 20 bytes of its id, and its encryption key the `dkg_key` that `keys` lists for its id (none if absent). It credits the total genesis stake to the staking address's balance, stores the genesis set as the set of epoch 0, and, if `P > 0`, schedules epoch 0's DKG run (§6.1). `kernel_init` traps, so the chain never starts, when `4·P > L`, when the genesis set has more than 256 members, or when any `dkg_key` that `keys` lists, for a member of the genesis set or not, is not a valid encryption key (§3.2).
 
 ## 3. The staking address
 
@@ -35,7 +35,7 @@ The *staking address* is `0x0000000000000000000000000000000000005354`. A transac
 
 ```solidity
 interface ISoloStaking {
-    function register(bytes calldata dkgKey) external;   // 0x82fbdc9c
+    function register(bytes calldata dkgKey) external payable;   // 0x82fbdc9c
     function bond() external payable;                    // 0x64c9ec6f
     function unbond(uint256 amount) external;            // 0x27de9e32
     function withdraw() external;                        // 0x3ccfd60b
@@ -60,7 +60,7 @@ A transaction to the staking address *can run* in the block at height `h` (for a
 
 | Action | Condition |
 |---|---|
-| `register(key)` | no value; the key is valid; the sender is not jailed; a sender not yet registered needs fewer than 256 registered validators |
+| `register(key)` | the key is valid; the sender is not jailed; a registered sender sends no value; a sender not yet registered sends a value of at least `max(min_stake, 1 gwei)` that is a multiple of 1 gwei, and needs fewer than 256 registered validators |
 | `bond()` | the sender is registered and not jailed; the value is non-zero and a multiple of 1 gwei |
 | `unbond(amount)` | no value; the sender is registered; `amount` is non-zero, a multiple of 1 gwei and at most its stake |
 | `withdraw()` | no value; the sender is registered; it has unbonding stake and `epoch(h) ≥ release_epoch` |
@@ -69,14 +69,18 @@ Admission (`kernel_stf_validate_tx`, and selection in `kernel_stf_build_block`) 
 
 ### 3.4 Execution
 
-A transaction that can run executes first as a plain EVM call to the staking address (intrinsic gas, fees, the nonce, and for `bond` the value moving to the staking address's balance). If that call succeeds the action applies, and the receipt carries its one event, emitted by the staking address with the sender as the indexed topic:
+A transaction that can run executes first as a plain EVM call to the staking address (intrinsic gas, fees, the nonce, and for `bond` and a first `register` the value moving to the staking address's balance). If that call succeeds the action applies, and the receipt carries its events, emitted by the staking address with the sender as the indexed topic:
 
-- `register`: a sender not yet registered becomes a validator: its id is `keccak256` of the public key that signed the transaction (the consensus key, 08 §2), its record is created with no stake, and it is appended to the registration order. A registered sender replaces its encryption key. Event `Registered(sender, id)`.
+- `register`: a sender not yet registered becomes a validator: its id is `keccak256` of the public key that signed the transaction (the consensus key, 08 §2), its record is created with the value as its stake, and it is appended to the registration order. Events `Registered(sender, id)` and `Bonded(sender, value)`. A registered sender replaces its encryption key. Event `Registered(sender, id)`.
 - `bond`: the stake grows by the value. Event `Bonded(sender, value)`.
 - `unbond`: the stake shrinks by `amount`, the unbonding stake grows by it, and `release_epoch` becomes `epoch(h) + 1 + unbonding_epochs`, for all of the unbonding stake. Event `Unbonded(sender, amount, release_epoch)`.
 - `withdraw`: all unbonding stake moves from the staking address's balance to the sender's. Event `Withdrawn(sender, amount)`.
 
 The staking address's balance is therefore always the sum of every validator's bonded and unbonding stake.
+
+### 3.5 Registration slots
+
+At most 256 validators are registered at once, so the work at each epoch end (§4) stays bounded. A slot costs the stake a first registration bonds, and a validator that holds nothing gives it back: at the end of each epoch, after the next set is decided, every registered validator that is not jailed, has no stake and no unbonding stake, and is not in the next set is *pruned*: its record and its address entry are deleted and it leaves the registration order. It can register again later like any other sender. A jailed validator is never pruned, and a pruned one that is later found to have offended is jailed all the same (§5).
 
 ## 4. Epochs and validator sets
 
@@ -96,6 +100,8 @@ Recording a new equivocation offence (08 §9) is the slashing hook. In the same 
 
 - `SLASH_BPS = 1000`: a tenth of its bonded stake and a tenth of its unbonding stake, each rounded down, are burned: they move from the staking address's balance to the zero address, where fees go and nobody can spend them;
 - it is jailed: it is never selected again (§4), cannot bond or register, and is never slashed again. It can still unbond and withdraw what remains.
+
+An offender whose record was pruned (§3.5) holds nothing to burn; its record is created again, jailed, empty and outside the registration order, with its address entry, so it can never register again.
 
 An offence is recorded once (08 §9), so one offence is never punished twice, and a validator is punished for at most one offence whatever else it signs. Slashing removes it from the next set, not from the current one. Unbonding stake is slashable until it is withdrawn, so unbonding does not escape an offence recorded before the withdrawal.
 
@@ -126,7 +132,7 @@ struct DkgEnvelope { epoch: u64, kind: u8, body: bytes, signature: [65] }
 
 `kind` 0 carries a DKG message of 12 §5 (`Dealing`, `Complaints` or `Justification`, its first byte the phase); `kind` 1 carries a `KeySetVote { key_set: bytes, public_shares: vec<bytes> }`. The signature is a recoverable secp256k1 signature by the sender's consensus key over the consensus message (08 §4) of kind 3, view `epoch` and hash `keccak256(kind ‖ body)`.
 
-Senders broadcast envelopes as `ConsensusMessage::Dkg` (08 §4). Every node keeps the envelopes it receives in a pool (at most 64) and drops those chain state holds or whose phase or epoch is over; a leader puts up to `MAX_DKG = 16` of them into its proposal's `dkg` field (never into a suffix proposal, 08 §3a), and execution passes them to the kernel in `Participation.dkg`.
+Senders broadcast envelopes as `ConsensusMessage::Dkg` (08 §4). Every node keeps the envelopes it receives in a pool (at most 64), each with its signer, but only those that could still be recorded in the block after its executed head: the envelope names that block's epoch, whose run exists, and its signature recovers to a signer; a `kind` 0 message is of the run's session, of that block's phase or a later one, from the dealer or recipient its sender index names, with nothing recorded for that sender and phase; a `kind` 1 vote is from a member of the epoch's set that has not confirmed, while no key set of the epoch is adopted. The pool keeps one envelope per sender and phase (for votes, per signer), the first it receives, so only the run's participants can fill it, each with one envelope per phase. After every block it drops the envelopes that no longer pass these checks; a leader puts up to `MAX_DKG = 16` of them into its proposal's `dkg` field (never into a suffix proposal, 08 §3a), and execution passes them to the kernel in `Participation.dkg`.
 
 Executing a block at height `h` records, of its first 16 envelopes, each that decodes, names `epoch(h)`, whose run exists, and whose signature recovers to a signer:
 
@@ -207,6 +213,6 @@ All of it is committed (10 §2).
 
 - Only self-bonding: no delegation, no rewards, no commission. Validator participation for rewards (codex ADR 0008) is not recorded.
 - A jailed validator stays jailed for good; it can only withdraw.
-- The threshold counts shareholders, not stake: a certificate proves that `⌊2N/3⌋ + 1` of `N` shareholders signed, while finality needs more than two thirds of the stake (08 §1). A light client trusting certificates trusts fewer than `N/3` shareholders to be faulty. Stake-weighted shares are left for later.
+- The threshold counts shareholders, not stake: a certificate proves that `⌊2N/3⌋ + 1` of `N` shareholders signed, while finality needs more than two thirds of the stake (08 §1). Shareholders holding little stake together can therefore sign any block, and seats cost no more than `max(min_stake, 1 gwei)` each when `max_validators` is 0, so a chain that wants its certificates to mean something sets both. Full nodes never rely on a threshold certificate: sync always checks the vote certificate against the stake (08 §7a), and the threshold certificate is only an artifact for light clients and verifiers on other chains, which trust fewer than `N/3` shareholders, departed ones included, to be faulty. Stake-weighted shares are left for later.
 - Shareholders who leave the set must keep their nodes running until a resharing completes; if fewer than the previous threshold of them deal, the key cannot move to the new set.
 - Evidence of an epoch is checked against that epoch's set, which chain state keeps for good; there is no bound on how late evidence may arrive.

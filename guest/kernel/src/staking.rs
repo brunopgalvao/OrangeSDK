@@ -200,13 +200,13 @@ pub fn init(genesis: &Genesis) {
     if set.validators.0.len() > MAX_REGISTERED {
         solo_guest::trap();
     }
+    if p.keys.0.iter().any(|k| !valid_key(&k.dkg_key)) {
+        solo_guest::trap();
+    }
     let mut total = 0u128;
     let mut registered = Vec::new();
     for v in &set.validators.0 {
         let dkg_key = p.keys.0.iter().find(|k| k.id == v.id).map(|k| k.dkg_key.clone()).unwrap_or_default();
-        if !dkg_key.is_empty() && !valid_key(&dkg_key) {
-            solo_guest::trap();
-        }
         let stake = u128::from(v.weight) * GWEI;
         total += stake;
         let address = address_of(&v.id);
@@ -234,13 +234,16 @@ fn action_of(s: &Signed, height: u64) -> Option<(StakingAction, Hash)> {
     let value = s.tx.value;
     let id = match &action {
         StakingAction::Register { dkg_key } => {
-            if value != 0 || !valid_key(dkg_key) {
+            if !valid_key(dkg_key) {
                 return None;
             }
             match registered {
                 Some((_, r)) if r.jailed => return None,
-                Some((id, _)) => id,
-                None if ids().len() < MAX_REGISTERED => {
+                Some((id, _)) if value == 0 => id,
+                Some(_) => return None,
+                // A new validator bonds at least the stake selection needs, so a
+                // registration slot is never free to take (spec 15 §3.3).
+                None if value >= p.min_stake.max(GWEI) && value % GWEI == 0 && ids().len() < MAX_REGISTERED => {
                     let pubkey = tx::recover_pubkey(&state::keccak256(&s.tx.signing_payload), &s.tx.signature())?;
                     state::keccak256(&pubkey)
                 }
@@ -284,7 +287,7 @@ pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Out
     };
     let mut outcome = evm::run(message, block, true);
     if outcome.status == call_status::SUCCESS {
-        outcome.logs.push(apply(action, &id, s, height));
+        outcome.logs.extend(apply(action, &id, s, height));
     }
     outcome
 }
@@ -295,40 +298,43 @@ fn log(topic: Hash, address: &Address, data: Vec<u8>) -> Log {
     Log { address: STAKING_ADDRESS, topics: Seq(vec![topic, indexed]), data }
 }
 
-fn apply(action: StakingAction, id: &Hash, s: &Signed, height: u64) -> Log {
+fn apply(action: StakingAction, id: &Hash, s: &Signed, height: u64) -> Vec<Log> {
     let p = params();
     let mut r = record(id).unwrap_or_default();
-    let log = match action {
+    let logs = match action {
         StakingAction::Register { dkg_key } => {
+            let mut logs = vec![log(event::REGISTERED, &s.from, id.to_vec())];
             if r.address == [0; 20] {
                 let mut all = ids();
                 all.push(*id);
                 state::set(keys::IDS, &Seq(all));
                 state::set(&concat(&[keys::BY_ADDRESS, &s.from]), id);
                 r.address = s.from;
+                r.stake = s.tx.value;
+                logs.push(log(event::BONDED, &s.from, word(s.tx.value).to_vec()));
             }
             r.dkg_key = dkg_key;
-            log(event::REGISTERED, &s.from, id.to_vec())
+            logs
         }
         StakingAction::Bond => {
             r.stake += s.tx.value;
-            log(event::BONDED, &s.from, word(s.tx.value).to_vec())
+            vec![log(event::BONDED, &s.from, word(s.tx.value).to_vec())]
         }
         StakingAction::Unbond { amount } => {
             r.stake -= amount;
             r.unbonding += amount;
             r.release_epoch = epoch_of(height, p.epoch_blocks) + 1 + p.unbonding_epochs;
-            log(event::UNBONDED, &s.from, [word(amount), word(u128::from(r.release_epoch))].concat())
+            vec![log(event::UNBONDED, &s.from, [word(amount), word(u128::from(r.release_epoch))].concat())]
         }
         StakingAction::Withdraw => {
             let amount = core::mem::take(&mut r.unbonding);
             debit(&STAKING_ADDRESS, amount);
             credit(&s.from, amount);
-            log(event::WITHDRAWN, &s.from, word(amount).to_vec())
+            vec![log(event::WITHDRAWN, &s.from, word(amount).to_vec())]
         }
     };
     put_record(id, &r);
-    log
+    logs
 }
 
 /// `x · SLASH_BPS / 10 000` without overflow.
@@ -339,14 +345,20 @@ fn cut(x: u128) -> u128 {
 /// The slashing hook of spec 08 §9, called when a new offence is recorded:
 /// burns `SLASH_BPS` of the offender's bonded and unbonding stake and jails
 /// it, so it is never selected again. A jailed validator is not slashed
-/// again, whatever else it signed.
+/// again, whatever else it signed. An offender whose record was pruned
+/// (§3.5) is jailed all the same: its record comes back, jailed and empty,
+/// without a registration slot, so it can never register again.
 pub fn slash(evidence: &Evidence) {
     if params().epoch_blocks == 0 {
         return;
     }
     let Some(set) = set_of(view_epoch(evidence.view)) else { return };
     let Some(v) = set.validators.0.get(evidence.validator as usize) else { return };
-    let Some(mut r) = record(&v.id) else { return };
+    let mut r = record(&v.id).unwrap_or_else(|| {
+        let address = address_of(&v.id);
+        state::set(&concat(&[keys::BY_ADDRESS, &address]), &v.id);
+        StakeRecord { address, ..StakeRecord::default() }
+    });
     if r.jailed {
         return;
     }
@@ -419,6 +431,29 @@ fn schedule_run(epoch: u64, set: &ValidatorSet) {
     state::set(&run_key(epoch), &run);
 }
 
+/// Frees the registration slots of validators that hold nothing: not
+/// jailed, no stake, no unbonding stake, and not in `next`, the set just
+/// decided. Their records go; they can register again like anyone else.
+fn prune(next: &ValidatorSet) {
+    let all = ids();
+    let before = all.len();
+    let kept: Vec<Hash> = all
+        .into_iter()
+        .filter(|id| {
+            let Some(r) = record(id) else { return false };
+            let empty = !r.jailed && r.stake == 0 && r.unbonding == 0 && !next.validators.0.iter().any(|v| v.id == *id);
+            if empty {
+                state::delete(&record_key(id));
+                state::delete(&concat(&[keys::BY_ADDRESS, &r.address]));
+            }
+            !empty
+        })
+        .collect();
+    if kept.len() != before {
+        state::set(keys::IDS, &Seq(kept));
+    }
+}
+
 /// Bookkeeping at the end of the block at `height`: at the end of epoch `e`
 /// it decides the set of `e + 1` and schedules its DKG run.
 pub fn end_block(height: u64) {
@@ -428,6 +463,7 @@ pub fn end_block(height: u64) {
     }
     let next = height / p.epoch_blocks;
     let set = select(&p).or_else(|| set_of(next - 1)).unwrap_or_default();
+    prune(&set);
     state::set(&set_key(next), &set);
     state::set_raw(b"meta/validators", &set.to_bytes());
     if p.dkg_phase_blocks != 0 {

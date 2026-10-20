@@ -157,47 +157,100 @@ pub fn duties(chain_id: u64, me: &Hash, executed: u64) -> Option<Vec<u8>> {
     envelope
 }
 
-/// The envelopes this node holds for proposals.
-pub fn pool() -> Vec<Vec<u8>> {
-    persist::get::<Seq<Vec<u8>>>(POOL_KEY).map(|s| s.0).unwrap_or_default()
+/// The pool's entries: each envelope's signer followed by the envelope.
+fn entries() -> Vec<Vec<u8>> {
+    let mut entries = persist::get::<Seq<Vec<u8>>>(POOL_KEY).map(|s| s.0).unwrap_or_default();
+    entries.retain(|e| e.len() > 32);
+    entries
 }
 
-/// Keeps an envelope for this node's proposals, unless it holds it already
-/// or the pool is full.
-pub fn pool_add(raw: Vec<u8>) {
-    let mut pool = pool();
-    if DkgEnvelope::from_bytes(&raw).is_err() || pool.contains(&raw) || pool.len() >= POOL_CAP {
+/// The envelopes this node holds for proposals.
+pub fn pool() -> Vec<Vec<u8>> {
+    entries().into_iter().map(|e| e[32..].to_vec()).collect()
+}
+
+/// The slot an envelope takes in the pool and on chain: for a DKG message
+/// its phase and sender index, for a confirmation its signer. The pool
+/// keeps one envelope per slot.
+fn slot(env: &DkgEnvelope, signer: &Hash) -> Option<(u8, u32, Hash)> {
+    if env.kind == envelope::MESSAGE { dkg_header(&env.body).map(|(at, _, index)| (at, index, ZERO)) } else { Some((3, 0, *signer)) }
+}
+
+const ZERO: Hash = [0; 32];
+
+/// Whether the envelope `env`, signed by `signer`, can still be recorded
+/// in a block after the one at `executed` (spec 15 §6.2): it names the
+/// epoch of the next block, whose run exists; a DKG message is of the run's
+/// session, of the current phase or a later one, and from the sender its
+/// index names, with nothing recorded for that sender and phase; a
+/// confirmation is from a member of the epoch's set that has not
+/// confirmed, while no key set of the epoch is adopted.
+fn wanted(env: &DkgEnvelope, signer: &Hash, executed: u64) -> bool {
+    let p = staking::params();
+    if p.epoch_blocks == 0 || p.dkg_phase_blocks == 0 {
+        return false;
+    }
+    let next = executed + 1;
+    let epoch = epoch_of(next, p.epoch_blocks);
+    let phase = ((next - epoch_start(epoch, p.epoch_blocks)) / p.dkg_phase_blocks).min(3) as u8;
+    if env.epoch != epoch {
+        return false;
+    }
+    let Some(run) = staking::dkg_run(epoch) else { return false };
+    if env.kind == envelope::MESSAGE {
+        let Some((at, session, index)) = dkg_header(&env.body) else { return false };
+        let roster = if at == 1 { &run.recipients.0 } else { &run.dealers.0 };
+        session == run.session
+            && at >= phase
+            && index != 0
+            && roster.get(index as usize - 1) == Some(signer)
+            && !staking::has_message(epoch, at, index)
+    } else {
+        env.kind == envelope::CONFIRM
+            && staking::key_set(epoch).is_none()
+            && !staking::has_vote(epoch, signer)
+            && staking::set_entries(epoch).is_some_and(|set| set.iter().any(|v| v.0 == *signer))
+    }
+}
+
+/// Keeps an envelope for this node's proposals when it can still be
+/// recorded after the executed head, it fills a slot the pool does not hold
+/// yet, and the pool has room. Every envelope is checked before it is
+/// kept, so a peer can fill the pool only with what the run's own
+/// participants signed, one envelope per participant and phase.
+pub fn pool_add(chain_id: u64, raw: Vec<u8>) {
+    let Ok(env) = DkgEnvelope::from_bytes(&raw) else { return };
+    let mut pool = entries();
+    if pool.len() >= POOL_CAP {
         return;
     }
-    pool.push(raw);
+    let Some(signer) = signer(chain_id, &env) else { return };
+    if !wanted(&env, &signer, state::height().unwrap_or(0)) {
+        return;
+    }
+    let taken = slot(&env, &signer);
+    let occupied = pool.iter().any(|e| {
+        let held: Hash = e[..32].try_into().expect("32 bytes");
+        DkgEnvelope::from_bytes(&e[32..]).ok().and_then(|other| slot(&other, &held)) == taken
+    });
+    if occupied {
+        return;
+    }
+    pool.push([&signer[..], &raw].concat());
     persist::set(POOL_KEY, &Seq(pool));
 }
 
 /// Drops the envelopes that can no longer be recorded after the block at
 /// `executed`: chain state holds them, their epoch or phase is over, or
 /// the epoch's key set is already adopted.
-pub fn pool_prune(chain_id: u64, executed: u64) {
-    let p = staking::params();
-    if p.epoch_blocks == 0 || p.dkg_phase_blocks == 0 {
-        return;
-    }
-    let next = executed + 1;
-    let epoch = epoch_of(next, p.epoch_blocks);
-    let phase = ((next - epoch_start(epoch, p.epoch_blocks)) / p.dkg_phase_blocks).min(3) as u8;
-    let pool = pool();
+pub fn pool_prune(executed: u64) {
+    let pool = entries();
     let before = pool.len();
     let kept: Vec<Vec<u8>> = pool
         .into_iter()
-        .filter(|raw| {
-            let Ok(env) = DkgEnvelope::from_bytes(raw) else { return false };
-            if env.epoch != epoch {
-                return env.epoch > epoch;
-            }
-            if env.kind == envelope::MESSAGE {
-                dkg_header(&env.body).is_some_and(|(at, _, index)| at >= phase && !staking::has_message(epoch, at, index))
-            } else {
-                staking::key_set(epoch).is_none() && signer(chain_id, &env).is_some_and(|id| !staking::has_vote(epoch, &id))
-            }
+        .filter(|e| {
+            let held: Hash = e[..32].try_into().expect("32 bytes");
+            DkgEnvelope::from_bytes(&e[32..]).is_ok_and(|env| wanted(&env, &held, executed))
         })
         .collect();
     if kept.len() != before {

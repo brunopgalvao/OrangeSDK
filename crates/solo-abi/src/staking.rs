@@ -42,7 +42,8 @@ pub const GWEI: u128 = 1_000_000_000;
 /// The fraction of an offender's stake that slashing burns, in basis points.
 pub const SLASH_BPS: u128 = 1_000;
 
-/// Most validators that can ever register; genesis validators count.
+/// Most validators registered at once; genesis validators count, and records
+/// that hold nothing are pruned at epoch ends.
 pub const MAX_REGISTERED: usize = 256;
 
 /// Most DKG envelopes one proposal carries; a proposal with more gets no votes.
@@ -422,7 +423,8 @@ pub fn dkg_header(message: &[u8]) -> Option<(u8, Hash, u32)> {
 /// A staking action (spec 15 §3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StakingAction {
-    /// Registers the sender's consensus key as a validator, or replaces its
+    /// Registers the sender's consensus key as a validator, bonding the
+    /// transaction's value (at least the minimum stake), or replaces its
     /// DKG encryption key.
     Register {
         /// Compressed G1 encryption key, 48 bytes.
