@@ -8,5 +8,4 @@ rustflags = [
   "-C", "link-arg=--no-relax",
   "-C", "relocation-model=static",
   "-C", "code-model=medium",
-  "-C", "target-feature=-c",
 ]
