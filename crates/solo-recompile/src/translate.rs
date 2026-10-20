@@ -25,10 +25,17 @@ pub struct Options {
     pub debug_map: bool,
 }
 
+/// Default maximum heap: 1 GiB (spec 03 §8 rule 10). Kernels are recompiled
+/// with the defaults, and one Osaka transaction (2^24 gas, EIP-7825) can keep
+/// close to 200 MiB live in the EVM; the heaviest execution-spec state test
+/// needs 192 MiB (spec 07 §4.2). The heap grows only as `sbrk` asks, at
+/// 256 gas a page, so the bound costs nothing until it is used.
+pub const HEAP_MAX: u32 = 1 << 30;
+
 impl Default for Options {
     fn default() -> Self {
         Options {
-            heap_max: 16 << 20,
+            heap_max: HEAP_MAX,
             stack_size: 1 << 20,
             stack_top: 0xFFFF_0000,
             debug_map: false,
@@ -1601,7 +1608,7 @@ mod tests {
         assert_eq!(m.layout.ro_size, 0);
         assert_eq!(m.layout.rw_base, 0x1_1000);
         assert_eq!(m.layout.heap_base, 0x1_2000);
-        assert_eq!(m.layout.heap_max, 16 << 20);
+        assert_eq!(m.layout.heap_max, 1 << 30);
         assert_eq!(m.layout.stack_base, 0xFFEF_0000);
         assert_eq!(m.layout.stack_top, 0xFFFF_0000);
         // Data and bss with alignment padding between them.

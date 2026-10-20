@@ -235,7 +235,8 @@ mod tests {
         assert_eq!(input.rodata.bytes, b"hello, solo");
         assert_eq!(input.data.size, 0);
         assert_eq!(input.bss.address, 0x1_2000);
-        assert_eq!(input.bss.size, 24); // COUNTER plus the allocator state
+        // COUNTER plus the allocator state: two words and 28 free-list heads.
+        assert_eq!(input.bss.size, 8 + 16 + 28 * 8);
         assert!(
             input
                 .symbols
