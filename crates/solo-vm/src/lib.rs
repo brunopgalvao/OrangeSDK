@@ -10,9 +10,14 @@
 
 extern crate alloc;
 
+pub mod builder;
 pub mod gas;
+pub mod host;
+pub mod interp;
 pub mod isa;
 pub mod leb128;
+pub mod memory;
+pub mod module;
 pub mod status;
 
 /// Version of the VM specification this crate implements, as `(major, minor)`.
