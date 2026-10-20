@@ -527,8 +527,10 @@ dependencies = [
  "blake2",
  "k256",
  "p256",
+ "proptest",
  "sha2",
  "solo-recompile",
+ "solo-trie",
  "solo-vm",
  "tiny-keccak",
 ]
@@ -542,6 +544,7 @@ dependencies = [
  "solo-host",
  "solo-recompile",
  "solo-rlp",
+ "solo-trie",
  "solo-vm",
 ]
 
@@ -572,6 +575,14 @@ dependencies = [
  "solo-node",
  "solo-recompile",
  "solo-rlp",
+]
+
+[[package]]
+name = "solo-trie"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+ "tiny-keccak",
 ]
 
 [[package]]
