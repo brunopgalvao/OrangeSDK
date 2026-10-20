@@ -1831,6 +1831,54 @@ mod tests {
             recompile(&input(&words, vec![], vec![]), &Options::default()),
             Err(RecompileError::UnpairedAuipc { address: TEXT + 4 })
         );
+        // So is one whose register feeds anything but an addi.
+        let words = [auipc(10, 0), enc_r(0x33, 0, 0, 11, 10, 10), RET];
+        assert_eq!(
+            recompile(&input(&words, vec![], vec![]), &Options::default()),
+            Err(RecompileError::UnpairedAuipc { address: TEXT })
+        );
+        // Two addis must agree on the low part.
+        let words = [auipc(10, 0), addi(11, 10, 8), addi(12, 10, 12), RET];
+        assert_eq!(
+            recompile(&input(&words, vec![], vec![]), &Options::default()),
+            Err(RecompileError::UnpairedAuipc { address: TEXT })
+        );
+        // The scan stops after the window even without a branch or an overwrite: the
+        // agreeing addis inside it pair the auipc, so the module builds.
+        let mut words = vec![auipc(10, 0), addi(11, 10, 8), addi(12, 10, 8)];
+        words.extend([addi(0, 0, 0); LOCAL_PAIR_WINDOW]);
+        words.push(RET);
+        assert!(recompile(&input(&words, vec![], vec![]), &Options::default()).is_ok());
+    }
+
+    #[test]
+    fn register_use_of_every_instruction_kind() {
+        // The straight-line scan behind relocation-less pairs needs, for every instruction,
+        // the register it writes, the registers it reads, and whether it ends the run. Pinned
+        // here rather than left to whatever patterns the guest fixtures happen to contain.
+        let x = |i| Some(r(i));
+        let cases = [
+            (lui(5, 0x1000), (x(5), [None, None], false)),
+            (auipc(5, 0x1000), (x(5), [None, None], false)),
+            (jal(1, 8), (x(1), [None, None], true)),
+            (jalr(1, 6, 0), (x(1), [x(6), None], true)),
+            (enc_b(0, 6, 7, 8), (None, [x(6), x(7)], true)),
+            (enc_i(0x03, 3, 5, 6, 0), (x(5), [x(6), None], false)),
+            (addi(5, 6, 1), (x(5), [x(6), None], false)),
+            (amo(0b00010, 3, 5, 6, 0), (x(5), [x(6), None], false)),
+            (enc_s(0x23, 3, 6, 7, 0), (None, [x(6), x(7)], false)),
+            (enc_r(0x33, 0, 0, 5, 6, 7), (x(5), [x(6), x(7)], false)),
+            (amo(0b00011, 3, 5, 6, 7), (x(5), [x(6), x(7)], false)),
+            (amo(0b00000, 3, 5, 6, 7), (x(5), [x(6), x(7)], false)),
+            (FENCE, (None, [None, None], false)),
+            (ECALL, (None, [None, None], true)),
+            (EBREAK, (None, [None, None], true)),
+            (UNIMP, (None, [None, None], true)),
+        ];
+        for (word, expected) in cases {
+            let rv = crate::riscv::decode(word).unwrap();
+            assert_eq!(registers(&rv), expected, "{word:#010x}");
+        }
     }
 
     #[test]

@@ -18,8 +18,8 @@ const HELLO: &str = concat!(
     "/../solo-recompile/tests/fixtures/hello.elf"
 );
 
-/// A kernel gas budget that lets the driver start (about 50k) but not produce a block
-/// (about 120k) with the pinned kernel fixture; rebuilding the fixture may move both numbers.
+/// A kernel gas budget that lets the driver start (about 53k) but not produce a block
+/// (about 178k) with the pinned kernel fixture; rebuilding the fixture may move both numbers.
 const STARVED_GAS: &str = "80000";
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4,
@@ -537,6 +537,10 @@ fn node_command_runs_a_multi_validator_chain() {
         ),
     );
     let ports = free_ports(5);
+    // Recompile once for all five nodes: five debug recompiles at once would start the
+    // validators minutes apart on a loaded machine.
+    let kernel = scratch("multi-kernel.solo");
+    std::fs::write(&kernel, load_kernel(KERNEL).unwrap()).unwrap();
     // Every node runs until all five have three blocks, so none strands the others by leaving.
     let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>> = std::sync::Arc::new(
         (0..5)
@@ -548,7 +552,7 @@ fn node_command_runs_a_multi_validator_chain() {
         let mut list: Vec<String> = vec![
             "node".into(),
             "--kernel".into(),
-            KERNEL.into(),
+            kernel.clone(),
             "--genesis".into(),
             genesis.clone(),
             "--listen".into(),
@@ -568,8 +572,9 @@ fn node_command_runs_a_multi_validator_chain() {
         let counts = std::sync::Arc::clone(&counts);
         threads.push(std::thread::spawn(move || {
             use std::sync::atomic::Ordering::SeqCst;
-            // Generous: an instrumented build under a parallel test load is slow.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+            // Generous: an instrumented build under a parallel test load is slow. The
+            // assertion below fails the test if the deadline is what ended the loop.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_mins(3);
             run_until(&argv, |rpc| {
                 counts[i].store(rpc.node().executed.len(), SeqCst);
                 let all = counts.iter().all(|c| c.load(SeqCst) >= 3);

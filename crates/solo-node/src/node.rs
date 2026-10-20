@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
 
-use solo_abi::chain::{BlockHeader, CallRequest, CallResult as CallOutcome, StorageQuery};
+use solo_abi::chain::{
+    BlockHeader, CallRequest, CallResult as CallOutcome, Evidence, StorageQuery,
+};
 use solo_abi::codec::Seq;
 use solo_abi::types::{
     self, Block, Effect, ExecContext, ExecuteArgs, ExecuteResult, FinalizeArgs, Genesis, Input,
@@ -721,6 +723,26 @@ impl Node {
     pub fn call(&mut self, request: &CallRequest) -> Result<CallOutcome, NodeError> {
         self.query_decoded(solo_abi::chain::query::CALL, &request.to_bytes())?
             .ok_or(NodeError::Decode(solo_abi::chain::query::CALL))
+    }
+
+    /// Equivocation evidence recorded in chain state, from index `first`, at
+    /// most [`EVIDENCE_PAGE`](solo_abi::chain::consensus::EVIDENCE_PAGE)
+    /// records; empty if the kernel does not serve the query.
+    ///
+    /// # Errors
+    /// See [`NodeError`].
+    pub fn evidence(&mut self, first: u64) -> Result<Vec<Evidence>, NodeError> {
+        let r = self.query(solo_abi::chain::query::EVIDENCE, &first.to_bytes())?;
+        Ok(Seq::<Evidence>::from_bytes(&r.body).unwrap_or_default().0)
+    }
+
+    /// The driver state as last persisted, decoded; `None` before the first
+    /// step or for a kernel whose driver state is not the reference driver's.
+    #[must_use]
+    pub fn simplex_state(&self) -> Option<solo_abi::chain::SimplexState> {
+        self.persisted_driver_state
+            .as_deref()
+            .and_then(|b| solo_abi::chain::SimplexState::from_bytes(b).ok())
     }
 
     /// Last finalized height.

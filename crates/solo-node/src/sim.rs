@@ -142,16 +142,44 @@ impl Sim {
         kernel: &[u8],
         genesis: &Genesis,
     ) -> Result<(), NodeError> {
+        self.restart(index, kernel, genesis, true)
+    }
+
+    /// Restarts a crashed node with the same key but nothing it persisted,
+    /// like a validator reinstalled from scratch: it starts in view 1 at genesis.
+    ///
+    /// # Errors
+    /// Whatever reopening the node reports.
+    pub fn revive_from_scratch(
+        &mut self,
+        index: usize,
+        kernel: &[u8],
+        genesis: &Genesis,
+    ) -> Result<(), NodeError> {
+        self.restart(index, kernel, genesis, false)
+    }
+
+    fn restart(
+        &mut self,
+        index: usize,
+        kernel: &[u8],
+        genesis: &Genesis,
+        keep: bool,
+    ) -> Result<(), NodeError> {
         let old = &self.nodes[index];
         let key = self.ids[index];
+        let (persisted, resumed) = if keep {
+            (old.persisted(), old.persisted_driver_state.clone())
+        } else {
+            (BTreeMap::new(), None)
+        };
         let config = NodeConfig {
             now_ms: self.now_ms,
             key: old.services_key(),
-            persisted: old.persisted(),
+            persisted,
             kernel_gas: old.kernel_gas,
             query_gas: old.query_gas,
         };
-        let resumed = old.persisted_driver_state.clone();
         self.nodes[index] = Self::open_started(kernel, genesis, config, resumed)?;
         self.ids[index] = key;
         self.alive[index] = true;

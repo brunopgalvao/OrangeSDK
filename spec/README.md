@@ -13,7 +13,7 @@ This directory is normative. An implementation that disagrees with it is wrong; 
 | 05 | [Host ABI](05-host-abi.md) — the frozen interface between host and kernel, and the sandboxed subset for contracts | draft |
 | 06 | [Driver interface](06-driver-interface.md) — inputs and effects of the consensus state machine | draft |
 | 07 | [Conformance](07-conformance.md) — test vectors, differential oracles, coverage requirements | draft |
-| 08 | [Simplex driver](08-simplex-driver.md) — the reference kernel's consensus: views, votes, certificates, persistence | draft |
+| 08 | [Simplex driver](08-simplex-driver.md) — the reference kernel's consensus: views, votes, view synchronization, certificates, equivocation evidence, persistence | draft |
 | 09 | [Peer-to-peer transport](09-p2p.md) — TCP framing, handshake, mapping between frames and driver inputs and effects | draft |
 | 10 | [State commitment](10-state-commitment.md) — the binary Merkle trie behind `storage_commit`, its proofs and their verification | draft |
 

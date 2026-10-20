@@ -3,7 +3,8 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use solo_abi::chain::{Account, BLOCK_GAS_LIMIT, BlockHeader, CallRequest, CallResult, Receipt, StorageQuery, call_status, query, reason};
+use solo_abi::chain::consensus::{MAX_EVIDENCE, signing_preimage};
+use solo_abi::chain::{Account, BLOCK_GAS_LIMIT, BlockHeader, CallRequest, CallResult, Evidence, Participation, Receipt, StorageQuery, call_status, query, reason};
 use solo_abi::codec::Seq;
 use solo_abi::types::{Address, Block, BuildArgs, ExecuteArgs, ExecuteResult, ExecuteSummary, FinalizeArgs, Hash, QueryArgs, QueryResult, ValidateArgs, ValidateResult};
 use solo_abi::{Decode, Encode};
@@ -11,7 +12,7 @@ use solo_eth::MAX_TX_GAS;
 
 use crate::evm::{self, BASE_FEE, BlockFields, Message};
 use crate::state;
-use crate::tx::{Signed, decode_signed};
+use crate::tx::{self, Signed, decode_signed};
 
 /// The checks that do not depend on the sender's account.
 fn well_formed(s: &Signed) -> Result<(), u32> {
@@ -96,6 +97,35 @@ pub fn build(args: &BuildArgs) -> Block {
     Block { header: header.to_bytes(), txs: Seq(selected), participation: Vec::new() }
 }
 
+/// Whether both messages of `evidence` are signed by the validator it names.
+fn verified(evidence: &Evidence, validators: &[Hash], chain_id: u64) -> bool {
+    let Some(id) = validators.get(evidence.validator as usize) else { return false };
+    evidence.well_formed()
+        && [&evidence.first, &evidence.second].iter().all(|m| {
+            let msg = state::keccak256(&signing_preimage(evidence.kind, chain_id, evidence.view, &m.hash));
+            tx::recover_pubkey(&msg, &m.signature.0).is_some_and(|pubkey| state::keccak256(&pubkey) == *id)
+        })
+}
+
+/// Records the equivocation evidence a block carries (spec 08 §9): at most
+/// `MAX_EVIDENCE` records, each kept only if both signatures verify and the
+/// offence is new. Nothing here can make a block invalid.
+fn record_evidence(participation: &[u8]) {
+    let Ok(participation) = Participation::from_bytes(participation) else { return };
+    if participation.evidence.0.is_empty() {
+        return;
+    }
+    let validators = state::validators();
+    let chain_id = state::chain_id();
+    for evidence in participation.evidence.0.iter().take(MAX_EVIDENCE) {
+        if verified(evidence, &validators, chain_id) {
+            // The slashing hook: once validators stake, the offender's stake is
+            // cut here, in the same state transition that records the offence.
+            state::put_evidence(evidence);
+        }
+    }
+}
+
 fn failed(height: u64, index: u32, cumulative: u64) -> Receipt {
     Receipt { status: 0, height, index, cumulative_gas_used: cumulative, ..Receipt::default() }
 }
@@ -159,6 +189,7 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let template = BlockHeader::from_bytes(&args.block.header).unwrap_or_else(|_| solo_guest::trap());
     let height = template.height;
     let block = BlockFields { number: height, timestamp: template.timestamp_ms / 1000 };
+    record_evidence(&args.block.participation);
     let mut receipts = Vec::new();
     let mut tx_hashes = Vec::new();
     let mut cumulative = 0u64;
@@ -276,6 +307,10 @@ pub fn query(args: &QueryArgs) -> QueryResult {
         },
         query::CALL => match CallRequest::from_bytes(&args.params) {
             Ok(request) => found(Some(call(request))),
+            Err(_) => bad_params(),
+        },
+        query::EVIDENCE => match u64::from_bytes(&args.params) {
+            Ok(first) => found(Some(Seq(state::evidence_from(first)))),
             Err(_) => bad_params(),
         },
         _ => QueryResult { status: 3, body: Vec::new() },
