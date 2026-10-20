@@ -106,7 +106,7 @@ pub struct Executor<S: Storage> {
     pub(crate) state: Overlay<S>,
     pub(crate) frames: Vec<Frame>,
     pub(crate) logs: Vec<(u32, Vec<u8>)>,
-    pub(crate) metrics: Vec<(String, i64, u32)>,
+    pub(crate) metrics: Vec<(String, i64, u32, Capability)>,
     max_depth: usize,
     extension: Option<Box<dyn Extension<S>>>,
     last_position: Option<([u8; 32], u32, usize)>,
@@ -205,9 +205,15 @@ impl<S: Storage> Executor<S> {
         &self.logs
     }
 
-    /// Metrics emitted so far, as `(name, value, kind)`.
-    pub fn metrics(&self) -> &[(String, i64, u32)] {
+    /// Metrics emitted since the last [`Executor::take_metrics`], as
+    /// `(name, value, kind, capability of the emitting instance)`.
+    pub fn metrics(&self) -> &[(String, i64, u32, Capability)] {
         &self.metrics
+    }
+
+    /// The emitted metrics, drained, so a long-running host does not keep them.
+    pub fn take_metrics(&mut self) -> Vec<(String, i64, u32, Capability)> {
+        std::mem::take(&mut self.metrics)
     }
 
     /// Calls the `main` export of `code_hash`.
