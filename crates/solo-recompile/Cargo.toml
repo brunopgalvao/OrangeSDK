@@ -15,6 +15,7 @@ solo-vm = { path = "../solo-vm" }
 object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
 
 [dev-dependencies]
+tiny-keccak = { version = "2", features = ["keccak"] }
 
 [lints]
 workspace = true
