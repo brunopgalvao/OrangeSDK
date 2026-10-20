@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn context_helpers() {
         let mut regs = [0u64; 16];
-        regs[Reg::A0.index()] = 0x1_0000_0000 | 42;
+        regs[Reg::A0.index()] = 0x1_0000_002A;
         let rodata = [0u8; 16];
         let mut mem = Memory::new(small_layout(), &rodata, &[0; 8]);
         let mut gas: i64 = 100;
@@ -114,7 +114,7 @@ mod tests {
             memory: &mut mem,
             gas: &mut gas,
         };
-        assert_eq!(ctx.arg(Reg::A0), 0x1_0000_0000 | 42);
+        assert_eq!(ctx.arg(Reg::A0), 0x1_0000_002A);
         assert_eq!(ctx.arg32(Reg::A0), 42);
         ctx.set(Reg::A1, 7);
         ctx.set(Reg::ZERO, 9);
@@ -143,7 +143,7 @@ mod tests {
             gas: &mut gas,
         };
         assert_eq!(h.call(0, &mut ctx), Err(Termination::HostError(u32::MAX)));
-        assert_eq!(alloc::format!("{:?}", NoHost), "NoHost");
+        assert_eq!(alloc::format!("{NoHost:?}"), "NoHost");
         assert_eq!(Capability::Sandboxed, Capability::Sandboxed);
     }
 }

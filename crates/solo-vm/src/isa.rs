@@ -218,6 +218,9 @@ pub enum LoadWidth {
 }
 
 impl LoadWidth {
+    /// Every load width, for exhaustive tests.
+    #[cfg(test)]
+    pub(crate) const ALL_FOR_TEST: [LoadWidth; 7] = Self::ALL;
     const ALL: [LoadWidth; 7] = [
         LoadWidth::B,
         LoadWidth::Bu,
@@ -265,6 +268,9 @@ pub enum StoreWidth {
 }
 
 impl StoreWidth {
+    /// Every store width, for exhaustive tests.
+    #[cfg(test)]
+    pub(crate) const ALL_FOR_TEST: [StoreWidth; 4] = Self::ALL;
     const ALL: [StoreWidth; 4] = [StoreWidth::B, StoreWidth::H, StoreWidth::W, StoreWidth::D];
 
     /// The opcode byte (spec 02 §8).
