@@ -13,9 +13,13 @@ solo-vm = { path = "../solo-vm" }
 libc = "0.2"
 
 [dev-dependencies]
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
+solo-abi = { path = "../solo-abi" }
+solo-host = { path = "../solo-host" }
+solo-node = { path = "../solo-node" }
 solo-recompile = { path = "../solo-recompile" }
-tiny-keccak = { version = "2", features = ["keccak"] }
+solo-rlp = { path = "../solo-rlp" }
 
 [lints]
 workspace = true

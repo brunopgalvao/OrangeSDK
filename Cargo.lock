@@ -528,6 +528,7 @@ dependencies = [
  "k256",
  "p256",
  "sha2",
+ "solo-jit",
  "solo-recompile",
  "solo-vm",
  "tiny-keccak",
@@ -537,11 +538,15 @@ dependencies = [
 name = "solo-jit"
 version = "0.0.1"
 dependencies = [
+ "k256",
  "libc",
  "proptest",
+ "solo-abi",
+ "solo-host",
+ "solo-node",
  "solo-recompile",
+ "solo-rlp",
  "solo-vm",
- "tiny-keccak",
 ]
 
 [[package]]

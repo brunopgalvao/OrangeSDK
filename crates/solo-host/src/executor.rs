@@ -1,7 +1,9 @@
 //! Call frames and nested invoke (spec 05 §4.4).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use solo_jit::Compiled;
 use solo_vm::host::{Capability, Host, HostContext};
 use solo_vm::interp::{Instance, InstanceError};
 use solo_vm::module::Program;
@@ -110,6 +112,20 @@ pub struct Executor<S: Storage> {
     max_depth: usize,
     extension: Option<Box<dyn Extension<S>>>,
     last_position: Option<([u8; 32], u32, usize)>,
+    backend: Backend,
+    native: HashMap<[u8; 32], Arc<Compiled>>,
+}
+
+/// Which backend runs instances. Results are identical (spec 07 §4); only
+/// speed differs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Backend {
+    /// The reference interpreter.
+    #[default]
+    Interpreter,
+    /// Native code from `solo-jit`, compiled once per code hash. Falls back
+    /// to the interpreter on targets without a native backend.
+    Native,
 }
 
 /// Default nesting limit (spec 05 §4.4).
@@ -127,6 +143,8 @@ impl<S: Storage> Executor<S> {
             max_depth: MAX_DEPTH,
             extension: None,
             last_position: None,
+            backend: Backend::Interpreter,
+            native: HashMap::new(),
         }
     }
 
@@ -178,6 +196,22 @@ impl<S: Storage> Executor<S> {
             self.cache.insert_program(hash, program);
         }
         Ok(hash)
+    }
+
+    /// Chooses the backend for every later call.
+    pub fn set_backend(&mut self, backend: Backend) {
+        self.backend = backend;
+    }
+
+    /// Native code for a cached program, compiled on first use; `None` where
+    /// the target has no native backend.
+    fn native_code(&mut self, hash: &[u8; 32], program: &Program) -> Option<Arc<Compiled>> {
+        if let Some(code) = self.native.get(hash) {
+            return Some(Arc::clone(code));
+        }
+        let code = Arc::new(Compiled::new(program).ok()?);
+        self.native.insert(*hash, Arc::clone(&code));
+        Some(code)
     }
 
     /// Lowers the nesting limit; for tests and constrained hosts.
@@ -269,12 +303,21 @@ impl<S: Storage> Executor<S> {
             iterators: Vec::new(),
         });
         self.state.push();
-        let started = Instance::new(&program, self, capability, export, &[], gas_limit);
+        let native = match self.backend {
+            Backend::Native => self.native_code(code_hash, &program),
+            Backend::Interpreter => None,
+        };
+        // Both backends report (status, gas left, position); spec 07 §4
+        // holds them to identical values.
+        let started = match &native {
+            Some(code) => solo_jit::Instance::new(code, self, capability, export, &[], gas_limit)
+                .map(|mut i| (i.run(self), i.gas(), i.position())),
+            None => Instance::new(&program, self, capability, export, &[], gas_limit)
+                .map(|mut i| (i.run(self), i.gas(), i.position())),
+        };
         let (status, gas_used, ran) = match started {
-            Ok(mut instance) => {
-                let status = instance.run(self);
-                let used = gas_limit - instance.gas().max(0);
-                let (block, index) = instance.position();
+            Ok((status, gas, (block, index))) => {
+                let used = gas_limit - gas.max(0);
                 self.last_position = Some((*code_hash, block, index));
                 (status, u64::try_from(used).unwrap_or(0), true)
             }

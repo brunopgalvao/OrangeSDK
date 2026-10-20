@@ -41,10 +41,21 @@ cargo test --workspace                    # includes running the recompiled gues
 cargo llvm-cov --workspace --fail-under-lines 100
 ```
 
+## Native backend
+
+`solo-jit` translates a validated program to native code once and runs it in-process. It is bit-exact with the reference interpreter, which stays the oracle: same registers, memory, gas (including the exact out-of-gas point), termination status and program position. Host calls, `sbrk`, `memcopy` and `memfill` return to Rust and are performed exactly as the interpreter performs them, so a host implements the same `Host` trait for both. The executor picks a backend with `Executor::set_backend(Backend::Native)`; on targets without a backend it falls back to the interpreter.
+
+Every change runs the differential suite of spec 07 §4.1: generated modules, per-instruction edge tables, the `hello` guest and the kernel's entrypoints, each on both backends. Timings, in release mode:
+
+```sh
+cargo test --release -p solo-jit --test bench --test guests -- --ignored --nocapture
+```
+
 ## Layout
 
 - `spec/` — normative specification (machine model, instruction set, module format, gas, host ABI, driver interface, conformance).
 - `crates/solo-vm` — reference interpreter, `no_std`-capable, the oracle for every other backend.
+- `crates/solo-jit` — the native backend: compiles a program ahead of time to AArch64 (Apple silicon) or x86-64 (Unix) machine code and runs it with the interpreter's interface and results.
 - `crates/solo-recompile` — turns a linked RV64 ELF into a Solo module.
 - `crates/solo-host` — module cache, storage overlays, the host ABI and the executor that runs modules.
 - `crates/solo-abi` — the canonical codec and the types shared by host and kernel (spec 06 and the reference chain records).

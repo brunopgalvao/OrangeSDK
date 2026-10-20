@@ -1046,3 +1046,47 @@ fn extensions_serve_high_handles() {
     );
     assert_eq!(exec.cache_mut().cost_table(), CostTable::V1);
 }
+
+#[test]
+fn native_backend_matches_the_interpreter() {
+    use crate::executor::Backend;
+    let elf = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../solo-recompile/tests/fixtures/hello.elf"
+    ))
+    .unwrap();
+    let input = solo_recompile::Input::load(&elf).unwrap();
+    let hello = solo_recompile::recompile(&input, &solo_recompile::Options::default()).unwrap();
+    let callee = callee();
+    let key = crate::storage::namespaced(&[0xCC; 32], b"c");
+    let run_all = |backend: Backend| {
+        let mut exec = executor();
+        exec.set_backend(backend);
+        let callee_hash = load(&mut exec, &callee, Capability::Sandboxed);
+        let mut ro = callee_hash.to_vec();
+        ro.extend_from_slice(&[0xCC; 32]);
+        ro.extend_from_slice(&[0x42, 0xFF]);
+        let mut results = vec![run(&mut exec, &hello, b"", 1_000_000)];
+        let mut positions = vec![exec.last_position()];
+        // A nested call that commits, one whose callee traps, and a run out of gas.
+        for (code, gas) in [
+            (module(&imports(), &caller(50_000, 0, 64), &ro), 200_000),
+            (module(&imports(), &caller(50_000, 0, 65), &ro), 200_000),
+            (hello.clone(), 50),
+        ] {
+            results.push(run(&mut exec, &code, b"", gas));
+            positions.push(exec.last_position());
+        }
+        (
+            results,
+            positions,
+            exec.state().get(&key),
+            exec.logs().to_vec(),
+        )
+    };
+    let interpreted = run_all(Backend::Interpreter);
+    assert_eq!(interpreted.0[0].status, Termination::Halt);
+    assert_eq!(interpreted.0[3].status, Termination::OutOfGas);
+    assert_eq!(run_all(Backend::Native), interpreted);
+    assert_eq!(Backend::default(), Backend::Interpreter);
+}
