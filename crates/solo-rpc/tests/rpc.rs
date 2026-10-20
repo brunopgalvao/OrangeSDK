@@ -63,13 +63,32 @@ fn encodings() {
     assert_eq!(reason_text(reason::MALFORMED), "malformed transaction");
     assert_eq!(reason_text(reason::BAD_SIGNATURE), "invalid signature");
     assert_eq!(reason_text(reason::WRONG_CHAIN), "wrong chain id");
-    assert_eq!(reason_text(reason::BAD_NONCE), "nonce too low or too high");
+    assert_eq!(
+        reason_text(reason::BAD_NONCE),
+        "nonce too low, too high or at its maximum"
+    );
     assert_eq!(
         reason_text(reason::INSUFFICIENT_FUNDS),
         "insufficient funds for value and gas"
     );
     assert_eq!(reason_text(reason::GAS_TOO_LOW), "intrinsic gas too low");
-    assert!(reason_text(reason::UNSUPPORTED).contains("not supported"));
+    assert_eq!(
+        reason_text(reason::UNSUPPORTED),
+        "transaction type not supported"
+    );
+    assert_eq!(
+        reason_text(reason::FEE_TOO_LOW),
+        "max fee per gas below the base fee or the priority fee"
+    );
+    assert_eq!(
+        reason_text(reason::GAS_LIMIT_TOO_HIGH),
+        "gas limit above the transaction or block cap"
+    );
+    assert_eq!(
+        reason_text(reason::INITCODE_TOO_LARGE),
+        "max initcode size exceeded"
+    );
+    assert_eq!(reason_text(reason::SENDER_NOT_EOA), "sender not an eoa");
     assert_eq!(reason_text(99), "rejected");
     assert_eq!(legacy_fields(b"garbage"), Legacy::default());
     assert_eq!(legacy_fields(&[0xC0]), Legacy::default());
@@ -330,7 +349,10 @@ fn rejections_carry_reasons() {
             "intrinsic gas",
         ),
         // A first byte below 0x80 is a typed envelope; 'g' is no type the kernel executes.
-        (b"garbage".to_vec(), "not supported"),
+        (
+            b"garbage".to_vec(),
+            "transaction rejected: transaction type not supported",
+        ),
         (vec![0xC0], "malformed"),
     ];
     for (raw, text) in cases {
