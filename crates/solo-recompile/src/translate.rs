@@ -1834,6 +1834,46 @@ mod tests {
     }
 
     #[test]
+    fn local_pair_scan_reads_every_instruction_kind() {
+        // After a relocation-less `auipc a0`, the scan passes a lui, a store, an ALU
+        // op, an atomic, a store-conditional and a fence that leave a0 alone, takes the
+        // two addis that read it with the same offset, and stops at the jump: a1 and a2
+        // become code pointers to the `ret` at 40.
+        let words = [
+            auipc(10, 0),
+            lui(16, 1),
+            enc_s(0x23, 2, 12, 11, 0),
+            enc_r(0x33, 0, 0, 13, 14, 15),
+            amo(0, 2, 13, 14, 15),
+            amo(3, 2, 13, 14, 15),
+            FENCE,
+            addi(11, 10, 40),
+            addi(12, 10, 40),
+            jal(0, 4),
+            RET,
+        ];
+        let m = module_of(&input(&words, vec![], vec![]));
+        assert_eq!(m.jump_table, vec![None, Some(1)]);
+        assert_eq!(
+            m.blocks[0][0],
+            Instruction::Li {
+                rd: Reg::A0,
+                imm: 8 - 40
+            }
+        );
+        // A trap ends the straight-line run as a jump does.
+        let words = [auipc(10, 0), addi(11, 10, 12), UNIMP, RET];
+        let m = module_of(&input(&words, vec![], vec![]));
+        assert_eq!(m.jump_table, vec![None, Some(1)]);
+        // Any other read of a0 before it is overwritten leaves the auipc unpaired.
+        let words = [auipc(10, 0), enc_r(0x33, 0, 0, 11, 10, 10), RET];
+        assert_eq!(
+            recompile(&input(&words, vec![], vec![]), &Options::default()),
+            Err(RecompileError::UnpairedAuipc { address: TEXT })
+        );
+    }
+
+    #[test]
     fn debug_map_lists_block_addresses() {
         let words = [enc_b(0, 0, 0, 8), addi(10, 10, 1), RET];
         let inp = input(&words, vec![], vec![]);
