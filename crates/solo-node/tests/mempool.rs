@@ -11,7 +11,7 @@ use solo_abi::chain::{Allocation, BlockHeader, GenesisParams, reason};
 use solo_abi::codec::Seq;
 use solo_abi::types::{Block, Effect, Genesis, Input};
 use solo_host::hash::keccak256;
-use solo_node::{Node, NodeConfig, PoolError, PoolLimits, Sim, SubmitError};
+use solo_node::{MAX_TX_BYTES, Node, NodeConfig, PoolError, PoolLimits, Sim, SubmitError};
 use solo_recompile::{Input as Elf, Options, recompile};
 use solo_rlp::{encode_bytes, encode_list, encode_uint};
 
@@ -43,7 +43,12 @@ impl Wallet {
 
     /// An EIP-155 legacy transfer of `value` to [`BOB`] at `gas_price`.
     fn transfer(&self, nonce: u64, value: u128, gas_price: u128) -> Vec<u8> {
-        let fields = solo_eth::legacy_unsigned(nonce, gas_price, 21_000, Some(BOB), value, &[]);
+        self.call(nonce, value, gas_price, 21_000, &[])
+    }
+
+    /// An EIP-155 legacy call to [`BOB`] with a gas limit and data.
+    fn call(&self, nonce: u64, value: u128, gas_price: u128, gas: u64, data: &[u8]) -> Vec<u8> {
+        let fields = solo_eth::legacy_unsigned(nonce, gas_price, gas, Some(BOB), value, data);
         let mut unsigned = fields.clone();
         encode_uint(u128::from(CHAIN_ID), &mut unsigned);
         encode_uint(0, &mut unsigned);
@@ -59,8 +64,11 @@ impl Wallet {
             u128::from(CHAIN_ID * 2 + 35 + u64::from(id.to_byte())),
             &mut signed,
         );
-        encode_bytes(&sig.r().to_bytes(), &mut signed);
-        encode_bytes(&sig.s().to_bytes(), &mut signed);
+        // RLP integers carry no leading zeros.
+        for half in [sig.r().to_bytes(), sig.s().to_bytes()] {
+            let first = half.iter().position(|b| *b != 0).unwrap_or(half.len());
+            encode_bytes(&half[first..], &mut signed);
+        }
         let mut raw = Vec::new();
         encode_list(&signed, &mut raw);
         raw
@@ -254,6 +262,49 @@ fn limits_evict_queued_transactions() {
 }
 
 #[test]
+fn a_transaction_no_block_can_carry_is_refused() {
+    // Larger than the per-transaction cap, it would sit pending for ever:
+    // no take could return it, and no block would spend its sender's funds.
+    let alice = Wallet::new(1);
+    let mut node = node(&[(&alice, 10 * ETHER)]);
+    let big = alice.call(0, 0, GWEI, 16_000_000, &vec![0; MAX_TX_BYTES]);
+    assert!(big.len() > MAX_TX_BYTES);
+    assert_eq!(
+        node.submit(&big),
+        Err(SubmitError::Pool(PoolError::Oversized))
+    );
+    assert!(node.mempool().is_empty());
+    assert!(node.take_tx_gossip().is_empty());
+}
+
+#[test]
+fn replacements_and_gap_fills_keep_the_pending_run_funded() {
+    let alice = Wallet::new(1);
+    let mut node = node(&[(&alice, 10 * ETHER)]);
+    let run: Vec<Vec<u8>> = (0..4).map(|n| alice.transfer(n, ETHER, GWEI)).collect();
+    for raw in &run {
+        node.submit(raw).unwrap();
+    }
+    // Alone the 9 ETH replacement is funded; with nonces 1 to 3 behind it,
+    // it is not (geth's overdraft check).
+    assert_eq!(
+        node.submit(&alice.transfer(0, 9 * ETHER, 2 * GWEI)),
+        Err(SubmitError::Pool(PoolError::Overdraft))
+    );
+    node.submit(&alice.transfer(0, ETHER, 2 * GWEI)).unwrap();
+    assert_eq!(node.mempool().status(), (4, 0));
+    // Nonce 5 is funded behind the run, and so is nonce 4 on its own; with
+    // both, the balance covers nonce 4 only, and nonce 5 goes.
+    let left = 10 * ETHER - 4 * cost(ETHER, GWEI) - 21_000 * GWEI;
+    let five = alice.transfer(5, left - cost(0, GWEI), GWEI);
+    node.submit(&five).unwrap();
+    assert_eq!(node.mempool().status(), (4, 1));
+    node.submit(&alice.transfer(4, 1, GWEI)).unwrap();
+    assert!(node.mempool().get(&keccak256(&five)).is_none());
+    assert_eq!(node.mempool().status(), (5, 0));
+}
+
+#[test]
 fn a_foreign_block_resets_the_pool() {
     let alice = Wallet::new(1);
     let mut node = node(&[(&alice, 10 * ETHER)]);
@@ -301,6 +352,70 @@ fn a_foreign_block_resets_the_pool() {
     assert_eq!(node.pending_nonce(&alice.address).unwrap(), 4);
 }
 
+/// A three-validator network over `latency_ms` where each wallet holds 100
+/// ETH and a block holds up to 64 transactions.
+fn network(wallets: &[Wallet], latency_ms: u64) -> Sim {
+    let keys: Vec<SigningKey> = (1..=3)
+        .map(|i| SigningKey::from_slice(&[0x10 + i; 32]).unwrap())
+        .collect();
+    let params = GenesisParams {
+        slot_ms: SLOT_MS,
+        max_txs: 64,
+        allocations: Seq(wallets
+            .iter()
+            .map(|w| Allocation {
+                address: w.address,
+                balance: 100 * ETHER,
+                ..Allocation::default()
+            })
+            .collect()),
+    };
+    let genesis = Genesis {
+        chain_id: CHAIN_ID,
+        fee_schedule: vec![],
+        modules: Seq(vec![]),
+        params: params.to_bytes(),
+        validators: Sim::validator_set(&keys).to_bytes(),
+    };
+    let config = NodeConfig {
+        now_ms: START_MS,
+        ..NodeConfig::default()
+    };
+    Sim::new(kernel_module(), &genesis, &keys, 0, &config, latency_ms).unwrap()
+}
+
+#[test]
+fn a_block_on_an_unexecuted_parent_takes_new_transactions() {
+    // Blocks execute on finalization, so with real latency a leader builds on
+    // a parent it has not executed and its pool still holds the parent's
+    // transactions. Ten of these fill a block's gas; if the take handed the
+    // parent's ones out again, every other block would be empty.
+    let wallets: Vec<Wallet> = (1..=4).map(Wallet::new).collect();
+    let mut sim = network(&wallets, 150);
+    let txs: Vec<Vec<u8>> = wallets
+        .iter()
+        .flat_map(|w| (0..10).map(move |n| w.call(n, 1, GWEI, 3_000_000, &[])))
+        .collect();
+    for raw in &txs {
+        sim.submit(0, raw).unwrap();
+    }
+    let hashes: Vec<[u8; 32]> = txs.iter().map(|raw| keccak256(raw)).collect();
+    let landed = sim
+        .run_until(60 * SLOT_MS, |s| {
+            hashes
+                .iter()
+                .all(|hash| s.nodes[0].receipt(hash).unwrap().is_some())
+        })
+        .unwrap();
+    assert!(landed, "{:?}", sim.finalized_heights().unwrap());
+    let node = &mut sim.nodes[0];
+    let head = node.block_number().unwrap();
+    let counts: Vec<usize> = (1..=head).map(|h| tx_hashes(node, h).len()).collect();
+    let first = counts.iter().position(|&n| n > 0).unwrap();
+    let last = counts.iter().rposition(|&n| n > 0).unwrap();
+    assert_eq!(counts[first..=last], [10, 10, 10, 10], "{counts:?}");
+}
+
 #[test]
 fn nonces_sent_backwards_reach_every_validator_and_land() {
     let keys: Vec<SigningKey> = (1..=3)
@@ -330,9 +445,13 @@ fn nonces_sent_backwards_reach_every_validator_and_land() {
     let mut sim = Sim::new(kernel_module(), &genesis, &keys, 0, &config, 25).unwrap();
     let txs: Vec<Vec<u8>> = (0..3).map(|n| alice.transfer(n, ETHER, GWEI)).collect();
     // Only the submitting node holds the gapped ones until nonce 0 arrives.
-    for raw in txs.iter().rev() {
+    for raw in txs[1..].iter().rev() {
         sim.submit(2, raw).unwrap();
     }
+    sim.advance(10 * 25).unwrap();
+    assert_eq!(sim.nodes[2].mempool().status(), (0, 2));
+    assert!(sim.nodes[0].mempool().is_empty() && sim.nodes[1].mempool().is_empty());
+    sim.submit(2, &txs[0]).unwrap();
     let hashes: Vec<[u8; 32]> = txs.iter().map(|raw| keccak256(raw)).collect();
     let landed = sim
         .run_until(20 * SLOT_MS, |s| {

@@ -10,7 +10,7 @@
 //! and tells the pool.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fmt;
 
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
@@ -29,6 +29,10 @@ pub const MAX_QUEUED: usize = 1024;
 pub const PER_SENDER: usize = 256;
 /// Most bytes of raw transactions the pool holds ([`PoolLimits::max_bytes`]).
 pub const MAX_BYTES: usize = 64 << 20;
+/// Most bytes of one raw transaction ([`PoolLimits::max_tx_bytes`]): geth's
+/// `txMaxSize`, well under the reference driver's take of 1 MiB, so that
+/// every pending transaction fits a block.
+pub const MAX_TX_BYTES: usize = 128 << 10;
 /// The least increase, in percent, of both fee fields that lets a transaction
 /// replace one with the same sender and nonce: geth's default price bump.
 pub const PRICE_BUMP: u128 = 10;
@@ -44,6 +48,8 @@ pub struct PoolLimits {
     pub per_sender: usize,
     /// Most bytes of raw transactions in all.
     pub max_bytes: usize,
+    /// Most bytes of one raw transaction.
+    pub max_tx_bytes: usize,
 }
 
 impl Default for PoolLimits {
@@ -53,6 +59,7 @@ impl Default for PoolLimits {
             max_queued: MAX_QUEUED,
             per_sender: PER_SENDER,
             max_bytes: MAX_BYTES,
+            max_tx_bytes: MAX_TX_BYTES,
         }
     }
 }
@@ -66,6 +73,11 @@ pub enum PoolError {
     Underpriced,
     /// The pool is at a limit and nothing cheaper can make room.
     Full,
+    /// The raw transaction is longer than [`PoolLimits::max_tx_bytes`].
+    Oversized,
+    /// A replacement whose cost, with the sender's other pending
+    /// transactions, exceeds the sender's balance.
+    Overdraft,
 }
 
 impl fmt::Display for PoolError {
@@ -73,6 +85,8 @@ impl fmt::Display for PoolError {
         f.write_str(match self {
             PoolError::Underpriced => "replacement transaction underpriced",
             PoolError::Full => "txpool is full",
+            PoolError::Oversized => "oversized data",
+            PoolError::Overdraft => "insufficient funds for gas * price + value",
         })
     }
 }
@@ -165,6 +179,9 @@ pub struct Inserted {
     pub replaced: Option<[u8; 32]>,
     /// Queued transactions evicted to make room.
     pub evicted: Vec<[u8; 32]>,
+    /// The sender's transaction dropped because the newcomer, filling a gap,
+    /// made it pending without the balance to cover it.
+    pub unfunded: Option<[u8; 32]>,
 }
 
 /// One sender's transactions, by nonce, and its account as of the last block.
@@ -192,6 +209,23 @@ impl Queue {
 
     fn is_pending(&self, nonce: u64) -> bool {
         (self.account.nonce..self.pending_end()).contains(&nonce)
+    }
+
+    /// The pending transactions, in nonce order.
+    fn pending(&self) -> impl Iterator<Item = &PoolTx> {
+        self.txs
+            .range(self.account.nonce..self.pending_end())
+            .map(|(_, tx)| tx)
+    }
+
+    /// The first pending transaction whose cost, with those before it,
+    /// exceeds the balance.
+    fn first_unfunded(&self) -> Option<&PoolTx> {
+        let mut spent = 0u128;
+        self.pending().find(|tx| {
+            spent = spent.saturating_add(tx.cost);
+            spent > self.account.balance
+        })
     }
 }
 
@@ -302,35 +336,54 @@ impl Mempool {
         }
     }
 
-    /// Refuses a transaction that would replace one with the same sender and
-    /// nonce without the price bump.
+    /// The checks of a newcomer that need no kernel (spec 14 §2): its size,
+    /// and for a replacement the price bump and that the sender's pending
+    /// transactions stay funded with it in place of the one it replaces
+    /// (geth's overdraft check).
     ///
     /// # Errors
-    /// [`PoolError::Underpriced`].
-    pub fn check_replacement(&self, tx: &PoolTx) -> Result<(), PoolError> {
-        let old = self
-            .queues
-            .get(&tx.sender)
-            .and_then(|q| q.txs.get(&tx.nonce));
-        match old {
-            Some(old) if !tx.bumps(old) => Err(PoolError::Underpriced),
-            _ => Ok(()),
+    /// [`PoolError::Oversized`], [`PoolError::Underpriced`] or
+    /// [`PoolError::Overdraft`].
+    pub fn check(&self, tx: &PoolTx) -> Result<(), PoolError> {
+        if tx.raw.len() > self.limits.max_tx_bytes {
+            return Err(PoolError::Oversized);
         }
+        let Some(queue) = self.queues.get(&tx.sender) else {
+            return Ok(());
+        };
+        let Some(old) = queue.txs.get(&tx.nonce) else {
+            return Ok(());
+        };
+        if !tx.bumps(old) {
+            return Err(PoolError::Underpriced);
+        }
+        let others = queue
+            .pending()
+            .filter(|t| t.nonce != tx.nonce)
+            .fold(0u128, |sum, t| sum.saturating_add(t.cost));
+        let overdrawn = others.saturating_add(tx.cost) > queue.account.balance;
+        if queue.is_pending(tx.nonce) && overdrawn {
+            return Err(PoolError::Overdraft);
+        }
+        Ok(())
     }
 
     /// Adds a transaction the kernel accepted. `account` is its sender's
     /// account as the node read it, used when the pool holds nothing of that
     /// sender yet. A transaction already held changes nothing.
     ///
+    /// A newcomer that fills a gap makes the transactions behind it pending;
+    /// the first of them its sender's balance cannot cover, with those
+    /// before it, is dropped, and the rest are queued behind the new gap.
+    ///
     /// # Errors
-    /// [`PoolError::Underpriced`] for a replacement without the price bump;
-    /// [`PoolError::Full`] when a limit holds and no cheaper queued
-    /// transaction can be evicted to make room.
+    /// See [`Mempool::check`]; [`PoolError::Full`] when a limit holds and no
+    /// cheaper queued transaction can be evicted to make room.
     pub fn insert(&mut self, mut tx: PoolTx, account: Account) -> Result<Inserted, PoolError> {
         if self.index.contains_key(&tx.hash) {
             return Ok(Inserted::default());
         }
-        self.check_replacement(&tx)?;
+        self.check(&tx)?;
         let (sender, nonce, priority) = (tx.sender, tx.nonce, tx.priority);
         let held = self.queues.get(&sender).map(|q| &q.txs);
         let replacing = held.is_some_and(|txs| txs.contains_key(&nonce));
@@ -348,9 +401,11 @@ impl Mempool {
             for victim in &victims {
                 self.remove(victim);
             }
+            let unfunded = self.drop_unfunded_behind(&sender, nonce);
             return Ok(Inserted {
                 replaced: replaced.map(|old| old.hash),
                 evicted: victims,
+                unfunded,
             });
         }
         match replaced {
@@ -425,6 +480,16 @@ impl Mempool {
         (!over(count, bytes, queued)).then_some(victims)
     }
 
+    /// Drops `sender`'s first unfunded pending transaction if its nonce is
+    /// above `nonce`, the newcomer's.
+    fn drop_unfunded_behind(&mut self, sender: &Address, nonce: u64) -> Option<[u8; 32]> {
+        let behind = self.queues.get(sender)?.first_unfunded()?.nonce;
+        (behind > nonce)
+            .then(|| self.take_out(sender, behind))
+            .flatten()
+            .map(|tx| tx.hash)
+    }
+
     /// Removes a transaction by hash. Its sender's later transactions stay,
     /// queued behind the gap.
     pub fn remove(&mut self, hash: &[u8; 32]) -> Option<PoolTx> {
@@ -436,8 +501,10 @@ impl Mempool {
     /// drops the transactions whose nonce the account has passed, the first
     /// pending one whose cost, with those before it, exceeds the balance,
     /// and every queued one that alone exceeds it. A sender whose code hash
-    /// changed loses every transaction: the kernel accepted them for an
-    /// account that no longer exists. Returns the hashes dropped.
+    /// changed loses every transaction: the reference kernel's transactions
+    /// cannot set code at a sender's address (it decodes no EIP-7702
+    /// transaction), so the kernel accepted them for an account in a state
+    /// that cannot recur. Returns the hashes dropped.
     pub fn reset(&mut self, sender: &Address, account: Account) -> Vec<[u8; 32]> {
         let Some(queue) = self.queues.get_mut(sender) else {
             return Vec::new();
@@ -491,10 +558,14 @@ impl Mempool {
     /// `max_bytes` and `max_gas` (spec 14 §3): each sender's by nonce, the
     /// senders interleaved by priority, then arrival. A sender whose next
     /// transaction does not fit, or whose balance would not cover it after
-    /// the ones before it, contributes nothing more. The pool keeps what it
-    /// hands out until a block includes it.
+    /// the ones before it, contributes nothing more. A transaction in `skip`
+    /// counts as already taken: it is left out and uses none of the budget,
+    /// but its cost counts against its sender's balance and the sender's
+    /// later transactions may follow it. The pool keeps what it hands out
+    /// until a block includes it.
     #[must_use]
-    pub fn take(&self, max_bytes: usize, max_gas: u64) -> Vec<Vec<u8>> {
+    pub fn take(&self, max_bytes: usize, max_gas: u64, skip: &[[u8; 32]]) -> Vec<Vec<u8>> {
+        let skip: HashSet<&[u8; 32]> = skip.iter().collect();
         let runs: Vec<(Vec<&PoolTx>, u128)> = self
             .queues
             .values()
@@ -518,13 +589,21 @@ impl Mempool {
         while let Some((_, _, run, at)) = heap.pop() {
             let tx = runs[run].0[at];
             let cost = spent[run].saturating_add(tx.cost);
-            if bytes + tx.raw.len() > max_bytes || gas + tx.gas > max_gas || cost > runs[run].1 {
+            let skipped = skip.contains(&tx.hash);
+            let (len, used) = if skipped {
+                (0, 0)
+            } else {
+                (tx.raw.len(), tx.gas)
+            };
+            if bytes + len > max_bytes || gas + used > max_gas || cost > runs[run].1 {
                 continue;
             }
-            bytes += tx.raw.len();
-            gas += tx.gas;
+            bytes += len;
+            gas += used;
             spent[run] = cost;
-            taken.push(tx.raw.clone());
+            if !skipped {
+                taken.push(tx.raw.clone());
+            }
             push(&mut heap, run, at + 1);
         }
         taken

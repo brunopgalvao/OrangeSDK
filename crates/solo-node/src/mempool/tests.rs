@@ -70,9 +70,10 @@ fn defaults_and_texts() {
             limits.max_txs,
             limits.max_queued,
             limits.per_sender,
-            limits.max_bytes
+            limits.max_bytes,
+            limits.max_tx_bytes
         ),
-        (MAX_TXS, MAX_QUEUED, PER_SENDER, MAX_BYTES)
+        (MAX_TXS, MAX_QUEUED, PER_SENDER, MAX_BYTES, 131_072)
     );
     assert_eq!(Mempool::new(limits).limits, limits);
     assert_eq!(
@@ -80,6 +81,11 @@ fn defaults_and_texts() {
         "replacement transaction underpriced"
     );
     assert_eq!(PoolError::Full.to_string(), "txpool is full");
+    assert_eq!(PoolError::Oversized.to_string(), "oversized data");
+    assert_eq!(
+        PoolError::Overdraft.to_string(),
+        "insufficient funds for gas * price + value"
+    );
     let invalid = ValidateResult::Invalid { reason: 4 };
     assert_eq!(rejection(&invalid), 4);
     let valid = ValidateResult::Valid {
@@ -164,7 +170,7 @@ fn replacement_needs_a_ten_percent_bump_on_both_fees() {
     for (fee_cap, tip_cap) in [(109, 110), (110, 109), (300, 100)] {
         let mut new = tx(1, 0, fee_cap);
         new.tip_cap = tip_cap;
-        assert_eq!(pool.check_replacement(&new), Err(PoolError::Underpriced));
+        assert_eq!(pool.check(&new), Err(PoolError::Underpriced));
         assert_eq!(add(&mut pool, &new), Err(PoolError::Underpriced));
     }
     let new = tx(1, 0, 110);
@@ -284,13 +290,13 @@ fn take_orders_by_nonce_within_and_priority_across_senders() {
     for t in &txs {
         add(&mut pool, t).unwrap();
     }
-    let all = pool.take(usize::MAX, u64::MAX);
+    let all = pool.take(usize::MAX, u64::MAX, &[]);
     // Sender 3 is queued; 2 and 4 tie and go in arrival order; 1's second
     // transaction, the dearest, waits for its first, the cheapest.
     assert_eq!(nonces(&pool, &all), [(2, 0), (4, 0), (1, 0), (1, 1)]);
     assert_eq!(pool.len(), 5, "taking keeps them");
     // Gas: two transactions' worth.
-    let two = pool.take(usize::MAX, 2 * GAS);
+    let two = pool.take(usize::MAX, 2 * GAS, &[]);
     assert_eq!(nonces(&pool, &two), [(2, 0), (4, 0)]);
     // Bytes: a sender whose next transaction does not fit drops out, the
     // others continue.
@@ -300,10 +306,10 @@ fn take_orders_by_nonce_within_and_priority_across_senders() {
     add(&mut pool, &tx(2, 0, 1)).unwrap();
     add(&mut pool, &tx(2, 1, 1)).unwrap();
     assert_eq!(
-        nonces(&pool, &pool.take(2 * len, u64::MAX)),
+        nonces(&pool, &pool.take(2 * len, u64::MAX, &[])),
         [(2, 0), (2, 1)]
     );
-    assert!(pool.take(0, u64::MAX).is_empty());
+    assert!(pool.take(0, u64::MAX, &[]).is_empty());
 }
 
 #[test]
@@ -315,9 +321,90 @@ fn take_stops_a_sender_its_balance_cannot_cover() {
     pool.insert(tx(1, 1, 10), rich(0)).unwrap();
     pool.insert(tx(2, 0, 1), rich(0)).unwrap();
     assert_eq!(
-        nonces(&pool, &pool.take(usize::MAX, u64::MAX)),
+        nonces(&pool, &pool.take(usize::MAX, u64::MAX, &[])),
         [(1, 0), (2, 0)]
     );
+}
+
+#[test]
+fn take_skips_what_an_unexecuted_block_carries() {
+    let mut pool = Mempool::default();
+    let (a0, a1, b0) = (tx(1, 0, 30), tx(1, 1, 20), tx(2, 0, 10));
+    for t in [&a0, &a1, &b0] {
+        add(&mut pool, t).unwrap();
+    }
+    // One transaction's budget: without the skip it goes to a0 again.
+    assert_eq!(nonces(&pool, &pool.take(usize::MAX, GAS, &[])), [(1, 0)]);
+    assert_eq!(
+        nonces(&pool, &pool.take(usize::MAX, GAS, &[a0.hash])),
+        [(1, 1)]
+    );
+    assert_eq!(
+        nonces(&pool, &pool.take(usize::MAX, 2 * GAS, &[a0.hash, a1.hash])),
+        [(2, 0)]
+    );
+    // A skipped transaction still spends its sender's balance.
+    let mut pool = Mempool::default();
+    pool.insert(a0.clone(), funded(0, a0.cost + a1.cost - 1))
+        .unwrap();
+    pool.insert(a1.clone(), rich(0)).unwrap();
+    assert!(pool.take(usize::MAX, u64::MAX, &[a0.hash]).is_empty());
+}
+
+#[test]
+fn a_transaction_too_large_for_a_block_is_refused() {
+    let mut pool = Mempool::default();
+    let at_cap = sized(1, 0, 1, MAX_TX_BYTES);
+    assert_eq!(add(&mut pool, &at_cap).map(|i| i.replaced), Ok(None));
+    let over = sized(1, 1, 1, MAX_TX_BYTES + 1);
+    assert_eq!(pool.check(&over), Err(PoolError::Oversized));
+    assert_eq!(add(&mut pool, &over), Err(PoolError::Oversized));
+    assert_eq!(pool.len(), 1);
+}
+
+#[test]
+fn a_replacement_must_leave_the_pending_run_funded() {
+    let mut pool = Mempool::default();
+    let unit = tx(1, 0, 10).cost;
+    let account = funded(0, 3 * unit);
+    let run: Vec<PoolTx> = (0..3).map(|n| tx(1, n, 10)).collect();
+    for t in &run {
+        pool.insert(t.clone(), account.clone()).unwrap();
+    }
+    let far = tx(1, 5, 10);
+    pool.insert(far.clone(), account.clone()).unwrap();
+    // Dearer on its own nonce: the balance no longer covers the run.
+    let mut dear = tx(1, 0, 11);
+    dear.cost = unit + 1;
+    assert_eq!(add(&mut pool, &dear), Err(PoolError::Overdraft));
+    assert_eq!(pool.get(&run[0].hash), Some(&run[0]));
+    // Within the balance it may replace.
+    dear.cost = unit;
+    assert_eq!(add(&mut pool, &dear).unwrap().replaced, Some(run[0].hash));
+    // A queued transaction is not part of the run.
+    let mut queued = tx(1, 5, 11);
+    queued.cost = 3 * unit;
+    assert_eq!(add(&mut pool, &queued).unwrap().replaced, Some(far.hash));
+}
+
+#[test]
+fn a_gap_fill_drops_the_first_follower_left_unfunded() {
+    let mut pool = Mempool::default();
+    let unit = tx(1, 0, 10).cost;
+    let account = funded(0, 2 * unit + unit / 2);
+    let txs: Vec<PoolTx> = (0..4).map(|n| tx(1, n, 10)).collect();
+    for n in [0, 2, 3] {
+        let inserted = pool.insert(txs[n].clone(), account.clone()).unwrap();
+        assert_eq!(inserted.unfunded, None);
+    }
+    // Nonce 1 makes 2 and 3 pending; the balance covers 0 and 1 only.
+    let inserted = pool.insert(txs[1].clone(), account).unwrap();
+    assert_eq!(inserted.unfunded, Some(txs[2].hash));
+    assert_eq!(pool.status(), (2, 1));
+    // A newcomer that is itself unfunded is the kernel's to refuse.
+    let mut pool = Mempool::default();
+    let inserted = pool.insert(txs[0].clone(), funded(0, 0)).unwrap();
+    assert_eq!(inserted.unfunded, None);
 }
 
 #[test]
@@ -414,7 +501,7 @@ fn check(pool: &Mempool) {
     // binds insertions only; the total never grows past its limit.
     assert!(pool.len() <= pool.limits.max_txs);
     let mut next: BTreeMap<Address, u64> = BTreeMap::new();
-    for raw in pool.take(usize::MAX, u64::MAX) {
+    for raw in pool.take(usize::MAX, u64::MAX, &[]) {
         let t = pool.get(&keccak256(&raw)).unwrap();
         let expected = next
             .entry(t.sender)
@@ -428,7 +515,7 @@ fn check(pool: &Mempool) {
 proptest! {
     #[test]
     fn invariants_hold(ops in prop::collection::vec(op(), 1..60)) {
-        let mut pool = Mempool::new(PoolLimits { max_txs: 10, max_queued: 4, per_sender: 5, max_bytes: usize::MAX });
+        let mut pool = Mempool::new(PoolLimits { max_txs: 10, max_queued: 4, per_sender: 5, max_bytes: usize::MAX, max_tx_bytes: usize::MAX });
         let mut nonce_of = [0u64; 4];
         for op in ops {
             match op {

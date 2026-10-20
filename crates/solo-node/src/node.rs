@@ -416,8 +416,12 @@ impl Node {
                 self.persisted_driver_state = Some(state);
                 None
             }
-            Effect::MempoolTake { max_bytes, max_gas } => {
-                let txs = self.pool.take(max_bytes as usize, max_gas);
+            Effect::MempoolTake {
+                max_bytes,
+                max_gas,
+                skip,
+            } => {
+                let txs = self.pool.take(max_bytes as usize, max_gas, &skip.0);
                 Some(Input::MempoolContents { txs: Seq(txs) })
             }
             Effect::MempoolReject { tx_hash, .. } => {
@@ -609,9 +613,7 @@ impl Node {
             Some(account) => account.clone(),
             None => self.account(&sender).map_err(SubmitError::Node)?,
         };
-        self.pool
-            .check_replacement(&tx)
-            .map_err(SubmitError::Pool)?;
+        self.pool.check(&tx).map_err(SubmitError::Pool)?;
         let ahead = self.pool.ahead(&sender, account.nonce, tx.nonce);
         match self.validate(raw, ahead)? {
             ValidateResult::Valid { priority, .. } => tx.priority = priority,

@@ -510,6 +510,7 @@ fn effects_injected_by_hand() {
         .apply_effect(Effect::MempoolTake {
             max_bytes: u32::try_from(t1.len()).unwrap(),
             max_gas: u64::MAX,
+            skip: Seq(vec![]),
         })
         .unwrap();
     assert_eq!(
@@ -519,8 +520,32 @@ fn effects_injected_by_hand() {
         }),
         "nonce order first"
     );
+    // With the first carried by an unexecuted block, the same budget holds
+    // the second.
+    let behind = node
+        .apply_effect(Effect::MempoolTake {
+            max_bytes: u32::try_from(t2.len()).unwrap(),
+            max_gas: 21_000,
+            skip: Seq(vec![h1]),
+        })
+        .unwrap();
+    assert_eq!(
+        behind,
+        Some(solo_abi::types::Input::MempoolContents {
+            txs: Seq(vec![t2.clone()])
+        })
+    );
     assert_eq!(node.mempool().len(), 2);
-    // Rejection drops a pending transaction; an unknown hash is a no-op.
+    // An unknown hash is a no-op; rejection drops a pending transaction.
+    assert_eq!(
+        node.apply_effect(Effect::MempoolReject {
+            tx_hash: [0xEE; 32],
+            reason: 1
+        })
+        .unwrap(),
+        None
+    );
+    assert_eq!(node.mempool().len(), 2);
     assert_eq!(
         node.apply_effect(Effect::MempoolReject {
             tx_hash: h2,

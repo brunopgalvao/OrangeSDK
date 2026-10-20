@@ -72,7 +72,7 @@ enum Effect {
   8  FinalizeBlock { height: u64, certificate: bytes }
   9  PersistState  { state: bytes }
   10 PeerScore     { peer: [32], delta: i64 }
-  11 MempoolTake   { max_bytes: u32, max_gas: u64 }
+  11 MempoolTake   { max_bytes: u32, max_gas: u64, skip: vec<[32]> }
   12 MempoolAdmit  { tx_hash: [32] }
   13 MempoolReject { tx_hash: [32], reason: u32 }
   14 Metric        { name: bytes, value: i64 }
@@ -81,7 +81,7 @@ enum Effect {
 
 The driver MAY also call the network, timer, and persistence host functions directly (05 §4.5–4.6) with identical meaning; the effect list exists so that a driver can be written as a pure function with no host imports at all, which is the form the simulator and the conformance suite use. A kernel SHOULD use one style, not both.
 
-Effects are applied by the host in list order after the entrypoint halts. `MempoolTake` is answered by `MempoolContents` with transactions in an order a block can execute, within `max_bytes` bytes and `max_gas` gas limits in all (14 §3). `ExecuteBlock` causes the host to run `kernel_stf_execute_block` (asynchronously, in a separate instance) and to deliver `BlockExecuted` as a later input. `FinalizeBlock` causes `kernel_stf_finalize_block` and advances the finalized head. `PersistState` writes to node-local storage and is the state returned at `Started.resumed_state` after a restart.
+Effects are applied by the host in list order after the entrypoint halts. `MempoolTake` is answered by `MempoolContents` with transactions in an order a block can execute, within `max_bytes` bytes and `max_gas` gas limits in all, treating the transactions whose hashes `skip` lists as already taken: they are left out and use none of the budget, and the transactions after them may follow (14 §3). A driver lists there what the blocks it builds on but has not executed carry. `ExecuteBlock` causes the host to run `kernel_stf_execute_block` (asynchronously, in a separate instance) and to deliver `BlockExecuted` as a later input. `FinalizeBlock` causes `kernel_stf_finalize_block` and advances the finalized head. `PersistState` writes to node-local storage and is the state returned at `Started.resumed_state` after a restart.
 
 ### 4.3 Driver determinism
 
