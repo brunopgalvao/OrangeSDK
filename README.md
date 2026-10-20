@@ -78,7 +78,7 @@ prometheus --config.file=ops/prometheus.yml   # then import ops/grafana-solo.jso
 Build everything and run the gates:
 
 ```sh
-tools/build-guest.sh                      # builds hello, kernel, kernel_v2 (upgrade-test), modules/counter and evm-conformance for riscv64imac-unknown-none-elf and refreshes their fixtures
+tools/build-guest.sh                      # builds hello, kernel, kernel_v2 (upgrade-test), modules/counter, modules/eth-light-client, modules/eth-message-verifier and evm-conformance for riscv64imac-unknown-none-elf at one fixed staging path (fixtures do not depend on the checkout) and refreshes their fixtures
 tools/build-contracts.sh                  # compiles contracts/ with solc 0.8.28 (not needed in CI) and refreshes contracts/build
 cargo run -p solo-recompile -- guest/target/riscv64imac-unknown-none-elf/release/hello hello.solo
 cargo test --workspace                    # includes running the recompiled guests on the interpreter

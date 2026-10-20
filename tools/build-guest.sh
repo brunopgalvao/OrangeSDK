@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds every guest program for the Solo target (hello, the kernel, the
-# example module and the conformance guest), refreshes the test fixtures and
-# prints the ELF paths. The kernel is built twice: as is, and with the
+# example module, the two bridge modules and the conformance guest),
+# refreshes the test fixtures and prints the ELF paths. The kernel is built
+# twice: as is, and with the
 # `upgrade-test` feature, the next kernel version the upgrade tests switch to.
 # The example module `counter` (spec 16) becomes the module tests' fixture,
 # and the bridge's two modules (spec 18) the bridge tests'. The kernel embeds
