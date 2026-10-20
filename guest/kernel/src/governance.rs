@@ -14,7 +14,7 @@ use solo_upgrade::action::{cancelled_log, proposed_log};
 use solo_upgrade::gates::{ended_epoch, epoch_of};
 use solo_upgrade::{Action, EnactedUpgrade, GateBook, MAX_CHUNKS, PendingUpgrade, Signal, UPGRADE_ADDRESS, UpgradeStatus, ValidatorSignal, keys, query};
 
-use crate::evm::{self, BlockFields, Message, Outcome};
+use crate::evm::{BlockFields, Message, Outcome};
 use crate::state;
 use crate::tx::Signed;
 
@@ -84,12 +84,12 @@ pub fn admit(s: &Signed) -> Result<(), u32> {
 /// keeps its gas and nonce and changes nothing else.
 pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Outcome {
     if s.tx.to != Some(UPGRADE_ADDRESS) {
-        return evm::run(message, block, true);
+        return crate::native::run(message, block, true);
     }
     let Some(action) = action_of(s) else {
         return Outcome { status: call_status::INVALID, gas_used: 0, output: Vec::new(), logs: Vec::new(), contract: None };
     };
-    let mut outcome = evm::run(message, block, true);
+    let mut outcome = crate::native::run(message, block, true);
     if outcome.status == call_status::SUCCESS {
         match apply(action, &s.from, height) {
             Some(logs) => outcome.logs.extend(logs),

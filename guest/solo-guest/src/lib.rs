@@ -72,6 +72,18 @@ stubs!(
     __solo_import_metric_emit,
 );
 
+/// The two result registers of a host function that returns `a0` and `a1`:
+/// a struct of two `u64` comes back in exactly those registers (RISC-V
+/// LP64 calling convention).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pair {
+    /// `a0`.
+    pub a0: u64,
+    /// `a1`.
+    pub a1: u64,
+}
+
 /// Raw host functions (spec 05 §4). Pointers are guest addresses.
 pub mod host {
     unsafe extern "C" {
@@ -91,6 +103,12 @@ pub mod host {
         pub fn __solo_import_storage_set(key: *const u8, key_len: u32, val: *const u8, val_len: u32) -> u64;
         pub fn __solo_import_storage_delete(key: *const u8, key_len: u32) -> u64;
         pub fn __solo_import_storage_commit(dst: *mut u8) -> u64;
+        pub fn __solo_import_storage_iter_open(prefix: *const u8, prefix_len: u32) -> u64;
+        pub fn __solo_import_storage_iter_next(handle: u64, key: *mut u8, key_cap: u32, val: *mut u8, val_cap: u32) -> super::Pair;
+        /// `a0` = status, `a1` = callee gas used (spec 05 §4.4).
+        pub fn __solo_import_invoke(code_hash: *const u8, namespace: *const u8, input: *const u8, input_len: u32, gas_limit: u64, flags: u64) -> super::Pair;
+        pub fn __solo_import_invoke_output_len() -> u64;
+        pub fn __solo_import_invoke_output_read(dst: *mut u8, offset: u32, len: u32) -> u64;
         pub fn __solo_import_secp256k1_recover(msg: *const u8, sig: *const u8, dst: *mut u8) -> u64;
         pub fn __solo_import_hash_keccak256(src: *const u8, len: u32, dst: *mut u8) -> u64;
         pub fn __solo_import_hash_sha256(src: *const u8, len: u32, dst: *mut u8) -> u64;

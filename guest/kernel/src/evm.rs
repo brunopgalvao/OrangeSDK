@@ -7,6 +7,8 @@ use revm::bytecode::Bytecode;
 use revm::context::result::{ExecutionResult, Output};
 use revm::context::transaction::{AccessList, AccessListItem};
 use revm::context::{BlockEnv, Context, TxEnv};
+use revm::handler::{EthPrecompiles, MainnetContext, PrecompileProvider};
+use revm::interpreter::InterpreterResult;
 use revm::precompile::{Crypto, PrecompileHalt};
 use revm::primitives::hardfork::SpecId;
 use revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE;
@@ -83,12 +85,22 @@ fn u128_of(v: U256) -> u128 {
 /// (`state::init`), only code writes storage, and creation sets the nonce to 1.
 /// revm creates only where there is neither code nor nonce, so it never creates
 /// over old slots, which is also why leaving out EIP-7610 is safe.
-fn commit(changes: impl IntoIterator<Item = (RAddress, RAccount)>) {
+///
+/// An account whose storage the precompile provider commits itself (a
+/// native contract, spec 16 §5) gets only its balance, nonce and code hash
+/// written here.
+fn commit<P: Precompiles>(changes: impl IntoIterator<Item = (RAddress, RAccount)>, precompiles: &P) {
     for (address, account) in changes {
         if !account.is_touched() {
             continue;
         }
         let a = address.0.0;
+        if precompiles.commit_storage(&a, &account) {
+            let info = &account.info;
+            let code_hash = if info.code_hash == KECCAK_EMPTY { [0; 32] } else { info.code_hash.0 };
+            state::set_account(&a, &Account { balance: u128_of(info.balance), nonce: info.nonce, code_hash });
+            continue;
+        }
         if account.is_selfdestructed() {
             // Post-Cancun, only an account created in the same transaction self-destructs;
             // it had no slots before, so every slot it has is one this transaction touched.
@@ -214,15 +226,34 @@ impl Env {
     }
 }
 
-/// Executes `message` at `block`; commits the state changes only if `commit_state`.
-pub fn run(message: Message, block: BlockFields, commit_state: bool) -> Outcome {
-    run_in(message, &Env::kernel(block), commit_state)
+/// The precompiles a message runs with. Ethereum's are [`EthPrecompiles`];
+/// a kernel adds its own beside them through this trait, so this file
+/// builds without them (the reference kernel's native contracts are in
+/// `native.rs`).
+pub trait Precompiles: PrecompileProvider<MainnetContext<StateDb>, Output = InterpreterResult> + Sized {
+    /// The provider for one message at `block`; `query` for a call query.
+    fn for_message(block: BlockFields, query: bool) -> Self;
+
+    /// Commits the storage changes of `account` at `address` if the
+    /// provider keeps that account's storage itself; whether it did.
+    fn commit_storage(&self, address: &Address, account: &RAccount) -> bool;
 }
 
-/// Executes `message` in `env`; commits the state changes only if
-/// `commit_state`. The conformance harness (spec 07 §4.2) runs Ethereum's
-/// state tests through this function with their own environments.
-pub fn run_in(message: Message, env: &Env, commit_state: bool) -> Outcome {
+impl Precompiles for EthPrecompiles {
+    fn for_message(_: BlockFields, _: bool) -> Self {
+        EthPrecompiles::new(SpecId::OSAKA)
+    }
+
+    fn commit_storage(&self, _: &Address, _: &RAccount) -> bool {
+        false
+    }
+}
+
+/// Executes `message` in `env` with the precompiles `P`; commits the state
+/// changes only if `commit_state`. The conformance harness (spec 07 §4.2)
+/// runs Ethereum's state tests through this function with their own
+/// environments.
+pub fn run_in<P: Precompiles>(message: Message, env: &Env, commit_state: bool) -> Outcome {
     install_host_crypto();
     let chain_id = env.chain_id;
     let skip_nonce = message.nonce.is_none();
@@ -268,7 +299,8 @@ pub fn run_in(message: Message, env: &Env, commit_state: bool) -> Outcome {
         })
         .with_block(block_env)
         .with_db(StateDb)
-        .build_mainnet();
+        .build_mainnet()
+        .with_precompiles(P::for_message(BlockFields { number: env.number, timestamp: env.timestamp }, !commit_state));
     let Ok(result) = evm.transact(tx) else {
         return Outcome { status: call_status::INVALID, gas_used: 0, output: Vec::new(), logs: Vec::new(), contract: None };
     };
@@ -284,7 +316,7 @@ pub fn run_in(message: Message, env: &Env, commit_state: bool) -> Outcome {
         ExecutionResult::Halt { gas, logs, .. } => (call_status::HALT, gas.tx_gas_used(), Vec::new(), logs, None),
     };
     if commit_state {
-        commit(result.state);
+        commit(result.state, &evm.precompiles);
     }
     let logs = logs
         .into_iter()

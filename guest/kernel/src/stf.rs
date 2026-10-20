@@ -55,6 +55,7 @@ fn check(raw: &[u8]) -> Result<Signed, u32> {
     well_formed(&s)?;
     crate::governance::admit(&s)?;
     crate::staking::admit(&s)?;
+    crate::modules::admit(&s)?;
     Ok(s)
 }
 
@@ -173,6 +174,8 @@ fn run_tx(raw: &[u8], chain_id: u64, block: BlockFields, index: u32, cumulative:
     };
     let outcome = if crate::staking::is_staking(&s) {
         crate::staking::run(&s, block.number, message, block)
+    } else if s.tx.to == Some(solo_abi::modules::MODULE_ADDRESS) {
+        crate::modules::run(&s, block.number, message, block)
     } else {
         crate::governance::run(&s, block.number, message, block)
     };
@@ -209,6 +212,7 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let height = template.height;
     let block = BlockFields { number: height, timestamp: template.timestamp_ms / 1000 };
     record_participation(&args.block.participation, height);
+    crate::modules::begin_block(height, template.timestamp_ms);
     let mut receipts = Vec::new();
     let mut tx_hashes = Vec::new();
     let mut cumulative = 0u64;
@@ -229,6 +233,7 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
         tx_hashes.push(hash);
     }
     let receipts_root = state::keccak256(&receipt_hashes);
+    crate::modules::end_block(height, template.timestamp_ms);
     crate::governance::end_block(height);
     crate::staking::end_block(height);
     let state_root = state::commit();
@@ -287,7 +292,7 @@ fn call(request: CallRequest) -> CallResult {
         nonce: None,
         access_list,
     };
-    let outcome = evm::run(message, BlockFields { number: height, timestamp }, false);
+    let outcome = crate::native::run(message, BlockFields { number: height, timestamp }, false);
     CallResult { status: outcome.status, gas_used: outcome.gas_used, output: outcome.output }
 }
 
@@ -334,6 +339,8 @@ pub fn query(args: &QueryArgs) -> QueryResult {
             Ok(first) => found(Some(Seq(state::evidence_from(first)))),
             Err(_) => bad_params(),
         },
-        _ => crate::staking::query(method, &args.params).unwrap_or_else(|| crate::governance::query(method, &args.params)),
+        _ => crate::staking::query(method, &args.params)
+            .or_else(|| crate::modules::query(method, &args.params))
+            .unwrap_or_else(|| crate::governance::query(method, &args.params)),
     }
 }

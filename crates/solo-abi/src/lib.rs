@@ -10,6 +10,7 @@ extern crate alloc;
 pub mod chain;
 pub mod codec;
 pub mod conformance;
+pub mod modules;
 pub mod staking;
 pub mod types;
 

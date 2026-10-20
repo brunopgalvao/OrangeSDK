@@ -19,7 +19,7 @@ use solo_abi::types::{Address, Genesis, Hash, QueryResult};
 use solo_abi::{Decode, Encode};
 use solo_guest::host;
 
-use crate::evm::{self, BlockFields, Message, Outcome};
+use crate::evm::{BlockFields, Message, Outcome};
 use crate::state;
 use crate::tx::{self, Signed};
 
@@ -285,7 +285,7 @@ pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Out
     let Some((action, id)) = action_of(s, height) else {
         return Outcome { status: call_status::INVALID, gas_used: 0, output: Vec::new(), logs: Vec::new(), contract: None };
     };
-    let mut outcome = evm::run(message, block, true);
+    let mut outcome = crate::native::run(message, block, true);
     if outcome.status == call_status::SUCCESS {
         outcome.logs.extend(apply(action, &id, s, height));
     }

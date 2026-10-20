@@ -1,0 +1,16 @@
+[package]
+name = "counter"
+description = "The example kernel module and native contract: a counter with block hooks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "counter"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+solo-guest = { path = "../../solo-guest" }
+solo-module = { path = "../../solo-module" }

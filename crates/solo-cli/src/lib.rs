@@ -11,11 +11,13 @@
 //! `validators` the dev node is the only validator, signing with
 //! [`DEV_KEY_SEED`]. Governed upgrades and feature gates (spec 13) are off
 //! unless the file names a `"governance"` address (with an optional
-//! `"upgradeDelay"` in blocks) or a non-zero `"epochBlocks"`.
+//! `"upgradeDelay"` in blocks) or a non-zero `"epochBlocks"`. Kernel modules
+//! installed at genesis (spec 16) are listed under `"modules"`; see [`modules`].
 
 #![forbid(unsafe_code)]
 
 pub mod doctor;
+pub mod modules;
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -102,6 +104,7 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
             allocations.push(parse_account(address, entry)?);
         }
     }
+    let modules = modules::parse_modules(&v, &mut allocations)?;
     let params = GenesisParams {
         slot_ms,
         max_txs: u32::try_from(max_txs)
@@ -136,7 +139,7 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
     Ok(Genesis {
         chain_id,
         fee_schedule: vec![],
-        modules: Seq(vec![]),
+        modules: Seq(modules),
         params: params.to_bytes(),
         validators: ValidatorSet {
             validators: Seq(validators),

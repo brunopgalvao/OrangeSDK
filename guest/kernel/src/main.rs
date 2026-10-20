@@ -10,6 +10,8 @@ mod dkg;
 mod driver;
 mod evm;
 mod governance;
+mod modules;
+mod native;
 mod persist;
 mod staking;
 mod state;
@@ -32,6 +34,7 @@ solo_guest::solo_export!(kernel_init, |input: &[u8]| -> Vec<u8> {
     let genesis: Genesis = decode_or_trap(input);
     state::init(&genesis);
     staking::init(&genesis);
+    modules::init(&genesis);
     Vec::new()
 });
 

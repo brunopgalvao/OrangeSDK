@@ -25,7 +25,7 @@ Capabilities granted to kernel modules by the kernel's capability manager are a 
 
 ### 3.1 Entrypoints the host calls
 
-The host starts an instance at an exported block (03 §5.2) with `a0`–`a5` set as the entrypoint's contract states and `sp` at `stack_top`. Return values are read from `a0`, `a1` at `Halt`. Which exports a kernel, a kernel module, or a contract must provide is defined by the kernel ABI (06 for the driver and state transition entrypoints; the kernel module interface in the design doc, to be specified in a later document). The host itself requires only:
+The host starts an instance at an exported block (03 §5.2) with `a0`–`a5` set as the entrypoint's contract states and `sp` at `stack_top`. Return values are read from `a0`, `a1` at `Halt`. Which exports a kernel, a kernel module, or a contract must provide is defined by the kernel ABI (06 for the driver and state transition entrypoints; 16 for the reference kernel's modules and native contracts). The host itself requires only:
 
 | Export | Who | Called when |
 |---|---|---|
@@ -107,6 +107,19 @@ Precompile-grade operations beyond this list (modexp, bn254, point evaluation) a
 | `invoke_output_read` | `a0` dst, `a1` offset, `a2` len | `a0` = bytes copied | Sandboxed | 10 + 1 per 32 bytes |
 
 `invoke` instantiates the module with code hash `code_hash` under storage namespace `namespace` with the given input blob, capability set `Sandboxed` unless the caller is privileged and `flags` bit 0 is set, and gas limit `gas_limit`, which is debited from the caller before the call and credited back minus `callee gas used` after. `flags` bit 1 (`static`) forbids the callee any storage write, `storage_delete`, or nested non-static invoke; a violation terminates the callee with `HostError(StaticViolation)` and returns that status to the caller. The callee's storage overlay is applied to the caller's overlay on `Halt` and discarded on any other termination; the caller receives the termination status in `a0`. Nesting depth is limited by the host to 1024; exceeding it returns `HostError(DepthExceeded)` without instantiating. The host manages the whole frame stack; the kernel never re-enters for a contract-to-contract call.
+
+#### 4.4.1 Modules in chain state
+
+A host runs a module it was handed directly (the kernel, and whatever else it loads itself) by its code hash alone. For any other code hash `h`, the module is the value of the key `code/` ‖ `h` (`63 6f 64 65 2f` followed by the 32 bytes) in the state visible to the caller, its own pending overlay writes included, so a kernel can store a module and invoke it within one entrypoint:
+
+The steps run in this order, and each outcome is the same whether or not the host has the module cached:
+
+1. A gas limit the VM rejects (04 §4) fails the call before instantiating with `InvalidArgument`, no gas used.
+2. The callee pays for loading: `⌈len / 32⌉` VM gas, `len` being the length of the value, is taken from its gas limit before any work on the value, on every call. A limit below that ends the callee with `OutOfGas` having used its whole limit, and `invoke` returns `CalleeTrapped`.
+3. The value must hash to `h` under `keccak256` and validate (03 §7) for the capability set of the call; otherwise the call fails before instantiating having used the load cost, and `invoke` returns `NotFound` with that gas used in `a1`. A missing export fails the same way.
+4. A host MAY cache what it loaded, but runs it only while the key still holds the same bytes, since another node may have no cache, and checks a cached module's imports against the capability set of each call, since it may have been validated for a wider one.
+
+This lookup is part of ABI version 1 as spec 16 publishes it: before it no chain kept modules under `code/`, so no earlier call observes a difference, and invoking a hash whose value there is not a module (EVM bytecode, which the reference kernel keeps under the same prefix) still returns `NotFound`.
 
 ### 4.5 Network (privileged)
 

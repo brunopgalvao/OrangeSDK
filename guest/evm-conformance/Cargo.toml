@@ -12,10 +12,12 @@ test = false
 bench = false
 
 # The same dependencies, at the same versions and features, as the kernel,
-# whose EVM, state and transaction modules this program compiles.
+# whose EVM, native-contract, module, state and transaction modules this
+# program compiles.
 [dependencies]
 solo-guest = { path = "../solo-guest" }
 solo-abi = { path = "../../crates/solo-abi", default-features = false }
 solo-rlp = { path = "../../crates/solo-rlp", default-features = false }
 solo-eth = { path = "../../crates/solo-eth", default-features = false }
+solo-upgrade = { path = "../../crates/solo-upgrade", default-features = false }
 revm = { version = "43.0.3", default-features = false, features = ["optional_eip3607"] }

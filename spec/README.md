@@ -21,6 +21,7 @@ This directory is normative. An implementation that disagrees with it is wrong; 
 | 13 | [Kernel upgrades and feature gates](13-upgrades.md) — the upgrade address and its actions, the upgrade timeline, feature-gate signalling, lock-in and activation | draft |
 | 14 | [Mempool](14-mempool.md) — host policy: per-sender nonce queues, pending and queued, replacement, limits and eviction, the block-ordered take, gossip | draft |
 | 15 | [Staking, epochs, slashing and the threshold key](15-staking.md) — the staking address, epochs and validator sets, slashing, the DKG runs, their messages in blocks, key-set adoption, the host's threshold keystore | draft |
+| 16 | [Kernel modules and native contracts](16-modules.md) — the module interface, capabilities, genesis and governance installs, block hooks, native contracts called from the EVM (`0xEF02` designators), the native gas rate | draft |
 
 ## Conventions
 

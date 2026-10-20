@@ -5,7 +5,7 @@
 //! with the precompiles the host accelerates routed to host functions, and
 //! with state read and written through the kernel's storage layout. The
 //! conformance guest (`guest/evm-conformance`) compiles the kernel's own
-//! EVM, state and transaction modules and runs one state test case per
+//! EVM, native-contract, module, state and transaction modules and runs one state test case per
 //! call; this crate parses the fixtures, runs each case on the VM, reads the
 //! post-state back from storage and compares Ethereum's state root and logs
 //! hash with the fixture's.

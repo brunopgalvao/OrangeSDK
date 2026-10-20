@@ -1,10 +1,12 @@
 //! The EVM conformance guest (spec 07 §4.2): runs one Ethereum state test
 //! case through the reference kernel's own EVM code.
 //!
-//! The kernel's `evm`, `state` and `tx` modules are compiled here from their
-//! source files, so there is one copy of the code under test: revm over the
-//! kernel's `StateDb`, its commit of revm's changes to storage, the host
-//! crypto behind the precompiles, genesis allocation and sender recovery.
+//! The kernel's `evm`, `native`, `modules`, `state` and `tx` modules are
+//! compiled here from their source files, so there is one copy of the code
+//! under test: revm over the kernel's `StateDb` with the kernel's precompile
+//! provider (Ethereum's precompiles and native contracts), its commit of
+//! revm's changes to storage, the host crypto behind the precompiles, genesis
+//! allocation and sender recovery.
 //! The case's pre-state goes in as genesis allocations, the transaction as
 //! signed bytes; the post-state stays in storage for the host to read.
 
@@ -16,6 +18,12 @@ extern crate alloc;
 #[allow(dead_code)]
 #[path = "../../kernel/src/evm.rs"]
 mod evm;
+#[allow(dead_code)]
+#[path = "../../kernel/src/modules.rs"]
+mod modules;
+#[allow(dead_code)]
+#[path = "../../kernel/src/native.rs"]
+mod native;
 #[allow(dead_code)]
 #[path = "../../kernel/src/state.rs"]
 mod state;
@@ -65,7 +73,7 @@ fn run(case: Case) -> Outcome {
         difficulty: env.difficulty,
         excess_blob_gas: env.excess_blob_gas,
     };
-    let outcome = evm::run_in(message, &env, true);
+    let outcome = native::run_in(message, &env, true);
     Outcome { status: outcome.status, gas_used: outcome.gas_used, logs: Seq(outcome.logs) }
 }
 
