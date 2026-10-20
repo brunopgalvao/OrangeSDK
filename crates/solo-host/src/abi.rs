@@ -478,8 +478,12 @@ fn bls12381_verify(ctx: &mut HostContext<'_>) -> Result<(), Termination> {
     let msg = read(ctx, msg, msg_len)?;
     let sig: [u8; 48] = read(ctx, sig, 48)?.try_into().expect("48 bytes read");
     let key: [u8; 96] = read(ctx, key, 96)?.try_into().expect("96 bytes read");
-    let dst = read(ctx, dst, dst_len)?;
-    let valid = solo_bls::host::verify(&msg, &dst, &sig, &key);
+    // The tag length is checked before the tag is read: gas does not cover
+    // the tag, so an out-of-range length must not make the host copy it.
+    let valid = dst_len != 0 && dst_len as usize <= solo_bls::host::MAX_DST_LENGTH && {
+        let dst = read(ctx, dst, dst_len)?;
+        solo_bls::host::verify(&msg, &dst, &sig, &key)
+    };
     ctx.set(Reg::A0, u64::from(!valid));
     Ok(())
 }

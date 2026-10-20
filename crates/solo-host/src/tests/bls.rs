@@ -135,6 +135,61 @@ fn verify_checks_every_range_before_reading() {
     }
 }
 
+#[test]
+fn verify_rejects_an_out_of_range_tag_length_without_reading_the_tag() {
+    let sk = SecretKey::generate(&[6; 32], b"").unwrap();
+    let key = sk.public_key().to_bytes();
+    let sig = sk.sign(b"m").to_bytes();
+    let mut exec = executor();
+    let mut gas = Vec::new();
+    // The tag pointer is unmapped: any read would fault. Lengths 0, 256,
+    // 2^20 and 2^32 - 1 return 1 without one, for the same gas.
+    for dst_len in [0, 256, 1 << 20, i64::from(u32::MAX)] {
+        let ro = [sig.as_slice(), &key, b"m"].concat();
+        let mut body = vec![
+            li(Reg::A0, RO + 144),
+            li(Reg::A1, 1),
+            li(Reg::A2, RO),
+            li(Reg::A3, RO + 48),
+            li(Reg::A4, 0x10),
+            li(Reg::A5, dst_len),
+            ecall(1),
+        ];
+        body.extend(report());
+        let r = run(
+            &mut exec,
+            &module(&["output_write", "bls12381_verify"], &body, &ro),
+            b"",
+            1_000_000,
+        );
+        assert_eq!(r.status, Termination::Halt, "dst_len {dst_len}");
+        assert_eq!(regs(&r).0, 1, "dst_len {dst_len}");
+        gas.push(r.gas_used);
+    }
+    assert!(gas.windows(2).all(|w| w[0] == w[1]), "{gas:?}");
+    // At 255 bytes the tag is read, so the same unmapped pointer faults.
+    let ro = [sig.as_slice(), &key, b"m"].concat();
+    let body = vec![
+        li(Reg::A0, RO + 144),
+        li(Reg::A1, 1),
+        li(Reg::A2, RO),
+        li(Reg::A3, RO + 48),
+        li(Reg::A4, 0x10),
+        li(Reg::A5, 255),
+        ecall(1),
+    ];
+    let r = run(
+        &mut exec,
+        &module(&["output_write", "bls12381_verify"], &body, &ro),
+        b"",
+        1_000_000,
+    );
+    assert_eq!(
+        r.status,
+        Termination::HostError(HostStatus::MemoryFault.code())
+    );
+}
+
 /// A body calling `bls12381_pairing_check(RO, count)` and reporting `a0`.
 fn pairing_module(import: &str, pairs: &[u8], count: i64) -> Vec<u8> {
     let mut body = vec![li(Reg::A0, RO), li(Reg::A1, count), ecall(1)];
