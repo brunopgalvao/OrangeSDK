@@ -214,13 +214,17 @@ fn bad_params() -> QueryResult {
     QueryResult { status: 2, body: Vec::new() }
 }
 
-/// Runs a call against the latest state without keeping its effects.
+/// Runs a call against the head state without keeping its effects. The EVM
+/// sees the head block (its number and timestamp), as `eth_call` at `latest`
+/// does. A message with an access list runs as an EIP-2930 transaction, the
+/// only way the EVM charges and warms one.
 fn call(request: CallRequest) -> CallResult {
     let height = state::height().unwrap_or(0);
     let timestamp = state::block_by_number(height).map_or(0, |h| h.timestamp_ms / 1000);
     let gas = if request.gas == 0 { MAX_TX_GAS } else { request.gas.min(MAX_TX_GAS) };
+    let access_list: Vec<solo_eth::AccessItem> = request.access_list.0.into_iter().map(|item| solo_eth::AccessItem { address: item.address, keys: item.keys.0 }).collect();
     let message = Message {
-        tx_type: 0,
+        tx_type: u8::from(!access_list.is_empty()),
         caller: request.from,
         to: request.to,
         value: request.value,
@@ -229,9 +233,9 @@ fn call(request: CallRequest) -> CallResult {
         gas_price: 0,
         priority_fee: None,
         nonce: None,
-        access_list: Vec::new(),
+        access_list,
     };
-    let outcome = evm::run(message, BlockFields { number: height + 1, timestamp }, false);
+    let outcome = evm::run(message, BlockFields { number: height, timestamp }, false);
     CallResult { status: outcome.status, gas_used: outcome.gas_used, output: outcome.output }
 }
 

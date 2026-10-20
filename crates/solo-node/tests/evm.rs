@@ -408,6 +408,7 @@ impl Chain {
             value,
             data: data.to_vec(),
             gas,
+            access_list: Seq(Vec::new()),
         };
         self.query(query::CALL, &request.to_bytes())
     }
@@ -1128,7 +1129,8 @@ fn block_opcodes_agree_with_headers() {
     assert_eq!(fields[5], word(0), "BASEFEE is zero");
     assert_eq!(fields[6], word(u128::from(BLOCK_GAS_LIMIT)), "GASLIMIT");
     assert_eq!(fields[7], word(0), "PREVRANDAO is zero");
-    // A call query runs in the block after the latest, at the latest block's time.
+    // A call query runs in the head block, at its number and time, as geth's
+    // `eth_call` at `latest` does.
     let now = chain.call(
         alice.address,
         Some(PROBE),
@@ -1140,7 +1142,7 @@ fn block_opcodes_agree_with_headers() {
     assert_eq!(
         now.output,
         [
-            word(3),
+            word(2),
             word(u128::from(header.timestamp_ms / 1000)),
             word(u128::from(CHAIN_ID))
         ]
@@ -1158,10 +1160,13 @@ fn block_opcodes_agree_with_headers() {
             )
             .output
     };
-    assert_eq!(hash_of(&mut chain, 2), block2);
     assert_eq!(hash_of(&mut chain, 1), block1);
+    // BLOCKHASH covers the blocks before the one the call runs in, so the head
+    // block's own hash is out of reach, as in a transaction it would be.
+    assert_eq!(hash_of(&mut chain, 2), [0; 32]);
+    assert_ne!(block2, [0; 32]);
     // The genesis block has no header, so its hash is zero, as block 1's parent hash
-    // and the RPC's block 0 say; the block being built has none yet either.
+    // and the RPC's block 0 say; later blocks have none yet either.
     assert_eq!(hash_of(&mut chain, 0), [0; 32]);
     assert_eq!(hash_of(&mut chain, 3), [0; 32]);
 }

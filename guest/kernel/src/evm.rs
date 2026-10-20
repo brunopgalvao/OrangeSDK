@@ -19,8 +19,9 @@ use solo_guest::host;
 
 use crate::state;
 
-/// Base fee per gas. Constant in this kernel version; fees go to the zero address.
-pub const BASE_FEE: u64 = 0;
+/// Base fee per gas, the constant the host's RPC reports too. Fixed in this
+/// kernel version; fees go to the zero address.
+pub use solo_abi::chain::BASE_FEE;
 
 /// Kernel state seen through revm's `Database`.
 pub struct StateDb;

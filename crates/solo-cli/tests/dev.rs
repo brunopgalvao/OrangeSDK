@@ -298,6 +298,10 @@ fn argument_and_file_errors() {
         run(&dev_args(&good, &["--kernel-gas", "x"])).unwrap_err(),
         "--kernel-gas must be a number"
     );
+    assert_eq!(
+        run(&dev_args(&good, &["--query-gas", "-1"])).unwrap_err(),
+        "--query-gas must be a number"
+    );
     // A guest without the kernel entrypoints fails to boot.
     let message = run(&dev_args(&good, &[])
         .iter()
@@ -332,7 +336,11 @@ fn argument_and_file_errors() {
 fn in_process_node_stops_on_blocks_and_on_request() {
     let good = genesis_file("inproc.json", GENESIS);
     // Produces one block, then the block limit ends the loop.
-    run(&dev_args(&good, &["--blocks", "1"])).unwrap();
+    run(&dev_args(
+        &good,
+        &["--blocks", "1", "--query-gas", "100000000"],
+    ))
+    .unwrap();
     // A starved kernel fails every slot; the caller's condition ends the loop after enough ticks.
     let mut iterations = 0;
     run_until(

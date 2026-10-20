@@ -106,6 +106,7 @@ struct ModuleInstall { address: [20], code_hash: [32], capabilities: u64, init: 
 
 - Driver entrypoints run with a gas budget set by the host from the latency preset. Exhausting it, or any termination other than `Halt`, is a *driver fault*: the host records it, restarts the driver instance from the last `PersistState`, and replays the log. Repeated faults on the same input halt the node with an alert; they are never papered over, because a deterministic fault will recur on every node and is a kernel bug or a kernel upgrade waiting to happen.
 - State-transition entrypoints run with the gas limit of the block or query. A fault in `kernel_stf_execute_block` makes the block invalid.
+- The query gas limit is host policy and is separate from the block limits: a query's work is chosen by whoever asks (an `eth_call` runs arbitrary code), and a host that serves queries on the thread that drives consensus relies on this limit to bound how long one query holds it. A query that exhausts it ends with `OutOfGas` and changes nothing; the host reports the query as aborted.
 - An entrypoint that calls a host function outside its group terminates with `HostError(Unavailable)`.
 
 ## 7. Kernel switchover

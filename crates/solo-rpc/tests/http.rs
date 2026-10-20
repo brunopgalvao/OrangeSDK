@@ -2,9 +2,10 @@
 
 mod common;
 
+use std::cell::Cell;
 use std::io::{Cursor, Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
 
 use common::{Wallet, node};
 use solo_rpc::Rpc;
@@ -130,34 +131,56 @@ fn connections_and_accept_loop() {
     assert!(client.join().unwrap().starts_with("HTTP/1.1 204"));
     listener.set_nonblocking(true).unwrap();
 
-    // The accept loop with idle callbacks, driven by a client thread.
-    let results = Arc::new(Mutex::new(Vec::new()));
-    let client = {
-        let results = Arc::clone(&results);
-        std::thread::spawn(move || {
-            let body = r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}"#;
-            let post = format!(
-                "POST / HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            let mut r = results.lock().unwrap();
-            r.push(talk(addr, post.as_bytes()));
-            r.push(talk(addr, b"GET /health HTTP/1.1\r\n\r\n"));
-            r.push(talk(addr, b"GET /other HTTP/1.1\r\n\r\n"));
-            r.push(talk(addr, b"PUT / HTTP/1.1\r\n\r\n"));
-            r.push(talk(addr, b"\r\n"));
-            let body = r#"{"jsonrpc":"2.0","id":9,"method":"solo_stop"}"#;
-            let post = format!(
-                "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            r.push(talk(addr, post.as_bytes()));
+    // The accept loop runs the node's background work while no connection
+    // is waiting...
+    let runs = Rc::new(Cell::new(0));
+    let counter = Rc::clone(&runs);
+    rpc.set_background(Box::new(move |_| counter.set(counter.get() + 1)));
+    let mut checks = 0;
+    serve(&listener, &mut rpc, |_| {
+        checks += 1;
+        checks == 1
+    });
+    assert_eq!(runs.get(), 1, "one idle turn");
+    // ...and after every connection, so a queue of requests cannot starve
+    // the node: these are all waiting before the loop starts.
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}"#;
+    let chain_id = format!(
+        "POST / HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let body = r#"{"jsonrpc":"2.0","id":9,"method":"solo_stop"}"#;
+    let stop = format!(
+        "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let requests: [&[u8]; 6] = [
+        chain_id.as_bytes(),
+        b"GET /health HTTP/1.1\r\n\r\n",
+        b"GET /other HTTP/1.1\r\n\r\n",
+        b"PUT / HTTP/1.1\r\n\r\n",
+        b"\r\n",
+        stop.as_bytes(),
+    ];
+    let streams: Vec<TcpStream> = requests
+        .iter()
+        .map(|request| {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.write_all(request).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            stream
         })
-    };
-    let mut idles = 0;
-    serve(&listener, &mut rpc, |_| idles += 1, |rpc| !rpc.stopped);
-    client.join().unwrap();
-    let results = results.lock().unwrap();
+        .collect();
+    serve(&listener, &mut rpc, |rpc| !rpc.stopped);
+    assert_eq!(runs.get(), 1 + requests.len());
+    let results: Vec<String> = streams
+        .into_iter()
+        .map(|mut stream| {
+            let mut out = String::new();
+            stream.read_to_string(&mut out).unwrap();
+            out
+        })
+        .collect();
     assert!(results[0].starts_with("HTTP/1.1 200 OK"), "{}", results[0]);
     assert!(
         results[0].ends_with(r#""result":"0x539"}"#),
@@ -170,5 +193,4 @@ fn connections_and_accept_loop() {
     assert!(results[4].starts_with("HTTP/1.1 400"), "{}", results[4]);
     assert!(results[5].ends_with(r#""result":true}"#), "{}", results[5]);
     assert!(rpc.stopped);
-    assert!(idles > 0);
 }

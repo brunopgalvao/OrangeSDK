@@ -44,6 +44,7 @@ fn genesis(validators: &[SigningKey], funded: [u8; 20]) -> Genesis {
         allocations: Seq(vec![Allocation {
             address: funded,
             balance: 100 * ETHER,
+            ..Allocation::default()
         }]),
     };
     Genesis {

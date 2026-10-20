@@ -149,6 +149,7 @@ impl Sim {
             key: old.services_key(),
             persisted: old.persisted(),
             kernel_gas: old.kernel_gas,
+            query_gas: old.query_gas,
         };
         let resumed = old.persisted_driver_state.clone();
         self.nodes[index] = Self::open_started(kernel, genesis, config, resumed)?;

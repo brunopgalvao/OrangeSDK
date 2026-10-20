@@ -8,14 +8,15 @@ rust-version.workspace = true
 
 [dependencies]
 solo-abi = { path = "../solo-abi" }
+solo-eth = { path = "../solo-eth" }
 solo-host = { path = "../solo-host" }
 solo-node = { path = "../solo-node" }
 solo-rlp = { path = "../solo-rlp" }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 serde_json = "1"
 
 [dev-dependencies]
 solo-recompile = { path = "../solo-recompile" }
-k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
 [lints]
 workspace = true

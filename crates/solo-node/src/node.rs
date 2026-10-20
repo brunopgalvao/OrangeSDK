@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
 
-use solo_abi::chain::BlockHeader;
+use solo_abi::chain::{BlockHeader, CallRequest, CallResult as CallOutcome, StorageQuery};
 use solo_abi::codec::Seq;
 use solo_abi::types::{
     self, Block, Effect, ExecContext, ExecuteArgs, ExecuteResult, FinalizeArgs, Genesis, Input,
@@ -32,6 +32,8 @@ pub struct NodeConfig {
     pub persisted: BTreeMap<Vec<u8>, Vec<u8>>,
     /// Gas budget per kernel call once running; `kernel_init` always gets [`KERNEL_GAS`].
     pub kernel_gas: i64,
+    /// Gas budget per `kernel_query` call; see [`QUERY_GAS`].
+    pub query_gas: i64,
 }
 
 impl Default for NodeConfig {
@@ -41,6 +43,7 @@ impl Default for NodeConfig {
             key: None,
             persisted: BTreeMap::new(),
             kernel_gas: KERNEL_GAS,
+            query_gas: QUERY_GAS,
         }
     }
 }
@@ -54,6 +57,17 @@ pub const KERNEL_GAS: i64 = 1 << 40;
 /// ([`Node::state_proof_at`]). The tries share every unchanged node, so each
 /// costs only the nodes its block changed.
 pub const PROOF_HISTORY: usize = 256;
+
+/// Gas allowed to each `kernel_query` call (spec 06 §6), unless
+/// [`Node::kernel_gas`] is lower. Queries run on the thread that drives
+/// consensus and an RPC caller chooses what they compute (`eth_call` runs
+/// any code), so this budget is what bounds how long one query holds the
+/// node. 2^26 is about three million EVM gas of plain opcodes or about a
+/// thousand `KECCAK256`s on the reference interpreter: 0.3 s to 3 s at load
+/// averages of 50 to 100 on the 12-core machine it was measured on
+/// (2026-10-20). Deploying the 2 KiB test contract takes about a million;
+/// ordinary calls take less.
+pub const QUERY_GAS: i64 = 1 << 26;
 
 /// The kernel's storage namespace. Privileged instances use bare keys, so
 /// this value is only passed through.
@@ -85,6 +99,20 @@ impl fmt::Display for NodeError {
 }
 
 impl std::error::Error for NodeError {}
+
+impl NodeError {
+    /// Whether a kernel call ran out of its gas budget.
+    #[must_use]
+    pub fn is_out_of_gas(&self) -> bool {
+        matches!(
+            self,
+            NodeError::Kernel {
+                status: Termination::OutOfGas,
+                ..
+            }
+        )
+    }
+}
 
 /// Why a transaction was not admitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +150,8 @@ pub struct Node {
     pub persisted_driver_state: Option<Vec<u8>>,
     /// Gas budget for each kernel call; see [`KERNEL_GAS`].
     pub kernel_gas: i64,
+    /// Gas budget for each kernel query, capped by `kernel_gas`; see [`QUERY_GAS`].
+    pub query_gas: i64,
     /// Raw transactions admitted since the last [`Node::take_tx_gossip`],
     /// for the transport to forward to peers.
     tx_gossip: Vec<Vec<u8>>,
@@ -178,6 +208,7 @@ impl Node {
             metrics: Vec::new(),
             persisted_driver_state: None,
             kernel_gas: KERNEL_GAS,
+            query_gas: config.query_gas,
             tx_gossip: Vec::new(),
             committed: BTreeMap::new(),
             proof_history: PROOF_HISTORY,
@@ -188,6 +219,15 @@ impl Node {
     }
 
     fn call_raw(&mut self, export: &'static str, input: &[u8]) -> Result<CallResult, NodeError> {
+        self.call_with(export, input, self.kernel_gas)
+    }
+
+    fn call_with(
+        &mut self,
+        export: &'static str,
+        input: &[u8],
+        gas: i64,
+    ) -> Result<CallResult, NodeError> {
         let kernel = self.kernel;
         self.services.borrow_mut().commitments.clear();
         let r = self.exec.call_export(
@@ -195,7 +235,7 @@ impl Node {
             export,
             KERNEL_NAMESPACE,
             input,
-            self.kernel_gas,
+            gas,
             Capability::Privileged,
             Flags::default(),
         );
@@ -209,7 +249,11 @@ impl Node {
         }
     }
 
-    fn call<T: Decode>(&mut self, export: &'static str, input: &[u8]) -> Result<T, NodeError> {
+    fn call_decoded<T: Decode>(
+        &mut self,
+        export: &'static str,
+        input: &[u8],
+    ) -> Result<T, NodeError> {
         let r = self.call_raw(export, input)?;
         T::from_bytes(&r.output)
             .ok()
@@ -308,7 +352,8 @@ impl Node {
     pub fn step(&mut self, input: Input) -> Result<(), NodeError> {
         let mut queue = VecDeque::from([input]);
         while let Some(input) = queue.pop_front() {
-            let effects: Seq<Effect> = self.call(exports::DRIVER_STEP, &input.to_bytes())?;
+            let effects: Seq<Effect> =
+                self.call_decoded(exports::DRIVER_STEP, &input.to_bytes())?;
             for effect in effects.0 {
                 if let Some(follow_up) = self.apply_effect(effect)? {
                     queue.push_back(follow_up);
@@ -448,7 +493,7 @@ impl Node {
         // an earlier block already recorded).
         let carried: Vec<[u8; 32]> = block.txs.0.iter().map(|raw| keccak256(raw)).collect();
         let args = ExecuteArgs { block, context }.to_bytes();
-        let result: ExecuteResult = self.call(exports::EXECUTE_BLOCK, &args)?;
+        let result: ExecuteResult = self.call_decoded(exports::EXECUTE_BLOCK, &args)?;
         // Keep the trie behind the root the block returned, which the header
         // carries: the kernel may write more after it asks for the root (the
         // reference kernel stores the header itself), so no later state
@@ -515,7 +560,7 @@ impl Node {
             context,
         };
         let result: ValidateResult = self
-            .call(exports::VALIDATE_TX, &args.to_bytes())
+            .call_decoded(exports::VALIDATE_TX, &args.to_bytes())
             .map_err(SubmitError::Node)?;
         match result {
             ValidateResult::Valid { priority, .. } => {
@@ -538,17 +583,22 @@ impl Node {
         }
     }
 
-    /// Runs a kernel query.
+    /// Runs a kernel query within [`Node::query_gas`].
     ///
     /// # Errors
-    /// See [`NodeError`].
+    /// See [`NodeError`]; a query that exhausts its budget is a
+    /// [`NodeError::Kernel`] for which [`NodeError::is_out_of_gas`] holds.
     pub fn query(&mut self, method: &str, params: &[u8]) -> Result<QueryResult, NodeError> {
         let args = QueryArgs {
             method: method.as_bytes().to_vec(),
             params: params.to_vec(),
             at: None,
         };
-        self.call(exports::QUERY, &args.to_bytes())
+        let gas = self.query_gas.min(self.kernel_gas);
+        let r = self.call_with(exports::QUERY, &args.to_bytes(), gas)?;
+        QueryResult::from_bytes(&r.output)
+            .ok()
+            .ok_or(NodeError::Decode(exports::QUERY))
     }
 
     fn query_decoded<T: Decode>(
@@ -632,6 +682,45 @@ impl Node {
     /// See [`NodeError`].
     pub fn transaction(&mut self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, NodeError> {
         self.query_decoded(solo_abi::chain::query::TRANSACTION, hash)
+    }
+
+    /// Contract code at `address`; empty for an account without code.
+    ///
+    /// # Errors
+    /// See [`NodeError`].
+    pub fn code(&mut self, address: &types::Address) -> Result<Vec<u8>, NodeError> {
+        Ok(self
+            .query_decoded(solo_abi::chain::query::CODE, address)?
+            .unwrap_or_default())
+    }
+
+    /// The value of storage slot `slot` of `address`; zero if never written.
+    ///
+    /// # Errors
+    /// See [`NodeError`].
+    pub fn storage(
+        &mut self,
+        address: &types::Address,
+        slot: &types::Hash,
+    ) -> Result<types::Hash, NodeError> {
+        let params = StorageQuery {
+            address: *address,
+            slot: *slot,
+        };
+        Ok(self
+            .query_decoded(solo_abi::chain::query::STORAGE, &params.to_bytes())?
+            .unwrap_or_default())
+    }
+
+    /// Executes a message against the latest state and discards its effects
+    /// (`eth_call`, `eth_estimateGas`). A `gas` of zero means the kernel's cap.
+    ///
+    /// # Errors
+    /// See [`NodeError`]; [`NodeError::Decode`] if the kernel does not answer
+    /// the call query.
+    pub fn call(&mut self, request: &CallRequest) -> Result<CallOutcome, NodeError> {
+        self.query_decoded(solo_abi::chain::query::CALL, &request.to_bytes())?
+            .ok_or(NodeError::Decode(solo_abi::chain::query::CALL))
     }
 
     /// Last finalized height.
