@@ -87,9 +87,20 @@ fn status_json_without_a_validator() {
         mempool: 3,
         uptime_seconds: 9.0,
         validator: None,
+        upgrade_alert: None,
+        missing_gates: 0,
     };
     let v = status_json(&status);
     assert_eq!(v["validator"], Value::Null);
+    assert_eq!(v["upgradeAlert"], Value::Null);
+    assert_eq!(v["missingGates"], serde_json::json!([]));
+    let blocked = status_json(&Status {
+        upgrade_alert: Some("cannot load".to_owned()),
+        missing_gates: 0b101,
+        ..status
+    });
+    assert_eq!(blocked["upgradeAlert"], "cannot load");
+    assert_eq!(blocked["missingGates"], serde_json::json!([0, 2]));
     assert_eq!(v["peers"], 2);
     assert_eq!(v["headAgeSeconds"], 1.5);
 }

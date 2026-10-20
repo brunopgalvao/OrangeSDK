@@ -255,3 +255,33 @@ fn bad_answers_are_reported() {
     assert!(report.contains("2 peers"), "{report}");
     server.join().unwrap();
 }
+
+#[test]
+fn the_status_carries_upgrade_alerts() {
+    let body = STATUS.split_once("\r\n\r\n").unwrap().1;
+    let with = |extra: &str| parse_status(&format!("{},{extra}}}", &body[..body.len() - 1]));
+    // A node of an earlier release sends neither field: nothing to report.
+    let plain = parse_status(body).unwrap();
+    assert_eq!((plain.upgrade_alert, plain.missing_gates), (None, 0));
+    let clear = with("\"upgradeAlert\":null,\"missingGates\":[]").unwrap();
+    assert_eq!((clear.upgrade_alert, clear.missing_gates), (None, 0));
+    let blocked = with("\"upgradeAlert\":\"cannot load\",\"missingGates\":[0,2,63]").unwrap();
+    assert_eq!(blocked.upgrade_alert.as_deref(), Some("cannot load"));
+    assert_eq!(blocked.missing_gates, 0b101 | 1 << 63);
+    let problems = solo_metrics::assess(&blocked, &[], &solo_metrics::Limits::default());
+    assert_eq!(
+        problems,
+        vec![
+            "the pending kernel upgrade cannot be enacted: cannot load",
+            "the chain locked in feature gates this release does not support: 0, 2, 63",
+        ]
+    );
+    for bad in [
+        "\"upgradeAlert\":5",
+        "\"missingGates\":3",
+        "\"missingGates\":[64]",
+        "\"missingGates\":[\"0\"]",
+    ] {
+        assert!(with(bad).is_err(), "{bad}");
+    }
+}

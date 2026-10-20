@@ -56,6 +56,8 @@ Names follow EIP-2159 where it defines a metric (`ethereum_*`); every other name
 | `solo_emitted_dropped_total` | counter | `reason` | Emitted metrics the node discarded (§5). |
 | `solo_p2p_bytes_total` | counter | `direction` | Bytes the transport read from and wrote to its connections. |
 | `solo_p2p_frames_total` | counter | `direction`, `kind` | Frames (09 §2) the transport received, and queued for sending, including each connection's `Hello`. |
+| `solo_upgrade_blocked` | gauge | — | `1` while a pending kernel upgrade cannot be enacted by this host (13 §7.2), else `0`. |
+| `solo_upgrade_missing_gates` | gauge | — | Feature gates the chain has locked in that this host release does not support (13 §7.2). |
 | `solo_build_info` | gauge | `version` | Always `1`; `version` is the node release. |
 | `solo_node_start_time_seconds` | gauge | — | Unix time at which the node opened. |
 
@@ -68,7 +70,7 @@ Label values:
 - `kind`: `hello`, `message`, `tx`, `request`, `response`, the frame variants of 09 §2.
 - `origin`, `name`, `reason`: §5.
 
-`solo_kernel_call_duration_seconds` has the bucket bounds 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5 and 10 seconds. Calls made by `invoke` inside a kernel call are part of that call and are not counted separately.
+`solo_kernel_call_duration_seconds` has the bucket bounds 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5 and 10 seconds. Calls made by `invoke` inside a kernel call are part of that call and are not counted separately. The calls a kernel switch makes (06 §7) are counted like any other: `kernel_version` of the running kernel and of a pending upgrade's module, when the host prepares it and at the switch, and the new kernel's `kernel_migrate`, so a `kernel_migrate` that halts the node is a fault in `solo_kernel_faults_total`.
 
 ## 5. Emitted metrics
 
@@ -106,8 +108,10 @@ Dropping is the "MAY drop" of 05 §4.7; it never changes what the instance obser
 | `mempool` | number | `solo_mempool_transactions`. |
 | `uptimeSeconds` | number | Seconds since the node opened. |
 | `validator` | string or null | The node's validator id (08 §2) as `0x` hex, or `null` for a node without a consensus key. |
+| `upgradeAlert` | string or null | Why the pending kernel upgrade cannot be enacted by this host (13 §7.2), or `null` when there is none or it can. |
+| `missingGates` | array of numbers | The gates (13 §8.1) the chain has locked in that this host release does not support, ascending; empty when there are none. |
 
-Fields are only ever added; a client ignores fields it does not know.
+Fields are only ever added; a client ignores fields it does not know, and reads `upgradeAlert` and `missingGates`, which an earlier release does not send, as `null` and empty when absent.
 
 ## 7. Alerts and the health verdict
 
@@ -123,6 +127,7 @@ The framework ships alert rules for Prometheus (`ops/alerts.yml`), a scrape conf
 | `SoloDriverFault` | `solo_kernel_faults_total` of a `kernel_driver_*` entrypoint increased in the last 5 m | — | critical |
 | `SoloKernelFault` | `solo_kernel_faults_total` of any other entrypoint increased in the last 5 m | — | warning |
 | `SoloKernelCallSlow` | p99 of `solo_kernel_call_duration_seconds` over 5 m `> 1` s, per entrypoint | 10 m | warning |
+| `SoloUpgradeBlocked` | `solo_upgrade_blocked + solo_upgrade_missing_gates > 0` | — | critical |
 | `SoloEmittedMetricsDropped` | `solo_emitted_dropped_total` increased in the last 15 m | — | info |
 
 `solo doctor [--rpc <addr>]` reads `/status` and `/metrics` once and judges the node by the same conditions on that snapshot. The node is unhealthy, with one reason per failed check, when:
@@ -132,7 +137,8 @@ The framework ships alert rules for Prometheus (`ops/alerts.yml`), a scrape conf
 3. `p2p` is true and `peers` is below the peer minimum (default 1, `--min-peers`);
 4. `mempool` exceeds the mempool limit (default 1000, `--max-mempool`);
 5. any `solo_kernel_faults_total` series is above zero: a fault since the node opened;
-6. for any entrypoint but `kernel_init` and `kernel_migrate`, which run once, `solo_kernel_call_duration_seconds` `_sum / _count` exceeds the call-time limit (default 1 s, `--max-call-ms`): a mean since the node opened, where the alert uses a recent p99.
+6. for any entrypoint but `kernel_init`, `kernel_migrate` and `kernel_version`, which run only at open or around a kernel switch, `solo_kernel_call_duration_seconds` `_sum / _count` exceeds the call-time limit (default 1 s, `--max-call-ms`): a mean since the node opened, where the alert uses a recent p99;
+7. `upgradeAlert` is not `null`, or `missingGates` is not empty: the node cannot run what the chain is upgrading to (13 §7.2).
 
 The doctor prints a summary line and `healthy` and exits with status 0, or prints the summary, `unhealthy:` and the reasons to standard error and exits with status 2. A node it cannot reach, or whose answers do not parse, is reported the same way with the reason.
 

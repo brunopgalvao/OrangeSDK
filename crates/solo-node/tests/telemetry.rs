@@ -144,6 +144,23 @@ fn the_driver_loop_records_progress_and_kernel_calls() {
     assert_eq!(node.telemetry().finalized(), 9);
 }
 
+/// The exports of the entrypoint table of spec 06 §3, in its order.
+fn spec_06_entrypoints() -> Vec<String> {
+    let spec = include_str!("../../../spec/06-driver-interface.md");
+    let table = spec
+        .split("## 3. Entrypoints")
+        .nth(1)
+        .unwrap()
+        .split("\n## ")
+        .next()
+        .unwrap();
+    table
+        .lines()
+        .filter_map(|l| l.strip_prefix("| `"))
+        .map(|l| l.split('`').next().unwrap().to_owned())
+        .collect()
+}
+
 #[test]
 fn fault_series_cover_every_entrypoint_of_spec_06() {
     let mut names = vec![
@@ -151,6 +168,7 @@ fn fault_series_cover_every_entrypoint_of_spec_06() {
         exports::DRIVER_STEP,
         exports::DRIVER_STATE,
         exports::MIGRATE,
+        exports::VERSION,
         exports::VALIDATE_TX,
         exports::BUILD_BLOCK,
         exports::EXECUTE_BLOCK,
@@ -158,6 +176,7 @@ fn fault_series_cover_every_entrypoint_of_spec_06() {
         exports::QUERY,
     ];
     assert_eq!(names, ENTRYPOINTS);
+    assert_eq!(spec_06_entrypoints(), ENTRYPOINTS);
     names.sort_unstable();
     names.dedup();
     assert_eq!(names.len(), ENTRYPOINTS.len());

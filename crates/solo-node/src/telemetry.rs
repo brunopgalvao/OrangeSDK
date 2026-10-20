@@ -87,13 +87,16 @@ impl Node {
     }
 
     /// Refreshes the gauges read at scrape time (chain id, mempool, timers,
-    /// head age) and renders every family: the body of `GET /metrics`.
+    /// head age, upgrade alerts) and renders every family: the body of `GET /metrics`.
     pub fn metrics_text(&mut self) -> String {
         // Without a chain id the family stays empty; the rest still renders.
         self.telemetry_chain_id().ok();
         let bytes = self.mempool().iter().map(|p| p.raw.len()).sum();
         let (count, timers) = (self.mempool().len(), self.timers().len());
         self.telemetry.refresh(count, bytes, timers);
+        let upgrades = &self.upgrades;
+        self.telemetry
+            .upgrade(upgrades.alert.is_some(), upgrades.missing_gates());
         self.telemetry.render()
     }
 
@@ -115,6 +118,8 @@ impl Node {
             mempool: self.mempool().len() as u64,
             uptime_seconds: self.telemetry.uptime_seconds(),
             validator: self.validator_id(),
+            upgrade_alert: self.upgrades.alert.clone(),
+            missing_gates: self.upgrades.missing_gates(),
         })
     }
 }

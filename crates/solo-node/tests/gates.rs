@@ -251,6 +251,11 @@ fn a_validator_signals_and_its_gate_activates_an_epoch_after_locking_in() {
     assert!(node.resolves("secp256k1_verify", Capability::Privileged));
     assert!(node.resolves("secp256k1_verify", Capability::Sandboxed));
     assert_eq!(node.upgrades().missing_gates(), 0);
+    assert!(
+        node.metrics_text()
+            .contains("\nsolo_upgrade_missing_gates 0\n")
+    );
+    assert_eq!(node.status().unwrap().missing_gates, 0);
     // A kernel that imports the gated function can now be prepared for an upgrade.
     let tiny = tiny_kernel(&2u32.to_le_bytes(), false, Some("secp256k1_verify"));
     let code_hash = keccak256(&tiny);
@@ -281,6 +286,14 @@ fn a_validator_signals_and_its_gate_activates_an_epoch_after_locking_in() {
     assert_eq!(node.upgrades().active(), 0);
     assert!(!node.resolves("secp256k1_verify", Capability::Privileged));
     assert_eq!(node.upgrades().missing_gates(), 1 << gate::SECP256K1_VERIFY);
+    // The operator hears of it through /metrics and /status (spec 13 §7.2).
+    let text = node.metrics_text();
+    assert!(text.contains("\nsolo_upgrade_missing_gates 1\n"), "{text}");
+    assert!(text.contains("\nsolo_upgrade_blocked 0\n"), "{text}");
+    assert_eq!(
+        node.status().unwrap().missing_gates,
+        1 << gate::SECP256K1_VERIFY
+    );
     // Locked in stays locked in.
     let gates = node.upgrade_status().unwrap().gates;
     assert_eq!(gates.record(gate::SECP256K1_VERIFY), Some(&record));

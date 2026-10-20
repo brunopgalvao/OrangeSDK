@@ -1440,6 +1440,78 @@
         "defaults": {},
         "overrides": []
       }
+    },
+    {
+      "type": "row",
+      "id": 30,
+      "title": "Kernel upgrades",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 70
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 31,
+      "title": "Upgrade alerts",
+      "description": "Whether the pending kernel upgrade cannot be enacted by this host, and how many locked-in feature gates this release does not support (spec 13 section 7.2). Anything above zero needs an operator before the activation height.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 71
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "solo_upgrade_blocked{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} upgrade blocked",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B",
+          "expr": "solo_upgrade_missing_gates{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} missing gates",
+          "range": true
+        }
+      ]
     }
   ]
 }

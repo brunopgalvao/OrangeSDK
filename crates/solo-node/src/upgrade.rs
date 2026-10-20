@@ -320,7 +320,8 @@ impl Node {
     /// Calls `export` of the compiled module `code_hash` against chain
     /// state, with the `Privileged` set and the kernel gas budget, as the
     /// kernel switch does: for inspecting a prepared upgrade. Writes are kept
-    /// if the call halts.
+    /// if the call halts. The call is recorded in the `solo_kernel_*`
+    /// families like any other entrypoint call (spec 11 §4).
     ///
     /// # Errors
     /// [`NodeError::Kernel`] unless the call halts.
@@ -330,6 +331,7 @@ impl Node {
         export: &'static str,
         input: &[u8],
     ) -> Result<Vec<u8>, NodeError> {
+        let started = std::time::Instant::now();
         let r = self.exec.call_export(
             &code_hash,
             export,
@@ -339,6 +341,7 @@ impl Node {
             Capability::Privileged,
             Flags::default(),
         );
+        crate::telemetry::record_call(&mut self.telemetry, &mut self.exec, export, started, &r);
         if r.status == Termination::Halt {
             Ok(r.output)
         } else {

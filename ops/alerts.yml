@@ -85,3 +85,11 @@ groups:
         annotations:
           summary: "{{ $labels.instance }} dropped emitted metrics ({{ $labels.reason }})"
           description: "The kernel or a module emitted metrics with bad names, unknown kinds, negative counter steps, or more names than the node keeps (spec 11 section 5)."
+
+      - alert: SoloUpgradeBlocked
+        expr: solo_upgrade_blocked + solo_upgrade_missing_gates > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} cannot run what the chain is upgrading to"
+          description: "The pending kernel upgrade cannot be enacted by this host (GET /status upgradeAlert says why), or the chain locked in feature gates this release does not support (missingGates). Cancel the upgrade through governance or install a newer host release before the activation height, or the node halts there (spec 13 section 7.2)."

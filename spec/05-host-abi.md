@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-The host ABI is the complete set of functions a module may call through `ecall`, and the complete set of entrypoints a host may call on a module. It is the boundary between what governance can change (everything inside the VM) and what only a node release can change (everything outside). Because of that it is designed to stay small, to grow only by addition, and to never change the meaning of an existing function. Version 1 has 27 functions. A function, once published in a released minor, is never removed and never changes behaviour; a replacement gets a new name.
+The host ABI is the complete set of functions a module may call through `ecall`, and the complete set of entrypoints a host may call on a module. It is the boundary between what governance can change (everything inside the VM) and what only a node release can change (everything outside). Because of that it is designed to stay small, to grow only by addition, and to never change the meaning of an existing function. Version 1 has 36 functions, all available from genesis (§4); gate 0 (13 §8.1) adds a 37th, `secp256k1_verify`. A function, once published in a released minor, is never removed and never changes behaviour; a replacement gets a new name.
 
 ## 2. Capability sets
 
@@ -156,5 +156,6 @@ Every function in §4.1–§4.4 MUST return identical results on every node give
 ## 7. Versioning and growth
 
 - `abi_version` returns 1. A host supporting version `n` supports every function of every version `≤ n`.
-- New functions arrive in a new version behind a feature gate (spec 13 §8): a gated function resolves only once the chain has activated its gate. A module importing a function from a version the host lacks, or one whose gate is not active, fails to load, which is the intended failure: it is visible at install, never at run time.
+- The functions of §4 without a gate in their capability cell, `bls12381_verify` and `bls12381_pairing_check` among them, are version 1 and resolve from genesis on every chain; a chain needs no gate to use them.
+- New functions added after that arrive behind a feature gate (spec 13 §8), and in a new version once one is published: a gated function resolves only once the chain has activated its gate. `secp256k1_verify` is the first, behind gate 0. A module importing a function from a version the host lacks, or one whose gate is not active, fails to load, which is the intended failure: it is visible at install, never at run time.
 - Per-unit and base costs in this document are part of the host-call cost table, version 1, and are recalibrated and versioned exactly like the instruction cost table (04 §2). A kernel declares the cost-table versions it was built against; the host charges by the versions the active fee schedule names.

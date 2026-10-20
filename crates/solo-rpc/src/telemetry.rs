@@ -21,6 +21,10 @@ pub fn status_json(s: &Status) -> Value {
         "mempool": s.mempool,
         "uptimeSeconds": s.uptime_seconds,
         "validator": s.validator.as_ref().map(|id| data(id)),
+        "upgradeAlert": s.upgrade_alert,
+        "missingGates": (0..64u32)
+            .filter(|g| s.missing_gates >> g & 1 == 1)
+            .collect::<Vec<_>>(),
     })
 }
 

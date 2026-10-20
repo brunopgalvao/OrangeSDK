@@ -217,6 +217,19 @@ fn a_node_switches_kernels_at_the_activation_height() {
     assert!(!node.resolves("secp256k1_verify", Capability::Privileged));
     assert_eq!(node.upgrades().held(), 0);
     assert_eq!(node.upgrades().halted(), None);
+    // The switch's kernel calls are entrypoint calls like any other (spec 11 §4).
+    let text = node.metrics_text();
+    let count = |entrypoint: &str| {
+        let line =
+            format!("solo_kernel_call_duration_seconds_count{{entrypoint=\"{entrypoint}\"}} ");
+        text.lines()
+            .find_map(|l| l.strip_prefix(&line))
+            .map_or(0, |n| n.parse::<u64>().unwrap())
+    };
+    assert_eq!(count("kernel_migrate"), 1, "{text}");
+    // Preparing read both versions, the switch read them again, and so did this test.
+    assert!(count("kernel_version") >= 4, "{text}");
+    assert!(text.contains("\nsolo_upgrade_blocked 0\n"), "{text}");
 }
 
 /// Runs a fresh single-validator chain that stages `code` and proposes it,
@@ -255,6 +268,14 @@ fn a_switch_that_cannot_complete_halts_the_node() {
     assert_eq!(node.kernel_hash(), keccak256(v1()));
     assert_eq!(node.upgrades().halted(), Some(&err));
     assert!(node.upgrades().switches.is_empty());
+    // The fault reaches the operator like any kernel fault (spec 11 §7).
+    let text = node.metrics_text();
+    assert!(
+        text.contains(
+            "solo_kernel_faults_total{entrypoint=\"kernel_migrate\",status=\"trap\"} 1\n"
+        ),
+        "{text}"
+    );
     let t = node.now_ms() + 10 * SLOT_MS;
     assert_eq!(node.tick(t), Err(err.clone()));
     assert_eq!(node.start(None), Err(err));
@@ -279,9 +300,12 @@ fn a_switch_that_cannot_complete_halts_the_node() {
     );
 
     // A module this host cannot load: an alert from the moment it is proposed, then a halt.
-    let (err, h, node) = halt_at_switch(b"not a module");
+    let (err, h, mut node) = halt_at_switch(b"not a module");
     let alert = node.upgrades().alert.clone().unwrap();
     assert!(alert.contains("cannot load"), "{alert}");
+    // Reported to the operator through /metrics and /status (spec 13 §7.2).
+    assert!(node.metrics_text().contains("\nsolo_upgrade_blocked 1\n"));
+    assert_eq!(node.status().unwrap().upgrade_alert, Some(alert.clone()));
     assert_eq!(node.upgrades().prepared, None);
     let NodeError::Upgrade(why) = &err else {
         panic!("{err:?}")

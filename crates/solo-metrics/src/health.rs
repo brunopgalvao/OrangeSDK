@@ -5,9 +5,9 @@
 use crate::node::{KERNEL_CALL_SECONDS, KERNEL_FAULTS, Status};
 use crate::parse::Sample;
 
-/// Entrypoints that run once per kernel, at open or at a switchover, and
-/// so say nothing about how the node keeps up: the call-time check skips them.
-pub const ONE_OFF_ENTRYPOINTS: [&str; 2] = ["kernel_init", "kernel_migrate"];
+/// Entrypoints that run once per kernel, at open or around a switchover,
+/// and so say nothing about how the node keeps up: the call-time check skips them.
+pub const ONE_OFF_ENTRYPOINTS: [&str; 3] = ["kernel_init", "kernel_migrate", "kernel_version"];
 
 /// Thresholds of the verdict. [`Limits::default`] matches the alert rules.
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +101,21 @@ pub fn assess(status: &Status, samples: &[Sample], limits: &Limits) -> Vec<Strin
             ));
         }
     }
+    if let Some(why) = &status.upgrade_alert {
+        problems.push(format!(
+            "the pending kernel upgrade cannot be enacted: {why}"
+        ));
+    }
+    if status.missing_gates != 0 {
+        let gates: Vec<String> = (0..64)
+            .filter(|g| status.missing_gates >> g & 1 == 1)
+            .map(|g: u32| g.to_string())
+            .collect();
+        problems.push(format!(
+            "the chain locked in feature gates this release does not support: {}",
+            gates.join(", ")
+        ));
+    }
     problems
 }
 
@@ -141,6 +156,8 @@ mod tests {
             mempool: 2,
             uptime_seconds: 12.0,
             validator: None,
+            upgrade_alert: None,
+            missing_gates: 0,
         }
     }
 
@@ -176,6 +193,8 @@ mod tests {
             finalized: 20,
             peers: 0,
             mempool: 1001,
+            upgrade_alert: Some("this host cannot load upgrade 0x01".to_owned()),
+            missing_gates: 0b101,
             ..status()
         };
         let metrics = parse(
@@ -199,6 +218,8 @@ mod tests {
                 "? faulted 1 times (?) since the node started",
                 "kernel_stf_execute_block takes 3.000s per call on average (limit 1s)",
                 "? takes 5.000s per call on average (limit 1s)",
+                "the pending kernel upgrade cannot be enacted: this host cannot load upgrade 0x01",
+                "the chain locked in feature gates this release does not support: 0, 2",
             ]
         );
         assert_eq!(Limits::default().clone(), DEFAULT_LIMITS);

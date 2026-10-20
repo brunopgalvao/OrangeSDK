@@ -23,11 +23,12 @@ pub const MAX_EMITTED_SERIES: usize = 256;
 
 /// The kernel entrypoints of spec 06 section 3, in its order: the
 /// `entrypoint` values whose fault series exist from the moment the node opens.
-pub const ENTRYPOINTS: [&str; 9] = [
+pub const ENTRYPOINTS: [&str; 10] = [
     "kernel_init",
     "kernel_driver_step",
     "kernel_driver_state",
     "kernel_migrate",
+    "kernel_version",
     "kernel_stf_validate_tx",
     "kernel_stf_build_block",
     "kernel_stf_execute_block",
@@ -225,6 +226,20 @@ pub const P2P_FRAMES: Desc = desc(
     &["direction", "kind"],
     "Frames the peer-to-peer transport received and queued for sending, by frame kind.",
 );
+/// `solo_upgrade_blocked`.
+pub const UPGRADE_BLOCKED: Desc = desc(
+    "solo_upgrade_blocked",
+    Kind::Gauge,
+    &[],
+    "1 while the pending kernel upgrade cannot be enacted by this host (spec 13 section 7.2), else 0.",
+);
+/// `solo_upgrade_missing_gates`.
+pub const UPGRADE_MISSING_GATES: Desc = desc(
+    "solo_upgrade_missing_gates",
+    Kind::Gauge,
+    &[],
+    "Feature gates the chain has locked in that this host release does not support (spec 13 section 7.2).",
+);
 /// `solo_build_info`.
 pub const BUILD_INFO: Desc = desc(
     "solo_build_info",
@@ -264,6 +279,8 @@ pub const ALL: &[Desc] = &[
     EMITTED_DROPPED,
     P2P_BYTES,
     P2P_FRAMES,
+    UPGRADE_BLOCKED,
+    UPGRADE_MISSING_GATES,
     BUILD_INFO,
     START_TIME,
 ];
@@ -362,6 +379,12 @@ pub struct Status {
     pub uptime_seconds: f64,
     /// The validator id, for a node with a consensus key.
     pub validator: Option<[u8; 32]>,
+    /// Why the pending kernel upgrade cannot be enacted by this host, while
+    /// it cannot (spec 13 §7.2).
+    pub upgrade_alert: Option<String>,
+    /// The locked-in feature gates this host does not support, one bit per
+    /// gate (spec 13 §7.2).
+    pub missing_gates: u64,
 }
 
 /// The node's metrics: a [`Registry`] over [`ALL`] plus the little state
@@ -425,6 +448,8 @@ impl NodeMetrics {
             &MEMPOOL_TRANSACTIONS,
             &MEMPOOL_BYTES,
             &DRIVER_TIMERS,
+            &UPGRADE_BLOCKED,
+            &UPGRADE_MISSING_GATES,
         ] {
             registry.set(d, &[], 0.0);
         }
@@ -593,6 +618,19 @@ impl NodeMetrics {
         self.registry.set(&DRIVER_TIMERS, &[], float(timers as u64));
         let age = self.head_age_seconds();
         self.registry.set(&HEAD_AGE, &[], age);
+    }
+
+    /// Sets the upgrade gauges: whether the pending kernel upgrade cannot be
+    /// enacted, and the locked-in gates this host does not support (one bit
+    /// per gate).
+    pub fn upgrade(&mut self, blocked: bool, missing_gates: u64) {
+        self.registry
+            .set(&UPGRADE_BLOCKED, &[], f64::from(u8::from(blocked)));
+        self.registry.set(
+            &UPGRADE_MISSING_GATES,
+            &[],
+            f64::from(missing_gates.count_ones()),
+        );
     }
 
     /// Last executed height.
@@ -814,6 +852,21 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_gauges_start_at_zero_and_follow_the_node() {
+        let mut m = NodeMetrics::new();
+        let read = |m: &NodeMetrics, d: &Desc| m.registry().value(d, &[]);
+        assert_eq!(read(&m, &UPGRADE_BLOCKED), Some(0.0));
+        assert_eq!(read(&m, &UPGRADE_MISSING_GATES), Some(0.0));
+        m.upgrade(true, 0b1001);
+        assert_eq!(read(&m, &UPGRADE_BLOCKED), Some(1.0));
+        assert_eq!(read(&m, &UPGRADE_MISSING_GATES), Some(2.0));
+        assert!(m.render().contains("\nsolo_upgrade_blocked 1\n"));
+        m.upgrade(false, 0);
+        assert_eq!(read(&m, &UPGRADE_BLOCKED), Some(0.0));
+        assert_eq!(read(&m, &UPGRADE_MISSING_GATES), Some(0.0));
+    }
+
+    #[test]
     fn status_is_plain_data() {
         let s = Status {
             version: VERSION.to_owned(),
@@ -826,6 +879,8 @@ mod tests {
             mempool: 0,
             uptime_seconds: 1.0,
             validator: None,
+            upgrade_alert: None,
+            missing_gates: 0,
         };
         assert_eq!(s.clone(), s);
         assert!(format!("{s:?}").contains("chain_id"));

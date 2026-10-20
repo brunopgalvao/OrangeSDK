@@ -66,6 +66,18 @@ pub fn parse_status(text: &str) -> Result<Status, String> {
             uptime_seconds: f("uptimeSeconds")?,
             // The verdict does not depend on the node's identity.
             validator: None,
+            // Fields a node of an earlier release does not send read as clear.
+            upgrade_alert: match v.get("upgradeAlert") {
+                None | Some(Value::Null) => None,
+                Some(why) => Some(why.as_str()?.to_owned()),
+            },
+            missing_gates: match v.get("missingGates") {
+                None => 0,
+                Some(gates) => gates.as_array()?.iter().try_fold(0u64, |mask, g| {
+                    let g = g.as_u64().filter(|g| *g < 64)?;
+                    Some(mask | 1 << g)
+                })?,
+            },
         })
     };
     status().ok_or_else(|| "status: a field is missing or has the wrong type".to_owned())

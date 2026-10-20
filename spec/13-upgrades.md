@@ -143,6 +143,8 @@ A host reports, without stopping:
 - a pending upgrade it cannot enact: the code does not hash to its code hash, the module is invalid, it imports a function this host cannot serve for block `H + 1`, its `kernel_version` does not halt with a `u32`, or that version is not above the running kernel's (06 §7.2), so that its `kernel_migrate` would trap at `H`. This is the "host lacks the ABI a pending kernel needs" alert of ADR 0011: governance can cancel, or operators can install a host release, before `H`.
 - gates the chain has locked in that its release does not support: the host cannot serve their behaviour once they activate, and must be replaced by a release that does.
 
+The reference node reports both through its telemetry (11): the gauges `solo_upgrade_blocked` and `solo_upgrade_missing_gates`, the `upgradeAlert` and `missingGates` fields of `/status`, the `SoloUpgradeBlocked` alert rule and a check of `solo doctor`.
+
 ## 8. Feature gates
 
 ### 8.1 Gates
@@ -153,7 +155,7 @@ A *gate* is a bit index from 0 to 63. A host release defines which behaviour eac
 |---|---|
 | 0 | the host function `secp256k1_verify` (05 §4.3) |
 
-A gated host function resolves (03 §5.1) only while its gate is active: before that, a module importing it fails to load. Once active it behaves exactly as specified, on every node.
+The host functions of 05 §4 that carry no gate, the BLS12-381 functions included, are part of ABI version 1 and resolve from genesis on every chain. A gated host function resolves (03 §5.1) only while its gate is active: before that, a module importing it fails to load. Once active it behaves exactly as specified, on every node.
 
 ### 8.2 Signalling
 
