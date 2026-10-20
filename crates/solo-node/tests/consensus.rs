@@ -10,10 +10,10 @@ use solo_abi::chain::consensus::{
 };
 use solo_abi::chain::{
     Allocation, Certificate, ConsensusMessage, Evidence, GenesisParams, Proposal, Signature,
-    SignedHash, SimplexState,
+    SignedHash, SignedVote, SimplexState, SyncResponse,
 };
 use solo_abi::codec::Seq;
-use solo_abi::types::Genesis;
+use solo_abi::types::{Genesis, Input};
 use solo_abi::{Decode, Encode};
 use solo_host::hash::keccak256;
 use solo_node::{Node, Outbound, Sim, validator_id};
@@ -470,6 +470,31 @@ fn sends(node: &mut Node, peer: &[u8; 32]) -> Vec<ConsensusMessage> {
         .collect()
 }
 
+/// The proposal `node` holds as notarized in `view`, if any.
+fn notarized_in(node: &Node, view: u64) -> Option<Proposal> {
+    let persisted = node.persisted();
+    let mut notar = b"notar/".to_vec();
+    notar.extend_from_slice(&view.to_le_bytes());
+    let mut prop = b"prop/".to_vec();
+    prop.extend_from_slice(persisted.get(&notar)?);
+    Some(Proposal::from_bytes(persisted.get(&prop)?).unwrap())
+}
+
+/// Whether `node` stores a proposal under `hash`.
+fn holds_proposal(node: &Node, hash: &[u8; 32]) -> bool {
+    let mut k = b"prop/".to_vec();
+    k.extend_from_slice(hash);
+    node.persisted().contains_key(&k)
+}
+
+/// The evidence `node` found that it still means to put in its proposals.
+fn pending_evidence(node: &Node) -> Vec<Evidence> {
+    node.persisted()
+        .get(b"simplex/evidence".as_slice())
+        .map(|b| Seq::<Evidence>::from_bytes(b).unwrap().0)
+        .unwrap_or_default()
+}
+
 fn equivocations(node: &Node) -> usize {
     node.metrics
         .iter()
@@ -560,11 +585,17 @@ fn a_laggard_is_answered_once_per_view() {
     let kernel = kernel_module();
     let genesis = genesis(&keys, address(&keys[0]));
     let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    // Run until validator 3 has led a view that node 0 notarized.
+    let led_by_3 = |s: &Sim| {
+        (1..simplex(s, 0).view)
+            .find(|&w| leader(w, 4) == 3 && notarized_in(&s.nodes[0], w).is_some())
+    };
     assert!(
         sim.run_until(20 * SLOT_MS, |s| s
             .nodes
             .iter()
-            .all(|n| n.finalized.len() >= 3))
+            .all(|n| n.finalized.len() >= 3)
+            && led_by_3(s).is_some())
             .unwrap()
     );
     let view = simplex(&sim, 0).view;
@@ -621,18 +652,30 @@ fn a_laggard_is_answered_once_per_view() {
         .deliver(third, TOPIC, vote(&keys[3], view - 1, certificate.hash))
         .unwrap();
     assert!(sends(&mut sim.nodes[0], &third).is_empty());
-    // A late proposal is a stale message like any other.
-    let first = sim.nodes[0].block_by_number(1).unwrap().unwrap();
-    let late = Proposal {
-        view: 1,
-        height: 1,
-        timestamp_ms: first.timestamp_ms,
-        ..Proposal::default()
-    };
+    // A stale message is answered only when its signer delivers it: an old vote or
+    // proposal replayed under other peer ids draws nothing, however many ids replay it.
+    let led = led_by_3(&sim).unwrap();
+    let late = notarized_in(&sim.nodes[0], led).unwrap();
+    for sybil in 0..20u8 {
+        let id = [0xA0 + sybil; 32];
+        sim.nodes[0]
+            .deliver(id, TOPIC, vote(&keys[1], 1, [0; 32]))
+            .unwrap();
+        sim.nodes[0]
+            .deliver(id, TOPIC, propose(&keys[3], late.clone()))
+            .unwrap();
+        assert!(sends(&mut sim.nodes[0], &id).is_empty(), "sybil {sybil}");
+    }
     sim.nodes[0]
-        .deliver(third, TOPIC, propose(&keys[0], late))
+        .deliver(third, TOPIC, vote(&keys[1], 1, [0; 32]))
+        .unwrap();
+    assert!(sends(&mut sim.nodes[0], &third).is_empty());
+    // A late proposal from the leader that made it is a stale message like any other.
+    sim.nodes[0]
+        .deliver(third, TOPIC, propose(&keys[3], late))
         .unwrap();
     assert_eq!(sends(&mut sim.nodes[0], &third).len(), 1);
+    assert_eq!(equivocations(&sim.nodes[0]), 0);
     // In a later view the first laggard is answered again.
     assert!(
         sim.run_until(10 * SLOT_MS, |s| simplex(s, 0).view > view)
@@ -696,51 +739,114 @@ fn forwarded_certificates_are_checked() {
     let genesis = genesis(&keys, address(&keys[0]));
     let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
     let peer = validator_id(&keys[1]);
-    let certify = |votes: Vec<SignedHash>, kind: u8, view: u64, proposal: Option<Proposal>| {
-        let hash = votes.first().map_or([0; 32], |v| v.hash);
-        ConsensusMessage::Certificate {
-            certificate: Certificate {
-                kind,
-                view,
-                hash,
-                votes: Seq(votes
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, v)| solo_abi::chain::SignedVote {
-                        validator: u32::try_from(i).unwrap(),
-                        signature: v.signature,
-                    })
-                    .collect()),
-            },
-            proposal,
-        }
-        .to_bytes()
-    };
-    let timeouts = |view: u64, signers: &[usize]| -> Vec<SignedHash> {
+    // Each vote is the validator index the certificate claims for it, and the vote.
+    let certify =
+        |votes: Vec<(u32, SignedHash)>, kind: u8, view: u64, proposal: Option<Proposal>| {
+            let hash = votes.first().map_or([0; 32], |v| v.1.hash);
+            ConsensusMessage::Certificate {
+                certificate: Certificate {
+                    kind,
+                    view,
+                    hash,
+                    votes: Seq(votes
+                        .into_iter()
+                        .map(|(validator, v)| SignedVote {
+                            validator,
+                            signature: v.signature,
+                        })
+                        .collect()),
+                },
+                proposal,
+            }
+            .to_bytes()
+        };
+    let by = |kind: u8, view: u64, hash: [u8; 32], signers: &[usize]| -> Vec<(u32, SignedHash)> {
         signers
             .iter()
-            .map(|&i| signed(&keys[i], KIND_VOTE, view, [0; 32]))
+            .map(|&i| {
+                (
+                    u32::try_from(i).unwrap(),
+                    signed(&keys[i], kind, view, hash),
+                )
+            })
             .collect()
     };
-    // Too few signers, a signature that does not verify, a proposal that does not match
-    // the hash, and an unknown kind all leave node 0 in view 1.
+    let timeouts = |view: u64, signers: &[usize]| by(KIND_VOTE, view, [0; 32], signers);
+    let now = sim.nodes[0].now_ms();
+    let proposal = Proposal {
+        view: 12,
+        height: 1,
+        timestamp_ms: now,
+        ..Proposal::default()
+    };
+    let hash = keccak256(&proposal.to_bytes());
+    let forged = Proposal {
+        timestamp_ms: now + 1,
+        ..proposal.clone()
+    };
+    // Too few signers, a signature that does not verify, a proposal with a timeout
+    // certificate, and an unknown kind all leave node 0 in view 1.
     let mut bad = timeouts(5, &[0, 1, 2]);
-    bad[2].signature = Signature([3; 65]);
+    bad[2].1.signature = Signature([3; 65]);
     let other = Proposal {
         view: 5,
         height: 1,
         ..Proposal::default()
     };
+    // So do certificates whose shape is wrong, checked before any signature: more votes
+    // than validators, however many of them verify; a validator named twice; an index
+    // outside the set; and votes signed by others than the validators they name.
+    let mut swollen: Vec<(u32, SignedHash)> = timeouts(5, &[0, 1, 2])
+        .iter()
+        .cycle()
+        .take(300)
+        .cloned()
+        .collect();
+    swollen.extend(timeouts(5, &[3]));
+    let mut twice = timeouts(5, &[0, 1, 2]);
+    twice.push(twice[0].clone());
+    let mut outside = timeouts(5, &[0, 1]);
+    outside.push((7, signed(&keys[2], KIND_VOTE, 5, [0; 32])));
+    let shifted: Vec<(u32, SignedHash)> = by(KIND_VOTE, 12, hash, &[1, 2, 3])
+        .into_iter()
+        .map(|(i, v)| (i - 1, v))
+        .collect();
     for message in [
         certify(timeouts(5, &[0, 1]), KIND_VOTE, 5, None),
         certify(bad, KIND_VOTE, 5, None),
         certify(timeouts(5, &[0, 1, 2]), KIND_VOTE, 5, Some(other)),
         certify(timeouts(5, &[0, 1, 2]), KIND_PROPOSE, 5, None),
         certify(timeouts(5, &[0, 1, 2]), KIND_FINALIZE, 5, None),
+        certify(swollen, KIND_VOTE, 5, None),
+        certify(twice, KIND_VOTE, 5, None),
+        certify(outside, KIND_VOTE, 5, None),
+        certify(shifted, KIND_VOTE, 12, Some(proposal.clone())),
     ] {
         sim.nodes[0].deliver(peer, TOPIC, message).unwrap();
         assert_eq!(simplex(&sim, 0).view, 1);
     }
+    // A genuine notarization of one proposal, carrying another, is dropped whole: the
+    // carried proposal never becomes the tip, nor is it stored under the notarized hash.
+    sim.nodes[0]
+        .deliver(
+            peer,
+            TOPIC,
+            certify(
+                by(KIND_VOTE, 12, hash, &[1, 2, 3]),
+                KIND_VOTE,
+                12,
+                Some(forged.clone()),
+            ),
+        )
+        .unwrap();
+    let state = simplex(&sim, 0);
+    assert_eq!((state.view, state.tip_height), (1, 0));
+    assert_ne!(state.tip_hash, hash);
+    assert!(!holds_proposal(&sim.nodes[0], &hash));
+    assert!(!holds_proposal(
+        &sim.nodes[0],
+        &keccak256(&forged.to_bytes())
+    ));
     // A quorum of timeout votes for a later view moves node 0 straight past it.
     sim.nodes[0]
         .deliver(
@@ -751,7 +857,6 @@ fn forwarded_certificates_are_checked() {
         .unwrap();
     assert_eq!(simplex(&sim, 0).view, 6);
     // Leaving a view by timeout doubles the next view's timeout.
-    let now = sim.nodes[0].now_ms();
     let timeout_of = |sim: &Sim, view: u64| {
         sim.nodes[0]
             .timers()
@@ -784,21 +889,17 @@ fn forwarded_certificates_are_checked() {
     assert_eq!(timeout_of(&sim, 10), Some(4 * 3 * SLOT_MS));
     // A notarization for a later view, with its proposal, moves node 0 past it, makes the
     // proposal its tip, and shortens the timeout again.
-    let proposal = Proposal {
-        view: 12,
-        height: 1,
-        timestamp_ms: now,
-        ..Proposal::default()
-    };
-    let hash = keccak256(&proposal.to_bytes());
-    let votes: Vec<SignedHash> = keys[1..]
-        .iter()
-        .map(|key| signed(key, KIND_VOTE, 12, hash))
-        .collect();
-    // The signers are validators 1 to 3 while the certificate claims 0 to 2: the signer of
-    // a vote is whoever its signature recovers to.
     sim.nodes[0]
-        .deliver(peer, TOPIC, certify(votes, KIND_VOTE, 12, Some(proposal)))
+        .deliver(
+            peer,
+            TOPIC,
+            certify(
+                by(KIND_VOTE, 12, hash, &[1, 2, 3]),
+                KIND_VOTE,
+                12,
+                Some(proposal),
+            ),
+        )
         .unwrap();
     let state = simplex(&sim, 0);
     assert_eq!(
@@ -906,7 +1007,107 @@ fn equivocations_are_detected_and_recorded_on_chain() {
             .unwrap()
     );
     assert_eq!(sim.nodes[0].evidence(0).unwrap().len(), 3);
+    for i in [0, 1] {
+        assert_eq!(pending_evidence(&sim.nodes[i]), Vec::new(), "node {i}");
+    }
     assert_agreement(&sim, &[0, 1, 2]);
+}
+
+#[test]
+fn equivocations_inside_certificates_are_detected() {
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, address(&keys[0]));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    let byzantine = validator_id(&keys[3]);
+    let node = &mut sim.nodes[1];
+    let finalizes = |view: u64, hash: [u8; 32], signers: &[usize]| -> Vec<SignedVote> {
+        signers
+            .iter()
+            .map(|&i| SignedVote {
+                validator: u32::try_from(i).unwrap(),
+                signature: signed(&keys[i], KIND_FINALIZE, view, hash).signature,
+            })
+            .collect()
+    };
+    // Validator 3 finalizes one hash in view 7, then shows up in a certificate for
+    // another. The certificate is dropped for a later bad signature, but the vote of
+    // validator 3 verified before it, which is enough to convict.
+    node.deliver(byzantine, TOPIC, finalize(&keys[3], 7, [1; 32]))
+        .unwrap();
+    let mut votes = finalizes(7, [2; 32], &[3, 0, 2]);
+    votes[1].signature = Signature([3; 65]);
+    let certificate = Certificate {
+        kind: KIND_FINALIZE,
+        view: 7,
+        hash: [2; 32],
+        votes: Seq(votes),
+    };
+    let message = ConsensusMessage::Certificate {
+        certificate,
+        proposal: None,
+    };
+    node.deliver(byzantine, TOPIC, message.to_bytes()).unwrap();
+    assert_eq!(equivocations(node), 1);
+    assert_eq!(node.simplex_state().unwrap().view, 1);
+    // Validator 3 finalizes one hash in view 1, then signs the finalize certificate of
+    // the block a sync response delivers.
+    node.deliver(byzantine, TOPIC, finalize(&keys[3], 1, [9; 32]))
+        .unwrap();
+    let block = Proposal {
+        view: 1,
+        height: 1,
+        timestamp_ms: 10_000 + SLOT_MS,
+        ..Proposal::default()
+    };
+    let hash = keccak256(&block.to_bytes());
+    // A proposal two heights ahead makes node 1 ask its sender for the blocks between.
+    let ahead = Proposal {
+        view: 1,
+        height: 3,
+        ..Proposal::default()
+    };
+    let leader_id = validator_id(&keys[0]);
+    node.deliver(leader_id, TOPIC, propose(&keys[0], ahead))
+        .unwrap();
+    let request_id = node
+        .take_outbound()
+        .into_iter()
+        .find_map(|m| match m {
+            Outbound::Request {
+                peer, request_id, ..
+            } if peer == leader_id => Some(request_id),
+            _ => None,
+        })
+        .expect("a sync request");
+    let response = SyncResponse {
+        finalized_height: 1,
+        proposals: Seq(vec![block]),
+        certificate: Some(Certificate {
+            kind: KIND_FINALIZE,
+            view: 1,
+            hash,
+            votes: Seq(finalizes(1, hash, &[0, 2, 3])),
+        }),
+    };
+    node.step(Input::Response {
+        request_id,
+        payload: response.to_bytes(),
+    })
+    .unwrap();
+    assert_eq!(equivocations(node), 2);
+    assert_eq!(node.simplex_state().unwrap().finalized_height, 1);
+    let mut kinds: Vec<(u8, u64)> = node
+        .persisted()
+        .iter()
+        .filter(|(k, _)| k.starts_with(b"evidence/"))
+        .map(|(_, v)| {
+            let e = Evidence::from_bytes(v).unwrap();
+            (e.kind, e.view)
+        })
+        .collect();
+    kinds.sort_unstable();
+    assert_eq!(kinds, vec![(KIND_FINALIZE, 1), (KIND_FINALIZE, 7)]);
 }
 
 #[test]

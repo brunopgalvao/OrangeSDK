@@ -252,7 +252,7 @@ impl Ctx {
                 }
                 self.observe(KIND_PROPOSE, view, proposer, SignedHash { hash, signature });
                 if view < self.s.view {
-                    self.forward_certificates();
+                    self.forward_certificates(proposer);
                     self.late_proposal(proposal, hash);
                 } else {
                     self.handle_proposal(proposal, hash);
@@ -320,17 +320,21 @@ impl Ctx {
         }
         let Some(validator) = self.verify(KIND_VOTE, view, &hash, &signature) else { return };
         self.observe(KIND_VOTE, view, validator, SignedHash { hash, signature });
-        self.forward_certificates();
+        self.forward_certificates(validator);
     }
 
     /// Sends the peer of the current input what it needs to reach this
     /// node's view: the certificate of the tip, with its proposal, and the
-    /// certificate that justified entering the current view. At most once
-    /// per peer until the view changes or its timeout fires again, so a
-    /// peer cannot make this node send more than it receives.
-    fn forward_certificates(&mut self) {
+    /// certificate that justified entering the current view. Only when the
+    /// stale message's `signer` is that peer itself, since an old signed
+    /// message proves nothing about whoever replays it, and at most once per
+    /// peer until the view changes or its timeout fires again. That bounds
+    /// what stale messages can draw out of this node to two certificates and
+    /// one proposal per validator per view and timeout period; it does not
+    /// make the answer smaller than the message that asked for it.
+    fn forward_certificates(&mut self, signer: u32) {
         let Some(peer) = self.peer else { return };
-        if self.s.answered.0.contains(&peer) {
+        if self.validators.get(signer as usize) != Some(&peer) || self.s.answered.0.contains(&peer) {
             return;
         }
         self.s.answered.0.push(peer);
@@ -351,8 +355,8 @@ impl Ctx {
         self.effects.push(Effect::Send { peer, topic: TOPIC, payload: m.to_bytes() });
     }
 
-    /// A certificate from a peer: every signature must verify and the
-    /// distinct signers must make a quorum, or it is dropped whole.
+    /// A certificate from a peer: it must pass [`Ctx::verified`], or it is
+    /// dropped whole.
     fn on_certificate(&mut self, certificate: Certificate, proposal: Option<Proposal>) {
         let Certificate { kind, view, hash, votes } = certificate;
         // Below the current view only a proposal this node lacks can still matter.
@@ -373,21 +377,13 @@ impl Ctx {
         if Self::votes(prefix, view, &hash).0.len() >= quorum(self.n()) && (!names_proposal || Self::proposal(&hash).is_some()) {
             return;
         }
-        let mut signed: Vec<SignedVote> = Vec::new();
-        for vote in votes.0 {
-            let Some(validator) = self.verify(kind, view, &hash, &vote.signature) else { return };
-            if !signed.iter().any(|v| v.validator == validator) {
-                signed.push(SignedVote { validator, signature: vote.signature });
-            }
-        }
-        if signed.len() < quorum(self.n()) {
+        if !self.verified(kind, view, &hash, &votes.0) {
             return;
         }
         if let Some(p) = &proposal {
             Self::store_proposal(&hash, p);
         }
-        for vote in signed {
-            self.observe(kind, view, vote.validator, SignedHash { hash, signature: vote.signature });
+        for vote in votes.0 {
             Self::add_vote(prefix, view, &hash, vote);
         }
         if kind == KIND_FINALIZE {
@@ -397,6 +393,33 @@ impl Ctx {
         } else {
             self.check_timeout(view);
         }
+    }
+
+    /// Whether `votes` certify `kind(view, hash)`: at most `n` votes, with
+    /// distinct validator indices in range, each signed by the validator it
+    /// names, and at least a quorum of them. The shape is checked before any
+    /// signature, so a certificate costs at most `n` recoveries however
+    /// large its message. Every vote that verifies is observed (§9), even
+    /// when the certificate as a whole fails.
+    fn verified(&mut self, kind: u8, view: u64, hash: &Hash, votes: &[SignedVote]) -> bool {
+        let n = self.n();
+        if votes.len() > n || votes.len() < quorum(n) {
+            return false;
+        }
+        let mut named = alloc::vec![false; n];
+        for vote in votes {
+            match named.get_mut(vote.validator as usize) {
+                Some(seen) if !*seen => *seen = true,
+                _ => return false,
+            }
+        }
+        for vote in votes {
+            if self.verify(kind, view, hash, &vote.signature) != Some(vote.validator) {
+                return false;
+            }
+            self.observe(kind, view, vote.validator, SignedHash { hash: *hash, signature: vote.signature });
+        }
+        true
     }
 
     /// Remembers the first hash `validator` signed of `kind` in `view`; a
@@ -622,15 +645,7 @@ impl Ctx {
         if certificate.kind != KIND_FINALIZE || state::keccak256(&last.to_bytes()) != certificate.hash {
             return;
         }
-        let mut signers: Vec<u32> = Vec::new();
-        for vote in &certificate.votes.0 {
-            if let Some(i) = self.verify(KIND_FINALIZE, certificate.view, &certificate.hash, &vote.signature)
-                && !signers.contains(&i)
-            {
-                signers.push(i);
-            }
-        }
-        if signers.len() < quorum(self.n()) {
+        if !self.verified(KIND_FINALIZE, certificate.view, &certificate.hash, &certificate.votes.0) {
             return;
         }
         let mut parent = self.finalized_hash();
