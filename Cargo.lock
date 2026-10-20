@@ -534,6 +534,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "solo-jit"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "proptest",
+ "solo-recompile",
+ "solo-vm",
+ "tiny-keccak",
+]
+
+[[package]]
 name = "solo-node"
 version = "0.0.1"
 dependencies = [

@@ -127,6 +127,22 @@ impl From<Writable> for Region {
     }
 }
 
+/// The backing bytes of every mapped region, for execution backends that
+/// access instance memory natively (spec 07 §4). Each entry is the region's
+/// guest base address and exactly its current extent, so an access of `n`
+/// bytes at `a` is inside it when `base <= a` and `a + n <= base + len`.
+#[derive(Debug)]
+pub struct Regions<'a> {
+    /// Read-only data.
+    pub ro: (u32, &'a [u8]),
+    /// Read-write data: `data` followed by `bss`.
+    pub rw: (u32, &'a mut [u8]),
+    /// The heap at its current size.
+    pub heap: (u32, &'a mut [u8]),
+    /// The stack.
+    pub stack: (u32, &'a mut [u8]),
+}
+
 /// The memory of one instance.
 #[derive(Debug, Clone)]
 pub struct Memory {
@@ -168,6 +184,17 @@ impl Memory {
     #[must_use]
     pub const fn layout(&self) -> &MemoryLayout {
         &self.layout
+    }
+
+    /// Every region with its backing bytes (see [`Regions`]).
+    pub fn regions_mut(&mut self) -> Regions<'_> {
+        let l = &self.layout;
+        Regions {
+            ro: (l.ro_base, &self.ro),
+            rw: (l.rw_base, &mut self.rw),
+            heap: (l.heap_base, &mut self.heap),
+            stack: (l.stack_base, &mut self.stack),
+        }
     }
 
     /// Current heap size in bytes, always a multiple of the page size.
@@ -480,6 +507,22 @@ pub(crate) mod tests {
             m.read(0xFFFC_0100, 5).unwrap(),
             &[0xAB, 0xAB, 0xAB, 0xAB, 0]
         );
+    }
+
+    #[test]
+    fn regions_expose_exact_extents() {
+        let mut m = mem();
+        m.sbrk(1).unwrap();
+        let r = m.regions_mut();
+        assert_eq!((r.ro.0, r.ro.1.len()), (0x1_0000, 16));
+        assert_eq!((r.rw.0, r.rw.1.len()), (0x2_0000, 32));
+        assert_eq!((r.heap.0, r.heap.1.len()), (0x3_0000, 4096));
+        assert_eq!((r.stack.0, r.stack.1.len()), (0xFFFC_0000, 0x2_0000));
+        r.stack.1[0] = 9;
+        r.rw.1[31] = 7;
+        assert!(alloc::format!("{r:?}").contains("Regions"));
+        assert_eq!(m.read(0xFFFC_0000, 1).unwrap(), &[9]);
+        assert_eq!(m.read(0x2_001F, 1).unwrap(), &[7]);
     }
 
     #[test]
