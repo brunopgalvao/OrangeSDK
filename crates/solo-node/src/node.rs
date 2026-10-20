@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
 
-use solo_abi::chain::BlockHeader;
+use solo_abi::chain::{BlockHeader, CallRequest, CallResult as CallOutcome, StorageQuery};
 use solo_abi::codec::Seq;
 use solo_abi::types::{
     self, Block, Effect, ExecContext, ExecuteArgs, ExecuteResult, FinalizeArgs, Genesis, Input,
@@ -193,7 +193,11 @@ impl Node {
         }
     }
 
-    fn call<T: Decode>(&mut self, export: &'static str, input: &[u8]) -> Result<T, NodeError> {
+    fn call_decoded<T: Decode>(
+        &mut self,
+        export: &'static str,
+        input: &[u8],
+    ) -> Result<T, NodeError> {
         let r = self.call_raw(export, input)?;
         T::from_bytes(&r.output)
             .ok()
@@ -292,7 +296,8 @@ impl Node {
     pub fn step(&mut self, input: Input) -> Result<(), NodeError> {
         let mut queue = VecDeque::from([input]);
         while let Some(input) = queue.pop_front() {
-            let effects: Seq<Effect> = self.call(exports::DRIVER_STEP, &input.to_bytes())?;
+            let effects: Seq<Effect> =
+                self.call_decoded(exports::DRIVER_STEP, &input.to_bytes())?;
             for effect in effects.0 {
                 if let Some(follow_up) = self.apply_effect(effect)? {
                     queue.push_back(follow_up);
@@ -428,7 +433,7 @@ impl Node {
         let context = Self::context_for(&header);
         let height = header.height;
         let args = ExecuteArgs { block, context }.to_bytes();
-        let result: ExecuteResult = self.call(exports::EXECUTE_BLOCK, &args)?;
+        let result: ExecuteResult = self.call_decoded(exports::EXECUTE_BLOCK, &args)?;
         let stored = self
             .block_by_number(height)?
             .ok_or(NodeError::Decode("stored header"))?;
@@ -484,7 +489,7 @@ impl Node {
             context,
         };
         let result: ValidateResult = self
-            .call(exports::VALIDATE_TX, &args.to_bytes())
+            .call_decoded(exports::VALIDATE_TX, &args.to_bytes())
             .map_err(SubmitError::Node)?;
         match result {
             ValidateResult::Valid { priority, .. } => {
@@ -517,7 +522,7 @@ impl Node {
             params: params.to_vec(),
             at: None,
         };
-        self.call(exports::QUERY, &args.to_bytes())
+        self.call_decoded(exports::QUERY, &args.to_bytes())
     }
 
     fn query_decoded<T: Decode>(
@@ -601,6 +606,45 @@ impl Node {
     /// See [`NodeError`].
     pub fn transaction(&mut self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, NodeError> {
         self.query_decoded(solo_abi::chain::query::TRANSACTION, hash)
+    }
+
+    /// Contract code at `address`; empty for an account without code.
+    ///
+    /// # Errors
+    /// See [`NodeError`].
+    pub fn code(&mut self, address: &types::Address) -> Result<Vec<u8>, NodeError> {
+        Ok(self
+            .query_decoded(solo_abi::chain::query::CODE, address)?
+            .unwrap_or_default())
+    }
+
+    /// The value of storage slot `slot` of `address`; zero if never written.
+    ///
+    /// # Errors
+    /// See [`NodeError`].
+    pub fn storage(
+        &mut self,
+        address: &types::Address,
+        slot: &types::Hash,
+    ) -> Result<types::Hash, NodeError> {
+        let params = StorageQuery {
+            address: *address,
+            slot: *slot,
+        };
+        Ok(self
+            .query_decoded(solo_abi::chain::query::STORAGE, &params.to_bytes())?
+            .unwrap_or_default())
+    }
+
+    /// Executes a message against the latest state and discards its effects
+    /// (`eth_call`, `eth_estimateGas`). A `gas` of zero means the kernel's cap.
+    ///
+    /// # Errors
+    /// See [`NodeError`]; [`NodeError::Decode`] if the kernel does not answer
+    /// the call query.
+    pub fn call(&mut self, request: &CallRequest) -> Result<CallOutcome, NodeError> {
+        self.query_decoded(solo_abi::chain::query::CALL, &request.to_bytes())?
+            .ok_or(NodeError::Decode(solo_abi::chain::query::CALL))
     }
 
     /// Last finalized height.
