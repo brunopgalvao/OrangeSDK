@@ -51,7 +51,7 @@ Unspecified registers and memory are unconstrained. A validation vector has `mod
 - **Interpreter against a semantic model.** A property-based harness generates random straight-line and looping programs over the arithmetic subset, executes them on the interpreter, and checks every register against a direct Rust model of 02 §5–§6. This runs in CI on every change.
 - **Backend against interpreter.** Every JIT backend is fuzzed against the interpreter on generated modules, comparing termination status, all registers, gas remaining, and a digest of memory. A mismatch is a release blocker for the backend. §4.1 states the procedure.
 - **Recompiler determinism.** Two runs over the corpus on different hosts must produce identical bytes.
-- **EVM path.** The EVM interpreter compiled to the VM runs Ethereum's execution spec tests for the target fork through a `t8n`-style adapter; the fixture set and fork are pinned in CI.
+- **EVM path.** The EVM compiled to the VM runs Ethereum's execution-spec state tests for the target fork; §4.2 states the procedure.
 
 ### 4.1 Differential testing of native backends
 
@@ -71,6 +71,37 @@ The harness runs every comparison under each register-allocation setting the bac
 - **Real guests.** The recompiled `hello` guest, and the reference kernel running `kernel_init`, `kernel_query`, `kernel_driver_state` and `kernel_stf_validate_tx` through the host executor with the node's privileged functions, must produce, after every call, identical call results, positions, logs, metrics and state commitments on both backends, and the harness must confirm that the native backend compiled the program rather than falling back to the interpreter.
 
 A backend MAY return `Unsupported` for a target it does not implement; callers then use the interpreter. Step limits (01 §6, `StepLimit`) are a debugging facility of the interpreter and are not required of native backends.
+
+### 4.2 Ethereum execution-spec conformance
+
+The reference kernel claims Ethereum equivalence at the Osaka fork. What it runs is not revm as revm's own test suite runs it: revm is compiled for `riscv64imac`, recompiled into a module (03 §8), executed by the interpreter or a native backend, with `ecrecover`, `SHA-256` and `P256VERIFY` answered by host functions (05 §4.3), and with every account, code and storage read and write going through the kernel's storage layout and its commit of revm's changes. Each of those layers can break Ethereum semantics without revm being wrong, so the whole pipeline is held to Ethereum's own test vectors.
+
+**Vectors.** The `state_test` fixtures of `ethereum/execution-spec-tests`, release `fusaka-devnet-5@v2.1.0` (`fixtures_fusaka-devnet-5.tar.gz`, SHA-256 `96a39d8eb8de742e450a7e7c63ffb4c2b82187f4fed9c1406f39ff3ef9f53a91`, filled 2025-09-08 from commit `7159decdb9107d6f052dd6a21a3d61b271a8e340` for Osaka). Only the `Osaka` expectations are read. `tools/fetch-conformance.sh` downloads that archive, checks the hash and extracts the state tests (5 571 cases in 266 files). The repository carries a subset, `crates/solo-conformance/tests/fixtures/state_tests`: 521 cases across the opcode families, the precompiles (identity, modexp with EIP-7823 and EIP-7883, BLAKE2, the KZG point evaluation, BLS12-381, `P256VERIFY`), CREATE and CREATE2, SELFDESTRUCT under EIP-6780, EIP-2930 and EIP-1559 transactions, the EIP-7623, EIP-7825 and EIP-3860 limits, transient storage, `MCOPY`, `CLZ`, `PUSH0` and the warm coinbase. `tools/curate-conformance.py` reproduces the subset from the full set: per category a quota of cases, taken round-robin across the category's test functions, trimmed to the fields the runner reads. Blockchain tests are not used: they check Ethereum's block structure (headers, withdrawals, system contracts, blob gas accounting), which the kernel replaces with its own (06, 08); the transaction-level semantics they share with state tests are covered by the state tests.
+
+**Procedure.** For each case the runner (`crates/solo-conformance`):
+
+1. encodes the environment (`currentCoinbase`, `currentNumber`, `currentTimestamp`, `currentGasLimit`, `currentBaseFee`, `currentRandom`, `currentDifficulty`, `currentExcessBlobGas`, the chain id), the pre-state as genesis allocations and the signed transaction (`txbytes`) as a `conformance::Case` (`solo_abi::conformance`);
+2. calls the export `conformance_run` of the conformance guest (`guest/evm-conformance`) on empty storage, privileged and with bare keys, exactly as the node loads the kernel, recompiled with the recompiler's defaults. The guest compiles the kernel's own `evm`, `state` and `tx` source files, so the code under test is the kernel's: genesis allocation (`state::init`), sender recovery (`tx::decode_signed`), and `evm::run_in`, the function behind the kernel's `evm::run`, with the case's environment in place of the kernel's fixed one. The kernel's block-level admission checks (`stf::well_formed`: its own block gas limit and fee floor) are not applied; revm's transaction validation is;
+3. reads the post-state back from storage in the kernel's layout (`acct/`, `code/`, `slot/` keys), computes Ethereum's state root over it (the hexary Merkle-Patricia trie of the Yellow Paper, appendix D) and `keccak256` of the RLP of the logs the guest returned;
+4. passes the case if and only if the transaction is refused (the guest reports `INVALID`) exactly when the fixture has `expectException`, the state root equals the fixture's `hash` and the logs hash equals its `logs`. When the root differs, the report names the first account and field that differ from the fixture's post-state.
+
+Every case runs on the interpreter and on the native backend. The interpreter's result is the one compared with the fixture; the native backend's result (status, gas, logs and the whole post-state) must equal it, or the case fails whatever the fixture says (§4.1), and the run confirms that the native backend compiled the guest rather than falling back. The guest gets 2^50 VM gas, so a case ends by its own EVM gas limit, never by the VM's.
+
+**Expected failures.** A case that fails must match an entry of `crates/solo-conformance/tests/fixtures/expected-failures.txt`, which gives the reason the kernel deliberately differs from Ethereum. An entry is a test id, a prefix of ids ending in `*`, or `type:N`, every case whose transaction has EIP-2718 type `N`. An entry naming one test must fail: when it passes, the entry is removed. A prefix or type entry must excuse at least one failure of the committed subset. Nothing is skipped: a case whose pre-state the kernel cannot hold (a balance of 2^128 or more, the kernel's limit) fails with that reason and needs an entry like any other. The entries in force:
+
+| Entry | Reason |
+|---|---|
+| `type:3` | The kernel does not accept EIP-4844 blob transactions (`solo-eth` decodes them as unsupported); a solochain has no blob data-availability layer. |
+| `type:4` | The kernel does not accept EIP-7702 set-code transactions yet; accounts holding a delegation designator from genesis do run delegated code. |
+
+**Results** (2026-10-20). Committed subset: 490 pass, 31 fail as expected (blob and set-code transactions), none fail otherwise; the test pins these numbers. Full pinned set: 4 223 pass, 1 348 fail as expected, none fail otherwise. A failure outside the list is a bug in the pipeline and gets a regression test where it is fixed; the first run found one: a single 2^24-gas transaction exhausting the guest heap (03 §8 rule 10).
+
+The CI gate runs the committed subset (`cargo test -p solo-conformance`). The full run is opt-in:
+
+```sh
+tools/fetch-conformance.sh
+cargo run --release -p solo-conformance -- --both --expected crates/solo-conformance/tests/fixtures/expected-failures.txt .conformance/fixtures/state_tests
+```
 
 ## 5. Calibration
 

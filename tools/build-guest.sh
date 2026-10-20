@@ -7,4 +7,6 @@ OBJCOPY=$(dirname "$(rustup which rustc)")/../lib/rustlib/$(rustc -vV | sed -n "
 ls -1 target/riscv64imac-unknown-none-elf/release/hello target/riscv64imac-unknown-none-elf/release/kernel
 cp target/riscv64imac-unknown-none-elf/release/hello ../crates/solo-recompile/tests/fixtures/hello.elf
 "$OBJCOPY" --strip-debug target/riscv64imac-unknown-none-elf/release/kernel ../crates/solo-node/tests/fixtures/kernel.elf
+mkdir -p ../crates/solo-conformance/tests/fixtures
+"$OBJCOPY" --strip-debug target/riscv64imac-unknown-none-elf/release/evm-conformance ../crates/solo-conformance/tests/fixtures/evm-conformance.elf
 echo "fixtures refreshed"

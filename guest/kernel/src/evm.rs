@@ -9,6 +9,7 @@ use revm::context::transaction::{AccessList, AccessListItem};
 use revm::context::{BlockEnv, Context, TxEnv};
 use revm::precompile::{Crypto, PrecompileHalt};
 use revm::primitives::hardfork::SpecId;
+use revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE;
 use revm::primitives::{Address as RAddress, B256, Bytes, KECCAK_EMPTY, TxKind, U256};
 use revm::state::{Account as RAccount, AccountInfo};
 use revm::{Database, ExecuteEvm, MainBuilder, MainContext};
@@ -171,10 +172,59 @@ pub struct Outcome {
     pub contract: Option<Address>,
 }
 
+/// The block environment a message runs in, as the EVM sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct Env {
+    /// Chain id.
+    pub chain_id: u64,
+    /// Height.
+    pub number: u64,
+    /// Timestamp in seconds.
+    pub timestamp: u64,
+    /// Block gas limit.
+    pub gas_limit: u64,
+    /// Base fee per gas.
+    pub basefee: u64,
+    /// Fee recipient (`COINBASE`).
+    pub beneficiary: Address,
+    /// `PREVRANDAO`.
+    pub prevrandao: Hash,
+    /// Difficulty, big-endian.
+    pub difficulty: Hash,
+    /// Excess blob gas, from which `BLOBBASEFEE` follows.
+    pub excess_blob_gas: u64,
+}
+
+impl Env {
+    /// What the reference kernel's blocks look like to the EVM: the fixed
+    /// block gas limit and base fee, the zero beneficiary, `PREVRANDAO` and
+    /// difficulty, and no excess blob gas.
+    pub fn kernel(block: BlockFields) -> Env {
+        Env {
+            chain_id: state::chain_id(),
+            number: block.number,
+            timestamp: block.timestamp,
+            gas_limit: BLOCK_GAS_LIMIT,
+            basefee: BASE_FEE,
+            beneficiary: [0; 20],
+            prevrandao: [0; 32],
+            difficulty: [0; 32],
+            excess_blob_gas: 0,
+        }
+    }
+}
+
 /// Executes `message` at `block`; commits the state changes only if `commit_state`.
 pub fn run(message: Message, block: BlockFields, commit_state: bool) -> Outcome {
+    run_in(message, &Env::kernel(block), commit_state)
+}
+
+/// Executes `message` in `env`; commits the state changes only if
+/// `commit_state`. The conformance harness (spec 07 §4.2) runs Ethereum's
+/// state tests through this function with their own environments.
+pub fn run_in(message: Message, env: &Env, commit_state: bool) -> Outcome {
     install_host_crypto();
-    let chain_id = state::chain_id();
+    let chain_id = env.chain_id;
     let skip_nonce = message.nonce.is_none();
     let tx = TxEnv {
         tx_type: message.tx_type,
@@ -196,14 +246,17 @@ pub fn run(message: Message, block: BlockFields, commit_state: bool) -> Outcome 
         gas_priority_fee: message.priority_fee,
         ..TxEnv::default()
     };
-    let block_env = BlockEnv {
-        number: U256::from(block.number),
-        timestamp: U256::from(block.timestamp),
-        gas_limit: BLOCK_GAS_LIMIT,
-        basefee: BASE_FEE,
-        prevrandao: Some(B256::ZERO),
+    let mut block_env = BlockEnv {
+        number: U256::from(env.number),
+        beneficiary: RAddress::from(env.beneficiary),
+        timestamp: U256::from(env.timestamp),
+        gas_limit: env.gas_limit,
+        basefee: env.basefee,
+        difficulty: U256::from_be_bytes(env.difficulty),
+        prevrandao: Some(B256::from(env.prevrandao)),
         ..BlockEnv::default()
     };
+    block_env.set_blob_excess_gas_and_price(env.excess_blob_gas, BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE);
     let mut evm = Context::mainnet()
         .modify_cfg_chained(|cfg| {
             cfg.set_spec_and_mainnet_gas_params(SpecId::OSAKA);

@@ -831,6 +831,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "solo-conformance"
+version = "0.0.1"
+dependencies = [
+ "k256",
+ "serde_json",
+ "solo-abi",
+ "solo-host",
+ "solo-recompile",
+ "solo-rlp",
+ "solo-vm",
+]
+
+[[package]]
 name = "solo-eth"
 version = "0.0.1"
 dependencies = [
