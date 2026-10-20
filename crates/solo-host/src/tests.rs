@@ -966,3 +966,82 @@ fn hello_guest_through_the_executor() {
     assert_eq!(r.output, keccak256(b"hello, solo"));
     assert!(r.gas_used > 100);
 }
+
+/// An extension serving `ext_double` (handle 100): a0 = 2 * a0, writing a marker key.
+struct Doubler;
+
+impl crate::executor::Extension<MemStorage> for Doubler {
+    fn resolve(&self, name: &str, capability: Capability) -> Option<u32> {
+        (name == "ext_double" && capability == Capability::Privileged).then_some(100)
+    }
+
+    fn call(
+        &mut self,
+        handle: u32,
+        ctx: &mut HostContext<'_>,
+        state: &mut crate::storage::Overlay<MemStorage>,
+    ) -> Result<(), Termination> {
+        assert_eq!(handle, 100);
+        ctx.charge(1)?;
+        let v = ctx.arg(Reg::A0);
+        ctx.set(Reg::A0, v * 2);
+        state.set(b"doubled", &v.to_le_bytes());
+        Ok(())
+    }
+}
+
+#[test]
+fn extensions_serve_high_handles() {
+    let mut exec = executor();
+    // Without an extension the import does not resolve and a high handle is unavailable.
+    assert!(
+        exec.load(&module(&["ext_double"], &[], &[]), Capability::Privileged)
+            .is_err()
+    );
+    let layout = ModuleBuilder::new().layout;
+    let mut mem = Memory::new(layout, &[], &[]);
+    let mut register_file = [0u64; Reg::COUNT];
+    let mut gas = 100;
+    let mut ctx = HostContext {
+        regs: &mut register_file,
+        memory: &mut mem,
+        gas: &mut gas,
+    };
+    assert_eq!(
+        solo_vm::host::Host::call(&mut exec, 100, &mut ctx),
+        Err(Termination::HostError(HostStatus::Unavailable.code()))
+    );
+    assert!(exec.extension_mut().is_none());
+    exec.set_extension(Box::new(Doubler));
+    assert!(exec.extension_mut().is_some());
+    assert!((exec.resolver())("ext_double", Capability::Privileged));
+    assert!(!(exec.resolver())("ext_double", Capability::Sandboxed));
+    assert!((exec.resolver())("abi_version", Capability::Sandboxed));
+    let mut body = vec![li(Reg::A0, 21), ecall(1)];
+    body.extend(report());
+    let bytes = module(&["output_write", "ext_double"], &body, &[]);
+    assert!(
+        exec.load(&bytes, Capability::Sandboxed).is_err(),
+        "privileged-only import"
+    );
+    let hash = exec.load(&bytes, Capability::Privileged).unwrap();
+    assert_eq!(
+        exec.load(&bytes, Capability::Privileged).unwrap(),
+        hash,
+        "second load is a no-op"
+    );
+    let r = exec.call(
+        &hash,
+        NS,
+        b"",
+        1_000,
+        Capability::Privileged,
+        Flags::default(),
+    );
+    assert_eq!(regs(&r).0, 42);
+    assert_eq!(
+        exec.state().get(b"doubled"),
+        Some(21u64.to_le_bytes().to_vec())
+    );
+    assert_eq!(exec.cache_mut().cost_table(), CostTable::V1);
+}

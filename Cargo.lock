@@ -455,6 +455,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "solo-rlp"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "solo-vm"
 version = "0.0.1"
 dependencies = [

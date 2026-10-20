@@ -55,6 +55,19 @@ impl ModuleCache {
         Ok(hash)
     }
 
+    /// The cost table block costs are computed with.
+    #[must_use]
+    pub const fn cost_table(&self) -> CostTable {
+        self.cost_table
+    }
+
+    /// Stores an already validated program under `hash`.
+    pub fn insert_program(&mut self, hash: [u8; 32], program: Program) {
+        self.programs
+            .entry(hash)
+            .or_insert_with(|| Arc::new(program));
+    }
+
     /// The program with this code hash, if cached.
     #[must_use]
     pub fn get(&self, hash: &[u8; 32]) -> Option<Arc<Program>> {

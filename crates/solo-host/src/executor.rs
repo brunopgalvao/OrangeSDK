@@ -11,6 +11,28 @@ use crate::abi;
 use crate::cache::ModuleCache;
 use crate::storage::{Overlay, Storage};
 
+/// Lowest handle an [`Extension`] may use; the built-in ABI owns the rest.
+pub const EXTENSION_HANDLE_BASE: u32 = 100;
+
+/// Host functions supplied by whoever embeds the executor: the privileged
+/// functions of spec 05 that need node state (commitments, time, timers,
+/// persistence, network). Handles are `EXTENSION_HANDLE_BASE` and above.
+pub trait Extension<S: Storage> {
+    /// Resolves a name under a capability set to a handle, or `None`.
+    fn resolve(&self, name: &str, capability: Capability) -> Option<u32>;
+
+    /// Performs the function.
+    ///
+    /// # Errors
+    /// A terminating status (spec 05 §6).
+    fn call(
+        &mut self,
+        handle: u32,
+        ctx: &mut HostContext<'_>,
+        state: &mut Overlay<S>,
+    ) -> Result<(), Termination>;
+}
+
 /// Flags of an `invoke` (spec 05 §4.4).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Flags {
@@ -86,6 +108,7 @@ pub struct Executor<S: Storage> {
     pub(crate) logs: Vec<(u32, Vec<u8>)>,
     pub(crate) metrics: Vec<(String, i64, u32)>,
     max_depth: usize,
+    extension: Option<Box<dyn Extension<S>>>,
 }
 
 /// Default nesting limit (spec 05 §4.4).
@@ -101,7 +124,50 @@ impl<S: Storage> Executor<S> {
             logs: Vec::new(),
             metrics: Vec::new(),
             max_depth: MAX_DEPTH,
+            extension: None,
         }
+    }
+
+    /// Installs the extension that serves handles from [`EXTENSION_HANDLE_BASE`] up.
+    pub fn set_extension(&mut self, extension: Box<dyn Extension<S>>) {
+        self.extension = Some(extension);
+    }
+
+    /// The installed extension, if any.
+    pub fn extension_mut(&mut self) -> Option<&mut (dyn Extension<S> + 'static)> {
+        self.extension.as_deref_mut()
+    }
+
+    /// Resolves an import against the built-in ABI and the extension; the
+    /// shape [`ModuleCache::insert`] takes.
+    pub fn resolver(&self) -> impl Fn(&str, Capability) -> bool + '_ {
+        move |name, capability| self.resolve(name, capability).is_some()
+    }
+
+    /// Loads a module into the cache, resolving imports against this executor.
+    ///
+    /// # Errors
+    /// [`crate::cache::LoadError`] if the module is invalid or imports something unavailable.
+    pub fn load(
+        &mut self,
+        bytes: &[u8],
+        capability: Capability,
+    ) -> Result<[u8; 32], crate::cache::LoadError> {
+        let abi_ok = |name: &str, cap: Capability| abi::resolve(name, cap).is_some();
+        let ext_ok = |name: &str, cap: Capability| {
+            self.extension
+                .as_ref()
+                .is_some_and(|e| e.resolve(name, cap).is_some())
+        };
+        let resolver = |name: &str, cap: Capability| abi_ok(name, cap) || ext_ok(name, cap);
+        let hash = crate::hash::keccak256(bytes);
+        if self.cache.get(&hash).is_none() {
+            let module = solo_vm::module::Module::parse(bytes, &|name| resolver(name, capability))
+                .map_err(crate::cache::LoadError::Invalid)?;
+            let program = solo_vm::module::Program::new(module, self.cache.cost_table());
+            self.cache.insert_program(hash, program);
+        }
+        Ok(hash)
     }
 
     /// Lowers the nesting limit; for tests and constrained hosts.
@@ -234,10 +300,20 @@ impl<S: Storage> Executor<S> {
 
 impl<S: Storage> Host for Executor<S> {
     fn resolve(&self, name: &str, capability: Capability) -> Option<u32> {
-        abi::resolve(name, capability)
+        abi::resolve(name, capability).or_else(|| {
+            self.extension
+                .as_ref()
+                .and_then(|e| e.resolve(name, capability))
+        })
     }
 
     fn call(&mut self, handle: u32, ctx: &mut HostContext<'_>) -> Result<(), Termination> {
-        abi::dispatch(self, handle, ctx)
+        if handle < EXTENSION_HANDLE_BASE {
+            return abi::dispatch(self, handle, ctx);
+        }
+        match self.extension.as_mut() {
+            Some(ext) => ext.call(handle, ctx, &mut self.state),
+            None => Err(Termination::HostError(HostStatus::Unavailable.code())),
+        }
     }
 }

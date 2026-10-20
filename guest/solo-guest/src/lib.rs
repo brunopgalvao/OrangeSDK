@@ -132,6 +132,47 @@ pub fn halt(a0: u64, a1: u64) -> ! {
     unsafe { host::__solo_halt(a0, a1) }
 }
 
+/// Reads the whole input blob.
+#[must_use]
+pub fn input_vec() -> alloc::vec::Vec<u8> {
+    // SAFETY: host functions with valid pointers into our own buffer.
+    unsafe {
+        let len = host::__solo_import_input_len() as usize;
+        let mut buf = alloc::vec![0u8; len];
+        host::__solo_import_input_read(buf.as_mut_ptr(), 0, len as u32);
+        buf
+    }
+}
+
+/// Defines an export named `solo_export_<name>` whose handler receives the
+/// input blob and returns the output blob; the instance halts with `(0, 0)`.
+#[macro_export]
+macro_rules! solo_export {
+    ($name:ident, $handler:expr) => {
+        $crate::__paste_export!($name, $handler);
+    };
+}
+
+/// Implementation detail of [`solo_export!`]: the export symbol is spelled
+/// `solo_export_` followed by the name through `concat_idents`-free linking
+/// via `export_name`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __paste_export {
+    ($name:ident, $handler:expr) => {
+        const _: () = {
+            #[unsafe(export_name = concat!("solo_export_", stringify!($name)))]
+            pub extern "C" fn entry() -> ! {
+                let handler: fn(&[u8]) -> alloc::vec::Vec<u8> = $handler;
+                let input = $crate::input_vec();
+                let out = handler(&input);
+                $crate::output(&out);
+                $crate::halt(0, 0)
+            }
+        };
+    };
+}
+
 /// Defines the `main` export. The function receives `a0`–`a5` and returns the
 /// pair placed in `a0`, `a1` at `Halt`.
 #[macro_export]
