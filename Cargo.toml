@@ -20,3 +20,18 @@ pedantic = "warn"
 [profile.release]
 debug = 1
 lto = "thin"
+
+# Signature signing and recovery dominate consensus tests and debug nodes; unoptimized
+# curve arithmetic costs milliseconds per signature (about 10x more than optimized),
+# enough to make real-time tests miss view timeouts on a loaded machine.
+[profile.dev.package.k256]
+opt-level = 3
+
+[profile.dev.package.ecdsa]
+opt-level = 3
+
+[profile.dev.package.elliptic-curve]
+opt-level = 3
+
+[profile.dev.package.crypto-bigint]
+opt-level = 3

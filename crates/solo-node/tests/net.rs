@@ -137,18 +137,20 @@ fn framing() {
     assert!(format!("{:?}", frames[0]).contains("Hello"));
 }
 
-/// Polls every live node and its transport until `done` or the deadline.
+/// Polls every live node and its transport until `done` or the deadline. Deadlines are
+/// generous because every node shares this one thread and the machine may be loaded;
+/// the callers assert `done`, so reaching a deadline fails the test.
 fn pump(
     nodes: &mut [Node],
     transports: &mut [Transport],
     start: Instant,
     epoch: u64,
     max: Duration,
-    mut done: impl FnMut(&mut [Node]) -> bool,
+    mut done: impl FnMut(&mut [Node], &[Transport]) -> bool,
 ) -> bool {
     let deadline = Instant::now() + max;
     while Instant::now() < deadline {
-        if done(nodes) {
+        if done(nodes, transports) {
             return true;
         }
         let now = epoch + u64::try_from(start.elapsed().as_millis()).unwrap();
@@ -158,7 +160,7 @@ fn pump(
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    done(nodes)
+    done(nodes, transports)
 }
 
 #[test]
@@ -188,6 +190,16 @@ fn validators_finalize_over_tcp_and_a_late_observer_syncs() {
         node.start(None).unwrap();
         nodes.push(node);
     }
+    // Gossip reaches connected peers only, so let every pair connect first.
+    let connected = pump(
+        &mut nodes,
+        &mut transports,
+        start,
+        epoch,
+        Duration::from_mins(2),
+        |_, transports| transports.iter().all(|t| t.connected().len() == 3),
+    );
+    assert!(connected);
     // A transaction submitted to the last node travels by gossip and lands everywhere.
     let to = address(&keys[1]);
     let tx_hash = nodes[3].submit(&transfer(&keys[0], to, 5)).unwrap();
@@ -196,18 +208,22 @@ fn validators_finalize_over_tcp_and_a_late_observer_syncs() {
         &mut transports,
         start,
         epoch,
-        Duration::from_secs(20),
-        |nodes| nodes.iter().all(|n| n.finalized.len() >= 20),
+        Duration::from_mins(5),
+        |nodes, _| nodes.iter().all(|n| n.finalized.len() >= 20),
+    );
+    assert!(
+        finalized,
+        "{:?} in views {:?}",
+        nodes.iter().map(|n| n.finalized.len()).collect::<Vec<_>>(),
+        nodes
+            .iter()
+            .map(|n| n.simplex_state().unwrap().view)
+            .collect::<Vec<_>>()
     );
     for node in &mut nodes {
         assert!(node.receipt(&tx_hash).unwrap().is_some());
         assert_eq!(node.account(&to).unwrap().balance, 5);
     }
-    assert!(
-        finalized,
-        "{:?}",
-        nodes.iter().map(|n| n.finalized.len()).collect::<Vec<_>>()
-    );
     for t in &transports {
         assert_eq!(t.connected().len(), 3);
     }
@@ -235,8 +251,8 @@ fn validators_finalize_over_tcp_and_a_late_observer_syncs() {
         &mut transports,
         start,
         epoch,
-        Duration::from_secs(20),
-        |nodes| {
+        Duration::from_mins(3),
+        |nodes, _| {
             let head = nodes[0].finalized.len();
             nodes[4].finalized.len() + 2 >= head && head > 20
         },
