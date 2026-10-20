@@ -3,12 +3,14 @@
 //! The method set is what wallets, `cast`, ethers, viem and explorers need
 //! against the reference kernel's EVM: sending every transaction type,
 //! receipts with logs, blocks, `eth_call` and gas estimation, code and
-//! storage, log filters, fee history and the `txpool` namespace. Responses take geth's shapes and
-//! error codes. Quantities are `0x` hex without leading zeros, data is `0x`
-//! hex, addresses are lowercase.
+//! storage, log filters, fee history and the `txpool` namespace, and the
+//! bridge relayer's `solo_getFinalityProof` and `solo_getOutboxProof`.
+//! Responses take geth's shapes and error codes. Quantities are `0x` hex
+//! without leading zeros, data is `0x` hex, addresses are lowercase.
 
 #![forbid(unsafe_code)]
 
+pub mod bridge;
 pub mod call;
 pub mod filter;
 pub mod hex;

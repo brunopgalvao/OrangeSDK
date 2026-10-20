@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 solo-abi = { path = "../solo-abi" }
+solo-bridge = { path = "../solo-bridge" }
 solo-eth = { path = "../solo-eth" }
 solo-host = { path = "../solo-host" }
 solo-metrics = { path = "../solo-metrics" }
