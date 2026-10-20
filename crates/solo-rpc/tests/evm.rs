@@ -11,12 +11,12 @@ use common::{
 };
 use serde_json::{Value, json};
 use solo_abi::Encode;
-use solo_abi::chain::BlockHeader;
+use solo_abi::chain::{BlockHeader, CallResult, call_status};
 use solo_abi::codec::Seq;
 use solo_abi::types::{Block, Effect};
 use solo_host::hash::keccak256;
 use solo_rpc::Rpc;
-use solo_rpc::call::revert_reason;
+use solo_rpc::call::{call_error, revert_reason};
 use solo_rpc::methods::{data, parse_quantity, quantity};
 
 const GWEI: u128 = 1_000_000_000;
@@ -238,6 +238,19 @@ fn deploy_code_storage_and_calls() {
     // applies to transactions only.
     let from_contract = json!({ "from": c, "to": data(&bob.address) });
     assert_eq!(ok(&mut rpc, "eth_call", json!([from_contract])), "0x");
+    // A sender that cannot pay the value the call carries is refused, not run.
+    let poor = Wallet::new(9);
+    let unfunded = json!({ "from": data(&poor.address), "to": data(&bob.address), "value": "0x1" });
+    assert_eq!(
+        err(&mut rpc, "eth_call", json!([unfunded])),
+        (
+            -32000,
+            format!(
+                "insufficient funds for gas * price + value: address {} have 0 want 1",
+                data(&poor.address)
+            )
+        )
+    );
     let low = json!({ "to": c, "input": data(&count), "gas": "0x5208" });
     assert_eq!(
         err(&mut rpc, "eth_call", json!([low])),
@@ -543,6 +556,21 @@ fn revert_reasons() {
     );
     // Too short, unknown selector, truncated or malformed payloads.
     assert_eq!(revert_reason(&[]), None);
+    // What the kernel refuses to run at all, after the checks the RPC makes
+    // itself, is a server error without data.
+    let refused = call_error(&CallResult {
+        status: call_status::INVALID,
+        gas_used: 0,
+        output: Vec::new(),
+    });
+    assert_eq!(
+        (refused.code, refused.message.as_str(), refused.data),
+        (
+            -32000,
+            "message cannot run: it fails the kernel's validation",
+            None
+        )
+    );
     assert_eq!(revert_reason(&[0x08, 0xc3, 0x79]), None);
     assert_eq!(revert_reason(&selector("NotOwner(address)")), None);
     assert_eq!(revert_reason(&panic(word(1))[..20]), None);

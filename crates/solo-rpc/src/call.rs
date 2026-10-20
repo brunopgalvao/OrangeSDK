@@ -195,8 +195,6 @@ pub fn call_error(result: &CallResult) -> RpcError {
         call_status::HALT => {
             RpcError::server("execution halted: out of gas or an exceptional halt")
         }
-        _ => RpcError::server(
-            "message cannot run: the sender has code or the message fails validation",
-        ),
+        _ => RpcError::server("message cannot run: it fails the kernel's validation"),
     }
 }
