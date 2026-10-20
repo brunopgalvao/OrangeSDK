@@ -78,6 +78,8 @@ record! {
         allocations: Seq<Allocation>,
         /// Governed kernel upgrades and host feature gates (spec 13).
         upgrades: UpgradeParams,
+        /// Staking, epochs, slashing and threshold keys (spec 15).
+        staking: crate::staking::StakingParams,
     }
 }
 
@@ -300,6 +302,10 @@ pub mod reason {
     /// attached, calldata that is not an action, or a sender the action does
     /// not authorize (spec 13 §2).
     pub const SYSTEM_ACTION: u32 = 12;
+    /// A transaction to the staking address that cannot run: staking
+    /// disabled, calldata that is not a staking action, or an action the
+    /// sender's stake does not allow (spec 15 §3).
+    pub const STAKING_ACTION: u32 = 13;
 }
 
 /// Storage key prefixes of the reference kernel.
@@ -353,7 +359,8 @@ record! {
     Validator {
         /// Identity, also the peer id.
         id: Hash,
-        /// Voting weight; the reference driver counts validators, not weight.
+        /// Voting weight: the validator's stake in gwei (spec 15). Quorums
+        /// are more than two thirds of the set's total weight (spec 08 §1).
         weight: u64,
     }
 }
@@ -383,6 +390,9 @@ record! {
         /// Equivocation evidence for the chain to record, at most
         /// [`consensus::MAX_EVIDENCE`] records.
         evidence: Seq<Evidence>,
+        /// Encoded DKG envelopes for the chain to record (spec 15 §6.2), at
+        /// most [`crate::staking::MAX_DKG`].
+        dkg: Seq<Vec<u8>>,
     }
 }
 
@@ -504,6 +514,8 @@ record! {
     Participation {
         /// Equivocation evidence, as the proposal carried it.
         evidence: Seq<Evidence>,
+        /// DKG envelopes, as the proposal carried them (spec 15 §6.2).
+        dkg: Seq<Vec<u8>>,
     }
 }
 
@@ -568,6 +580,9 @@ record! {
         proposals: Seq<Proposal>,
         /// Finalize certificate whose hash is the last proposal's.
         certificate: Option<Certificate>,
+        /// The threshold certificate of spec 12 §7 for the last proposal, if
+        /// the responder holds one; empty otherwise.
+        threshold: Vec<u8>,
     }
 }
 
@@ -608,6 +623,23 @@ pub enum ConsensusMessage {
         /// The certified proposal, when the certificate names one the sender holds.
         proposal: Option<Proposal>,
     },
+    /// A finalize vote with the voter's threshold partial signature over
+    /// the proposal's certificate message (spec 08 §4, spec 12 §7).
+    FinalizeShare {
+        /// View.
+        view: u64,
+        /// Proposal hash.
+        hash: Hash,
+        /// Signature of the finalize vote.
+        signature: Signature,
+        /// The partial signature.
+        partial: crate::staking::PartialShare,
+    },
+    /// A DKG envelope for leaders to put in proposals (spec 15 §6.2).
+    Dkg {
+        /// The encoded `DkgEnvelope`.
+        envelope: Vec<u8>,
+    },
 }
 
 impl Encode for ConsensusMessage {
@@ -643,6 +675,19 @@ impl Encode for ConsensusMessage {
                 e.raw(&[3]);
                 e.put(certificate).put(proposal);
             }
+            ConsensusMessage::FinalizeShare {
+                view,
+                hash,
+                signature,
+                partial,
+            } => {
+                e.raw(&[4]);
+                e.put(view).put(hash).put(signature).put(partial);
+            }
+            ConsensusMessage::Dkg { envelope } => {
+                e.raw(&[5]);
+                e.put(envelope);
+            }
         }
     }
 }
@@ -668,6 +713,13 @@ impl Decode for ConsensusMessage {
                 certificate: d.get()?,
                 proposal: d.get()?,
             },
+            4 => ConsensusMessage::FinalizeShare {
+                view: d.get()?,
+                hash: d.get()?,
+                signature: d.get()?,
+                partial: d.get()?,
+            },
+            5 => ConsensusMessage::Dkg { envelope: d.get()? },
             tag => return Err(DecodeError::BadTag(tag)),
         })
     }
@@ -802,6 +854,10 @@ mod tests {
                 min_delay: 10,
                 epoch_blocks: 100,
             },
+            staking: crate::staking::StakingParams {
+                epoch_blocks: 24,
+                ..crate::staking::StakingParams::default()
+            },
         });
         roundtrip(&BlockHeader {
             height: 1,
@@ -868,7 +924,14 @@ mod tests {
         });
         assert_eq!(TRANSFER_GAS, 21_000);
         assert_eq!(query::ACCOUNT, "account");
-        assert_eq!((reason::BAD_NONCE, reason::SYSTEM_ACTION), (4, 12));
+        assert_eq!(
+            (
+                reason::BAD_NONCE,
+                reason::SYSTEM_ACTION,
+                reason::STAKING_ACTION
+            ),
+            (4, 12, 13)
+        );
         assert_eq!(keys::ACCOUNT, b"acct/");
         assert!(alloc::format!("{:?}", Account::default()).contains("Account"));
         for name in [
@@ -917,6 +980,7 @@ mod tests {
             timestamp_ms: 9,
             txs: Seq(vec![vec![1, 2], vec![]]),
             evidence: Seq(vec![Evidence::default()]),
+            dkg: Seq(vec![vec![3]]),
         };
         roundtrip(&proposal);
         roundtrip(&Validator {
@@ -945,6 +1009,7 @@ mod tests {
             finalized_height: 9,
             proposals: Seq(vec![Proposal::default()]),
             certificate: Some(Certificate::default()),
+            threshold: vec![1; 89],
         });
         roundtrip(&SimplexState {
             view: 4,
@@ -985,6 +1050,19 @@ mod tests {
                 certificate: Certificate::default(),
                 proposal: Some(Proposal::default()),
             },
+            ConsensusMessage::FinalizeShare {
+                view: 2,
+                hash: [4; 32],
+                signature: Signature([5; 65]),
+                partial: crate::staking::PartialShare {
+                    key_set: 1,
+                    index: 2,
+                    signature: vec![6; 48],
+                },
+            },
+            ConsensusMessage::Dkg {
+                envelope: vec![7, 8],
+            },
         ] {
             roundtrip(&message);
             assert!(format!("{message:?}").len() > 10);
@@ -1016,6 +1094,7 @@ mod tests {
         roundtrip(&low);
         roundtrip(&Participation {
             evidence: Seq(vec![e.clone()]),
+            dkg: Seq(vec![vec![1]]),
         });
         // The id names validator, view and kind, big-endian, so records sort by offender.
         let mut id = vec![0, 0, 0, 3];

@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use solo_abi::staking::KEY_ROLE_THRESHOLD;
 use solo_host::storage::MAX_STORED_KEY_LEN;
 use solo_host::{Extension, Overlay, Storage};
 use solo_vm::host::{Capability, HostContext};
@@ -59,6 +60,8 @@ pub struct NodeServices {
     pub outbound: Vec<Outbound>,
     /// The consensus key (`sign` with key role 0), if this node has one.
     pub key: Option<k256::ecdsa::SigningKey>,
+    /// The threshold keystore (`sign` with key role 2).
+    pub keystore: crate::keystore::Keystore,
     /// Request ids handed out by `net_request`.
     pub next_request_id: u64,
     /// The state trie behind each root `storage_commit` returned, in order:
@@ -248,16 +251,24 @@ impl<S: Storage> Extension<S> for NodeExtension {
                 ctx.charge(10_000)?;
                 let msg = read(ctx, a1, a2)?;
                 let cap = ctx.arg32(Reg::A4);
-                let signature = match (&services.key, <[u8; 32]>::try_from(msg.as_slice())) {
-                    (Some(key), Ok(digest)) if ctx.arg(Reg::A0) == 0 && cap >= 65 => {
-                        sign_recoverable(key, &digest)
-                    }
+                let services = &mut *services;
+                let reply = match ctx.arg(Reg::A0) {
+                    0 => match (&services.key, <[u8; 32]>::try_from(msg.as_slice())) {
+                        (Some(key), Ok(digest)) if cap >= 65 => {
+                            sign_recoverable(key, &digest).map(|sig| sig.to_vec())
+                        }
+                        _ => None,
+                    },
+                    KEY_ROLE_THRESHOLD => services.keystore.handle(services.key.as_ref(), &msg),
                     _ => None,
                 };
-                match signature {
-                    Some(sig) => {
-                        ctx.memory.write(a3, &sig).map_err(|_| fault())?;
-                        ctx.set(Reg::A0, 65);
+                match reply {
+                    Some(bytes) => {
+                        // Key role 2 answers vary in length: like every variable-length
+                        // result, they are truncated to `cap` and report their full length.
+                        let n = bytes.len().min(cap as usize);
+                        ctx.memory.write(a3, &bytes[..n]).map_err(|_| fault())?;
+                        ctx.set(Reg::A0, bytes.len() as u64);
                     }
                     None => ctx.set(Reg::A0, 0),
                 }

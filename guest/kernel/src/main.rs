@@ -6,10 +6,12 @@
 
 extern crate alloc;
 
+mod dkg;
 mod driver;
 mod evm;
 mod governance;
 mod persist;
+mod staking;
 mod state;
 mod stf;
 mod tx;
@@ -29,6 +31,7 @@ fn decode_or_trap<T: Decode>(bytes: &[u8]) -> T {
 solo_guest::solo_export!(kernel_init, |input: &[u8]| -> Vec<u8> {
     let genesis: Genesis = decode_or_trap(input);
     state::init(&genesis);
+    staking::init(&genesis);
     Vec::new()
 });
 

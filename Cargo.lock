@@ -887,6 +887,7 @@ dependencies = [
  "k256",
  "p256",
  "solo-abi",
+ "solo-bls",
  "solo-host",
  "solo-metrics",
  "solo-recompile",

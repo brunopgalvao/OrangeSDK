@@ -1091,6 +1091,7 @@ fn equivocations_inside_certificates_are_detected() {
             hash,
             votes: Seq(finalizes(1, hash, &[0, 2, 3])),
         }),
+        threshold: vec![],
     };
     node.step(Input::Response {
         request_id,
@@ -1198,6 +1199,7 @@ fn the_chain_keeps_only_evidence_that_verifies() {
             good.clone(),
             good.clone(),
         ]),
+        dkg: Seq(vec![]),
     };
     for i in 0..3 {
         sim.nodes[i]
@@ -1226,6 +1228,7 @@ fn the_chain_keeps_only_evidence_that_verifies() {
         timestamp_ms: sim.now_ms.max(state.tip_timestamp_ms + 1),
         txs: Seq(vec![]),
         evidence: Seq(vec![good; MAX_EVIDENCE + 1]),
+        dkg: Seq(vec![]),
     };
     for i in 0..3 {
         sim.nodes[i]

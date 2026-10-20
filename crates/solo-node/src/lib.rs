@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod extension;
+pub mod keystore;
 pub mod net;
 pub mod node;
 pub mod sim;

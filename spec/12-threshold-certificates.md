@@ -6,7 +6,7 @@ This document specifies the finality certificate that codex ADR 0008 calls for a
 
 A certificate is 89 bytes and verifies with one pairing check against a group public key that never changes, so a light client on Ethereum (codex ADR 0013, tier 2) stores the key once and verifies every certificate for about 115 000 gas of precompile calls.
 
-The reference implementation is `crates/solo-bls`. This version defines the formats, the protocols and the host functions; the Simplex driver (08) does not produce these certificates yet (§10).
+The reference implementation is `crates/solo-bls`. The Simplex driver (08 §6a) produces these certificates once the validators of an epoch have generated a key; spec 15 §6 specifies how the DKG runs inside the reference kernel, with its messages carried in blocks, its phases at fixed heights and the secret halves in the host's keystore.
 
 Numbers in this document are big-endian wherever they are part of a signed message or a certificate, because Ethereum contracts rebuild them with `abi.encodePacked`. DKG messages use the canonical encoding of 06 §2 like every other driver message.
 
@@ -237,9 +237,10 @@ The implementation also passes the RFC 9380 vectors of Appendices J.9.1 (`BLS123
 
 ## 10. Limits of this version
 
-- The Simplex driver (08) does not run the DKG or produce these certificates yet. Wiring them in needs: validator encryption keys in the validator set, DKG messages carried in blocks with phases at fixed heights, a key role for the share in the host keystore so that `sign` produces partial signatures, partial signatures in finalize votes, and a cheap combination path in the kernel (a G1 multi-scalar multiplication host function or combination in the node host).
+- The reference kernel's DKG (15 §6) carries messages in blocks, ends phases at fixed heights and adopts a key set only when more than two thirds of the stake confirm the same public outcome, which is how it checks that every participant derived the same key set. Partial signatures ride on finalize votes and are combined in the host's keystore (05 §4.3), natively, rather than in the interpreter.
+- The threshold counts shareholders, not stake (15 §9).
 - `bls12381_verify` covers this scheme only. Verifying the Ethereum consensus layer's signatures (keys in G1, signatures in G2) for the sync-committee light client of ADR 0013 needs its own host function.
-- The DKG is synchronous; a run whose messages are not delivered to everyone alike can end with different outputs at different participants, which the driver detects by comparing the resulting key set before adopting it.
+- The DKG is synchronous; a run whose messages are not delivered to everyone alike can end with different outputs at different participants. In the reference kernel every participant reads the same messages from chain state, and a key set is adopted only once more than two thirds of the stake confirm it.
 
 ## Appendix A. Reference verifier (informative)
 
