@@ -32,6 +32,8 @@ cast call $COUNTER 'count()(uint256)' --rpc-url $RPC
 cast logs --address $COUNTER --from-block 0 --rpc-url $RPC
 ```
 
+The mempool works as geth's does (spec 14): an account can have many transactions waiting, so `cast send` twice in a row, `forge script` and batch senders work without waiting for blocks. A transaction whose nonce is ahead of the account waits, queued, until the nonces before it arrive; a block takes each account's transactions in nonce order; a transaction replaces the waiting one with the same nonce only if it raises both fee fields by 10%. `eth_getTransactionCount` at `pending` counts the waiting transactions, and `txpool_status` and `txpool_content` show the pool.
+
 The node keeps the state of the head block only: state methods (`eth_getBalance`, `eth_call`, ...) answer for the head and refuse an older block rather than answer from the wrong state. Requests run on the thread that drives consensus, so each kernel query runs within a budget (`--query-gas`, 2^26 VM gas by default) and long requests (batches, gas estimation, log scans) let the node poll its peers and tick between their steps.
 
 An `alloc` entry is either a balance in wei (a decimal string, `0x` hex, or a JSON number) or a geth-style account, which is how a chain predeploys contracts at genesis:
