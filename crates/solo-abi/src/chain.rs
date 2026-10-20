@@ -274,6 +274,10 @@ pub const TRANSFER_GAS: u64 = 21_000;
 /// Gas limit of every block.
 pub const BLOCK_GAS_LIMIT: u64 = 30_000_000;
 
+/// Base fee per gas of the reference kernel: zero in this version, so a
+/// transaction pays its priority fee (or its legacy gas price) and nothing more.
+pub const BASE_FEE: u64 = 0;
+
 record! {
     /// A consensus validator. `id` is `keccak256` of the uncompressed
     /// secp256k1 public key (64 bytes), which is what signature recovery yields.
@@ -637,9 +641,10 @@ mod tests {
                 call_status::SUCCESS,
                 call_status::HALT,
                 call_status::INVALID,
-                BLOCK_GAS_LIMIT
+                BLOCK_GAS_LIMIT,
+                BASE_FEE
             ),
-            (0, 2, 3, 30_000_000)
+            (0, 2, 3, 30_000_000, 0)
         );
         roundtrip(&DriverState {
             next_height: 1,

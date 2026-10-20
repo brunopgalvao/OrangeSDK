@@ -7,7 +7,7 @@ A framework for EVM-compatible solochains.
 - The kernel, including consensus, is upgraded by governance. The host is upgraded by releases behind feature gates.
 - Type 2 Ethereum compatibility: standard EVM bytecode, exact gas, full RPC.
 
-Status: spec v0 written; the reference kernel runs Simplex BFT consensus (spec 08) across validators connected over TCP (spec 09), with catch-up sync for nodes that fall behind. Ethereum legacy transfers work end to end, from `eth_sendRawTransaction` to receipts. See `spec/README.md`.
+Status: spec v0 written; the reference kernel runs Simplex BFT consensus (spec 08) across validators connected over TCP (spec 09), with catch-up sync for nodes that fall behind. Ethereum transactions (legacy, EIP-2930 and EIP-1559) run on the EVM inside the kernel, and the JSON-RPC serves what wallets, `cast`, ethers, viem and explorers use: receipts with logs, `eth_call` and gas estimation, code and storage, log filters, fee history. See `spec/README.md`.
 
 ## Try it
 
@@ -19,7 +19,18 @@ cast chain-id --rpc-url http://127.0.0.1:8545
 cast balance 0x1a642f0e3c3af545e7acbd38b07251b3990914f1 --rpc-url http://127.0.0.1:8545
 ```
 
-The genesis address above is the account of the private key `0x01…01` (32 bytes of `0x01`), funded with one million ether. The kernel is a Rust guest compiled to RISC-V and recompiled to a Solo module on start; value transfers work, contracts arrive with the EVM interpreter.
+The genesis address above is the account of the private key `0x01…01` (32 bytes of `0x01`), funded with one million ether. The kernel is a Rust guest compiled to RISC-V and recompiled to a Solo module on start; it executes the EVM (revm) inside the Solo VM, so contracts deploy and run as on Ethereum:
+
+```sh
+KEY=0x0101010101010101010101010101010101010101010101010101010101010101
+RPC=http://127.0.0.1:8545
+# Deploy the test contract (crates/solo-node/tests/fixtures/Counter.sol) with a starting count of 5.
+cast send --private-key $KEY --rpc-url $RPC --create "$(cat crates/solo-node/tests/fixtures/Counter.bin)$(cast abi-encode 'f(uint256)' 5 | cut -c3-)"
+COUNTER=$(cast compute-address 0x1a642f0e3c3af545e7acbd38b07251b3990914f1 --nonce 0 | awk '{print $NF}')
+cast send --private-key $KEY --rpc-url $RPC $COUNTER 'increment(uint256)' 2
+cast call $COUNTER 'count()(uint256)' --rpc-url $RPC
+cast logs --address $COUNTER --from-block 0 --rpc-url $RPC
+```
 
 Run a chain of several validators, each with its own key. `solo key` prints the validator id to list in the genesis file:
 
