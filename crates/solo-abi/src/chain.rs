@@ -213,6 +213,10 @@ pub mod query {
     pub const STORAGE: &str = "storage";
     /// `(CallRequest) -> CallResult` a message against the latest state, discarded.
     pub const CALL: &str = "call";
+    /// `(u64 first) -> vec<Evidence>` equivocation evidence recorded on chain,
+    /// in the order recorded, from index `first`, at most
+    /// [`EVIDENCE_PAGE`](super::consensus::EVIDENCE_PAGE) records.
+    pub const EVIDENCE: &str = "evidence";
 }
 
 /// Validation failure reasons reported by the reference kernel.
@@ -266,6 +270,12 @@ pub mod keys {
     pub const CODE: &[u8] = b"code/";
     /// `slot/` + address + slot → 32-byte value; absent means zero.
     pub const SLOT: &[u8] = b"slot/";
+    /// `evidence/` + index (big-endian u64) → `Evidence`, in the order recorded.
+    pub const EVIDENCE: &[u8] = b"evidence/";
+    /// `meta/evidence_count` → u64, number of evidence records.
+    pub const EVIDENCE_COUNT: &[u8] = b"meta/evidence_count";
+    /// `evseen/` + `Evidence::id` → u64 index: one record per offence.
+    pub const EVIDENCE_SEEN: &[u8] = b"evseen/";
 }
 
 /// Intrinsic gas of a value transfer.
@@ -307,6 +317,9 @@ record! {
         timestamp_ms: u64,
         /// Transactions, raw.
         txs: Seq<Vec<u8>>,
+        /// Equivocation evidence for the chain to record, at most
+        /// [`consensus::MAX_EVIDENCE`] records.
+        evidence: Seq<Evidence>,
     }
 }
 
@@ -358,6 +371,80 @@ record! {
 }
 
 record! {
+    /// A hash and a validator's signature over it: one consensus message
+    /// whose kind and view are known from context.
+    SignedHash {
+        /// Proposal hash, or zero for a timeout vote.
+        hash: Hash,
+        /// The signature.
+        signature: Signature,
+    }
+}
+
+record! {
+    /// Proof that a validator signed two different hashes of one kind in one
+    /// view (spec 08 §9): two proposals, two block votes, or two finalize
+    /// votes. Canonical when `first.hash < second.hash`.
+    Evidence {
+        /// Kind: `consensus::KIND_*`.
+        kind: u8,
+        /// View both messages name.
+        view: u64,
+        /// The offender's index in the validator set.
+        validator: u32,
+        /// The message with the lower hash.
+        first: SignedHash,
+        /// The message with the higher hash.
+        second: SignedHash,
+    }
+}
+
+impl Evidence {
+    /// Canonical evidence from two messages of `validator`, in either order.
+    #[must_use]
+    pub fn new(kind: u8, view: u64, validator: u32, a: SignedHash, b: SignedHash) -> Evidence {
+        let (first, second) = if a.hash <= b.hash { (a, b) } else { (b, a) };
+        Evidence {
+            kind,
+            view,
+            validator,
+            first,
+            second,
+        }
+    }
+
+    /// Names the offence rather than the signatures: validator (big-endian
+    /// u32), view (big-endian u64) and kind. One record per offence.
+    #[must_use]
+    pub fn id(&self) -> [u8; 13] {
+        let mut out = [0u8; 13];
+        out[..4].copy_from_slice(&self.validator.to_be_bytes());
+        out[4..12].copy_from_slice(&self.view.to_be_bytes());
+        out[12] = self.kind;
+        out
+    }
+
+    /// The checks that need no signature recovery: a known kind, two
+    /// different hashes in canonical order, and no timeout vote among them
+    /// (a timeout vote and a block vote in one view are allowed).
+    #[must_use]
+    pub fn well_formed(&self) -> bool {
+        self.kind <= consensus::KIND_FINALIZE
+            && self.first.hash < self.second.hash
+            && !(self.kind == consensus::KIND_VOTE && self.first.hash == [0; 32])
+    }
+}
+
+record! {
+    /// What the reference kernel puts in `Block::participation`: consensus
+    /// facts about validators that executing the block records in chain state.
+    Participation {
+        /// Equivocation evidence, as the proposal carried it.
+        evidence: Seq<Evidence>,
+    }
+}
+
+record! {
     /// The reference driver's persisted state (`PersistState` and `kernel_driver_state`).
     SimplexState {
         /// Current view, starting at 1.
@@ -388,6 +475,15 @@ record! {
         sync_request_id: u64,
         /// Peer the outstanding sync request went to.
         sync_peer: Hash,
+        /// Peers sent this view's entry certificate since the view began or
+        /// its timeout last fired (spec 08 §5a).
+        answered: Seq<Hash>,
+        /// Doublings of the view timeout: one more for each view left by a
+        /// timeout certificate, one fewer for each view notarized within half
+        /// the timeout, at most `consensus::MAX_BACKOFF` (spec 08 §5a).
+        backoff: u8,
+        /// When this node entered or resumed its current view.
+        view_started_ms: u64,
     }
 }
 
@@ -440,6 +536,15 @@ pub enum ConsensusMessage {
         /// Signature.
         signature: Signature,
     },
+    /// A quorum certificate for a peer that lags (spec 08 §5a): timeout
+    /// votes, block votes with the proposal they notarize, or finalize votes
+    /// with the proposal they finalize.
+    Certificate {
+        /// The votes; `kind` is `KIND_VOTE` or `KIND_FINALIZE`.
+        certificate: Certificate,
+        /// The certified proposal, when the certificate names one the sender holds.
+        proposal: Option<Proposal>,
+    },
 }
 
 impl Encode for ConsensusMessage {
@@ -468,6 +573,13 @@ impl Encode for ConsensusMessage {
                 e.raw(&[2]);
                 e.put(view).put(hash).put(signature);
             }
+            ConsensusMessage::Certificate {
+                certificate,
+                proposal,
+            } => {
+                e.raw(&[3]);
+                e.put(certificate).put(proposal);
+            }
         }
     }
 }
@@ -488,6 +600,10 @@ impl Decode for ConsensusMessage {
                 view: d.get()?,
                 hash: d.get()?,
                 signature: d.get()?,
+            },
+            3 => ConsensusMessage::Certificate {
+                certificate: d.get()?,
+                proposal: d.get()?,
             },
             tag => return Err(DecodeError::BadTag(tag)),
         })
@@ -510,8 +626,32 @@ pub mod consensus {
     pub const KIND_FINALIZE: u8 = 2;
     /// Key role the driver signs with (`sign` host function).
     pub const KEY_ROLE: u64 = 0;
-    /// The timeout of a view, in slots.
+    /// The timeout of a view, in slots, before backoff. A node still in the
+    /// view when it fires repeats its timeout vote and re-arms it.
     pub const TIMEOUT_SLOTS: u64 = 3;
+    /// Most doublings of the view timeout after views that timed out.
+    pub const MAX_BACKOFF: u8 = 4;
+    /// Most evidence records one proposal carries; a proposal with more gets no votes.
+    pub const MAX_EVIDENCE: usize = 8;
+    /// Most evidence records one `query::EVIDENCE` answer holds.
+    pub const EVIDENCE_PAGE: u64 = 64;
+    /// Peer score change for the peer that delivered an equivocation.
+    pub const EQUIVOCATION_PENALTY: i64 = -100;
+
+    /// How long a node waits in a view before timing out, and between repeats
+    /// of its timeout vote: `TIMEOUT_SLOTS` slots doubled `backoff` times
+    /// (at most `MAX_BACKOFF`), saturating.
+    #[must_use]
+    pub const fn view_timeout_ms(slot_ms: u64, backoff: u8) -> u64 {
+        let doublings = if backoff < MAX_BACKOFF {
+            backoff
+        } else {
+            MAX_BACKOFF
+        };
+        TIMEOUT_SLOTS
+            .saturating_mul(slot_ms)
+            .saturating_mul(1 << doublings)
+    }
 
     /// Timer id of the timeout of `view`.
     #[must_use]
@@ -660,6 +800,7 @@ mod tests {
             query::BLOCK_BY_HASH,
             query::RECEIPT,
             query::TRANSACTION,
+            query::EVIDENCE,
         ] {
             assert!(!name.is_empty());
         }
@@ -672,6 +813,9 @@ mod tests {
             keys::BLOCK_HASH,
             keys::RECEIPT,
             keys::TX_RAW,
+            keys::EVIDENCE,
+            keys::EVIDENCE_COUNT,
+            keys::EVIDENCE_SEEN,
         ] {
             assert!(!key.is_empty());
         }
@@ -693,6 +837,7 @@ mod tests {
             parent: [1; 32],
             timestamp_ms: 9,
             txs: Seq(vec![vec![1, 2], vec![]]),
+            evidence: Seq(vec![Evidence::default()]),
         };
         roundtrip(&proposal);
         roundtrip(&Validator {
@@ -726,6 +871,9 @@ mod tests {
             view: 4,
             me: Some(1),
             voted: true,
+            answered: Seq(vec![[5; 32]]),
+            backoff: 2,
+            view_started_ms: 7,
             ..SimplexState::default()
         });
         assert_eq!(Signature::default(), Signature([0; 65]));
@@ -745,6 +893,19 @@ mod tests {
                 hash: [3; 32],
                 signature: Signature([3; 65]),
             },
+            ConsensusMessage::Certificate {
+                certificate: Certificate {
+                    kind: consensus::KIND_VOTE,
+                    view: 3,
+                    hash: [0; 32],
+                    votes: Seq(vec![vote.clone()]),
+                },
+                proposal: None,
+            },
+            ConsensusMessage::Certificate {
+                certificate: Certificate::default(),
+                proposal: Some(Proposal::default()),
+            },
         ] {
             roundtrip(&message);
             assert!(format!("{message:?}").len() > 10);
@@ -753,6 +914,59 @@ mod tests {
             ConsensusMessage::from_bytes(&[7]),
             Err(DecodeError::BadTag(7))
         );
+    }
+
+    #[test]
+    fn evidence_is_canonical() {
+        let low = SignedHash {
+            hash: [1; 32],
+            signature: Signature([7; 65]),
+        };
+        let high = SignedHash {
+            hash: [2; 32],
+            signature: Signature([8; 65]),
+        };
+        // Either arrival order gives the same record.
+        let e = Evidence::new(consensus::KIND_VOTE, 9, 3, high.clone(), low.clone());
+        assert_eq!(
+            e,
+            Evidence::new(consensus::KIND_VOTE, 9, 3, low.clone(), high.clone())
+        );
+        assert_eq!((e.first.hash, e.second.hash), ([1; 32], [2; 32]));
+        roundtrip(&e);
+        roundtrip(&low);
+        roundtrip(&Participation {
+            evidence: Seq(vec![e.clone()]),
+        });
+        // The id names validator, view and kind, big-endian, so records sort by offender.
+        let mut id = vec![0, 0, 0, 3];
+        id.extend_from_slice(&9u64.to_be_bytes());
+        id.push(consensus::KIND_VOTE);
+        assert_eq!(e.id().to_vec(), id);
+        assert!(e.well_formed());
+        let zero = SignedHash {
+            hash: [0; 32],
+            signature: Signature([9; 65]),
+        };
+        // A timeout vote beside a block vote is allowed; two proposals or finalize votes are not.
+        assert!(
+            !Evidence::new(consensus::KIND_VOTE, 9, 3, zero.clone(), high.clone()).well_formed()
+        );
+        assert!(
+            Evidence::new(consensus::KIND_PROPOSE, 9, 3, zero.clone(), high.clone()).well_formed()
+        );
+        assert!(
+            Evidence::new(consensus::KIND_FINALIZE, 9, 3, low.clone(), high.clone()).well_formed()
+        );
+        // The same hash twice, an unknown kind, or a non-canonical order is not evidence.
+        assert!(!Evidence::new(consensus::KIND_VOTE, 9, 3, low.clone(), low.clone()).well_formed());
+        assert!(!Evidence::new(3, 9, 3, low.clone(), high.clone()).well_formed());
+        let swapped = Evidence {
+            first: high,
+            second: low,
+            ..e
+        };
+        assert!(!swapped.well_formed());
     }
 
     #[test]
@@ -772,7 +986,17 @@ mod tests {
             identity_preimage(1337),
             signing_preimage(KIND_VOTE, 1337, 0, &[0; 32])
         );
-        assert_eq!((TOPIC, KEY_ROLE, TIMEOUT_SLOTS), (1, 0, 3));
+        assert_eq!((TOPIC, KEY_ROLE, TIMEOUT_SLOTS, MAX_BACKOFF), (1, 0, 3, 4));
+        // The timeout doubles per step of backoff up to 16 times the base, and saturates.
+        assert_eq!(
+            [0, 1, 2, 4, 5, 255].map(|b| view_timeout_ms(400, b)),
+            [1_200, 2_400, 4_800, 19_200, 19_200, 19_200]
+        );
+        assert_eq!(view_timeout_ms(u64::MAX / 2, 1), u64::MAX);
+        assert_eq!(
+            (MAX_EVIDENCE, EVIDENCE_PAGE, EQUIVOCATION_PENALTY),
+            (8, 64, -100)
+        );
         assert_eq!((KIND_PROPOSE, KIND_FINALIZE), (0, 2));
     }
 }
