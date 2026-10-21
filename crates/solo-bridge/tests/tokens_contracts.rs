@@ -38,9 +38,9 @@ const MESSAGE_GAS: u64 = 1_500_000;
 const BIG: u128 = 1 << 100;
 
 /// Gas of a `deposit` of ETH on `TokenGatewayOnEthereum`, the first one, as a transaction.
-const DEPOSIT_ETH_GAS: u64 = 95_029;
+const DEPOSIT_ETH_GAS: u64 = 95_051;
 /// Gas of the first `deposit` of an ERC-20 there.
-const DEPOSIT_TOKEN_GAS: u64 = 135_918;
+const DEPOSIT_TOKEN_GAS: u64 = 135_940;
 /// Gas of a `deposit` that burns a wrapped token on the other side.
 const WITHDRAW_GAS: u64 = 56_024;
 
