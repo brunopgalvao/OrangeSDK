@@ -399,10 +399,33 @@ mod tests {
             &deposit_calldata(&NATIVE, &[1; 20], 5)[..4],
             &abi::selector("deposit(address,address,uint256)")
         );
-        assert_eq!(claim_calldata(&[1; 20], &[2; 20]).len(), 68);
-        assert_eq!(claim_to_calldata(&[1; 20], &[2; 20]).len(), 68);
-        assert_eq!(set_lock_cap_calldata(&[1; 20], 2).len(), 68);
-        assert_eq!(set_mint_cap_calldata(&[1; 20], 2).len(), 68);
+        // Selectors as solc --hashes prints them, then the arguments in order.
+        let two_addresses = [word(&[1; 20]), word(&[2; 20])].concat();
+        let address_and_two = [word(&[1; 20]), word(&[2])].concat();
+        for (calldata, selector, args) in [
+            (
+                claim_calldata(&[1; 20], &[2; 20]),
+                [0x21, 0xc0, 0xb3, 0x42],
+                &two_addresses,
+            ),
+            (
+                claim_to_calldata(&[1; 20], &[2; 20]),
+                [0x34, 0xa1, 0xca, 0x89],
+                &two_addresses,
+            ),
+            (
+                set_lock_cap_calldata(&[1; 20], 2),
+                [0x5f, 0x20, 0x98, 0x57],
+                &address_and_two,
+            ),
+            (
+                set_mint_cap_calldata(&[1; 20], 2),
+                [0xc0, 0x6a, 0xbe, 0x77],
+                &address_and_two,
+            ),
+        ] {
+            assert_eq!(calldata, [&selector[..], args].concat());
+        }
         assert_eq!(
             address_view("balanceOf(address)", &[1; 20])[..4],
             [0x70, 0xa0, 0x82, 0x31]
@@ -416,9 +439,51 @@ mod tests {
             guardian: [6; 20],
             message_gas: 7,
         };
-        assert_eq!(eth.constructor_args().len(), 7 * 32);
+        assert_eq!(
+            eth.constructor_args(),
+            [
+                word(&[1; 20]),
+                word(&[2; 20]),
+                word(&[3]),
+                word(&[4; 20]),
+                word(&[5; 20]),
+                word(&[6; 20]),
+                word(&[7]),
+            ]
+            .concat()
+        );
         let solo = SoloGatewayConfig::new(1, [2; 20], [3; 20], [4; 20], "Solo", "SOLO");
         assert_eq!((solo.outbox, solo.inbox), (OUTBOX_ADDRESS, INBOX_ADDRESS));
-        assert_eq!(solo.constructor_args().len(), 8 * 32 + 2 * 64);
+        let padded = |text: &[u8]| {
+            let mut w = [0; 32];
+            w[..text.len()].copy_from_slice(text);
+            w
+        };
+        assert_eq!(
+            solo.constructor_args(),
+            [
+                word(&[0x4f, 0x42]),
+                word(&[0x45, 0x49]),
+                word(&[1]),
+                word(&[2; 20]),
+                word(&[3; 20]),
+                word(&[4; 20]),
+                // The two strings' offsets, then each one's length and padded bytes.
+                word(&[1, 0x00]),
+                word(&[1, 0x40]),
+                word(&[4]),
+                padded(b"Solo"),
+                word(&[4]),
+                padded(b"SOLO"),
+            ]
+            .concat()
+        );
+    }
+
+    /// `bytes` as the low end of a 32-byte word.
+    fn word(bytes: &[u8]) -> [u8; 32] {
+        let mut w = [0; 32];
+        w[32 - bytes.len()..].copy_from_slice(bytes);
+        w
     }
 }
