@@ -57,11 +57,11 @@ impl Default for NodeConfig {
 pub const KERNEL_GAS: i64 = 1 << 40;
 
 /// The kernel gas a block of the reference kernel can take at most (spec 19
-/// §5): the precompile budget, 2^31, plus 256 kernel gas per EVM gas of the
+/// §5): the precompile budget, 2^34, plus 256 kernel gas per EVM gas of the
 /// block gas limit, plus room for what every block and transaction costs
 /// besides. A node whose kernel gas is below it can fail to execute a valid
 /// block and stall; [`KERNEL_GAS`] is far above.
-pub const BLOCK_KERNEL_GAS: i64 = 1 << 34;
+pub const BLOCK_KERNEL_GAS: i64 = 1 << 35;
 
 /// How many of the most recently executed blocks a node keeps the state trie
 /// of, to prove entries against their header roots

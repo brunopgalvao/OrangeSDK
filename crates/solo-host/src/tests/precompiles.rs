@@ -621,6 +621,11 @@ fn gas_comes_first_and_every_range_is_checked() {
     for name in ["evm_bls12381_g1_msm", "evm_bls12381_g2_msm"] {
         let body = call_module(name, &[], &[Arg::Ro(0), Arg::Val(1 << 28), Arg::Dst], 0);
         assert_eq!(
+            exec_module(&mut exec, &body, 1 << 30).status,
+            Termination::OutOfGas,
+            "{name}"
+        );
+        assert_eq!(
             exec_module(&mut exec, &body, i64::MAX >> 2).status,
             fault,
             "{name}"

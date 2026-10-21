@@ -15,7 +15,7 @@ use solo_host::hash::keccak256;
 use solo_host::{Executor, Flags, MemStorage, ModuleCache};
 use solo_node::upgrade::{
     BLS12381_FAST_AGGREGATE_VERIFY, GATED, PRECOMPILE_HANDLE, SECP256K1_VERIFY, SUPPORTED, gated,
-    signal_tx,
+    precompile, signal_tx,
 };
 use solo_node::{GatedExtension, Node, NodeConfig, NodeExtension, NodeServices};
 use solo_upgrade::{Action, gate};
@@ -126,6 +126,7 @@ fn the_gated_function_resolves_only_while_its_gate_is_active() {
         assert_eq!(gated(name, Capability::Sandboxed, 0b100), Some(handle));
     }
     assert_eq!(PRECOMPILE_HANDLE, 202);
+    assert_eq!(precompile(12), GATED[14]);
     assert_eq!(
         (GATED[0].name, GATED[0].handle, SECP256K1_VERIFY),
         ("secp256k1_verify", 200, 200)

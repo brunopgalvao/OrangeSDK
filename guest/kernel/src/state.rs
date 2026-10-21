@@ -104,14 +104,11 @@ pub fn block_by_number(height: u64) -> Option<BlockHeader> {
     get(&block_key(height))
 }
 
-/// The hash of the block at `height`: stored beside its header, so that
-/// `BLOCKHASH` costs one read of 32 bytes however large the header is; a
-/// block stored before the hash was (by an earlier kernel version) is hashed
-/// from its header.
+/// The hash of the block at `height`, stored beside its header so that
+/// `BLOCKHASH` costs one read of 32 bytes however large the header is
+/// (spec 19 §4).
 pub fn block_hash(height: u64) -> Option<Hash> {
-    get_raw(&concat(keys::BLOCK_NUMBER, &height.to_be_bytes()))
-        .and_then(|v| Hash::try_from(v.as_slice()).ok())
-        .or_else(|| block_by_number(height).map(|h| keccak256(&h.to_bytes())))
+    get_raw(&concat(keys::BLOCK_NUMBER, &height.to_be_bytes())).and_then(|v| Hash::try_from(v.as_slice()).ok())
 }
 
 /// Block header by hash.

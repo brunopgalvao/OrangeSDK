@@ -24,6 +24,7 @@ This directory is normative. An implementation that disagrees with it is wrong; 
 | 16 | [Kernel modules and native contracts](16-modules.md) — the module interface, capabilities, genesis and governance installs, block hooks, native contracts called from the EVM (`0xEF02` designators), the native gas rate | draft |
 | 17 | [Bridge to Ethereum](17-bridge-out.md) — the outbox system address and its messages in state, the proposal anchor that certificates vouch for, the Ethereum light client and inbox with delay, rate limits, guardian and owner, relaying, the `finality_proof` query and the `solo_getFinalityProof` and `solo_getOutboxProof` RPC methods | draft |
 | 18 | [Ethereum to Solo](18-bridge-in.md) — the sync-committee light client of Ethereum, the outbox on Ethereum, message proofs, the message verifier and the inbox, delay, rate limit and pause, admission | draft |
+| 19 | [Precompiles and kernel gas](19-precompiles.md) — kernel gas per EVM gas of every precompile and ordinary operation, the bound, the precompile host functions behind gate 2 and the module that reaches them, `KECCAK256` and `BLOCKHASH`, the per-block budget before the gate, the kernel gas of a block | draft |
 
 ## Conventions
 

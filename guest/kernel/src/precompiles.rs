@@ -62,7 +62,7 @@ pub mod op {
 
 /// Kernel gas a block (or a query) may have used for an in-guest precompile
 /// above the bound to start (spec 19 §5).
-pub const PRECOMPILE_BUDGET: u64 = 1 << 31;
+pub const PRECOMPILE_BUDGET: u64 = 1 << 34;
 
 /// Kernel gas per EVM gas each in-guest operation is assumed to cost when
 /// checked against the budget, by op; 0 for those within the bound of

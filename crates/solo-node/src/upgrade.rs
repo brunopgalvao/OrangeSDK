@@ -63,7 +63,8 @@ pub const BLS12381_FAST_AGGREGATE_VERIFY: u32 = 201;
 pub const PRECOMPILE_HANDLE: u32 = solo_host::precompiles::HANDLE_BASE;
 
 /// The precompile host function `i`, behind gate 2.
-const fn precompile(i: u32) -> GatedFunction {
+#[must_use]
+pub const fn precompile(i: u32) -> GatedFunction {
     GatedFunction {
         name: solo_host::precompiles::FUNCTIONS[i as usize].0,
         gate: gate::PRECOMPILES,

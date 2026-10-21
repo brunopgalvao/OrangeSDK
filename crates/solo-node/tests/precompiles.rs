@@ -24,7 +24,7 @@ const CALL_GAS: u32 = 60_000;
 /// Two fit a block with room for the validator's signal transaction.
 const TX_GAS: u64 = 14_900_000;
 /// The precompile budget of spec 19 §5.
-const BUDGET: u64 = 1 << 31;
+const BUDGET: u64 = 1 << 34;
 
 fn hex(s: &str) -> Vec<u8> {
     (0..s.len())
@@ -162,9 +162,9 @@ fn blocks_of_point_evaluations_execute_within_the_kernel_gas() {
     assert!(
         receipts
             .iter()
-            .all(|r| r.status == 1 && r.gas_used > 14_000_000)
+            .all(|r| r.status == 1 && r.gas_used > 12_000_000)
     );
-    assert!((10..40).contains(&passed), "{passed} passed in the guest");
+    assert!((100..400).contains(&passed), "{passed} passed in the guest");
     let heaviest = *blocks.iter().max().unwrap();
     assert!(
         heaviest > BUDGET / 2 && heaviest < BUDGET + 256 * 30_000_000,

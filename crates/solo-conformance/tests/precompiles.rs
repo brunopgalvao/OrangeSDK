@@ -23,7 +23,7 @@ use solo_host::hash::sha256;
 const BOUND: u64 = 256;
 
 /// The budget of spec 19 §5.
-const BUDGET: u64 = 1 << 31;
+const BUDGET: u64 = 1 << 34;
 
 fn hex(s: &str) -> Vec<u8> {
     let s: String = s.chars().filter(char::is_ascii_hexdigit).collect();
@@ -467,27 +467,27 @@ fn kernel_gas_per_evm_gas_stays_within_the_bound() {
 
 #[test]
 fn in_guest_precompiles_halt_past_the_budget() {
-    // Point evaluations with 60 000 gas each, 40 of them: in the guest the
+    // Point evaluations with 60 000 gas each, 250 of them: in the guest the
     // budget lets fewer through; on the host all succeed.
     let input = kzg(true);
-    let code = caller(10, 40, 60_000);
+    let code = caller(10, 250, 60_000);
     let mut guest = Runner::new(GUEST, Backend::Native).unwrap();
     let executed = execute(&mut guest, code.clone(), &input);
     let passed = u64::from(slot(&executed, 0)[31]);
-    assert!((10..40).contains(&passed), "{passed} passed");
+    assert!((100..250).contains(&passed), "{passed} passed");
     assert!(
         guest.gas_used() < BUDGET + (BUDGET >> 3),
         "{} VM gas",
         guest.gas_used()
     );
     let mut host = Runner::gated(GUEST, Backend::Native).unwrap();
-    assert_eq!(slot(&execute(&mut host, code, &input), 0), word(40));
+    assert_eq!(slot(&execute(&mut host, code, &input), 0), word(250));
     // The precompiles within the bound are never checked: 40 large modular
-    // exponentiations pass in the guest whatever the budget.
+    // exponentiations pass in the guest, at 17 million kernel gas each.
     let input = modexp(&[0xFF; 1024], &[0xFF], &[0xEF; 1024]);
     let executed = execute(&mut guest, caller(5, 40, 240_000), &input);
     assert_eq!(slot(&executed, 0), word(40));
-    assert!(guest.gas_used() > BUDGET / 4);
+    assert!(guest.gas_used() > 40 * 17_000_000);
 }
 
 /// A loop running `body`, which must leave the stack as it found it,
@@ -601,8 +601,7 @@ fn measure_ordinary() {
 }
 
 /// Storage holding block 0 with `txs` transaction hashes, and its hash
-/// beside it if `hashed`, as the kernel stores blocks (an earlier kernel
-/// stored no hash).
+/// beside it if `hashed`, as the kernel stores blocks.
 fn with_block(txs: usize, hashed: bool) -> (solo_host::MemStorage, [u8; 32]) {
     use solo_abi::Encode;
     use solo_host::Storage;
@@ -623,14 +622,13 @@ fn with_block(txs: usize, hashed: bool) -> (solo_host::MemStorage, [u8; 32]) {
 #[test]
 fn blockhash_reads_the_stored_hash_whatever_the_header() {
     let mut runner = Runner::new(GUEST, Backend::Native).unwrap();
-    // SSTORE(0, BLOCKHASH(0)): the stored hash, or the header's for a block
-    // stored without one.
+    // SSTORE(0, BLOCKHASH(0)): the stored hash; the header alone is never read.
     for hashed in [true, false] {
         let (storage, hash) = with_block(3, hashed);
         let executed = runner
             .run_on(&call_case(vec![0x5F, 0x40, 0x5F, 0x55, 0x00], &[]), storage)
             .unwrap();
-        assert_eq!(slot(&executed, 0), hash);
+        assert_eq!(slot(&executed, 0), if hashed { hash } else { [0; 32] });
     }
     // A thousand transaction hashes in the header cost nothing more.
     let mut gas = Vec::new();
