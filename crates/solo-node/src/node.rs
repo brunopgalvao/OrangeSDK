@@ -42,6 +42,9 @@ pub struct NodeConfig {
     /// serve historical queries and proofs; see [`STATE_HISTORY`] and
     /// [`ARCHIVE`].
     pub state_history: usize,
+    /// Key writes of history the node keeps per block of `state_history`;
+    /// see [`HISTORY_KEYS_PER_BLOCK`].
+    pub history_keys_per_block: usize,
 }
 
 impl Default for NodeConfig {
@@ -53,6 +56,7 @@ impl Default for NodeConfig {
             kernel_gas: KERNEL_GAS,
             query_gas: QUERY_GAS,
             state_history: STATE_HISTORY,
+            history_keys_per_block: HISTORY_KEYS_PER_BLOCK,
         }
     }
 }
@@ -73,11 +77,26 @@ pub const BLOCK_KERNEL_GAS: i64 = 1 << 35;
 /// queries at those heights ([`Node::query_at`]), and the state trie behind
 /// each header's root, to prove entries against it
 /// ([`Node::state_proof_at`]). Both keep only what each block changed: the
-/// old values of the keys it wrote, and the trie nodes on their paths.
+/// old values of the keys it wrote, and the trie nodes on their paths. The
+/// window is shorter when its blocks write more than
+/// [`HISTORY_KEYS_PER_BLOCK`] keys each on average.
 pub const STATE_HISTORY: usize = 1024;
 
-/// A [`NodeConfig::state_history`] that keeps the state of every block.
+/// A [`NodeConfig::state_history`] that keeps the state of every block,
+/// however many keys they write.
 pub const ARCHIVE: usize = usize::MAX;
+
+/// Key writes of history a node keeps per block of its window, by default
+/// (spec 20 §5.1). A node keeps at most `state_history` times this many:
+/// when the blocks of its window wrote more committed keys than that in
+/// all, it drops the oldest of them until the rest fit, so blocks that
+/// write heavily cannot make history outgrow its memory. Each key write
+/// kept costs its old value and the trie nodes on its path, about 1 to
+/// 1.5 KB (measured 2026-10-21 over 200 000 entries: 1.4 KB at 1 500
+/// writes per block, 1.0 KB at 6 000), so the default window holds at most
+/// about 0.5 to 0.75 GB of history, while blocks that write fewer keys
+/// keep all of their 1 024.
+pub const HISTORY_KEYS_PER_BLOCK: usize = 512;
 
 /// Gas allowed to each `kernel_query` call (spec 06 §6), unless
 /// [`Node::kernel_gas`] is lower. Queries run on the thread that drives
@@ -178,11 +197,15 @@ pub struct Node {
     /// for the transport to forward to peers.
     tx_gossip: Vec<Vec<u8>>,
     /// The state trie behind the root each recent executed block returned,
-    /// by height; at most [`Node::state_history`] of them.
+    /// by height, from [`Node::oldest_state`] on.
     committed: BTreeMap<u64, solo_trie::Trie>,
     /// How many executed blocks' states to keep; see [`STATE_HISTORY`]. A
     /// change applies from the next executed block.
     pub state_history: usize,
+    /// Key writes of history to keep per block of `state_history`; see
+    /// [`HISTORY_KEYS_PER_BLOCK`]. A change applies from the next executed
+    /// block.
+    pub history_keys_per_block: usize,
     /// The state commitment of the genesis state, as `kernel_init` left it.
     genesis_root: [u8; 32],
     /// Telemetry (spec 11); consensus-ignored.
@@ -245,6 +268,7 @@ impl Node {
             tx_gossip: Vec::new(),
             committed: BTreeMap::new(),
             state_history: config.state_history.max(1),
+            history_keys_per_block: config.history_keys_per_block,
             genesis_root: [0; 32],
             telemetry: solo_metrics::NodeMetrics::new(),
             upgrades: Upgrades::new(active_gates),
@@ -570,15 +594,19 @@ impl Node {
             .rev()
             .find(|trie| trie.root() == result.state_root);
         self.committed.extend(kept.map(|trie| (height, trie)));
+        // The window: the last `state_history` blocks, fewer when they wrote
+        // more keys than its budget (spec 20 §5.1). A height's trie goes
+        // with its values.
         let history = self.state_history.max(1);
-        while self.committed.len() > history {
-            self.committed.pop_first();
-        }
         let base = self.exec.state_mut().base_mut();
         base.seal(height);
         if history != ARCHIVE {
-            base.prune((height + 1).saturating_sub(history as u64));
+            let by_blocks = (height + 1).saturating_sub(history as u64);
+            let budget = history.saturating_mul(self.history_keys_per_block);
+            base.prune(by_blocks.max(base.oldest_within(budget)));
         }
+        let oldest = self.oldest_state();
+        self.committed = self.committed.split_off(&oldest);
         let stored = self
             .block_by_number(height)?
             .ok_or(NodeError::Decode("stored header"))?;
@@ -1010,7 +1038,7 @@ impl Node {
     /// returned, which is the `state_root` of that block's header for the
     /// reference kernel (spec 06 §5, spec 10 §5), or the genesis state for
     /// height 0. `None` unless this node executed that block, or started
-    /// from genesis, within its last [`Node::state_history`].
+    /// from genesis, and keeps its state (from [`Node::oldest_state`] on).
     #[must_use]
     pub fn state_proof_at(&self, height: u64, key: &[u8]) -> Option<solo_trie::Proof> {
         self.committed.get(&height).map(|trie| trie.prove(key))

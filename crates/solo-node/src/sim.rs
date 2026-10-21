@@ -180,6 +180,7 @@ impl Sim {
             kernel_gas: old.kernel_gas,
             query_gas: old.query_gas,
             state_history: old.state_history,
+            history_keys_per_block: old.history_keys_per_block,
         };
         self.nodes[index] = Self::open_started(kernel, genesis, config, resumed)?;
         self.ids[index] = key;

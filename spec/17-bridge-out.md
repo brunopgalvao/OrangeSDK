@@ -175,7 +175,7 @@ A relayer needs, from a Solo node: messages (the outbox's `MessageSent` logs, th
 
 **The query.** `finality_proof` takes a `u64` height and returns, with status 0, `FinalityProof { certificate: bytes, proposal: bytes }`: the threshold certificate the node stored for that height (08 §6a; 97 bytes, version 2, from the reference driver) and the encoded proposal its block hash names, which may be a descendant of the block at that height finalized with it. Status 1 means the node stored no threshold certificate for that height; status 2, bad params. The answer is node-local, like every certificate.
 
-**Historical proofs.** The reference node keeps the state trie of each of the executed blocks in its state history (spec 20 §5: the last 1 024 by default, every block on an archive node), so it proves against any of those roots. A relayer submits an anchor no older than that, or keeps the proofs it needs.
+**Historical proofs.** The reference node keeps the state trie of each of the executed blocks in its state history (spec 20 §5.1: the last 1 024 by default, fewer while blocks write heavily, every block on an archive node), so it proves against any of those roots. A relayer submits an anchor no older than that, or keeps the proofs it needs.
 
 **RPC.** Beside the Ethereum methods, `crates/solo-rpc` serves:
 

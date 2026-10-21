@@ -216,6 +216,36 @@ impl MemStorage {
         history.oldest = oldest;
     }
 
+    /// How many key writes the history holds: reading as the oldest version
+    /// needs the old value of every key each later version wrote, once per
+    /// version. What history costs grows with it. 0 without history.
+    #[must_use]
+    pub fn history_keys(&self) -> usize {
+        self.history
+            .as_ref()
+            .map_or(0, |h| h.written.values().map(Vec::len).sum())
+    }
+
+    /// The oldest version the store can still read as while holding at most
+    /// `keys` key writes of history ([`MemStorage::history_keys`]), from
+    /// what each sealed version wrote: the oldest kept version when all fit,
+    /// the latest when its own writes are already more. Pruning to it keeps
+    /// history within `keys`. 0 without history.
+    #[must_use]
+    pub fn oldest_within(&self, keys: usize) -> u64 {
+        let Some(history) = self.history.as_ref() else {
+            return 0;
+        };
+        let mut held = 0usize;
+        for (version, written) in history.written.iter().rev() {
+            held += written.len();
+            if held > keys {
+                return *version;
+            }
+        }
+        history.oldest
+    }
+
     /// The versions the store can read as, oldest and latest; `None` without
     /// history.
     #[must_use]
@@ -836,6 +866,36 @@ mod tests {
         s.prune(9);
         assert_eq!(s.versions(), Some((3, 3)));
         assert_eq!(read(&mut s, 3).2, None);
+    }
+
+    #[test]
+    fn history_keys_bound_the_versions_kept() {
+        let mut s = MemStorage::default();
+        // Without history there is nothing to hold.
+        assert_eq!((s.history_keys(), s.oldest_within(0)), (0, 0));
+        s.keep_history(0);
+        // Version 1 writes three keys, version 2 one key twice and a local
+        // key, which history leaves out, and version 3 two.
+        for key in [&b"a"[..], b"b", b"c"] {
+            s.set(key, b"1");
+        }
+        s.seal(1);
+        s.set(b"a", b"2");
+        s.set(b"a", b"2b");
+        s.set(b"local/x", b"2");
+        s.seal(2);
+        s.set(b"a", b"3");
+        assert!(s.delete(b"b"));
+        s.seal(3);
+        assert_eq!(s.history_keys(), 6);
+        // Reading as version v needs what every version above v wrote.
+        for (keys, oldest) in [(6, 0), (5, 1), (3, 1), (2, 2), (1, 3), (0, 3)] {
+            assert_eq!(s.oldest_within(keys), oldest, "{keys}");
+        }
+        // Pruning to it keeps the history within the bound.
+        s.prune(s.oldest_within(2));
+        assert_eq!((s.versions(), s.history_keys()), (Some((2, 3)), 2));
+        assert_eq!(s.oldest_within(usize::MAX), 2);
     }
 
     #[test]

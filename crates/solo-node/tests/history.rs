@@ -151,3 +151,44 @@ fn an_archive_node_keeps_what_a_windowed_node_prunes() {
         100 * ETHER
     );
 }
+
+#[test]
+fn blocks_that_write_more_keys_than_the_budget_shorten_the_window() {
+    // A window of 1 000 blocks, longer than the chain, with no key writes of
+    // history allowed: whatever a block writes is over budget, so the node
+    // keeps the head's state only, and its trie only.
+    let mut node = node(1_000);
+    node.history_keys_per_block = 0;
+    let bob = Wallet::new(0x44);
+    include(&mut node, &alice().tx(0, bob.address, ETHER, 21_000, &[]));
+    let head = node.block_number().unwrap();
+    assert_eq!(node.oldest_state(), head);
+    assert_eq!(node.state().base().history_keys(), 0);
+    assert_eq!(
+        node.account_at(&bob.address, Some(head - 1)),
+        Err(NodeError::StateUnavailable {
+            height: head - 1,
+            oldest: head
+        })
+    );
+    assert!(node.state_proof_at(head - 1, b"meta/chain_id").is_none());
+    assert!(node.state_proof_at(head, b"meta/chain_id").is_some());
+    // One key write per block of the window, 1 000 in all: the next blocks
+    // fit, and the window grows again from where it was.
+    node.history_keys_per_block = 1;
+    for nonce in 1..3u64 {
+        include(
+            &mut node,
+            &alice().tx(nonce, bob.address, ETHER, 21_000, &[]),
+        );
+    }
+    assert!(node.block_number().unwrap() > head);
+    assert_eq!(node.oldest_state(), head);
+    let writes = node.state().base().history_keys();
+    assert!((1..=1_000).contains(&writes), "{writes}");
+    assert_eq!(
+        node.account_at(&bob.address, Some(head)).unwrap().balance,
+        ETHER
+    );
+    assert!(node.state_proof_at(head, b"meta/chain_id").is_some());
+}

@@ -156,7 +156,11 @@ A proof is against the trie behind the root of the block's header, which the nod
 
 ### 5.1 Retention
 
-The reference node keeps the state of its latest `state_history` executed blocks, 1 024 by default (`STATE_HISTORY`; `solo node --state-history <blocks>`), or of every block from genesis on an archive node (`--archive`, `ARCHIVE`). It keeps, per executed block, the value every committed key held before the block (and the host writes between it and the block before) changed it, and the state trie behind the block's root, which shares every node the block did not change. A block that leaves the window takes both with it. The oldest height whose state the node keeps is the head less `state_history − 1`, or 0 while the chain is shorter; the genesis state, height 0, is kept until then. Keys under `local/` are outside history, as outside the commitment (10 §2).
+The reference node keeps the state of its latest `state_history` executed blocks, 1 024 by default (`STATE_HISTORY`; `solo node --state-history <blocks>`), or of every block from genesis on an archive node (`--archive`, `ARCHIVE`). It keeps, per executed block, the value every committed key held before the block (and the host writes between it and the block before) changed it, and the state trie behind the block's root, which shares every node the block did not change. A block that leaves the window takes both with it. Keys under `local/` are outside history, as outside the commitment (10 §2).
+
+History is also bounded in key writes, so that blocks that write heavily cannot make it outgrow the node's memory: the node keeps at most `512 × state_history` of them (`HISTORY_KEYS_PER_BLOCK`), a key counting once for each block that wrote it. When the blocks of the window wrote more, it drops the oldest of them until the rest fit, and the window holds fewer blocks; the head's state is always kept. Each key write kept costs its old value and the trie nodes on its path, about 1 to 1.5 KB (measured 2026-10-21 over 200 000 entries: 1.4 KB per write at 1 500 writes per block, 1.0 KB at 6 000), so the default window holds at most about 0.5 to 0.75 GB of history whatever its blocks write, while blocks that write 512 keys or fewer each on average keep all 1 024. An archive node has no bound.
+
+The oldest height whose state the node keeps is therefore the head less `state_history − 1`, later when the bound in key writes holds fewer blocks, or 0 while the chain is shorter; the genesis state, height 0, is kept until then.
 
 ### 5.2 Queries at a height
 
