@@ -21,3 +21,5 @@ solo-rlp = { path = "../../crates/solo-rlp", default-features = false }
 solo-eth = { path = "../../crates/solo-eth", default-features = false }
 solo-upgrade = { path = "../../crates/solo-upgrade", default-features = false }
 revm = { version = "43.0.3", default-features = false, features = ["optional_eip3607"] }
+# revm's keccak256 through the host (`precompiles::native_keccak256`, spec 19 §4).
+alloy-primitives = { version = "1.7.3", default-features = false, features = ["native-keccak"] }

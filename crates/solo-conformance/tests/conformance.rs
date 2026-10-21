@@ -1,7 +1,8 @@
 //! The committed conformance subset (spec 07 §4.2): every case through the
 //! conformance guest on the interpreter and the native backend, compared with
 //! the fixtures, with every failure on the expected-failure list and every
-//! list entry used.
+//! list entry used; and again with feature gate 2 active, the precompiles on
+//! the host (spec 19), each case agreeing with the guest's own precompiles.
 
 use std::path::Path;
 use std::process::Command;
@@ -52,6 +53,31 @@ fn committed_subset_passes_on_both_backends() {
     assert_eq!(report.categories.len(), 28);
 }
 
+#[test]
+fn committed_subset_passes_with_gate_2_on_both_backends() {
+    let cases = cases();
+    let expected = suite::expectations(&std::fs::read_to_string(EXPECTED).unwrap()).unwrap();
+    let mut runners = vec![
+        Runner::gated(GUEST, Backend::Interpreter).unwrap(),
+        Runner::gated(GUEST, Backend::Native).unwrap(),
+        Runner::new(GUEST, Backend::Native).unwrap(),
+    ];
+    let report = suite::run(&cases, &mut runners, &expected);
+    println!("{report}");
+    assert!(report.ok(false), "{report}");
+    assert!(runners[0].is_gated() && runners[1].is_gated() && !runners[2].is_gated());
+    assert_eq!(runners[1].label(), "Native backend with gate 2");
+    assert_eq!(runners[1].runs_natively(), Some(true));
+    assert_eq!(
+        report.total(),
+        Counts {
+            passed: 490,
+            expected: 31,
+            failed: 0
+        }
+    );
+}
+
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_solo-conformance"))
 }
@@ -88,6 +114,22 @@ fn command_runs_a_directory_on_both_backends() {
         ["total", "3", "2", "0"],
         "{stdout}"
     );
+}
+
+#[test]
+fn command_runs_with_gate_2() {
+    let out = bin()
+        .args([
+            "--native",
+            "--gated",
+            &fixture_file("prague/eip2537_bls_12_381_precompiles/bls12_map_fp_to_g1"),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    let total = stdout.lines().find(|l| l.starts_with("total")).unwrap();
+    assert_eq!(total.split_whitespace().nth(3), Some("0"), "{stdout}");
 }
 
 #[test]

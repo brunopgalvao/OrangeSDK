@@ -345,6 +345,9 @@ pub mod keys {
     pub const BLOCK: &[u8] = b"block/";
     /// `bhash/` + hash → u64 height.
     pub const BLOCK_HASH: &[u8] = b"bhash/";
+    /// `bnum/` + height (big-endian u64) → the block's 32-byte hash, which
+    /// `BLOCKHASH` reads without decoding and hashing the header (spec 19 §4).
+    pub const BLOCK_NUMBER: &[u8] = b"bnum/";
     /// `receipt/` + tx hash → Receipt.
     pub const RECEIPT: &[u8] = b"receipt/";
     /// `txraw/` + tx hash → raw transaction bytes.
@@ -980,6 +983,7 @@ mod tests {
             keys::LAST_HASH,
             keys::BLOCK,
             keys::BLOCK_HASH,
+            keys::BLOCK_NUMBER,
             keys::RECEIPT,
             keys::TX_RAW,
             keys::EVIDENCE,

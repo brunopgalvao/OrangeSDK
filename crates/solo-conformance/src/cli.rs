@@ -9,9 +9,10 @@ use solo_host::Backend;
 use crate::run::Runner;
 use crate::{GUEST, fixture, suite};
 
-const USAGE: &str = "usage: solo-conformance [--native | --both] [--expected FILE] PATH...\n\
+const USAGE: &str = "usage: solo-conformance [--native | --both] [--gated] [--expected FILE] PATH...\n\
     Runs the execution-spec state tests in PATH (fixture files, or directories searched for *.json)\n\
-    through the conformance guest on the interpreter (default), the native backend, or both.";
+    through the conformance guest on the interpreter (default), the native backend, or both;\n\
+    with --gated, as the kernel runs them once feature gate 2 is active (precompiles on the host).";
 
 /// Every `*.json` file under `path` (or `path` itself), sorted.
 ///
@@ -52,6 +53,7 @@ pub fn main(args: &[String], out: &mut String) -> i32 {
 
 fn run(args: &[String], out: &mut String) -> Result<bool, String> {
     let mut backends = vec![Backend::Interpreter];
+    let mut gated = false;
     let mut expected = Vec::new();
     let mut paths = Vec::new();
     let mut args = args.iter();
@@ -59,6 +61,7 @@ fn run(args: &[String], out: &mut String) -> Result<bool, String> {
         match arg.as_str() {
             "--native" => backends = vec![Backend::Native],
             "--both" => backends = vec![Backend::Interpreter, Backend::Native],
+            "--gated" => gated = true,
             "--expected" => {
                 let file = args.next().ok_or(USAGE)?;
                 let text = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
@@ -81,7 +84,13 @@ fn run(args: &[String], out: &mut String) -> Result<bool, String> {
     }
     let mut runners = backends
         .into_iter()
-        .map(|b| Runner::new(GUEST, b))
+        .map(|b| {
+            if gated {
+                Runner::gated(GUEST, b)
+            } else {
+                Runner::new(GUEST, b)
+            }
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let report = suite::run(&cases, &mut runners, &expected);
     let _ = write!(out, "{report}");

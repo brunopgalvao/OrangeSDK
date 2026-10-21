@@ -1,7 +1,7 @@
 //! The EVM conformance guest (spec 07 §4.2): runs one Ethereum state test
 //! case through the reference kernel's own EVM code.
 //!
-//! The kernel's `evm`, `native`, `outbox`, `modules`, `state` and `tx` modules are
+//! The kernel's `evm`, `native`, `outbox`, `modules`, `precompiles`, `state` and `tx` modules are
 //! compiled here from their source files, so there is one copy of the code
 //! under test: revm over the kernel's `StateDb` with the kernel's precompile
 //! provider (Ethereum's precompiles and native contracts), its commit of
@@ -9,6 +9,10 @@
 //! allocation and sender recovery.
 //! The case's pre-state goes in as genesis allocations, the transaction as
 //! signed bytes; the post-state stays in storage for the host to read.
+//! `conformance_run` runs the precompiles as the kernel does before feature
+//! gate 2, in the guest; `conformance_run_gated` as it does once the gate is
+//! active, on the host through the precompile module (spec 19), which needs
+//! a host that serves the gate's functions.
 
 #![no_std]
 #![no_main]
@@ -28,6 +32,9 @@ mod native;
 #[path = "../../kernel/src/outbox.rs"]
 mod outbox;
 #[allow(dead_code)]
+#[path = "../../kernel/src/precompiles.rs"]
+mod precompiles;
+#[allow(dead_code)]
 #[path = "../../kernel/src/state.rs"]
 mod state;
 #[allow(dead_code)]
@@ -45,10 +52,11 @@ use solo_abi::{Decode, Encode};
 
 use crate::evm::{Env, Message};
 
-fn run(case: Case) -> Outcome {
+fn run(case: Case, accelerated: bool) -> Outcome {
     let env = case.env;
     let params = GenesisParams { allocations: case.allocations, ..GenesisParams::default() };
     state::init(&Genesis { chain_id: env.chain_id, params: params.to_bytes(), ..Genesis::default() });
+    precompiles::begin(accelerated);
     let Ok(signed) = tx::decode_signed(&case.tx, env.chain_id) else {
         return Outcome { status: call_status::INVALID, gas_used: 0, logs: Seq(Vec::new()) };
     };
@@ -82,7 +90,14 @@ fn run(case: Case) -> Outcome {
 
 solo_guest::solo_export!(conformance_run, |input: &[u8]| -> Vec<u8> {
     match Case::from_bytes(input) {
-        Ok(case) => run(case).to_bytes(),
+        Ok(case) => run(case, false).to_bytes(),
+        Err(_) => solo_guest::trap(),
+    }
+});
+
+solo_guest::solo_export!(conformance_run_gated, |input: &[u8]| -> Vec<u8> {
+    match Case::from_bytes(input) {
+        Ok(case) => run(case, true).to_bytes(),
         Err(_) => solo_guest::trap(),
     }
 });

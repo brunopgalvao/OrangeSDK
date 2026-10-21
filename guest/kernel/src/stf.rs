@@ -213,6 +213,7 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let template = BlockHeader::from_bytes(&args.block.header).unwrap_or_else(|_| solo_guest::trap());
     let height = template.height;
     let block = BlockFields { number: height, timestamp: template.timestamp_ms / 1000 };
+    crate::precompiles::begin(crate::governance::gate_active(solo_upgrade::gate::PRECOMPILES, height));
     record_participation(&args.block.participation, height);
     crate::modules::begin_block(height, template.timestamp_ms);
     let mut receipts = Vec::new();
@@ -294,6 +295,8 @@ fn call(request: CallRequest) -> CallResult {
         nonce: None,
         access_list,
     };
+    // The host serves the gates active for the next block (spec 13 §7.1).
+    crate::precompiles::begin(crate::governance::gate_active(solo_upgrade::gate::PRECOMPILES, height + 1));
     let outcome = crate::native::run(message, BlockFields { number: height, timestamp }, false);
     CallResult { status: outcome.status, gas_used: outcome.gas_used, output: outcome.output }
 }
