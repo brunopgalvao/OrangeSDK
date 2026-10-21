@@ -1033,7 +1033,8 @@ fn locked_always_covers_what_is_minted() {
     }
     assert!(delivered > 50, "{delivered}");
     // Unpause, lift the caps, deliver everything, bridge everything back and claim what is owed:
-    // every original balance is whole again and nothing stays locked or minted.
+    // nothing is left owed or in flight, both equalities still hold, and the only value still
+    // locked and minted is what the test receiver holds of wrapped tokens it does not bridge back.
     for (gateway, token) in homes {
         let other = if gateway == on_eth { on_solo } else { on_eth };
         ok(&w.eth.call(OWNER, gateway, &abi::call("unpause()", &[])));
