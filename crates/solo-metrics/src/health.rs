@@ -158,6 +158,10 @@ mod tests {
             validator: None,
             upgrade_alert: None,
             missing_gates: 0,
+            kernel_version: 1,
+            kernel_hash: [0; 32],
+            active_gates: 0,
+            pending_upgrade: None,
         }
     }
 

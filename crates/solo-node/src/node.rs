@@ -274,6 +274,11 @@ impl Node {
             upgrades: Upgrades::new(active_gates),
         };
         node.call_unit(exports::INIT, &genesis.to_bytes())?;
+        // The kernel's version and gates are known before the first block:
+        // the query spec 13 §7.1 makes after every block, once at open,
+        // within the init budget, so telemetry never asks the kernel at
+        // scrape time.
+        node.upgrades.status = Some(node.upgrade_status()?);
         node.kernel_gas = config.kernel_gas;
         // The genesis state is version 0; each executed block seals its height.
         node.exec.state_mut().base_mut().keep_history(0);

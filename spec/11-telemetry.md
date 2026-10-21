@@ -58,6 +58,9 @@ Names follow EIP-2159 where it defines a metric (`ethereum_*`); every other name
 | `solo_p2p_frames_total` | counter | `direction`, `kind` | Frames (09 §2) the transport received, and queued for sending, including each connection's `Hello`. |
 | `solo_upgrade_blocked` | gauge | — | `1` while a pending kernel upgrade cannot be enacted by this host (13 §7.2), else `0`. |
 | `solo_upgrade_missing_gates` | gauge | — | Feature gates the chain has locked in that this host release does not support (13 §7.2). |
+| `solo_upgrade_activation_height` | gauge | — | The activation height of the pending kernel upgrade (13 §4), or `0` while none is pending. |
+| `solo_kernel_version` | gauge | — | The running kernel's version (06 §7.1), as its `upgrade_status` reports it; `0` for a kernel that does not serve the query. |
+| `solo_gate_active` | gauge | `gate` | `1` while the feature gate is active for the next block and served by this host (13 §8.6), else `0`. One series per gate the host release supports, from the moment the node opens. |
 | `solo_build_info` | gauge | `version` | Always `1`; `version` is the node release. |
 | `solo_node_start_time_seconds` | gauge | — | Unix time at which the node opened. |
 
@@ -68,6 +71,7 @@ Label values:
 - `level`: `error`, `warn`, `info`, `debug`, `trace` for `log_emit` levels 0 to 4; `other` for any other level.
 - `direction`: `in` or `out`.
 - `kind`: `hello`, `message`, `tx`, `request`, `response`, the frame variants of 09 §2.
+- `gate`: a feature gate's index (13 §8.1), in decimal.
 - `origin`, `name`, `reason`: §5.
 
 `solo_kernel_call_duration_seconds` has the bucket bounds 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5 and 10 seconds. Calls made by `invoke` inside a kernel call are part of that call and are not counted separately. The calls a kernel switch makes (06 §7) are counted like any other: `kernel_version` of the running kernel and of a pending upgrade's module, when the host prepares it and at the switch, and the new kernel's `kernel_migrate`, so a `kernel_migrate` that halts the node is a fault in `solo_kernel_faults_total`.
@@ -110,8 +114,12 @@ Dropping is the "MAY drop" of 05 §4.7; it never changes what the instance obser
 | `validator` | string or null | The node's validator id (08 §2) as `0x` hex, or `null` for a node without a consensus key. |
 | `upgradeAlert` | string or null | Why the pending kernel upgrade cannot be enacted by this host (13 §7.2), or `null` when there is none or it can. |
 | `missingGates` | array of numbers | The gates (13 §8.1) the chain has locked in that this host release does not support, ascending; empty when there are none. |
+| `kernelVersion` | number | `solo_kernel_version`. |
+| `kernelHash` | string | The code hash (03 §1) of the running kernel, as `0x` hex. |
+| `activeGates` | array of numbers | The gates active for the next block that this host serves (13 §8.6), ascending; empty when there are none. |
+| `pendingUpgrade` | object or null | The pending kernel upgrade (13 §4) as `{"codeHash": string, "activationHeight": number}`, or `null` while none is pending. |
 
-Fields are only ever added; a client ignores fields it does not know, and reads `upgradeAlert` and `missingGates`, which an earlier release does not send, as `null` and empty when absent.
+Fields are only ever added; a client ignores fields it does not know, and reads the fields an earlier release does not send as absent: `upgradeAlert` and `pendingUpgrade` as `null`, `missingGates` and `activeGates` as empty, `kernelVersion` as `0` and `kernelHash` as zero.
 
 ## 7. Alerts and the health verdict
 

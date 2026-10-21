@@ -515,6 +515,7 @@ impl Rpc {
             "solo_getFinalityProof" => crate::bridge::finality_proof(&mut self.node, params)?,
             "solo_getOutboxProof" => crate::bridge::outbox_proof(&mut self.node, params)?,
             "solo_getRotation" => crate::bridge::rotation(&mut self.node, params)?,
+            "solo_upgradeStatus" => crate::upgrades::upgrade_status(&mut self.node)?,
             other => {
                 return Err(RpcError::with_code(
                     -32601,

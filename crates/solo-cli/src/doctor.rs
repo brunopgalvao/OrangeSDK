@@ -7,7 +7,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use serde_json::Value;
-use solo_metrics::{Limits, Status, assess, parse, summary};
+use solo_metrics::{Limits, PendingUpgrade, Status, assess, parse, summary};
 
 /// Fetches `path` from the node's HTTP server at `addr` (`host:port`) and
 /// returns the body of a `200` response.
@@ -53,6 +53,21 @@ pub fn parse_status(text: &str) -> Result<Status, String> {
         .ok_or("status: not a JSON document")?;
     let u = |key: &str| v.get(key).and_then(Value::as_u64);
     let f = |key: &str| v.get(key).and_then(Value::as_f64);
+    // A list of gates as a bit set; a field a node of an earlier release does
+    // not send reads as empty.
+    let mask = |key: &str| match v.get(key) {
+        None => Some(0),
+        Some(gates) => gates.as_array()?.iter().try_fold(0u64, |mask, g| {
+            let g = g.as_u64().filter(|g| *g < 64)?;
+            Some(mask | 1 << g)
+        }),
+    };
+    let hash = |value: &Value| -> Option<[u8; 32]> {
+        solo_rpc::methods::parse_hex(value.as_str()?)
+            .ok()?
+            .try_into()
+            .ok()
+    };
     let status = || -> Option<Status> {
         Some(Status {
             version: v.get("version")?.as_str()?.to_owned(),
@@ -71,12 +86,22 @@ pub fn parse_status(text: &str) -> Result<Status, String> {
                 None | Some(Value::Null) => None,
                 Some(why) => Some(why.as_str()?.to_owned()),
             },
-            missing_gates: match v.get("missingGates") {
+            missing_gates: mask("missingGates")?,
+            kernel_version: match v.get("kernelVersion") {
                 None => 0,
-                Some(gates) => gates.as_array()?.iter().try_fold(0u64, |mask, g| {
-                    let g = g.as_u64().filter(|g| *g < 64)?;
-                    Some(mask | 1 << g)
-                })?,
+                Some(n) => u32::try_from(n.as_u64()?).ok()?,
+            },
+            kernel_hash: match v.get("kernelHash") {
+                None => [0; 32],
+                Some(h) => hash(h)?,
+            },
+            active_gates: mask("activeGates")?,
+            pending_upgrade: match v.get("pendingUpgrade") {
+                None | Some(Value::Null) => None,
+                Some(p) => Some(PendingUpgrade {
+                    code_hash: hash(p.get("codeHash")?)?,
+                    activation_height: p.get("activationHeight")?.as_u64()?,
+                }),
             },
         })
     };

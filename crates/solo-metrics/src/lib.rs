@@ -18,6 +18,8 @@ pub mod parse;
 pub mod registry;
 
 pub use health::{DEFAULT_LIMITS, Limits, assess, summary};
-pub use node::{Direction, NodeMetrics, Origin, Status, Traffic, VERSION, exported_names};
+pub use node::{
+    Direction, NodeMetrics, Origin, PendingUpgrade, Status, Traffic, VERSION, exported_names,
+};
 pub use parse::{ParseError, Sample, parse};
 pub use registry::{CONTENT_TYPE, Desc, Kind, Registry};

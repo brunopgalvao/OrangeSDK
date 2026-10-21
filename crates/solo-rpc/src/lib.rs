@@ -19,6 +19,7 @@ pub mod http;
 pub mod methods;
 pub mod proof;
 pub mod txpool;
+pub mod upgrades;
 pub mod views;
 
 pub use methods::{Rpc, RpcError};
