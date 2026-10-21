@@ -571,12 +571,15 @@ impl Rpc {
         let height = self.proof_height(params.get(2))?;
         let (header, _) = self.header_at(height)?.unwrap_or_default();
         let oldest = self.node.oldest_state();
-        let unavailable = || RpcError::server(missing_state(&header.state_root, height, oldest));
+        // `proof_height` refused a height whose state is gone, and the node
+        // keeps a height's trie as long as its state: this error is the
+        // same, should the two ever disagree.
+        let unavailable = RpcError::server(missing_state(&header.state_root, height, oldest));
         let key = proof::account_key(&address);
         let account_proof = self
             .node
             .state_proof_at(height, &key)
-            .ok_or_else(unavailable)?;
+            .ok_or(unavailable.clone())?;
         let at = (height < self.block_number()?).then_some(height);
         let account = self.node.account_at(&address, at)?;
         let present = matches!(account_proof.terminal,
@@ -587,7 +590,7 @@ impl Rpc {
             let slot_proof = self
                 .node
                 .state_proof_at(height, &proof::slot_key(&address, slot))
-                .ok_or_else(unavailable)?;
+                .ok_or(unavailable.clone())?;
             storage.push(proof::storage_entry(requested, &value, &slot_proof));
         }
         Ok(proof::response(
