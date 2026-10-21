@@ -58,6 +58,20 @@ pub const SECP256K1_VERIFY: u32 = 200;
 /// Handle of `bls12381_fast_aggregate_verify`.
 pub const BLS12381_FAST_AGGREGATE_VERIFY: u32 = 201;
 
+/// Handle of the first precompile host function (spec 05 §4.8); the
+/// others follow in the order of [`solo_host::precompiles::FUNCTIONS`].
+pub const PRECOMPILE_HANDLE: u32 = solo_host::precompiles::HANDLE_BASE;
+
+/// The precompile host function `i`, behind gate 2.
+const fn precompile(i: u32) -> GatedFunction {
+    GatedFunction {
+        name: solo_host::precompiles::FUNCTIONS[i as usize].0,
+        gate: gate::PRECOMPILES,
+        handle: PRECOMPILE_HANDLE + i,
+        sandboxed: true,
+    }
+}
+
 /// The gated host functions this host release serves.
 pub const GATED: &[GatedFunction] = &[
     GatedFunction {
@@ -72,10 +86,25 @@ pub const GATED: &[GatedFunction] = &[
         handle: BLS12381_FAST_AGGREGATE_VERIFY,
         sandboxed: true,
     },
+    precompile(0),
+    precompile(1),
+    precompile(2),
+    precompile(3),
+    precompile(4),
+    precompile(5),
+    precompile(6),
+    precompile(7),
+    precompile(8),
+    precompile(9),
+    precompile(10),
+    precompile(11),
+    precompile(12),
 ];
 
 /// The feature gates this host release supports: one bit per gate in [`GATED`].
-pub const SUPPORTED: u64 = 1 << gate::SECP256K1_VERIFY | 1 << gate::BLS12381_FAST_AGGREGATE_VERIFY;
+pub const SUPPORTED: u64 = 1 << gate::SECP256K1_VERIFY
+    | 1 << gate::BLS12381_FAST_AGGREGATE_VERIFY
+    | 1 << gate::PRECOMPILES;
 
 /// The handle of gated function `name` for `capability`, if its gate is in `active`.
 #[must_use]
@@ -121,6 +150,9 @@ impl<S: Storage> Extension<S> for GatedExtension {
         }
         if handle == BLS12381_FAST_AGGREGATE_VERIFY {
             return solo_host::gated::bls12381_fast_aggregate_verify(ctx);
+        }
+        if handle >= PRECOMPILE_HANDLE {
+            return solo_host::precompiles::dispatch(handle, ctx);
         }
         self.inner.call(handle, ctx, state)
     }

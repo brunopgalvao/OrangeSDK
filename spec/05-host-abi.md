@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-The host ABI is the complete set of functions a module may call through `ecall`, and the complete set of entrypoints a host may call on a module. It is the boundary between what governance can change (everything inside the VM) and what only a node release can change (everything outside). Because of that it is designed to stay small, to grow only by addition, and to never change the meaning of an existing function. Version 1 has 36 functions, all available from genesis (§4); gate 0 (13 §8.1) adds a 37th, `secp256k1_verify`, and gate 1 a 38th, `bls12381_fast_aggregate_verify`. A function, once published in a released minor, is never removed and never changes behaviour; a replacement gets a new name.
+The host ABI is the complete set of functions a module may call through `ecall`, and the complete set of entrypoints a host may call on a module. It is the boundary between what governance can change (everything inside the VM) and what only a node release can change (everything outside). Because of that it is designed to stay small, to grow only by addition, and to never change the meaning of an existing function. Version 1 has 36 functions, all available from genesis (§4); gate 0 (13 §8.1) adds a 37th, `secp256k1_verify`, gate 1 a 38th, `bls12381_fast_aggregate_verify`, and gate 2 the thirteen precompile functions of §4.8. A function, once published in a released minor, is never removed and never changes behaviour; a replacement gets a new name.
 
 ## 2. Capability sets
 
@@ -10,7 +10,7 @@ An instance is created with one capability set (01 §8). The import resolution a
 
 | Set | May import |
 |---|---|
-| `Sandboxed` | Everything in §4.1 (memory and context), §4.2 (storage, own namespace only), §4.3 (crypto), §4.4 (invoke), `log_emit`, `metric_emit` |
+| `Sandboxed` | Everything in §4.1 (memory and context), §4.2 (storage, own namespace only), §4.3 (crypto), §4.4 (invoke), `log_emit`, `metric_emit`, §4.8 (precompile arithmetic, once gate 2 is active) |
 | `Privileged` | Everything |
 
 Capabilities granted to kernel modules by the kernel's capability manager are a kernel concern layered above this ABI: a module with the "validator set write" capability still calls ordinary storage functions; the kernel decides which keys it may write. The host enforces only the two sets above.
@@ -99,7 +99,7 @@ For role 0, `sign` writes the signature to `dst` when `cap` is at least 65 and r
 
 `bls12381_fast_aggregate_verify` is `FastAggregateVerify` of draft-irtf-cfrg-bls-signature-05 with the proof-of-possession ciphersuite `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`, the scheme of Ethereum's sync committees (spec 18 §3.1): it reads `count` compressed G1 public keys of 48 bytes each at `keys`, `msg_len` bytes at `msg` and a compressed G2 signature of 96 bytes at `sig`, hashes `msg` to G2 with suite `BLS12381G2_XMD:SHA-256_SSWU_RO_` under that tag, and returns 0 exactly when `e(Σ keys, H(msg)) = e(g1, sig)`. It returns 1 when `count` is 0, when a key does not decode, lies outside the prime-order subgroup or is the identity (`KeyValidate`), when the keys sum to the identity, and when the signature does not decode or lies outside its subgroup. Keys must have had their proofs of possession checked when they were registered, as the beacon chain checks them at deposit. Gas is charged before any range is read, so a `count` whose keys would exceed the address space ends the instance with `OutOfGas` or `MemoryFault`. The per-key cost covers decoding a key with its subgroup check and adding it, measured on 2026-10-21 at the same rate per microsecond as `bls12381_verify`, whose 100 000 gas cover decoding both points as well as the pairing check (`crates/solo-bls/tests/calibration.rs` times both in one run and converts; it gives a base of 115 000 to 122 000 and 5 300 to 5 700 per key); a 512-key check costs 2 941 000 plus the message words. It resolves only once feature gate 1 is active (spec 13 §8).
 
-Precompile-grade operations beyond this list (modexp, bn254, point evaluation) are kernel-level precompiles implemented in modules with native acceleration, not host functions.
+The arithmetic of the other EVM precompiles (modexp, bn254, BLAKE2F, point evaluation, the EIP-2537 operations) is in §4.8, behind gate 2.
 
 ### 4.4 Invoke
 
@@ -158,6 +158,30 @@ Network functions are *effects* in the driver model (06): they enqueue; nothing 
 
 Both are ignored by consensus. A host MAY drop them under load. They are charged so that a contract cannot use them as free work. The meaning of `kind` and of `level`, and how a node exports what it records, are in 11 §4–§5.
 
+### 4.8 Precompile arithmetic (gate 2)
+
+The arithmetic of the Ethereum precompiles that an interpreted guest computes far more slowly than Ethereum's gas assumes (spec 19 §2), for the kernel's EVM to hand to the host (spec 19 §3). Each function takes the operands exactly as revm's `Crypto` trait hands them to its backend and computes what that trait's default implementation computes (revm 43, its arkworks and `aurora-engine-modexp` backends), so a kernel computing them itself gets the same bytes. Every function is `Sandboxed` and resolves only once feature gate 2 is active (spec 13 §8.1).
+
+Encodings: a bn254 G1 point is `x ‖ y`, 32-byte big-endian coordinates, and a G2 point the 128 bytes of EIP-197; a BLS12-381 field element is 48 bytes big-endian (EIP-2537's 64-byte element without its 16 zero bytes), a G1 point `x ‖ y` (96 bytes), a G2 point `x0 ‖ x1 ‖ y0 ‖ y1` (192 bytes), a scalar 32 bytes big-endian. A point *is invalid* when it is not on its curve, or for the multi-scalar multiplications and pairings outside the prime-order subgroup, or for BLS12-381 has a coordinate not below the field modulus, as EIP-196, EIP-197 and EIP-2537 define.
+
+| Name | Arguments | Result | Ethereum gas `g` |
+|---|---|---|---|
+| `evm_modexp` | `a0` input (`base ‖ exp ‖ mod`), `a1` base_len, `a2` exp_len, `a3` mod_len, `a4` dst | `a0` = 0, `base^exp mod mod` written to `dst` as `mod_len` bytes; 1 when a length exceeds 1 024, nothing read or written | EIP-7883's, from the lengths and the exponent's first 32 bytes; 0 for status 1 |
+| `evm_bn254_add` | `a0` input (two G1 points, 128), `a1` dst(64) | `a0` = 0, the sum written; 1 for an invalid point | 150 |
+| `evm_bn254_mul` | `a0` input (point ‖ scalar, 96), `a1` dst(64) | `a0` = 0, the product written; 1 for an invalid point | 6 000 |
+| `evm_bn254_pairing` | `a0` pairs (G1 ‖ G2, 192 each), `a1` count | `a0` = 0 when the product of the pairings is one (always for `count` 0), 1 when it is not, 2 for an invalid point | 45 000 + 34 000 · count |
+| `evm_blake2f` | `a0` input (213, EIP-152), `a1` dst(64) | `a0` = 0, the state written as 8 little-endian words; 1 when the final flag is neither 0 nor 1, nothing written | rounds |
+| `evm_kzg_point_evaluation` | `a0` input (`z(32) ‖ y(32) ‖ commitment(48) ‖ proof(48)`) | `a0` = 0 when the proof verifies against Ethereum's trusted setup (EIP-4844's `verify_kzg_proof`; the versioned-hash check is the caller's), 1 otherwise | 50 000 |
+| `evm_bls12381_g1_add` | `a0` input (two G1 points, 192), `a1` dst(96) | `a0` = 0, the sum written; 1 for an invalid point | 375 |
+| `evm_bls12381_g1_msm` | `a0` pairs (G1 ‖ scalar, 128 each), `a1` count, `a2` dst(96) | `a0` = 0, the sum of the products written (the point at infinity, zeros, for `count` 0); 1 for an invalid point | EIP-2537's G1MSM for `count` pairs (base 12 000 and its discount table) |
+| `evm_bls12381_g2_add` | `a0` input (two G2 points, 384), `a1` dst(192) | as G1 | 600 |
+| `evm_bls12381_g2_msm` | `a0` pairs (G2 ‖ scalar, 224 each), `a1` count, `a2` dst(192) | as G1 | EIP-2537's G2MSM (base 22 500 and its discount table) |
+| `evm_bls12381_pairing` | `a0` pairs (G1 ‖ G2, 288 each), `a1` count | `a0` = 0 when the product of the pairings is one (always for `count` 0), 1 when it is not, 2 for an invalid point | 37 700 + 32 600 · count |
+| `evm_bls12381_map_fp_to_g1` | `a0` input (48), `a1` dst(96) | `a0` = 0, the point written; 1 when the element is not below the modulus | 5 500 |
+| `evm_bls12381_map_fp2_to_g2` | `a0` input (`c0 ‖ c1`, 96), `a1` dst(192) | `a0` = 0, the point written; 1 when a coefficient is not below the modulus | 23 800 |
+
+Each costs `200 + 2 · g` VM gas, `g` being the Ethereum (Osaka) gas of the operation in the last column. It is charged before any range is read, except that `evm_modexp` reads the at most 32 bytes of the exponent its gas depends on first and `evm_blake2f` the 4 bytes of its round count; so a `count` whose operands would exceed the address space ends the instance with `OutOfGas` or `MemoryFault`, never with work done. The rate is calibrated like `bls12381_fast_aggregate_verify`'s (§4.3): `crates/solo-host/tests/precompile_calibration.rs` times every operation in the same run as `bls12381_verify` and converts at that function's rate; on 2026-10-21 the costliest operation per Ethereum gas, point evaluation, needed 1.5 VM gas per gas, every other at most 0.7 (spec 19 table 3.1). The functions are the 39th to the 51st of the ABI, in the order of the table, which is also the order the precompile module of spec 19 §3.2 numbers them.
+
 ## 5. Determinism requirements on the host
 
 Every function in §4.1–§4.4 MUST return identical results on every node given identical chain state and arguments. Functions in §4.5–§4.7 have no result the program can branch on except a status that MUST be `0` whenever the arguments are well-formed; a host that cannot send a message still returns `0` and drops it. This is what allows the driver to be a pure state machine over host effects.
@@ -180,5 +204,5 @@ Every function in §4.1–§4.4 MUST return identical results on every node give
 
 - `abi_version` returns 1. A host supporting version `n` supports every function of every version `≤ n`.
 - The functions of §4 without a gate in their capability cell, `bls12381_verify` and `bls12381_pairing_check` among them, are version 1 and resolve from genesis on every chain; a chain needs no gate to use them.
-- New functions added after that arrive behind a feature gate (spec 13 §8), and in a new version once one is published: a gated function resolves only once the chain has activated its gate. `secp256k1_verify` is the first, behind gate 0; `bls12381_fast_aggregate_verify` the second, behind gate 1. A module importing a function from a version the host lacks, or one whose gate is not active, fails to load, which is the intended failure: it is visible at install, never at run time.
+- New functions added after that arrive behind a feature gate (spec 13 §8), and in a new version once one is published: a gated function resolves only once the chain has activated its gate. `secp256k1_verify` is the first, behind gate 0; `bls12381_fast_aggregate_verify` the second, behind gate 1; the precompile functions of §4.8 follow, behind gate 2. A module importing a function from a version the host lacks, or one whose gate is not active, fails to load, which is the intended failure: it is visible at install, never at run time.
 - Per-unit and base costs in this document are part of the host-call cost table, version 1, and are recalibrated and versioned exactly like the instruction cost table (04 §2). A kernel declares the cost-table versions it was built against; the host charges by the versions the active fee schedule names.

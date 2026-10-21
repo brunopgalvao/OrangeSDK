@@ -125,6 +125,10 @@ pub mod gate {
     /// The `bls12381_fast_aggregate_verify` host function (spec 05 §4.3),
     /// which the Ethereum light client of spec 18 needs.
     pub const BLS12381_FAST_AGGREGATE_VERIFY: u8 = 1;
+    /// The precompile host functions (spec 05 §4.8, spec 19): bn254, modexp,
+    /// BLAKE2F, KZG point evaluation and the EIP-2537 BLS12-381 operations
+    /// the kernel's EVM runs on the host once this gate is active.
+    pub const PRECOMPILES: u8 = 2;
 }
 
 #[cfg(test)]
@@ -160,5 +164,9 @@ mod tests {
             ("kernel_version", "upgrade_status", "upgrade_code")
         );
         assert_eq!((gate::SECP256K1_VERIFY, SIGNAL_GAS), (0, 100_000));
+        assert_eq!(
+            (gate::BLS12381_FAST_AGGREGATE_VERIFY, gate::PRECOMPILES),
+            (1, 2)
+        );
     }
 }

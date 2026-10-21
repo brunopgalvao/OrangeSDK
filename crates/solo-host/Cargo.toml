@@ -16,6 +16,10 @@ sha2 = "0.10"
 blake2 = "0.10"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+# The arithmetic of the EVM precompiles behind gate 2 (spec 05 §4.8): the
+# crate and backends (arkworks, aurora-engine-modexp) the kernel's revm runs
+# in the guest, so the host path and the guest's fallback agree bit for bit.
+revm-precompile = { version = "43.0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 solo-recompile = { path = "../solo-recompile" }
