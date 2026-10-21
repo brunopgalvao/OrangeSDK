@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use solo_host::{CallResult, Executor, MemStorage};
-use solo_metrics::{NodeMetrics, Origin, Status, VERSION};
+use solo_metrics::{NodeMetrics, Origin, PendingUpgrade, Status, VERSION};
 use solo_vm::host::Capability;
 use solo_vm::status::Termination;
 
@@ -97,6 +97,15 @@ impl Node {
         let upgrades = &self.upgrades;
         self.telemetry
             .upgrade(upgrades.alert.is_some(), upgrades.missing_gates());
+        let status = upgrades.status.as_ref();
+        self.telemetry.kernel_state(
+            status.map_or(0, |s| s.version),
+            status
+                .and_then(|s| s.pending.as_ref())
+                .map_or(0, |p| p.activation_height),
+            upgrades.active(),
+            upgrades.features,
+        );
         self.telemetry.render()
     }
 
@@ -120,6 +129,18 @@ impl Node {
             validator: self.validator_id(),
             upgrade_alert: self.upgrades.alert.clone(),
             missing_gates: self.upgrades.missing_gates(),
+            kernel_version: self.upgrades.status.as_ref().map_or(0, |s| s.version),
+            kernel_hash: self.kernel,
+            active_gates: self.upgrades.active(),
+            pending_upgrade: self
+                .upgrades
+                .status
+                .as_ref()
+                .and_then(|s| s.pending.as_ref())
+                .map(|p| PendingUpgrade {
+                    code_hash: p.code_hash,
+                    activation_height: p.activation_height,
+                }),
         })
     }
 }

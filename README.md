@@ -63,11 +63,11 @@ Run a chain of several validators, each with its own key. `solo key` prints the 
 ```sh
 solo key 5151515151515151515151515151515151515151515151515151515151515151
 # genesis.json: {"chainId": 1337, "slotMs": 400, "alloc": {...}, "validators": ["0x<id 1>", "0x<id 2>", ...]}
-solo node --kernel kernel.elf --genesis genesis.json --key <seed 1> --listen 127.0.0.1:30301 --rpc 127.0.0.1:8545
-solo node --kernel kernel.elf --genesis genesis.json --key <seed 2> --listen 127.0.0.1:30302 --rpc 127.0.0.1:8546 --peer 127.0.0.1:30301
+solo node --kernel kernel.elf --genesis genesis.json --key <seed 1> --data-dir node-1 --listen 127.0.0.1:30301 --rpc 127.0.0.1:8545
+solo node --kernel kernel.elf --genesis genesis.json --key <seed 2> --data-dir node-2 --listen 127.0.0.1:30302 --rpc 127.0.0.1:8546 --peer 127.0.0.1:30301
 ```
 
-A node without `--key` follows the chain as an observer. A node that falls behind syncs the finalized blocks it missed from its peers.
+A node without `--key` follows the chain as an observer. A validator keeps its driver state in `--data-dir` (`driver.state`, the latest persisted state, and `persist.log`, a journal of the driver's node-local writes), written before anything it signs leaves the node, so a restarted validator resumes the view it left and never votes twice in one view (spec 08 §7). Chain state is not kept: a restarted node re-executes the blocks it had finalized from the proposals in its data directory, and a node that falls behind syncs the finalized blocks it misses from its peers.
 
 Watch it: every node serves Prometheus metrics at `GET /metrics` and a JSON status at `GET /status` on its JSON-RPC address (spec 11), and `solo doctor` turns both into a verdict, exiting non-zero when the node is unhealthy. `ops/` has the alert rules, a Prometheus configuration and a Grafana dashboard:
 
@@ -76,6 +76,29 @@ curl -s http://127.0.0.1:8545/status
 solo doctor --rpc 127.0.0.1:8545
 prometheus --config.file=ops/prometheus.yml   # then import ops/grafana-solo.json into Grafana
 ```
+
+## Run a devnet
+
+`solo devnet` runs a network of validator processes on one machine, with staking, epochs and the rotating threshold key of spec 15 on, governed kernel upgrades and feature gates of spec 13 on, and the bridges off. `init` draws the keys (reproducibly with `--seed`), recompiles the kernel once and writes the genesis, one directory per node (its key, and once it runs its log and driver state) and the manifest `devnet.json`; `up` starts every node over the TCP transport of spec 09 and waits for them; `status` and `wait` watch them without reading logs:
+
+```sh
+solo devnet init --dir devnet --kernel crates/solo-node/tests/fixtures/kernel.elf --validators 4
+solo devnet up --dir devnet &                 # JSON-RPC on 127.0.0.1:8545 to 8548, logs in devnet/node-*/log
+solo devnet wait --dir devnet --peers 3 --head 10
+solo devnet status --dir devnet
+solo devnet stop --dir devnet --node 3        # the others keep finalizing
+solo devnet start --dir devnet --node 3       # back in the view it left, it syncs and signs again
+solo devnet down --dir devnet
+```
+
+The genesis funds the README's account above (`solo key` prints a validator's id, address and the DKG encryption key a `staking.keys` entry needs). `solo upgrade` proposes a kernel upgrade with the governance key `init` wrote: it stages the module in chunks, waits for the receipts and proposes an activation height; every node then switches at that block (spec 06 §7):
+
+```sh
+solo upgrade --rpc 127.0.0.1:8545 --key-file devnet/governance.key --kernel crates/solo-node/tests/fixtures/kernel_v2.elf
+solo devnet wait --dir devnet --kernel-version 2
+```
+
+`tools/rehearse-upgrade.sh devnet` rehearses, against the running devnet, what a chain goes through: the upgrade (the governance step is one shell function, for when governance grows beyond a single key), every validator signalling the feature gates and the gates locking in and activating everywhere, a validator stopping while the others keep finalizing, that validator coming back with its driver state, catching up and signing threshold certificates again, and no validator having voted twice across its restart; it prints a PASS or FAIL line per phase. `cargo test -p solo-cli --test devnet` runs it end to end on four processes. `ops/docker-compose.yml` runs the same topology as containers with Prometheus and Grafana wired to `ops/alerts.yml` and `ops/grafana-solo.json`; see `ops/README.md`.
 
 Build everything and run the gates:
 
@@ -113,12 +136,12 @@ cargo test --release -p solo-jit --test bench --test guests -- --ignored --nocap
 - `crates/solo-node` — the node host: privileged functions (including `sign`), the driver loop, the mempool of spec 14 (per-sender nonce queues, replacement, limits), queries, the kernel switchover and gated host functions of spec 13, telemetry, the threshold keystore behind `sign` key role 2 (spec 15 §6.4), the TCP transport, and `Sim`, an in-process network of nodes with a virtual clock.
 - `crates/solo-rpc` — Ethereum JSON-RPC over a node, including `txpool_status` and `txpool_content` and the bridge relayer's `solo_getFinalityProof` and `solo_getOutboxProof`, with a minimal HTTP server.
 - `crates/solo-bridge` — the relayer library of the bridge to Ethereum (spec 17): light-client submissions from threshold certificates, outbox proofs, and the calldata of every call to the contracts; and the token bridge's messages, wrapped-token addresses, calls and constructor arguments (spec 21, `solo_bridge::tokens`).
-- `crates/solo-cli` — the `solo` command (`solo dev`, `solo node`, `solo key`, `solo gov`, `solo doctor`).
+- `crates/solo-cli` — the `solo` command (`solo dev`, `solo node`, `solo key`, `solo gov`, `solo doctor`, `solo upgrade`, `solo devnet`).
 - `crates/solo-metrics` — telemetry: a metrics registry with Prometheus text exposition, the node's metric schema, and the health rules `solo doctor` applies.
 - `crates/solo-ethlc` — the Ethereum-to-Solo bridge (spec 18): SSZ, the Altair light-client sync protocol at the Electra format, Merkle-Patricia proofs, the light-client and message-verifier logic and the admission checks, `no_std`; with `testing`, a synthetic beacon chain, an Ethereum state with `eth_getProof` proofs and an EVM.
 - `crates/solo-conformance` — Ethereum execution-spec state tests through the whole pipeline: the kernel's EVM code recompiled to a module, on the interpreter and the native backend, compared by Ethereum state root and logs hash (spec 07 §4.2), with feature gate 2 inactive and active (`--gated`, spec 19).
 - `guest/` — separate workspace for programs that run on the VM: the `solo-guest` runtime, `hello`, the reference `kernel`, `solo-module` (the runtime for kernel modules and native contracts), the example module `modules/counter`, the bridge's `modules/eth-light-client` and `modules/eth-message-verifier`, `modules/precompiles` (the only importer of the gate-2 precompile functions, spec 19), and `evm-conformance`, which runs one state test through the kernel's EVM code.
 - `contracts/` — the bridges' Solidity contracts with compiled fixtures in `contracts/build`: deployed on Ethereum, `SoloFinalityVerifierV2`, `SoloLightClientV2` (rotating keys), `SoloFinalityVerifierV1`, `SoloLightClient` (a fixed key) and `SoloInbox` of the bridge to Ethereum (spec 17) and `EthereumOutbox` of the bridge from Ethereum (spec 18); deployed on Solo, `EthereumInbox` (spec 18); the token bridge's `TokenGatewayOnEthereum`, `TokenGatewayOnSolo` and `BridgedToken` in `contracts/tokens` (spec 21); their interfaces and test contracts.
 - `examples/` — a genesis file for `solo dev`.
-- `tools/` — build scripts; `fetch-conformance.sh` downloads the pinned execution-spec fixture set for a full conformance run; `build-contracts.sh` compiles `contracts/` with solc 0.8.28 and refreshes its fixtures.
-- `ops/` — operator assets: Prometheus alert rules and configuration, a Grafana dashboard.
+- `tools/` — build scripts; `fetch-conformance.sh` downloads the pinned execution-spec fixture set for a full conformance run; `build-contracts.sh` compiles `contracts/` with solc 0.8.28 and refreshes its fixtures; `rehearse-upgrade.sh` rehearses a kernel upgrade, a gate activation and a validator restart on a devnet, and `compose-rehearsal.sh` does so on the compose stack.
+- `ops/` — operator assets: Prometheus alert rules and configuration, a Grafana dashboard, and the Dockerfile and compose file of a four-validator devnet with Prometheus and Grafana (`ops/README.md`).

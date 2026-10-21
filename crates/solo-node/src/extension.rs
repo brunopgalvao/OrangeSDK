@@ -56,6 +56,9 @@ pub struct NodeServices {
     pub timers: BTreeMap<u64, u64>,
     /// Node-local persisted key-value pairs (`persist_*`).
     pub persisted: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// The `persist_set` writes since the node last collected them, in
+    /// order, for a [`crate::DriverStore`] to journal.
+    pub persist_writes: Vec<(Vec<u8>, Vec<u8>)>,
     /// Messages waiting for the transport, in order.
     pub outbound: Vec<Outbound>,
     /// The consensus key (`sign` with key role 0), if this node has one.
@@ -231,6 +234,7 @@ impl<S: Storage> Extension<S> for NodeExtension {
                 ctx.charge(100 + per_32(a3))?;
                 let key = read(ctx, a0, a1)?;
                 let value = read(ctx, a2, a3)?;
+                services.persist_writes.push((key.clone(), value.clone()));
                 services.persisted.insert(key, value);
                 ctx.set(Reg::A0, 0);
             }

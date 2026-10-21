@@ -356,7 +356,13 @@ impl Node {
     /// # Errors
     /// See [`NodeError`].
     pub fn upgrade_status(&mut self) -> Result<UpgradeStatus, NodeError> {
-        let r = self.query(query::STATUS, &[])?;
+        // A read the host makes for itself, with fixed parameters: it runs
+        // under the kernel budget, not the cap `--query-gas` puts on what
+        // clients ask for, so a small cap cannot blind the host to a switch.
+        let cap = std::mem::replace(&mut self.query_gas, i64::MAX);
+        let r = self.query(query::STATUS, &[]);
+        self.query_gas = cap;
+        let r = r?;
         let status = (r.status == 0).then(|| UpgradeStatus::from_bytes(&r.body));
         status
             .transpose()

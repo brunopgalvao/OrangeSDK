@@ -240,6 +240,27 @@ pub const UPGRADE_MISSING_GATES: Desc = desc(
     &[],
     "Feature gates the chain has locked in that this host release does not support (spec 13 section 7.2).",
 );
+/// `solo_upgrade_activation_height`.
+pub const UPGRADE_ACTIVATION_HEIGHT: Desc = desc(
+    "solo_upgrade_activation_height",
+    Kind::Gauge,
+    &[],
+    "Activation height of the pending kernel upgrade (spec 13 section 4), or 0 while none is pending.",
+);
+/// `solo_kernel_version`.
+pub const KERNEL_VERSION: Desc = desc(
+    "solo_kernel_version",
+    Kind::Gauge,
+    &[],
+    "Version of the running kernel (spec 06 section 7.1), as its upgrade_status reports it; 0 before the kernel has answered.",
+);
+/// `solo_gate_active`.
+pub const GATE_ACTIVE: Desc = desc(
+    "solo_gate_active",
+    Kind::Gauge,
+    &["gate"],
+    "1 while the feature gate is active for the next block and served by this host (spec 13 section 8.6), else 0; one series per gate this host supports.",
+);
 /// `solo_build_info`.
 pub const BUILD_INFO: Desc = desc(
     "solo_build_info",
@@ -281,6 +302,9 @@ pub const ALL: &[Desc] = &[
     P2P_FRAMES,
     UPGRADE_BLOCKED,
     UPGRADE_MISSING_GATES,
+    UPGRADE_ACTIVATION_HEIGHT,
+    KERNEL_VERSION,
+    GATE_ACTIVE,
     BUILD_INFO,
     START_TIME,
 ];
@@ -385,6 +409,26 @@ pub struct Status {
     /// The locked-in feature gates this host does not support, one bit per
     /// gate (spec 13 §7.2).
     pub missing_gates: u64,
+    /// The running kernel's version (spec 06 §7.1), as its `upgrade_status`
+    /// reports it; 0 before the kernel has answered.
+    pub kernel_version: u32,
+    /// Code hash of the running kernel (spec 03 §1).
+    pub kernel_hash: [u8; 32],
+    /// The feature gates active for the next block that this host serves,
+    /// one bit per gate (spec 13 §8.6).
+    pub active_gates: u64,
+    /// The pending kernel upgrade, while one is pending.
+    pub pending_upgrade: Option<PendingUpgrade>,
+}
+
+/// A kernel upgrade the chain has proposed and not yet switched to or
+/// withdrawn (spec 13 §4), as `/status` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUpgrade {
+    /// Code hash of the new kernel.
+    pub code_hash: [u8; 32],
+    /// The last height the running kernel executes.
+    pub activation_height: u64,
 }
 
 /// The node's metrics: a [`Registry`] over [`ALL`] plus the little state
@@ -450,6 +494,8 @@ impl NodeMetrics {
             &DRIVER_TIMERS,
             &UPGRADE_BLOCKED,
             &UPGRADE_MISSING_GATES,
+            &UPGRADE_ACTIVATION_HEIGHT,
+            &KERNEL_VERSION,
         ] {
             registry.set(d, &[], 0.0);
         }
@@ -631,6 +677,26 @@ impl NodeMetrics {
             &[],
             f64::from(missing_gates.count_ones()),
         );
+    }
+
+    /// Sets the gauges of the kernel and its gates: the running kernel's
+    /// version, the activation height of the pending upgrade (0 for none),
+    /// and one `solo_gate_active` series per gate in `supported`, at 1 for
+    /// the gates in `active`.
+    pub fn kernel_state(
+        &mut self,
+        version: u32,
+        activation_height: u64,
+        active: u64,
+        supported: u64,
+    ) {
+        self.registry.set(&KERNEL_VERSION, &[], f64::from(version));
+        self.registry
+            .set(&UPGRADE_ACTIVATION_HEIGHT, &[], float(activation_height));
+        for gate in (0..64u32).filter(|g| (supported | active) >> g & 1 == 1) {
+            let on = f64::from(u8::from(active >> gate & 1 == 1));
+            self.registry.set(&GATE_ACTIVE, &[&gate.to_string()], on);
+        }
     }
 
     /// Last executed height.
@@ -864,6 +930,23 @@ mod tests {
         m.upgrade(false, 0);
         assert_eq!(read(&m, &UPGRADE_BLOCKED), Some(0.0));
         assert_eq!(read(&m, &UPGRADE_MISSING_GATES), Some(0.0));
+        // The kernel gauges: version and activation height from zero, one
+        // gate series per supported gate, at 1 while the gate is active.
+        assert_eq!(read(&m, &KERNEL_VERSION), Some(0.0));
+        assert_eq!(read(&m, &UPGRADE_ACTIVATION_HEIGHT), Some(0.0));
+        assert_eq!(m.registry().series(&GATE_ACTIVE), 0);
+        m.kernel_state(1, 0, 0, 0b101);
+        assert_eq!(read(&m, &KERNEL_VERSION), Some(1.0));
+        assert_eq!(m.registry().value(&GATE_ACTIVE, &["0"]), Some(0.0));
+        assert_eq!(m.registry().value(&GATE_ACTIVE, &["2"]), Some(0.0));
+        assert_eq!(m.registry().series(&GATE_ACTIVE), 2);
+        m.kernel_state(2, 40, 0b1100, 0b101);
+        assert_eq!(read(&m, &KERNEL_VERSION), Some(2.0));
+        assert_eq!(read(&m, &UPGRADE_ACTIVATION_HEIGHT), Some(40.0));
+        assert_eq!(m.registry().value(&GATE_ACTIVE, &["2"]), Some(1.0));
+        assert_eq!(m.registry().value(&GATE_ACTIVE, &["3"]), Some(1.0));
+        assert_eq!(m.registry().value(&GATE_ACTIVE, &["0"]), Some(0.0));
+        assert!(m.render().contains("\nsolo_gate_active{gate=\"3\"} 1\n"));
     }
 
     #[test]
@@ -881,8 +964,16 @@ mod tests {
             validator: None,
             upgrade_alert: None,
             missing_gates: 0,
+            kernel_version: 1,
+            kernel_hash: [7; 32],
+            active_gates: 0,
+            pending_upgrade: Some(PendingUpgrade {
+                code_hash: [8; 32],
+                activation_height: 9,
+            }),
         };
         assert_eq!(s.clone(), s);
         assert!(format!("{s:?}").contains("chain_id"));
+        assert!(format!("{s:?}").contains("activation_height: 9"));
     }
 }

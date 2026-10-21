@@ -159,7 +159,7 @@ A host reports, without stopping:
 - a pending upgrade it cannot enact: the code does not hash to its code hash, the module is invalid, it imports a function this host cannot serve for block `H + 1`, its `kernel_version` does not halt with a `u32`, or that version is not above the running kernel's (06 §7.2), so that its `kernel_migrate` would trap at `H`. This is the "host lacks the ABI a pending kernel needs" alert of ADR 0011: governance can cancel (under the stake track on the fast track, §9.2), or operators can install a host release, before `H`.
 - gates the chain has locked in that its release does not support: the host cannot serve their behaviour once they activate, and must be replaced by a release that does.
 
-The reference node reports both through its telemetry (11): the gauges `solo_upgrade_blocked` and `solo_upgrade_missing_gates`, the `upgradeAlert` and `missingGates` fields of `/status`, the `SoloUpgradeBlocked` alert rule and a check of `solo doctor`.
+The reference node reports both through its telemetry (11): the gauges `solo_upgrade_blocked` and `solo_upgrade_missing_gates`, the `upgradeAlert` and `missingGates` fields of `/status`, the `SoloUpgradeBlocked` alert rule and a check of `solo doctor`. It also reports where an upgrade and the gates stand, so that an operator can follow a switch and an activation across every node: the gauges `solo_kernel_version`, `solo_upgrade_activation_height` and `solo_gate_active`, the `kernelVersion`, `kernelHash`, `activeGates` and `pendingUpgrade` fields of `/status`, and `upgrade_status` (§6) as the JSON-RPC method `solo_upgradeStatus`, with the host's own view (code hash, active and supported gates, the upgrade it has prepared, its alert) under `host`.
 
 ## 8. Feature gates
 

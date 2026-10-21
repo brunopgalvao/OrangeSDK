@@ -2,10 +2,17 @@
 //!
 //! `solo dev --kernel <kernel.elf|kernel.solo> --genesis <genesis.json>
 //! [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>]
-//! [--state-history <blocks> | --archive]`
+//! [--state-history <blocks> | --archive] [--data-dir <dir>]`
 //! runs a single-node development chain with Ethereum JSON-RPC. The node keeps
 //! the state of its latest 1 024 blocks for historical queries and proofs, or
 //! `--state-history` of them, or every block's with `--archive` (spec 20 §5).
+//! `--data-dir` keeps the driver's node-local data on disk
+//! ([`solo_node::DriverStore`]): a node started again over the same
+//! directory resumes the view it left with the votes it cast there, so it
+//! never votes twice in one view (spec 08 §3 and §7); `solo node` requires
+//! it for a validator. Chain state is not kept: a restarted node re-executes
+//! the chain it had finalized from its tables and syncs the rest from its
+//! peers.
 //! The genesis file is
 //! JSON: `{"chainId": 1337, "slotMs": 400, "maxTxs": 64,
 //! "alloc": {"0x<address>": "<wei>"}, "validators": ["0x<32-byte id>"]}`.
@@ -20,14 +27,23 @@
 //! which also has `solo gov`, the encoder of governance calls. Kernel modules
 //! installed at genesis (spec 16) are listed under `"modules"`; see [`modules`].
 //! The Ethereum-to-Solo bridge (spec 18) is configured under `"bridgeIn"`;
-//! see [`bridge`].
+//! see [`bridge`]. Staking, epochs and the threshold key (spec 15) under
+//! `"staking"`; see [`staking`].
+//!
+//! `solo upgrade` stages and proposes a kernel upgrade through governance
+//! (see [`upgrade`]), and `solo devnet` runs a network of validator
+//! processes on one machine and watches it (see [`devnet`]).
 
 #![forbid(unsafe_code)]
 
 pub mod bridge;
+pub mod client;
+pub mod devnet;
 pub mod doctor;
 pub mod gov;
 pub mod modules;
+pub mod staking;
+pub mod upgrade;
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -80,11 +96,19 @@ pub const DEFAULT_RPC: &str = "127.0.0.1:8545";
 
 /// Usage line printed on a command-line mistake.
 pub const USAGE: &str = "usage:
-  solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
-  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex>] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
+  solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive] [--data-dir <dir>]
+  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
   solo key  <64 hex>
   solo gov  submit <target> <0x calldata> | vote <id> yes|no | execute <id> | veto <id> | pause <target> | set-guardian <address> | set-mode stake | set-params <voting> <timelock> <quorumBps> <deposit>
-  solo doctor [--rpc 127.0.0.1:8545] [--max-head-age <s>] [--max-finality-lag <blocks>] [--min-peers <n>] [--max-mempool <txs>] [--max-call-ms <ms>]";
+  solo doctor [--rpc 127.0.0.1:8545] [--max-head-age <s>] [--max-finality-lag <blocks>] [--min-peers <n>] [--max-mempool <txs>] [--max-call-ms <ms>]
+  solo upgrade --kernel <kernel.elf|kernel.solo> (--key <64 hex> | --key-file <path>) [--rpc 127.0.0.1:8545] [--delay <blocks>] [--required-gates <g,g,...>] [--timeout <s>]
+  solo devnet init --dir <dir> --kernel <kernel.elf|kernel.solo> [--validators 4] [--chain-id 1337] [--slot-ms 400] [--epoch-blocks 20] [--dkg-phase-blocks 5] [--upgrade-delay 2] [--host 127.0.0.1] [--p2p-port 30301] [--rpc-port 8545] [--seed <64 hex>] [--governance-key <64 hex>] [--force]
+  solo devnet up --dir <dir> [--blocks <n>]
+  solo devnet down --dir <dir>
+  solo devnet stop|start --dir <dir> --node <i>
+  solo devnet status (--dir <dir> | --rpc <addr,...>) [--json]
+  solo devnet wait (--dir <dir> | --rpc <addr,...>) [--nodes <i,...>] [--timeout <s>] [--head <n>] [--finalized <n>] [--peers <n>] [--kernel-version <v>] [--kernel-hash <0x...>] [--active-gates <g,...>] [--signalled <g,...>] [--locked-in <g,...>] [--certified <n> --above <height>] [--caught-up] [--no-equivocations]
+  solo devnet node --dir <dir> --index <i> [solo node options]";
 
 /// Where `solo node` listens for peers unless `--listen` says otherwise.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:30333";
@@ -123,9 +147,9 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
             .ok_or("genesis: maxTxs too large")?,
         allocations: Seq(allocations),
         upgrades: parse_upgrades(&v)?,
+        staking: staking::parse_staking(&v)?,
         bridge_in: bridge::parse_bridge(&v)?,
         governance: gov::parse_governance(&v)?,
-        ..GenesisParams::default()
     };
     let mut validators = Vec::new();
     match v.get("validators") {
@@ -217,7 +241,7 @@ fn parse_account(address: [u8; 20], entry: &Value) -> Result<Allocation, String>
 }
 
 /// A balance: a decimal or `0x` hex string, or a JSON number.
-fn parse_balance(value: &Value) -> Result<u128, String> {
+pub(crate) fn parse_balance(value: &Value) -> Result<u128, String> {
     Ok(match value {
         Value::String(s) => {
             parse_number_text(s).ok_or("genesis: balance must be a decimal or 0x hex string")?
@@ -297,15 +321,35 @@ pub fn parse_key(text: &str) -> Result<k256::ecdsa::SigningKey, String> {
         .ok_or_else(|| "key: not a valid secp256k1 secret key".to_owned())
 }
 
-/// What `solo key` prints: the validator id for genesis and the Ethereum address.
+/// What `solo key` prints: the validator id for genesis, the Ethereum
+/// address, and the DKG encryption key to list under `staking.keys` (spec
+/// 15 §2).
 #[must_use]
 pub fn describe_key(key: &k256::ecdsa::SigningKey) -> String {
     let id = solo_node::validator_id(key);
     format!(
-        "validator {}\naddress   {}",
+        "validator {}\naddress   {}\ndkg       {}",
         solo_rpc::methods::data(&id),
-        solo_rpc::methods::data(&id[12..])
+        solo_rpc::methods::data(&id[12..]),
+        solo_rpc::methods::data(&solo_node::keystore::encryption_key(key))
     )
+}
+
+/// The consensus key named by `--key <hex>` or `--key-file <path>`, if either
+/// is given.
+///
+/// # Errors
+/// A message if both are given, the file cannot be read, or the key does not parse.
+pub fn key_argument(args: &[String]) -> Result<Option<k256::ecdsa::SigningKey>, String> {
+    match (arg(args, "--key"), arg(args, "--key-file")) {
+        (Some(_), Some(_)) => Err("--key and --key-file exclude each other".to_owned()),
+        (Some(hex), None) => parse_key(&hex).map(Some),
+        (None, Some(path)) => match std::fs::read_to_string(&path) {
+            Ok(text) => parse_key(text.trim()).map(Some),
+            Err(e) => Err(format!("{path}: {e}")),
+        },
+        (None, None) => Ok(None),
+    }
 }
 
 /// Every value following an occurrence of `name` in `args`.
@@ -347,7 +391,7 @@ pub fn load_kernel(path: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-fn parse_number(args: &[String], name: &str) -> Result<Option<u64>, String> {
+pub(crate) fn parse_number(args: &[String], name: &str) -> Result<Option<u64>, String> {
     match arg(args, name) {
         Some(text) => match text.parse() {
             Ok(n) => Ok(Some(n)),
@@ -423,8 +467,8 @@ fn parse_peers(args: &[String]) -> Result<Vec<std::net::SocketAddr>, String> {
         .collect()
 }
 
-/// What the commands that run no node print: `key`, `doctor` and `gov`.
-/// `None` for any other command.
+/// What the commands that run no node print: `key`, `doctor`, `gov` and
+/// `upgrade`. `None` for any other command.
 fn tool_output(command: &str, args: &[String]) -> Option<Result<String, CliError>> {
     Some(
         match command {
@@ -435,13 +479,116 @@ fn tool_output(command: &str, args: &[String]) -> Option<Result<String, CliError
                 .map(|key| describe_key(&key)),
             "doctor" => doctor::run(args),
             "gov" => gov::parse(args.get(2..).unwrap_or(&[])).map(|call| gov::describe(&call)),
+            "upgrade" => upgrade::run(args),
             _ => return None,
         }
         .map_err(CliError::from),
     )
 }
 
-fn run_inner(
+/// The peer-to-peer transport of `solo node`, bound to `--listen`.
+fn bind_transport(
+    args: &[String],
+    node: &solo_node::Node,
+    chain_id: u64,
+    peers: Vec<std::net::SocketAddr>,
+) -> Result<solo_node::Transport, CliError> {
+    let listen_arg = arg(args, "--listen");
+    let listen = listen_arg.as_deref().unwrap_or(DEFAULT_LISTEN);
+    // An observer still needs an identity for its peers; a hash of its address will do.
+    let id = node
+        .validator_id()
+        .unwrap_or_else(|| solo_host::hash::keccak256(listen.as_bytes()));
+    let t = match solo_node::Transport::bind(listen, id, chain_id, peers) {
+        Ok(t) => t,
+        Err(e) => return Err(format!("{listen}: {e}").into()),
+    };
+    let bound = t.local_addr().map_or(listen.to_owned(), |a| a.to_string());
+    eprintln!("p2p listening on {bound}");
+    Ok(t)
+}
+
+/// A driver store, if any, with the tables and the state it holds from a
+/// previous run.
+type Opened = (
+    Option<solo_node::DriverStore>,
+    solo_node::store::Tables,
+    Option<Vec<u8>>,
+);
+
+/// The driver store `--data-dir` names and what it holds; none without the
+/// option, which a validator's `solo node` may not leave out.
+fn open_store(args: &[String], validator: bool) -> Result<Opened, CliError> {
+    let Some(dir) = arg(args, "--data-dir") else {
+        if validator {
+            return Err(
+                "--data-dir is required for a validator: its driver state must outlive a restart (spec 08 §7)"
+                    .into(),
+            );
+        }
+        return Ok((None, solo_node::store::Tables::new(), None));
+    };
+    let mut store = solo_node::DriverStore::open(std::path::Path::new(&dir))
+        .map_err(|e| format!("{dir}: {e}"))?;
+    let (persisted, resumed) = store.take_loaded();
+    Ok((Some(store), persisted, resumed))
+}
+
+/// Says where the driver's state lives, which view it started in and, on a
+/// resume, how many of its own finalized blocks it re-executed from its
+/// tables before anything else happened (spec 08 §7).
+fn report_driver_state(node: &solo_node::Node, resuming: bool) {
+    if let Some(store) = node.store() {
+        let view = node.simplex_state().map_or(0, |s| s.view);
+        let how = if resuming {
+            format!(
+                "resumed in view {view}, {} blocks re-executed from its tables",
+                node.executed.len()
+            )
+        } else {
+            format!("new, from view {view}")
+        };
+        eprintln!("driver state in {}: {how}", store.dir().display());
+    }
+}
+
+/// Binds the JSON-RPC listener and announces the node.
+fn bind_rpc(
+    rpc_addr: &str,
+    command: &str,
+    chain_id: u64,
+    key: Option<&k256::ecdsa::SigningKey>,
+) -> Result<std::net::TcpListener, CliError> {
+    let listener = match solo_rpc::http::bind(rpc_addr) {
+        Ok(listener) => listener,
+        Err(e) => return Err(format!("{rpc_addr}: {e}").into()),
+    };
+    let bound = listener.local_addr().ok();
+    let bound = bound.map_or(rpc_addr.to_owned(), |a| a.to_string());
+    let validator = key.map_or("none (observer)".to_owned(), |k| {
+        solo_rpc::methods::data(&solo_node::validator_id(k))
+    });
+    eprintln!(
+        "solo {command} node: chain id {chain_id}, validator {validator}, JSON-RPC on http://{bound}"
+    );
+    Ok(listener)
+}
+
+/// Prints every kernel switch (spec 06 §7.3) the node performed since `seen`.
+fn report_switches(node: &solo_node::Node, seen: &mut usize) {
+    for s in &node.upgrades().switches[*seen..] {
+        eprintln!(
+            "kernel switch after block {}: version {} to {} ({})",
+            s.height,
+            s.from_version,
+            s.to_version,
+            solo_rpc::methods::data(&s.code_hash)
+        );
+    }
+    *seen = node.upgrades().switches.len();
+}
+
+pub(crate) fn run_inner(
     args: &[String],
     keep_going: &mut dyn FnMut(&solo_rpc::Rpc) -> bool,
 ) -> Result<(), CliError> {
@@ -449,6 +596,9 @@ fn run_inner(
     if let Some(output) = tool_output(command, args) {
         println!("{}", output?);
         return Ok(());
+    }
+    if command == "devnet" {
+        return devnet::run(args, keep_going).map_err(CliError);
     }
     if command != "dev" && command != "node" {
         return Err(USAGE.into());
@@ -469,9 +619,10 @@ fn run_inner(
     let key = if command == "dev" {
         Some(dev_key())
     } else {
-        arg(args, "--key").map(|k| parse_key(&k)).transpose()?
+        key_argument(args)?
     };
     let peers = parse_peers(args)?;
+    let (store, persisted, resumed) = open_store(args, command == "node" && key.is_some())?;
     let start = Instant::now();
     let epoch = unix_ms();
     let mut node = solo_node::Node::open(
@@ -480,6 +631,7 @@ fn run_inner(
         solo_node::NodeConfig {
             now_ms: epoch,
             key: key.clone(),
+            persisted,
             kernel_gas,
             query_gas,
             state_history,
@@ -487,37 +639,21 @@ fn run_inner(
         },
     )?;
     let chain_id = node.chain_id().unwrap_or(0);
-    node.start(None)?;
-    let mut transport = None;
-    if command == "node" {
-        let listen_arg = arg(args, "--listen");
-        let listen = listen_arg.as_deref().unwrap_or(DEFAULT_LISTEN);
-        // An observer still needs an identity for its peers; a hash of its address will do.
-        let id = node
-            .validator_id()
-            .unwrap_or_else(|| solo_host::hash::keccak256(listen.as_bytes()));
-        let t = match solo_node::Transport::bind(listen, id, chain_id, peers) {
-            Ok(t) => t,
-            Err(e) => return Err(format!("{listen}: {e}").into()),
-        };
-        let bound = t.local_addr().map_or(listen.to_owned(), |a| a.to_string());
-        eprintln!("p2p listening on {bound}");
-        transport = Some(t);
+    if let Some(store) = store {
+        node.attach_store(store);
     }
-    let mut rpc = solo_rpc::Rpc::new(node);
-    let listener = match solo_rpc::http::bind(rpc_addr) {
-        Ok(listener) => listener,
-        Err(e) => return Err(format!("{rpc_addr}: {e}").into()),
+    let resuming = resumed.is_some();
+    node.start(resumed)?;
+    report_driver_state(&node, resuming);
+    let mut transport = if command == "node" {
+        Some(bind_transport(args, &node, chain_id, peers)?)
+    } else {
+        None
     };
-    let bound = listener.local_addr().ok();
-    let bound = bound.map_or(rpc_addr.to_owned(), |a| a.to_string());
-    let validator = key.as_ref().map_or("none (observer)".to_owned(), |k| {
-        solo_rpc::methods::data(&solo_node::validator_id(k))
-    });
-    eprintln!(
-        "solo {command} node: chain id {chain_id}, validator {validator}, JSON-RPC on http://{bound}"
-    );
+    let mut rpc = solo_rpc::Rpc::new(node);
+    let listener = bind_rpc(rpc_addr, command, chain_id, key.as_ref())?;
     let mut last_tick = Instant::now();
+    let mut switches_seen = 0usize;
     let blocks_seen = Rc::new(Cell::new(0u64));
     let seen = Rc::clone(&blocks_seen);
     // The network and the clock, between connections and between the steps
@@ -532,6 +668,10 @@ fn run_inner(
         }
         last_tick = Instant::now();
         report(node.tick(now));
+        // What a timer step did reaches the disk now; a transport does the
+        // same before it sends (spec 08 §7).
+        report(node.sync_store());
+        report_switches(node, &mut switches_seen);
         let executed = node.executed.len();
         if executed as u64 > seen.get() {
             seen.set(executed as u64);

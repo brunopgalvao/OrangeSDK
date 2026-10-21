@@ -345,6 +345,9 @@ impl Transport {
                 self.handle(i, frame, node)?;
             }
         }
+        // What the driver did is on disk before any peer hears of it (spec
+        // 08 §7): a node whose store refuses sends nothing until it accepts.
+        node.sync_store()?;
         for message in node.take_outbound() {
             match message {
                 Outbound::Broadcast { topic, payload } => {

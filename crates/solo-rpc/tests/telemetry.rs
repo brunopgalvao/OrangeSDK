@@ -89,18 +89,36 @@ fn status_json_without_a_validator() {
         validator: None,
         upgrade_alert: None,
         missing_gates: 0,
+        kernel_version: 1,
+        kernel_hash: [0xAB; 32],
+        active_gates: 0,
+        pending_upgrade: None,
     };
     let v = status_json(&status);
     assert_eq!(v["validator"], Value::Null);
     assert_eq!(v["upgradeAlert"], Value::Null);
     assert_eq!(v["missingGates"], serde_json::json!([]));
+    assert_eq!(v["kernelVersion"], 1);
+    assert_eq!(v["kernelHash"], format!("0x{}", "ab".repeat(32)));
+    assert_eq!(v["activeGates"], serde_json::json!([]));
+    assert_eq!(v["pendingUpgrade"], Value::Null);
     let blocked = status_json(&Status {
         upgrade_alert: Some("cannot load".to_owned()),
         missing_gates: 0b101,
+        active_gates: 0b10,
+        pending_upgrade: Some(solo_metrics::PendingUpgrade {
+            code_hash: [0xCD; 32],
+            activation_height: 77,
+        }),
         ..status
     });
     assert_eq!(blocked["upgradeAlert"], "cannot load");
     assert_eq!(blocked["missingGates"], serde_json::json!([0, 2]));
+    assert_eq!(blocked["activeGates"], serde_json::json!([1]));
+    assert_eq!(
+        blocked["pendingUpgrade"],
+        serde_json::json!({"codeHash": format!("0x{}", "cd".repeat(32)), "activationHeight": 77})
+    );
     assert_eq!(v["peers"], 2);
     assert_eq!(v["headAgeSeconds"], 1.5);
 }

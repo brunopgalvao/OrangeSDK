@@ -1,0 +1,9 @@
+# Loads ops/grafana-solo.json, mounted at /var/lib/grafana/dashboards.
+apiVersion: 1
+providers:
+  - name: solo
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

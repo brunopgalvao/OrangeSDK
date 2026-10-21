@@ -520,6 +520,7 @@ impl Rpc {
             "solo_getGovernance" => crate::governance::governance(&mut self.node)?,
             "solo_getProposals" => crate::governance::proposals(&mut self.node)?,
             "solo_getProposal" => crate::governance::proposal(&mut self.node, params)?,
+            "solo_upgradeStatus" => crate::upgrades::upgrade_status(&mut self.node)?,
             other => {
                 return Err(RpcError::with_code(
                     -32601,

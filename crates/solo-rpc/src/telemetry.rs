@@ -22,10 +22,21 @@ pub fn status_json(s: &Status) -> Value {
         "uptimeSeconds": s.uptime_seconds,
         "validator": s.validator.as_ref().map(|id| data(id)),
         "upgradeAlert": s.upgrade_alert,
-        "missingGates": (0..64u32)
-            .filter(|g| s.missing_gates >> g & 1 == 1)
-            .collect::<Vec<_>>(),
+        "missingGates": gates(s.missing_gates),
+        "kernelVersion": s.kernel_version,
+        "kernelHash": data(&s.kernel_hash),
+        "activeGates": gates(s.active_gates),
+        "pendingUpgrade": s.pending_upgrade.as_ref().map(|p| json!({
+            "codeHash": data(&p.code_hash),
+            "activationHeight": p.activation_height,
+        })),
     })
+}
+
+/// The gates of a bit set, ascending.
+#[must_use]
+pub fn gates(mask: u64) -> Vec<u32> {
+    (0..64u32).filter(|g| mask >> g & 1 == 1).collect()
 }
 
 /// The `GET /metrics` response: every family in the text format 0.0.4.

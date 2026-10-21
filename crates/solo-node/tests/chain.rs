@@ -9,7 +9,7 @@ use solo_abi::chain::{Allocation, GenesisParams, reason};
 use solo_abi::codec::Seq;
 use solo_abi::types::Genesis;
 use solo_host::hash::keccak256;
-use solo_node::{Node, NodeConfig, Sim, SubmitError};
+use solo_node::{DriverStore, Node, NodeConfig, NodeError, Sim, SubmitError};
 use solo_recompile::{Input, Options, recompile};
 use solo_rlp::{encode_bytes, encode_list, encode_uint};
 
@@ -646,4 +646,100 @@ fn effects_injected_by_hand() {
         1,
         "an empty block once re-armed"
     );
+}
+
+#[test]
+fn a_store_keeps_the_driver_state_across_a_restart() {
+    let dir = std::env::temp_dir().join(format!("solo-chain-store-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let alice = Wallet::new(1);
+    let bob = Wallet::new(2);
+    let mut store = DriverStore::open(&dir).unwrap();
+    let (tables, state) = store.take_loaded();
+    assert!(tables.is_empty() && state.is_none());
+    let config = NodeConfig {
+        now_ms: 1_000,
+        key: Some(node_key()),
+        persisted: tables,
+        ..NodeConfig::default()
+    };
+    let mut node = Node::open(&kernel_module(), &genesis(&alice), config).unwrap();
+    node.attach_store(store);
+    assert_eq!(node.store().map(DriverStore::dir), Some(dir.as_path()));
+    node.start(state).unwrap();
+    node.submit(&alice.transfer(0, bob.address, ETHER, 1, 21_000, Some(CHAIN_ID), &[]))
+        .unwrap();
+    node.tick(1_000 + SLOT_MS).unwrap();
+    assert_eq!(node.block_number().unwrap(), 1);
+    node.sync_store().unwrap();
+    let view = node.simplex_state().unwrap().view;
+    assert!(view >= 2, "{view}");
+    assert_eq!(
+        std::fs::read(dir.join(solo_node::store::STATE_FILE)).unwrap(),
+        node.persisted_driver_state.clone().unwrap()
+    );
+    drop(node);
+    // A fresh process over the same directory resumes in the view it left,
+    // with its tables (its own proposals among them), and goes on.
+    let mut store = DriverStore::open(&dir).unwrap();
+    let (tables, state) = store.take_loaded();
+    assert!(!tables.is_empty());
+    let config = NodeConfig {
+        now_ms: 5_000,
+        key: Some(node_key()),
+        persisted: tables,
+        ..NodeConfig::default()
+    };
+    let mut fresh = Node::open(&kernel_module(), &genesis(&alice), config).unwrap();
+    fresh.attach_store(store);
+    fresh.start(state).unwrap();
+    assert!(fresh.simplex_state().unwrap().view >= view);
+    fresh.tick(5_000 + SLOT_MS).unwrap();
+    assert!(fresh.block_number().unwrap() >= 1);
+    assert_eq!(fresh.account(&bob.address).unwrap().balance, ETHER);
+    fresh.sync_store().unwrap();
+    // A disk that refuses is a node error; the next sync writes the same again.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fresh
+            .apply_effect(solo_abi::types::Effect::PersistState {
+                state: vec![1, 2, 3],
+            })
+            .unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let err = fresh.sync_store().unwrap_err();
+        assert!(
+            matches!(err, NodeError::Store(_)) && err.to_string().starts_with("driver store: "),
+            "{err}"
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        fresh.sync_store().unwrap();
+        assert_eq!(
+            std::fs::read(dir.join(solo_node::store::STATE_FILE)).unwrap(),
+            vec![1, 2, 3]
+        );
+    }
+}
+
+#[test]
+fn a_small_query_cap_does_not_blind_the_host() {
+    let alice = Wallet::new(1);
+    let config = NodeConfig {
+        now_ms: 1_000,
+        key: Some(node_key()),
+        query_gas: 1_000,
+        ..NodeConfig::default()
+    };
+    let mut node = Node::open(&kernel_module(), &genesis(&alice), config).unwrap();
+    // The host's own read of `upgrade_status` runs under the kernel budget,
+    // at open and after every block; a client's query stays under the cap.
+    assert_eq!(node.upgrades().status.as_ref().map(|s| s.version), Some(1));
+    assert_eq!(node.upgrade_status().unwrap().version, 1);
+    node.start(None).unwrap();
+    node.tick(1_000 + SLOT_MS).unwrap();
+    assert_eq!(node.executed.last().map(|e| e.0), Some(1));
+    assert!(node.block_number().unwrap_err().is_out_of_gas());
+    assert!(node.evidence(0).unwrap_err().is_out_of_gas());
+    assert_eq!(node.query_gas, 1_000);
 }

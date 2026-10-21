@@ -23,6 +23,7 @@ use solo_vm::status::Termination;
 
 use crate::extension::{NodeExtension, NodeServices, Outbound, validator_id};
 use crate::mempool::{Mempool, PoolError, PoolLimits, PoolTx, rejection};
+use crate::store::DriverStore;
 use crate::upgrade::{GatedExtension, Upgrades};
 
 /// How to open a node.
@@ -131,6 +132,9 @@ pub enum NodeError {
     /// A query named a height whose state the node does not keep: pruned,
     /// below `oldest`, or not executed yet (spec 20 §5).
     StateUnavailable { height: u64, oldest: u64 },
+    /// The node-local store refused a write (spec 06 §4.2); nothing the
+    /// driver did since the last successful write has been sent.
+    Store(String),
 }
 
 impl fmt::Display for NodeError {
@@ -144,6 +148,7 @@ impl fmt::Display for NodeError {
                 f,
                 "state of block {height} is not available: the node keeps the state from block {oldest}"
             ),
+            NodeError::Store(why) => write!(f, "driver store: {why}"),
         }
     }
 }
@@ -212,6 +217,8 @@ pub struct Node {
     pub(crate) telemetry: solo_metrics::NodeMetrics,
     /// Kernel switchover and feature-gate state (`crate::upgrade`).
     pub(crate) upgrades: Upgrades,
+    /// Where the driver's node-local data goes between steps, if anywhere.
+    store: Option<DriverStore>,
 }
 
 impl Node {
@@ -272,8 +279,15 @@ impl Node {
             genesis_root: [0; 32],
             telemetry: solo_metrics::NodeMetrics::new(),
             upgrades: Upgrades::new(active_gates),
+            store: None,
         };
         node.call_unit(exports::INIT, &genesis.to_bytes())?;
+        // The kernel's version and gates are known before the first block:
+        // the query spec 13 §7.1 makes after every block, once at open and
+        // under the kernel budget like every host read of it. A kernel that
+        // does not serve it reads as the default (spec 06 §7.2), so the node
+        // opens and its telemetry reports version 0 (spec 11 §4).
+        node.upgrades.status = Some(node.upgrade_status().unwrap_or_default());
         node.kernel_gas = config.kernel_gas;
         // The genesis state is version 0; each executed block seals its height.
         node.exec.state_mut().base_mut().keep_history(0);
@@ -439,10 +453,21 @@ impl Node {
 
     /// Delivers one input to the driver and applies every resulting effect,
     /// including the follow-up inputs they produce, until the node is quiet.
+    /// A step is the host's own work: the reads it makes of the kernel on
+    /// the way (the upgrade status and code, a signal's nonce) run under the
+    /// kernel budget, not the cap [`Node::query_gas`] puts on what clients
+    /// ask between steps.
     ///
     /// # Errors
     /// See [`NodeError`].
     pub fn step(&mut self, input: Input) -> Result<(), NodeError> {
+        let cap = std::mem::replace(&mut self.query_gas, i64::MAX);
+        let stepped = self.step_capless(input);
+        self.query_gas = cap;
+        stepped
+    }
+
+    fn step_capless(&mut self, input: Input) -> Result<(), NodeError> {
         self.upgrade_halted()?;
         let mut queue = VecDeque::from([input]);
         while let Some(input) = queue.pop_front() {
@@ -455,8 +480,49 @@ impl Node {
             }
             self.switch_kernel_if_due(&mut queue)?;
         }
+        self.collect_persist_writes();
         self.send_gate_signal();
         Ok(())
+    }
+
+    /// Hands the `persist_set` writes of the step to the store, or drops
+    /// them when the node keeps nothing on disk.
+    fn collect_persist_writes(&mut self) {
+        let writes = std::mem::take(&mut self.services.borrow_mut().persist_writes);
+        if let Some(store) = &mut self.store {
+            store.pending.extend(writes);
+        }
+    }
+
+    /// Keeps the driver's node-local data in `store` from now on: every
+    /// `persist_set` and the latest `PersistState`, written by
+    /// [`Node::sync_store`]. The node was opened with the tables the store
+    /// loaded and started with its state (spec 06 §4.2, spec 08 §7).
+    pub fn attach_store(&mut self, store: DriverStore) {
+        self.store = Some(store);
+    }
+
+    /// The attached store, if any.
+    #[must_use]
+    pub fn store(&self) -> Option<&DriverStore> {
+        self.store.as_ref()
+    }
+
+    /// Writes what the driver persisted since the last call to the store,
+    /// synced to disk; nothing without a store. The transport calls this
+    /// before it sends anything, so what a peer sees is on disk first.
+    ///
+    /// # Errors
+    /// [`NodeError::Store`] when the disk refuses; the next call writes the
+    /// same again.
+    pub fn sync_store(&mut self) -> Result<(), NodeError> {
+        let Some(store) = &mut self.store else {
+            return Ok(());
+        };
+        let services = self.services.borrow();
+        store
+            .sync(self.persisted_driver_state.as_deref(), &services.persisted)
+            .map_err(|e| NodeError::Store(e.to_string()))
     }
 
     /// Applies one driver effect as the host would, returning any follow-up
