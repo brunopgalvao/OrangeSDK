@@ -74,15 +74,15 @@ MODEXP's worst case is a modulus of at most 32 bytes, which EIP-7883 prices at a
 | `SLOAD`, warm | 13 000 | 345 200 | 26.5 |
 | `SSTORE`, warm | 13 000 | 490 749 | 37.7 |
 | `TSTORE`, `TLOAD` | 23 400 | 543 284 | 23.2 |
-| `BALANCE`, cold | 263 000 | 1 158 565 | 4.4 |
-| `EXTCODEHASH`, cold | 263 000 | 1 239 765 | 4.7 |
+| `BALANCE`, cold | 263 000 | 1 153 502 | 4.3 |
+| `EXTCODEHASH`, cold | 263 000 | 1 234 702 | 4.6 |
 | `BLOCKHASH`, block with 1 000 transactions | 5 000 | 673 700 | 134.7 |
 | `SELFBALANCE` | 3 300 | 278 600 | 84.4 |
 | `STATICCALL` of an empty account | 14 100 | 1 001 000 | 70.9 |
 | `STATICCALL` of the identity precompile | 15 600 | 982 000 | 62.9 |
 | `STATICCALL` of itself | 423 700 | 36 181 300 | 85.3 |
-| `LOG0`, empty | 40 500 | 278 554 | 6.8 |
-| `CREATE`, empty | 3 203 400 | 2 779 351 | 0.8 |
+| `LOG0`, empty | 40 500 | 277 954 | 6.8 |
+| `CREATE`, empty | 3 203 400 | 2 779 241 | 0.8 |
 
 Before this change `KECCAK256` cost 945 (32 B) and 1 974 (1 KiB) VM gas per EVM gas, the guest hashing in software, and `BLOCKHASH` 274 for an empty block and 17 469 for one of 1 000 transactions, the kernel decoding, re-encoding and hashing the stored header on every call (§4).
 
