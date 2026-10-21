@@ -106,7 +106,7 @@ The block's **Ethereum header** is the Prague/Osaka header with these values, in
 
 The **block hash** is `keccak256` of the header's RLP. The kernel computes it after storing the block's receipts, stores it beside the record (the `bnum/` and `bhash/` indexes) and as the next block's `parent_hash`; `BLOCKHASH` returns it (19 §4); the host reports it in `BlockExecuted` (06 §4.1) and the RPC serves it as `hash`. The RPC's block view is exactly the header's fields with that hash, plus `size` (the length of `rlp([header, transactions, [], []])`, a typed transaction as the string of its bytes), `totalDifficulty` 0, empty `uncles` and `withdrawals`, and the transactions. So `keccak256(rlp(header))`, rebuilt from the view by any Ethereum library, is the view's `hash`, and the parent link holds from block 1 on.
 
-**Genesis.** The kernel stores no record for height 0. The RPC serves a synthetic block 0: the genesis state root (the commitment of the state `kernel_init` left, which the node records when it starts), empty transactions and receipts roots, the chain's gas limit and base fee, a zero bloom, and hash zero, which is block 1's `parentHash`. Its hash is not the hash of its header.
+**Genesis.** The kernel stores no record for height 0. The RPC serves a synthetic block 0: the genesis state root (the commitment of the state `kernel_init` left, which the node records when it starts), empty transactions and receipts roots, the chain's gas limit and base fee, a zero bloom, and hash zero, which is block 1's `parentHash`. Its hash is not the hash of its header. The zero hash names it wherever the RPC takes a block hash, as any block's hash names its block: `eth_getBlockByHash`, `eth_getBlockReceipts`, `eth_getLogs` with `blockHash`, and a state method's block parameter (§5.2).
 
 ### 3.2 Transactions and receipts roots
 
@@ -127,7 +127,7 @@ The block's `logs_bloom` is the OR of its receipts' blooms. A transaction the bl
 
 ### 4.1 Request and response
 
-`eth_getProof(address, storageKeys, block)` takes an address, a list of storage keys (hex words of at most 32 bytes) and a block parameter as the state methods take one (§5). It returns:
+`eth_getProof(address, storageKeys, block)` takes an address, a list of at most 1 024 storage keys (`MAX_PROOF_KEYS`; hex words of at most 32 bytes) and a block parameter as the state methods take one (§5). A longer list is refused with `-32602`, `too many storage keys: <n>, the limit is 1024`. Each key costs a kernel query and a proof on the thread that drives consensus, so the node's background work runs before each, as between the entries of a batch; the head can move meanwhile, and every value and proof in the response is of the block the request named. It returns:
 
 | Field | Content |
 |---|---|

@@ -16,7 +16,9 @@ use common::{
 };
 use serde_json::{Value, json};
 use solo_rpc::Rpc;
-use solo_rpc::methods::{data, parse_hex, parse_quantity};
+use solo_rpc::methods::{MAX_PROOF_KEYS, data, parse_hex, parse_quantity};
+use std::cell::Cell;
+use std::rc::Rc;
 use tiny_keccak::{Hasher, Keccak};
 
 fn keccak(data: &[u8]) -> [u8; 32] {
@@ -281,6 +283,35 @@ fn blocks_carry_ethereum_headers_and_patricia_roots() {
     );
     assert_eq!(genesis["stateRoot"], data(&rpc.node().genesis_state_root()));
     assert_ne!(genesis["stateRoot"], data(&[0; 32]));
+    // Block 1's parent hash names it as any block's hash names its block:
+    // by hash, for receipts and logs, and as a state method's block
+    // parameter, directly or as an EIP-1898 object (spec 20 §5.2).
+    let zero = data(&[0; 32]);
+    let first = ok(&mut rpc, "eth_getBlockByNumber", json!(["0x1", false]));
+    assert_eq!(first["parentHash"], zero);
+    assert_eq!(
+        ok(&mut rpc, "eth_getBlockByHash", json!([zero, false])),
+        genesis
+    );
+    assert_eq!(
+        ok(&mut rpc, "eth_getBlockReceipts", json!([zero])),
+        json!([])
+    );
+    assert_eq!(
+        ok(&mut rpc, "eth_getLogs", json!([{ "blockHash": zero }])),
+        json!([])
+    );
+    let allocation = format!("{:#x}", 100 * ETHER);
+    for block in [json!(zero), json!({ "blockHash": zero })] {
+        assert_eq!(
+            ok(
+                &mut rpc,
+                "eth_getBalance",
+                json!([data(&alice.address), block])
+            ),
+            allocation
+        );
+    }
 }
 
 #[test]
@@ -546,6 +577,123 @@ fn get_proof_verifies_independently_at_every_kept_height() {
     assert!(
         message.ends_with(&format!("the node keeps the state from block {oldest}")),
         "{message}"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn get_proof_hands_the_node_its_work_between_keys_and_caps_them() {
+    let alice = Wallet::new(1);
+    let mut rpc = Rpc::new(node_funding(&[&alice]));
+    let mut now = 1_000;
+    let counter = created_address(&alice.address, 0);
+    let create = Fields {
+        nonce: 0,
+        to: None,
+        value: 0,
+        gas_limit: 1_000_000,
+        data: &counter_initcode(5),
+    };
+    mine(&mut rpc, &mut now, &[alice.legacy(&create)]);
+    let height = rpc.node_mut().block_number().unwrap();
+    // Each time the node gets the thread back it mines a block that
+    // increments the counter, so the head moves during the request.
+    let increment = calldata("increment(uint256)", &[1]);
+    let raws: Vec<Vec<u8>> = (1..=4)
+        .map(|nonce| {
+            alice.legacy(&Fields {
+                nonce,
+                to: Some(counter),
+                value: 0,
+                gas_limit: 200_000,
+                data: &increment,
+            })
+        })
+        .collect();
+    let turns = Rc::new(Cell::new(0usize));
+    let seen = Rc::clone(&turns);
+    let clock = Rc::new(Cell::new(now));
+    rpc.set_background(Box::new(move |node| {
+        let hash = node.submit(&raws[seen.get()]).unwrap();
+        seen.set(seen.get() + 1);
+        while node.receipt(&hash).unwrap().is_none() {
+            clock.set(clock.get() + SLOT_MS);
+            node.tick(clock.get()).unwrap();
+        }
+    }));
+    let c = data(&counter);
+    let proof = ok(
+        &mut rpc,
+        "eth_getProof",
+        json!([c, ["0x0", "0x5", "0x0"], "latest"]),
+    );
+    assert_eq!(turns.get(), 3);
+    assert_eq!(rpc.node_mut().block_number().unwrap(), height + 3);
+    // The answer is still the head the request named: its root, and slot
+    // values that match their proofs against it.
+    let block = ok(
+        &mut rpc,
+        "eth_getBlockByNumber",
+        json!([format!("{height:#x}"), false]),
+    );
+    assert_eq!(proof["stateRoot"], block["stateRoot"]);
+    let root = fixed::<32>(&proof["stateRoot"]);
+    for (entry, (slot, value)) in
+        proof["storageProof"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip([(0, 5), (5, 0), (0, 5)])
+    {
+        assert_eq!(number(&entry["value"]), value);
+        let key = [&b"slot/"[..], &counter, &word(slot)].concat();
+        let expected = (value != 0).then(|| keccak(&word(value)));
+        assert_eq!(
+            verify(&root, &key, entry["proof"].as_array().unwrap()),
+            Some(expected)
+        );
+    }
+    // A block that the background work executes can prune the height: the
+    // request then fails as for any pruned height.
+    rpc.node_mut().state_history = 1;
+    let latest = rpc.node_mut().block_number().unwrap();
+    let (code, message) = err(&mut rpc, "eth_getProof", json!([c, ["0x0"], "latest"]));
+    assert_eq!(code, -32000);
+    let oldest = rpc.node().oldest_state();
+    assert_eq!(oldest, latest + 1);
+    assert!(message.starts_with("missing trie node "), "{message}");
+    assert!(
+        message.ends_with(&format!(
+            "state of block {latest} is not available, the node keeps the state from block {oldest}"
+        )),
+        "{message}"
+    );
+    // At most MAX_PROOF_KEYS keys, each handing the node its work.
+    let quiet = Rc::new(Cell::new(0usize));
+    let count = Rc::clone(&quiet);
+    rpc.set_background(Box::new(move |_| count.set(count.get() + 1)));
+    let keys: Vec<String> = (0..=MAX_PROOF_KEYS).map(|k| format!("{k:#x}")).collect();
+    let (code, message) = err(&mut rpc, "eth_getProof", json!([c, keys, "latest"]));
+    assert_eq!(
+        (code, message),
+        (
+            -32602,
+            format!(
+                "too many storage keys: {}, the limit is {MAX_PROOF_KEYS}",
+                MAX_PROOF_KEYS + 1
+            )
+        )
+    );
+    assert_eq!(quiet.get(), 0);
+    let proof = ok(
+        &mut rpc,
+        "eth_getProof",
+        json!([c, keys[..MAX_PROOF_KEYS], "latest"]),
+    );
+    assert_eq!(quiet.get(), MAX_PROOF_KEYS);
+    assert_eq!(
+        proof["storageProof"].as_array().unwrap().len(),
+        MAX_PROOF_KEYS
     );
 }
 

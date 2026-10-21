@@ -35,6 +35,11 @@ pub type Background = Box<dyn FnMut(&mut Node)>;
 /// Most blocks one `eth_feeHistory` request reports, as in geth.
 pub const MAX_FEE_HISTORY: u64 = 1024;
 
+/// Most storage keys one `eth_getProof` request may ask for (spec 20 §4.1):
+/// each costs a kernel query and a proof on the thread that drives
+/// consensus.
+pub const MAX_PROOF_KEYS: usize = 1024;
+
 /// Gas a call with value forwards for free; part of geth's first guess in
 /// gas estimation.
 const CALL_STIPEND: u64 = 2_300;
@@ -210,8 +215,9 @@ fn rewards(receipts: &[Receipt], gas_used: u64, percentiles: &[f64]) -> Vec<Stri
 /// Requests run on the caller's thread, which also drives the node, so what
 /// one request can make the node compute is bounded: each kernel query by
 /// the node's query budget ([`Node::query_gas`]), and the requests that
-/// make many queries (batches, gas estimation, log and fee-history scans)
-/// hand the node its [`Background`] work between them.
+/// make many queries (batches, gas estimation, log and fee-history scans,
+/// the storage keys of a proof) hand the node its [`Background`] work
+/// between them.
 pub struct Rpc {
     node: Node,
     background: Option<Background>,
@@ -248,8 +254,9 @@ impl Rpc {
 
     /// Runs the background work once, if any is set. The HTTP server calls
     /// this between connections; requests call it between batch entries,
-    /// between gas-estimation runs and between the blocks of a log or
-    /// fee-history scan, so the node keeps voting while they are served.
+    /// between gas-estimation runs, between the blocks of a log or
+    /// fee-history scan and between the storage keys of `eth_getProof`, so
+    /// the node keeps voting while they are served.
     /// The head can move during such a request.
     pub fn run_background(&mut self) {
         if let Some(work) = self.background.as_mut() {
@@ -356,14 +363,9 @@ impl Rpc {
         if height == head {
             return Ok(None);
         }
-        let oldest = self.node.oldest_state();
-        if height < oldest {
+        if height < self.node.oldest_state() {
             let (header, _) = self.header_at(height)?.unwrap_or_default();
-            return Err(RpcError::server(missing_state(
-                &header.state_root,
-                height,
-                oldest,
-            )));
+            return Err(self.unavailable(&header.state_root, height));
         }
         Ok(Some(height))
     }
@@ -388,10 +390,20 @@ impl Rpc {
     }
 
     fn hash_height(&mut self, hash: &str) -> Result<u64, RpcError> {
-        match self.node.block_by_hash(&parse_hash(hash)?)? {
+        match self.header_by_hash(&parse_hash(hash)?)? {
             Some(header) => Ok(header.height),
             None => Err(RpcError::server("header for hash not found")),
         }
+    }
+
+    /// The header of the block whose hash is `hash`. The zero hash names
+    /// the synthetic genesis, whose hash it is (spec 20 §3.1); the kernel
+    /// indexes every other block by its hash.
+    fn header_by_hash(&mut self, hash: &[u8; 32]) -> Result<Option<BlockHeader>, RpcError> {
+        if *hash == [0; 32] {
+            return Ok(self.header_at(0)?.map(|(header, _)| header));
+        }
+        Ok(self.node.block_by_hash(hash)?)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -477,7 +489,7 @@ impl Rpc {
             "eth_getBlockByHash" => {
                 let hash = hash_param(params, 0)?;
                 let full = params.get(1).and_then(Value::as_bool).unwrap_or(false);
-                match self.node.block_by_hash(&hash)? {
+                match self.header_by_hash(&hash)? {
                     Some(header) => self.block_json(&header, &hash, full)?,
                     None => Value::Null,
                 }
@@ -486,7 +498,7 @@ impl Rpc {
                 let block = param_str(params, 0)?;
                 let found = if block.len() == 66 {
                     let hash = parse_hash(block)?;
-                    self.node.block_by_hash(&hash)?.map(|header| (header, hash))
+                    self.header_by_hash(&hash)?.map(|header| (header, hash))
                 } else {
                     let height = self.resolve_block(block)?;
                     self.header_at(height)?
@@ -557,12 +569,21 @@ impl Rpc {
     }
 
     /// `eth_getProof(address, slots, block)`: the account and the slots with
-    /// their spec 10 proofs against the block's state root (spec 20 §4).
+    /// their spec 10 proofs against the block's state root (spec 20 §4), at
+    /// most [`MAX_PROOF_KEYS`] slots. Each slot is a kernel query, so the
+    /// node's background work runs before each; the head can move meanwhile,
+    /// and every read names the height the request resolved to.
     fn proof(&mut self, params: &[Value]) -> Result<Value, RpcError> {
         let address = address_param(params, 0)?;
         let Some(Value::Array(keys)) = params.get(1) else {
             return Err(RpcError::invalid_params("missing storage keys"));
         };
+        if keys.len() > MAX_PROOF_KEYS {
+            return Err(RpcError::invalid_params(format!(
+                "too many storage keys: {}, the limit is {MAX_PROOF_KEYS}",
+                keys.len()
+            )));
+        }
         let mut slots = Vec::with_capacity(keys.len());
         for key in keys {
             let key = key.as_str().unwrap_or_default();
@@ -570,27 +591,27 @@ impl Rpc {
         }
         let height = self.proof_height(params.get(2))?;
         let (header, _) = self.header_at(height)?.unwrap_or_default();
-        let oldest = self.node.oldest_state();
         // `proof_height` refused a height whose state is gone, and the node
         // keeps a height's trie as long as its state: this error is the
         // same, should the two ever disagree.
-        let unavailable = RpcError::server(missing_state(&header.state_root, height, oldest));
+        let unavailable = self.unavailable(&header.state_root, height);
         let key = proof::account_key(&address);
-        let account_proof = self
-            .node
-            .state_proof_at(height, &key)
-            .ok_or(unavailable.clone())?;
-        let at = (height < self.block_number()?).then_some(height);
-        let account = self.node.account_at(&address, at)?;
+        let account_proof = self.node.state_proof_at(height, &key).ok_or(unavailable)?;
+        let account = self.node.account_at(&address, Some(height))?;
         let present = matches!(account_proof.terminal,
             solo_trie::Terminal::Leaf { path, .. } if path == keccak256(&key));
         let mut storage = Vec::with_capacity(slots.len());
         for (requested, slot) in &slots {
-            let value = self.node.storage_at(&address, slot, at)?;
+            self.run_background();
+            // The background work can execute blocks and prune the height,
+            // its trie with its state: the proof is looked up first, so the
+            // error is the pruned-state one.
+            let unavailable = self.unavailable(&header.state_root, height);
             let slot_proof = self
                 .node
                 .state_proof_at(height, &proof::slot_key(&address, slot))
-                .ok_or(unavailable.clone())?;
+                .ok_or(unavailable)?;
+            let value = self.node.storage_at(&address, slot, Some(height))?;
             storage.push(proof::storage_entry(requested, &value, &slot_proof));
         }
         Ok(proof::response(
@@ -600,6 +621,12 @@ impl Rpc {
             &account_proof,
             &storage,
         ))
+    }
+
+    /// The error for `height`, whose header carries `root`, once the node no
+    /// longer keeps its state (spec 20 §5.3).
+    fn unavailable(&self, root: &[u8; 32], height: u64) -> RpcError {
+        RpcError::server(missing_state(root, height, self.node.oldest_state()))
     }
 
     /// Runs a message, first checking what the kernel would refuse it for so
@@ -844,7 +871,7 @@ impl Rpc {
     /// The heights a filter covers, within the chain and the range limit.
     fn filter_heights(&mut self, blocks: &Blocks) -> Result<(u64, u64), RpcError> {
         match blocks {
-            Blocks::Hash(hash) => match self.node.block_by_hash(hash)? {
+            Blocks::Hash(hash) => match self.header_by_hash(hash)? {
                 Some(header) => Ok((header.height, header.height)),
                 None => Err(RpcError::server("unknown block")),
             },

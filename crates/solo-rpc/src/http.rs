@@ -20,10 +20,15 @@ pub struct Request {
     pub body: Vec<u8>,
 }
 
+/// Largest request body read, geth's default: a `Content-Length` above it is
+/// refused before anything is allocated for the body.
+pub const MAX_BODY: usize = 5 * 1024 * 1024;
+
 /// Reads one HTTP request from a stream.
 ///
 /// # Errors
-/// Any I/O or framing problem, as a message.
+/// Any I/O or framing problem, or a body longer than [`MAX_BODY`], as a
+/// message.
 pub fn read_request(stream: &mut (impl Read + ?Sized)) -> Result<Request, String> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -43,6 +48,11 @@ pub fn read_request(stream: &mut (impl Read + ?Sized)) -> Result<Request, String
         {
             content_length = value.trim().parse().map_err(|_| "bad content-length")?;
         }
+    }
+    if content_length > MAX_BODY {
+        return Err(format!(
+            "body too large: {content_length} bytes, the limit is {MAX_BODY}"
+        ));
     }
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body).map_err(|e| e.to_string())?;
