@@ -69,7 +69,10 @@ fn status_of(node: &mut Node) -> Result<GovernanceStatus, RpcError> {
     status
         .transpose()
         .map(Option::unwrap_or_default)
-        .map_err(|_| RpcError::server("the kernel's governance status does not decode"))
+        .ok()
+        .ok_or(RpcError::server(
+            "the kernel's governance status does not decode",
+        ))
 }
 
 /// `solo_getGovernance()`: the mode, the key, the guardian, the proposal
