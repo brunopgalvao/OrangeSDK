@@ -339,7 +339,7 @@ fn transactions_blocks_and_receipts() {
     assert_eq!(by_number["parentHash"], data(&[0; 32]));
     assert_eq!(by_number["transactions"], json!([hash_hex]));
     // The Merkle-Patricia root of the one raw transaction (spec 20 §3.2).
-    let root = alloy_trie::root::ordered_trie_root_encoded(&[raw.clone()]);
+    let root = alloy_trie::root::ordered_trie_root_encoded(std::slice::from_ref(&raw));
     assert_eq!(by_number["transactionsRoot"], data(&root.0));
     assert_eq!(by_number["gasUsed"], "0x5208");
     assert_eq!(by_number["logsBloom"], data(&[0; 256]));
