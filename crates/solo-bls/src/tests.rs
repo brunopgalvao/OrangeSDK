@@ -281,6 +281,62 @@ fn worked_example_threshold() {
     }
 }
 
+/// Spec 12 §9.5: a version-2 certificate and a rotation message, signed by
+/// the key of §9.1 as key set 3, handing off to the §9.3 group key as key set 4.
+mod rotation_example {
+    pub const KEY_ID: u64 = 3;
+    pub const NEXT_ID: u64 = 4;
+    pub const NEXT_KEY: &str = "822bbc35275c08f014e718c9f66fe0ac83943afc0cdc3fd07316cb86bdc358d1b69ccc36c50f0ba06f9d2a5c47c18ee81889cd077e07f0854856cfa804d50e210008424da41554c2e4409d089aceae7298f898636df1836bf31b5af73ff64b66";
+    pub const MESSAGE: &str = "534f4c4f2d46494e414c49545902000000000000053900000000000000030000000000000001abababababababababababababababababababababababababababababababab";
+    pub const CERTIFICATE: &str = "0200000000000000030000000000000001ababababababababababababababababababababababababababababababababac8b3147a6f437a1f32f35433f4b579f94758b24c9ccae8b19cf19243d17b6cf5aa1491b59a2513432e34f8b9153e6e4";
+    pub const ROTATION: &str = "534f4c4f2d524f544154450100000000000005390000000000000004822bbc35275c08f014e718c9f66fe0ac83943afc0cdc3fd07316cb86bdc358d1b69ccc36c50f0ba06f9d2a5c47c18ee81889cd077e07f0854856cfa804d50e210008424da41554c2e4409d089aceae7298f898636df1836bf31b5af73ff64b66";
+    pub const ROTATION_SIGNATURE: &str = "9890904bd14581711fa00553e5a4447d9b2135a5fe02c4cbe3e0ae5989599a9c32c7827f27711ccd8d6d258624d7006a";
+}
+
+#[test]
+fn worked_example_rotation() {
+    use example::{BLOCK, CHAIN_ID, HEIGHT, IKM};
+    use rotation_example::*;
+    let sk = SecretKey::generate(&unhex(IKM), b"").unwrap();
+    let pk = sk.public_key();
+    let msg = certificate::message_v2(CHAIN_ID, KEY_ID, HEIGHT, &BLOCK);
+    let cert = certificate::CertificateV2 {
+        key_id: KEY_ID,
+        height: HEIGHT,
+        block_hash: BLOCK,
+        signature: sk.sign(&msg),
+    };
+    assert_eq!(cert.message(CHAIN_ID), msg);
+    assert!(cert.verify(CHAIN_ID, &pk));
+    assert!(!cert.verify(CHAIN_ID + 1, &pk));
+    let next = PublicKey::from_bytes(&unhex(NEXT_KEY).try_into().unwrap()).unwrap();
+    let rotation = certificate::rotation_message(CHAIN_ID, NEXT_ID, &next);
+    let rotation_signature = sk.sign(&rotation);
+    assert_eq!(hex(&msg), MESSAGE);
+    assert_eq!(hex(&cert.to_bytes()), CERTIFICATE);
+    assert_eq!(hex(&rotation), ROTATION);
+    assert_eq!(hex(&rotation_signature.to_bytes()), ROTATION_SIGNATURE);
+    assert_eq!(
+        certificate::CertificateV2::from_bytes(&cert.to_bytes()),
+        Ok(cert)
+    );
+    let bytes = cert.to_bytes();
+    assert_eq!(
+        certificate::CertificateV2::from_bytes(&bytes[..96]),
+        Err(Error::InvalidLength)
+    );
+    assert_eq!(
+        certificate::CertificateV2::from_bytes(&unhex(example::CERTIFICATE)),
+        Err(Error::UnsupportedVersion)
+    );
+    let mut bad = bytes;
+    bad[49..].fill(0xFF);
+    assert_eq!(
+        certificate::CertificateV2::from_bytes(&bad),
+        Err(Error::InvalidPoint)
+    );
+}
+
 #[test]
 fn certificate_decoding_and_combination_errors() {
     use example::*;

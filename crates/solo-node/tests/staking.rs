@@ -2,25 +2,31 @@
 //! epochs that change the set as validators bond and unbond, quorums
 //! weighed by stake, an equivocator slashed once and excluded, and the
 //! threshold key: a DKG that completes and switches certificates to BLS,
-//! resharing that keeps the group key across a set change, a DKG that
-//! survives a misbehaving dealer, and a node that syncs across an epoch
-//! boundary on BLS certificates.
+//! a fresh key each epoch that the old key hands off to, a failed DKG that
+//! keeps the active key, a DKG that survives a misbehaving dealer, a node
+//! that syncs across a rotation on BLS certificates, and shareholders
+//! slashed once for partial signatures no honest shareholder makes.
 
 use k256::ecdsa::SigningKey;
 use solo_abi::chain::consensus::{
     KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE, TOPIC, leader, signing_preimage,
 };
 use solo_abi::chain::{
-    Allocation, Certificate, ConsensusMessage, GenesisParams, Proposal, Signature, SyncResponse,
-    Validator, ValidatorSet, reason,
+    Allocation, BlockHeader, Certificate, ConsensusMessage, GenesisParams, Proposal, Signature,
+    SyncResponse, Validator, ValidatorSet, reason,
 };
 use solo_abi::codec::Seq;
-use solo_abi::staking::{
-    DkgEnvelope, DkgRequest, DkgRun, GWEI, KIND_DKG, KeystoreRequest, PartialShare,
-    STAKING_ADDRESS, StakingAction, StakingParams, StakingStatus, ValidatorKey, certificate_bytes,
-    certificate_message, envelope, event, first_view, keys as skeys, query, selector, view_epoch,
+use solo_abi::rotation::{
+    self, Handoff, RotationCertificate, ThresholdEvidence,
+    certificate_bytes as certificate_bytes_v2, certificate_message as certificate_message_v2,
+    offence, rotation_message,
 };
-use solo_abi::types::{Genesis, Input};
+use solo_abi::staking::{
+    DkgEnvelope, DkgRequest, DkgRun, GWEI, KIND_DKG, KeySetRecord, KeystoreRequest, PartialShare,
+    STAKING_ADDRESS, StakingAction, StakingParams, StakingStatus, ValidatorKey, envelope, event,
+    first_view, keys as skeys, query, selector, view_epoch,
+};
+use solo_abi::types::{Block, Effect, Genesis, Input};
 use solo_abi::{Decode, Encode};
 use solo_host::hash::keccak256;
 use solo_node::keystore::{Keystore, encryption_key};
@@ -113,23 +119,38 @@ fn genesis(
     }
 }
 
+/// Staking in epochs of `epoch_blocks`; with threshold keys, a key age of 2
+/// and the shortest unbonding period it allows (spec 15 §6.7).
 fn staking(epoch_blocks: u64, dkg_phase_blocks: u64) -> StakingParams {
     StakingParams {
         epoch_blocks,
-        unbonding_epochs: 0,
+        unbonding_epochs: if dkg_phase_blocks == 0 { 0 } else { 4 },
         min_stake: 0,
         max_validators: 0,
         dkg_phase_blocks,
+        max_key_age: 2,
         keys: Seq(vec![]),
     }
 }
 
 /// A legacy EIP-155 transaction from `key` to `to`.
 fn tx(key: &SigningKey, nonce: u64, to: [u8; 20], value: u128, data: &[u8]) -> Vec<u8> {
+    tx_with_gas(key, nonce, to, value, data, 200_000)
+}
+
+/// [`tx`] with gas limit `gas`.
+fn tx_with_gas(
+    key: &SigningKey,
+    nonce: u64,
+    to: [u8; 20],
+    value: u128,
+    data: &[u8],
+    gas: u64,
+) -> Vec<u8> {
     let fields = |out: &mut Vec<u8>| {
         encode_uint(u128::from(nonce), out);
         encode_uint(1_000_000_000, out);
-        encode_uint(200_000, out);
+        encode_uint(u128::from(gas), out);
         encode_bytes(&to, out);
         encode_uint(value, out);
         encode_bytes(data, out);
@@ -214,6 +235,11 @@ fn selectors_and_events_are_the_solidity_ones() {
         event::UNBONDED
     );
     assert_eq!(keccak256(b"Withdrawn(address,uint256)"), event::WITHDRAWN);
+    assert_eq!(sel("report(bytes)"), selector::REPORT);
+    assert_eq!(
+        keccak256(b"Reported(address,uint8,uint64)"),
+        event::REPORTED
+    );
     // The certificate helpers of the ABI are the ones of solo-bls.
     let message = solo_abi::staking::certificate_message(CHAIN_ID, 3, &[7; 32]);
     assert_eq!(
@@ -223,6 +249,18 @@ fn selectors_and_events_are_the_solidity_ones() {
     assert_eq!(
         solo_abi::staking::DST_SIGNATURE,
         solo_bls::sig::DST_SIGNATURE
+    );
+    // And so are the version-2 message and the rotation message.
+    assert_eq!(
+        certificate_message_v2(CHAIN_ID, 2, 3, &[7; 32]),
+        solo_bls::certificate::message_v2(CHAIN_ID, 2, 3, &[7; 32]).to_vec()
+    );
+    let pk = solo_bls::SecretKey::generate(&[1; 32], b"")
+        .unwrap()
+        .public_key();
+    assert_eq!(
+        rotation_message(CHAIN_ID, 4, &pk.to_bytes()),
+        solo_bls::certificate::rotation_message(CHAIN_ID, 4, &pk).to_vec()
     );
 }
 
@@ -601,16 +639,94 @@ fn bls_certificate(node: &Node, height: u64) -> Option<Vec<u8>> {
     node.persisted().get(&k).cloned()
 }
 
-fn verifies(group_key: &[u8], cert: &[u8]) -> bool {
-    let key = solo_bls::PublicKey::from_bytes(group_key.try_into().unwrap()).unwrap();
-    solo_bls::Certificate::from_bytes(cert)
+/// The key set with id `id` that `node`'s chain adopted.
+fn key_set(node: &Node, id: u64) -> Option<KeySetRecord> {
+    node.state_get(&[skeys::KEY_SET, &id.to_be_bytes()].concat())
+        .map(|b| KeySetRecord::from_bytes(&b).unwrap())
+}
+
+fn public_key(record: &KeySetRecord) -> solo_bls::PublicKey {
+    solo_bls::PublicKey::from_bytes(record.key_set[..96].try_into().unwrap()).unwrap()
+}
+
+/// Whether `cert` is a version-2 certificate (97 bytes, spec 12 §7) that
+/// verifies under the group key of the key set it names.
+fn verifies(node: &Node, cert: &[u8]) -> bool {
+    let c = solo_bls::certificate::CertificateV2::from_bytes(cert).unwrap();
+    c.verify(CHAIN_ID, &public_key(&key_set(node, c.key_id).unwrap()))
+}
+
+/// The key set id a version-2 certificate names.
+fn key_id_of(cert: &[u8]) -> u64 {
+    solo_bls::certificate::CertificateV2::from_bytes(cert)
         .unwrap()
-        .verify(CHAIN_ID, &key)
+        .key_id
+}
+
+/// The handoff out of key set `from` that `node`'s chain recorded.
+fn handoff(node: &mut Node, from: u64) -> Option<Handoff> {
+    let r = node
+        .query(rotation::query::HANDOFF, &from.to_bytes())
+        .unwrap();
+    (r.status == 0).then(|| Handoff::from_bytes(&r.body).unwrap())
+}
+
+/// A chain-state `u64` of key set `id` under `prefix`.
+fn height_of(node: &Node, prefix: &[u8], id: u64) -> Option<u64> {
+    node.state_get(&[prefix, &id.to_be_bytes()].concat())
+        .map(|b| u64::from_bytes(&b).unwrap())
+}
+
+/// Validator `key`'s partial signature over `message` with its share of key
+/// set `id`, its keystore having replayed the run from `node`'s chain state.
+fn partial_of(node: &Node, key: &SigningKey, id: u64, message: &[u8]) -> PartialShare {
+    let run = DkgRun::from_bytes(
+        &node
+            .state_get(&[skeys::RUN, &id.to_be_bytes()].concat())
+            .unwrap(),
+    )
+    .unwrap();
+    let transcript: Vec<Vec<u8>> = node
+        .state_scan(&[skeys::MESSAGE, &id.to_be_bytes()].concat())
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect();
+    let index = u32::try_from(
+        run.recipients
+            .0
+            .iter()
+            .position(|r| *r == validator_id(key))
+            .unwrap(),
+    )
+    .unwrap()
+        + 1;
+    let mut store = Keystore::default();
+    let replay = KeystoreRequest::Dkg(DkgRequest {
+        key_set: id,
+        session: run.session,
+        threshold: run.threshold,
+        dealers: u32::try_from(run.dealers.0.len()).unwrap(),
+        recipients: run.keys.clone(),
+        recipient: index,
+        transcript: Seq(transcript),
+        upto: 3,
+        ..DkgRequest::default()
+    });
+    store.handle(Some(key), &replay.to_bytes()).unwrap();
+    let sign = KeystoreRequest::Sign {
+        key_set: id,
+        message: message.to_vec(),
+    };
+    PartialShare {
+        key_set: id,
+        index,
+        signature: store.handle(Some(key), &sign.to_bytes()).unwrap(),
+    }
 }
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn threshold_keys_across_epochs() {
+fn threshold_keys_rotate_across_epochs() {
     // Four genesis validators, a fifth key that joins in epoch 1 while the fourth leaves,
     // and an observer that is offline until the end.
     let keys = keys(5);
@@ -618,7 +734,8 @@ fn threshold_keys_across_epochs() {
     let genesis = genesis(&keys, &[0, 1, 2, 3], &[STAKE; 4], &staking(24, 4));
     let mut sim = Sim::new(kernel, &genesis, &keys, 1, &at(10_000), 20).unwrap();
     sim.crash(5);
-    // Epoch 0's DKG: four dealers, threshold 3, the key adopted in its confirmation phase.
+    // Epoch 0's DKG: four dealers, threshold 3, the key adopted in its confirmation phase
+    // and active at once, as the first key needs no handoff.
     let done = sim
         .run_until(80 * SLOT_MS, |s| adopted(s, &[0, 1, 2, 3, 4], 0))
         .unwrap();
@@ -627,9 +744,8 @@ fn threshold_keys_across_epochs() {
     let first = s.active.unwrap();
     assert_eq!((first.threshold(), first.shareholders.0.len()), (3, 4));
     assert_eq!(s.group_key, first.key_set[..96].to_vec());
-    let group_key = s.group_key.clone();
-    // Certificates switch to BLS: once the key is active every finalized block gets one
-    // (89 bytes, spec 12 §7) that verifies under the group key.
+    // Certificates switch to BLS: once the key is active every finalized block gets a
+    // version-2 certificate (97 bytes, spec 12 §7) naming key set 0.
     let start = sim.nodes[0].finalized_height().unwrap() + 1;
     let switched = sim
         .run_until(40 * SLOT_MS, |s| {
@@ -639,8 +755,8 @@ fn threshold_keys_across_epochs() {
     assert!(switched);
     for h in [start, start + 1] {
         let cert = bls_certificate(&sim.nodes[0], h).unwrap();
-        assert_eq!(cert.len(), 89);
-        assert!(verifies(&group_key, &cert));
+        assert_eq!((cert.len(), key_id_of(&cert)), (97, 0));
+        assert!(verifies(&sim.nodes[0], &cert));
     }
     // A set change: the fifth key registers with its stake, the fourth unbonds.
     let register = StakingAction::Register {
@@ -660,11 +776,11 @@ fn threshold_keys_across_epochs() {
         ),
     )
     .unwrap();
-    // Epoch 1 reshares among the new set; the departed validator still deals its share.
-    let reshared = sim
+    // Epoch 1 generates a fresh key among the new set, and key 0 hands off to it.
+    let rotated = sim
         .run_until(160 * SLOT_MS, |s| adopted(s, &[0, 1, 2, 3, 4], 1))
         .unwrap();
-    assert!(reshared, "{:?}", sim.finalized_heights().unwrap());
+    assert!(rotated, "{:?}", sim.finalized_heights().unwrap());
     let s = status(&mut sim.nodes[4]);
     let second = s.active.unwrap();
     let ids: Vec<[u8; 32]> = [0, 1, 2, 4]
@@ -672,30 +788,54 @@ fn threshold_keys_across_epochs() {
         .map(|&i| validator_id(&keys[i]))
         .collect();
     assert_eq!(second.shareholders.0, ids);
-    assert_ne!(second.key_set, first.key_set);
-    // The group key is the same, so certificates of the new set verify under it.
-    assert_eq!(s.group_key, group_key);
-    assert_eq!(&second.key_set[..96], group_key.as_slice());
+    assert_ne!(second.key_set[..96], first.key_set[..96]);
+    assert_eq!(s.group_key, second.key_set[..96].to_vec());
     let run = DkgRun::from_bytes(
         &sim.nodes[0]
             .state_get(&[skeys::RUN, &1u64.to_be_bytes()].concat())
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(run.previous, Some(0));
+    assert_eq!((run.previous, &run.dealers.0), (None, &ids));
+    // The handoff is key 0's group signature over the rotation message to key set 1.
+    let h = handoff(&mut sim.nodes[0], 0).unwrap();
+    assert_eq!(
+        (h.from, h.to, h.key.as_slice()),
+        (0, 1, &second.key_set[..96])
+    );
+    let signature =
+        solo_bls::Signature::from_bytes(&h.signature.clone().try_into().unwrap()).unwrap();
+    assert!(public_key(&first).verify(&h.message(CHAIN_ID), &signature));
+    assert_eq!(
+        height_of(&sim.nodes[0], rotation::keys::REPLACED, 0),
+        Some(h.height)
+    );
+    assert_eq!(
+        height_of(&sim.nodes[0], rotation::keys::ACTIVATED, 1),
+        Some(h.height)
+    );
+    assert!(handoff(&mut sim.nodes[0], 1).is_none());
+    // Certificates now name key set 1 and verify under its key, not key 0's.
     let later = sim.nodes[4].finalized_height().unwrap() + 2;
     assert!(
         sim.run_until(40 * SLOT_MS, |s| bls_certificate(&s.nodes[4], later)
             .is_some())
             .unwrap()
     );
-    assert!(verifies(
-        &group_key,
-        &bls_certificate(&sim.nodes[4], later).unwrap()
-    ));
-    // The observer comes back with nothing and syncs from genesis across the epoch
-    // boundary: once it has executed the block that adopted the key, the threshold
-    // certificates of the responses are what it verifies.
+    let cert = bls_certificate(&sim.nodes[4], later).unwrap();
+    assert_eq!(key_id_of(&cert), 1);
+    assert!(verifies(&sim.nodes[4], &cert));
+    let c = solo_bls::certificate::CertificateV2::from_bytes(&cert).unwrap();
+    assert!(!c.verify(CHAIN_ID, &public_key(&first)));
+    // The observer comes back with nothing, two sync batches after the handoff, and syncs
+    // from genesis across the rotation: the threshold certificates it keeps verify under
+    // the key set they name, key 0's before the handoff and key 1's after.
+    let past = h.height + 34;
+    assert!(
+        sim.run_until(120 * SLOT_MS, |s| s.nodes[0].finalized_height().unwrap()
+            >= past)
+            .unwrap()
+    );
     sim.revive_from_scratch(5, kernel, &genesis).unwrap();
     let head = sim.nodes[0].finalized_height().unwrap();
     let synced = sim
@@ -705,17 +845,111 @@ fn threshold_keys_across_epochs() {
         .unwrap();
     assert!(synced, "{:?}", sim.finalized_heights().unwrap());
     assert!(status(&mut sim.nodes[5]).epoch >= 1);
-    let by_threshold: Vec<u64> = (25..=head)
+    let by_threshold: Vec<u64> = (1..=head)
         .filter(|&h| bls_certificate(&sim.nodes[5], h).is_some())
         .collect();
     assert!(!by_threshold.is_empty());
-    for h in by_threshold {
-        assert!(verifies(
-            &group_key,
-            &bls_certificate(&sim.nodes[5], h).unwrap()
-        ));
+    let mut named = std::collections::BTreeSet::new();
+    for height in by_threshold {
+        let cert = bls_certificate(&sim.nodes[5], height).unwrap();
+        assert!(verifies(&sim.nodes[5], &cert));
+        named.insert(key_id_of(&cert));
     }
+    assert!(named.contains(&0) && named.contains(&1), "{named:?}");
     assert_agreement(&sim);
+    // Honest rotation produced no evidence and slashed no one.
+    assert_eq!(evidence_count(&mut sim.nodes[0]), 0);
+    assert!(!record_of(&mut sim.nodes[0], &keys[1]).jailed);
+    // A valid partial of key 0 over a proposal anchored below the handoff is honest, so
+    // it is no evidence of a stale key: key 0 was still in force at that anchor.
+    let early = Proposal {
+        height: h.height + 1,
+        anchor_height: h.height - 1,
+        anchor_root: sim.nodes[0]
+            .block_by_number(h.height - 1)
+            .unwrap()
+            .unwrap()
+            .state_root,
+        ..Proposal::default()
+    };
+    let subject = early.to_bytes();
+    let message = certificate_message_v2(CHAIN_ID, 0, early.height, &keccak256(&subject));
+    let p = partial_of(&sim.nodes[0], &keys[1], 0, &message);
+    assert!(share_verifies(
+        &first.public_shares.0[p.index as usize - 1],
+        &message,
+        &p.signature
+    ));
+    let honest = ThresholdEvidence {
+        kind: offence::STALE_KEY,
+        key_set: 0,
+        index: p.index,
+        signature: p.signature,
+        subject,
+    };
+    let refused = action(
+        &keys[2],
+        0,
+        0,
+        &StakingAction::Report {
+            evidence: honest.to_bytes(),
+        },
+    );
+    assert_eq!(
+        sim.submit(2, &refused),
+        Err(SubmitError::Rejected(reason::STAKING_ACTION))
+    );
+    // A partial of key 0 over a proposal anchored at or after the handoff is slashable:
+    // its shareholders had all moved to key set 1 by then (spec 15 §5.1).
+    let fake = Proposal {
+        height: h.height + 2,
+        anchor_height: h.height,
+        anchor_root: sim.nodes[0]
+            .block_by_number(h.height)
+            .unwrap()
+            .unwrap()
+            .state_root,
+        ..Proposal::default()
+    };
+    let subject = fake.to_bytes();
+    let message = certificate_message_v2(CHAIN_ID, 0, fake.height, &keccak256(&subject));
+    let p = partial_of(&sim.nodes[0], &keys[1], 0, &message);
+    let evidence = ThresholdEvidence {
+        kind: offence::STALE_KEY,
+        key_set: 0,
+        index: p.index,
+        signature: p.signature,
+        subject,
+    };
+    let report = action(
+        &keys[2],
+        0,
+        0,
+        &StakingAction::Report {
+            evidence: evidence.to_bytes(),
+        },
+    );
+    let hash = sim.submit(2, &report).unwrap();
+    assert!(
+        sim.run_until(40 * SLOT_MS, |s| s.nodes[0]
+            .receipt(&hash)
+            .unwrap()
+            .is_some())
+            .unwrap()
+    );
+    let receipt = sim.nodes[0].receipt(&hash).unwrap().unwrap();
+    assert_eq!(receipt.status, 1);
+    let log = &receipt.logs.0[0];
+    assert_eq!(
+        (log.topics.0[0], &log.topics.0[1][12..]),
+        (event::REPORTED, &address(&keys[1])[..])
+    );
+    // `Reported(offender, kind, key_set)`: kind 2, key set 0.
+    let mut kind = [0u8; 32];
+    kind[31] = offence::STALE_KEY;
+    assert_eq!(log.data, [kind, [0u8; 32]].concat());
+    assert!(record_of(&mut sim.nodes[0], &keys[1]).jailed);
+    assert_eq!(evidence_count(&mut sim.nodes[0]), 1);
 }
 
 #[test]
@@ -796,7 +1030,6 @@ fn a_dkg_with_a_misbehaving_dealer_still_completes() {
     assert!(message(1, 1).is_some());
     assert!(message(2, 5).is_none());
     // The key the four honest dealers made signs: all four shareholders' partials combine.
-    let s = status(&mut sim.nodes[2]);
     let start = sim.nodes[2].finalized_height().unwrap() + 1;
     assert!(
         sim.run_until(40 * SLOT_MS, |s| bls_certificate(&s.nodes[2], start)
@@ -804,7 +1037,7 @@ fn a_dkg_with_a_misbehaving_dealer_still_completes() {
             .unwrap()
     );
     assert!(verifies(
-        &s.group_key,
+        &sim.nodes[2],
         &bls_certificate(&sim.nodes[2], start).unwrap()
     ));
 }
@@ -986,44 +1219,9 @@ fn shareholders_with_little_stake_cannot_certify_blocks_to_a_syncing_node() {
     let hash = keccak256(&fake.to_bytes());
     // The three replay the run from chain state in their own keystores and sign the fake
     // block; their partials combine into a certificate that verifies under the group key.
-    let run = DkgRun::from_bytes(
-        &sim.nodes[4]
-            .state_get(&[skeys::RUN, &0u64.to_be_bytes()].concat())
-            .unwrap(),
-    )
-    .unwrap();
-    let transcript: Vec<Vec<u8>> = sim.nodes[4]
-        .state_scan(&[skeys::MESSAGE, &0u64.to_be_bytes()].concat())
-        .into_iter()
-        .map(|(_, v)| v)
-        .collect();
-    let message = certificate_message(CHAIN_ID, fake.height, &hash);
-    let partials = (1..4u32)
-        .map(|index| {
-            let key = &keys[index as usize];
-            let mut store = Keystore::default();
-            let replay = KeystoreRequest::Dkg(DkgRequest {
-                key_set: 0,
-                session: run.session,
-                threshold: run.threshold,
-                dealers: u32::try_from(run.dealers.0.len()).unwrap(),
-                recipients: run.keys.clone(),
-                recipient: index + 1,
-                transcript: Seq(transcript.clone()),
-                upto: 3,
-                ..DkgRequest::default()
-            });
-            store.handle(Some(key), &replay.to_bytes()).unwrap();
-            let sign = KeystoreRequest::Sign {
-                key_set: 0,
-                message: message.clone(),
-            };
-            PartialShare {
-                key_set: 0,
-                index: index + 1,
-                signature: store.handle(Some(key), &sign.to_bytes()).unwrap(),
-            }
-        })
+    let message = certificate_message_v2(CHAIN_ID, 0, fake.height, &hash);
+    let partials = (1..4)
+        .map(|i| partial_of(&sim.nodes[4], &keys[i], 0, &message))
         .collect();
     let combine = KeystoreRequest::Combine {
         key_set: record.key_set.clone(),
@@ -1033,8 +1231,8 @@ fn shareholders_with_little_stake_cannot_certify_blocks_to_a_syncing_node() {
     let signature = Keystore::default()
         .handle(None, &combine.to_bytes())
         .unwrap();
-    let forged = certificate_bytes(fake.height, &hash, &signature);
-    assert!(verifies(&s.group_key, &forged));
+    let forged = certificate_bytes_v2(0, fake.height, &hash, &signature);
+    assert!(verifies(&sim.nodes[4], &forged));
     // A proposal far above its tip, signed by the view's leader, makes the observer ask
     // the test for blocks.
     let set = set_of(&mut sim.nodes[4], view_epoch(st.view)).unwrap();
@@ -1158,10 +1356,470 @@ fn an_epoch_end_finalized_by_a_suffix_and_a_restarted_shareholder() {
         })
         .unwrap();
     assert!(resumed);
-    let group_key = status(&mut sim.nodes[2]).group_key;
     assert!(verifies(
-        &group_key,
+        &sim.nodes[2],
         &bls_certificate(&sim.nodes[0], end + 3).unwrap()
     ));
+    assert_agreement(&sim);
+}
+
+#[test]
+fn threshold_keys_need_an_unbonding_period_past_the_key_age() {
+    // A key age of 2 epochs needs at least 4 epochs of unbonding: the age, one epoch of
+    // handoff latency and one in which evidence about the last trusted anchor lands.
+    let keys = keys(1);
+    let ok = genesis(&keys, &[0], &[STAKE], &staking(16, 2));
+    assert!(Node::new(kernel_module(), &ok, 0).is_ok());
+    let with = |age: u64, unbonding: u64, phase: u64| {
+        let mut params = GenesisParams::from_bytes(&ok.params).unwrap();
+        params.staking.max_key_age = age;
+        params.staking.unbonding_epochs = unbonding;
+        params.staking.dkg_phase_blocks = phase;
+        Genesis {
+            params: params.to_bytes(),
+            ..ok.clone()
+        }
+    };
+    for (age, unbonding) in [(0, 4), (2, 3), (3, 4)] {
+        assert!(
+            Node::new(kernel_module(), &with(age, unbonding, 2), 0).is_err(),
+            "{age} {unbonding}"
+        );
+    }
+    assert!(Node::new(kernel_module(), &with(3, 5, 2), 0).is_ok());
+    // Without threshold keys neither matters.
+    assert!(Node::new(kernel_module(), &with(0, 0, 0), 0).is_ok());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_failed_dkg_keeps_the_active_key() {
+    // Two validators hold nearly all the stake and two very little; all four hold shares.
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let weights = [1_000_000, 1_000_000, 1, 1];
+    let genesis = genesis(&keys, &[0, 1, 2, 3], &weights, &staking(24, 4));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    let done = sim
+        .run_until(80 * SLOT_MS, |s| adopted(s, &[0, 1, 2, 3], 0))
+        .unwrap();
+    assert!(done, "{:?}", sim.finalized_heights().unwrap());
+    // The two small ones go down before epoch 1's dealings. Two dealers of four cannot
+    // reach the threshold of three, so epoch 1's run makes no key, while the two large
+    // ones keep finalizing.
+    sim.crash(2);
+    sim.crash(3);
+    let dealt = sim
+        .run_until(200 * SLOT_MS, |s| {
+            (0..2).all(|i| s.nodes[i].finalized_height().unwrap() >= 30)
+        })
+        .unwrap();
+    assert!(dealt, "{:?}", sim.finalized_heights().unwrap());
+    let dealings = sim.nodes[0]
+        .state_scan(&[skeys::MESSAGE, &1u64.to_be_bytes(), &[0]].concat())
+        .len();
+    assert_eq!(dealings, 2);
+    // They come back; epoch 1 ends without a key set 1, and key 0 is still active.
+    sim.revive(2, kernel, &genesis).unwrap();
+    sim.revive(3, kernel, &genesis).unwrap();
+    let ended = sim
+        .run_until(200 * SLOT_MS, |s| {
+            (0..4).all(|i| s.nodes[i].finalized_height().unwrap() >= 49)
+        })
+        .unwrap();
+    assert!(ended, "{:?}", sim.finalized_heights().unwrap());
+    assert!(key_set(&sim.nodes[0], 1).is_none());
+    assert_eq!(status(&mut sim.nodes[0]).active.unwrap().id, 0);
+    assert!(handoff(&mut sim.nodes[0], 0).is_none());
+    // A later run makes a key, and key 0, still active, hands off to it.
+    let handed = sim
+        .run_until(400 * SLOT_MS, |s| handoff(&mut s.nodes[0], 0).is_some())
+        .unwrap();
+    assert!(handed, "{:?}", sim.finalized_heights().unwrap());
+    let h = handoff(&mut sim.nodes[0], 0).unwrap();
+    assert!(h.to >= 2, "{h:?}");
+    assert!(key_set(&sim.nodes[0], 1).is_none());
+    assert_eq!(status(&mut sim.nodes[0]).active.unwrap().id, h.to);
+    assert_agreement(&sim);
+}
+
+/// `env` signed by `key` as a DKG envelope (spec 15 §6.2).
+fn envelope_of(key: &SigningKey, epoch: u64, kind: u8, body: Vec<u8>) -> ConsensusMessage {
+    let body_hash = keccak256(&DkgEnvelope::signed_hash_preimage(kind, &body));
+    let digest = keccak256(&signing_preimage(KIND_DKG, CHAIN_ID, epoch, &body_hash));
+    let env = DkgEnvelope {
+        epoch,
+        kind,
+        body,
+        signature: Signature(solo_node::sign_recoverable(key, &digest).unwrap()),
+    };
+    ConsensusMessage::Dkg {
+        envelope: env.to_bytes(),
+    }
+}
+
+/// Whether `signature` (48 bytes) verifies over `message` under the public
+/// share `share` (96 bytes), as the kernel checks a partial.
+fn share_verifies(share: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    let key = solo_bls::PublicKey::from_bytes(share.try_into().unwrap()).unwrap();
+    let signature = solo_bls::Signature::from_bytes(signature.try_into().unwrap()).unwrap();
+    key.verify(message, &signature)
+}
+
+fn evidence_count(node: &mut Node) -> usize {
+    let r = node
+        .query(rotation::query::THRESHOLD_EVIDENCE, &0u64.to_bytes())
+        .unwrap();
+    Seq::<ThresholdEvidence>::from_bytes(&r.body)
+        .unwrap()
+        .0
+        .len()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn threshold_misbehaviour_is_slashed_once() {
+    // Four validators with nodes and a funded outsider who reports.
+    let keys = keys(5);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, &[0, 1, 2, 3], &[STAKE; 4], &staking(24, 4));
+    let mut sim = Sim::new(kernel, &genesis, &keys[..4], 0, &at(10_000), 20).unwrap();
+    let done = sim
+        .run_until(80 * SLOT_MS, |s| adopted(s, &[0, 1, 2, 3], 0))
+        .unwrap();
+    assert!(done, "{:?}", sim.finalized_heights().unwrap());
+    // Validator 3's partial over a proposal whose anchor root is not the root the chain
+    // executed at height 2.
+    let fake = Proposal {
+        height: 40,
+        anchor_height: 2,
+        anchor_root: [0x66; 32],
+        ..Proposal::default()
+    };
+    let subject = fake.to_bytes();
+    let message = certificate_message_v2(CHAIN_ID, 0, fake.height, &keccak256(&subject));
+    let p = partial_of(&sim.nodes[0], &keys[3], 0, &message);
+    let evidence = ThresholdEvidence {
+        kind: offence::ANCHOR,
+        key_set: 0,
+        index: p.index,
+        signature: p.signature,
+        subject,
+    };
+    let before = record_of(&mut sim.nodes[0], &keys[3]);
+    let pot = balance(&mut sim.nodes[0], STAKING_ADDRESS);
+    let report = |nonce: u64, evidence: &ThresholdEvidence| {
+        action(
+            &keys[4],
+            nonce,
+            0,
+            &StakingAction::Report {
+                evidence: evidence.to_bytes(),
+            },
+        )
+    };
+    // Evidence that shows nothing cannot run: validator 3's partial, valid under its
+    // share, over the same proposal with the root the chain executed.
+    let mut proposal = fake.clone();
+    proposal.anchor_root = sim.nodes[0].block_by_number(2).unwrap().unwrap().state_root;
+    let subject = proposal.to_bytes();
+    let message = certificate_message_v2(CHAIN_ID, 0, proposal.height, &keccak256(&subject));
+    let valid = partial_of(&sim.nodes[0], &keys[3], 0, &message);
+    let share = &key_set(&sim.nodes[0], 0).unwrap().public_shares.0[valid.index as usize - 1];
+    assert!(share_verifies(share, &message, &valid.signature));
+    let honest = ThresholdEvidence {
+        kind: offence::ANCHOR,
+        key_set: 0,
+        index: valid.index,
+        signature: valid.signature,
+        subject,
+    };
+    assert_eq!(
+        sim.submit(0, &report(0, &honest)),
+        Err(SubmitError::Rejected(reason::STAKING_ACTION))
+    );
+    // Reported in a transaction to the staking address, it slashes and jails validator 3.
+    let hash = sim.submit(0, &report(0, &evidence)).unwrap();
+    assert!(
+        sim.run_until(40 * SLOT_MS, |s| s.nodes[0]
+            .receipt(&hash)
+            .unwrap()
+            .is_some())
+            .unwrap()
+    );
+    let receipt = sim.nodes[0].receipt(&hash).unwrap().unwrap();
+    assert_eq!(receipt.status, 1);
+    assert!(receipt.gas_used > rotation::REPORT_GAS + 21_000);
+    let log = &receipt.logs.0[0];
+    assert_eq!(
+        (log.address, log.topics.0[0], &log.topics.0[1][12..]),
+        (STAKING_ADDRESS, event::REPORTED, &address(&keys[3])[..])
+    );
+    assert_eq!(log.data, [[0u8; 32], [0u8; 32]].concat());
+    let after = record_of(&mut sim.nodes[0], &keys[3]);
+    assert!(after.jailed);
+    assert_eq!(after.stake, before.stake - before.stake / 10);
+    assert_eq!(
+        balance(&mut sim.nodes[0], STAKING_ADDRESS),
+        pot - before.stake / 10
+    );
+    assert_eq!(evidence_count(&mut sim.nodes[0]), 1);
+    // Once: the same offence cannot be reported again.
+    assert_eq!(
+        sim.submit(0, &report(1, &evidence)),
+        Err(SubmitError::Rejected(reason::STAKING_ACTION))
+    );
+    // Validator 2 signs a rotation to key set 0 with another group key than the one the
+    // chain adopted, and sends it as a rotation share: the nodes see it is evidence,
+    // put it in their proposals, and the chain slashes validator 2.
+    let wrong = key_set(&sim.nodes[0], 0).unwrap().public_shares.0[0].clone();
+    let p = partial_of(
+        &sim.nodes[0],
+        &keys[2],
+        0,
+        &rotation_message(CHAIN_ID, 0, &wrong),
+    );
+    let share = solo_abi::rotation::RotationShare {
+        to: 0,
+        key: wrong.clone(),
+        partial: p.clone(),
+    };
+    let m = envelope_of(&keys[2], 0, envelope::ROTATION_SHARE, share.to_bytes());
+    for i in 0..4 {
+        sim.nodes[i]
+            .deliver(validator_id(&keys[2]), TOPIC, m.to_bytes())
+            .unwrap();
+    }
+    let slashed = sim
+        .run_until(40 * SLOT_MS, |s| {
+            record_of(&mut s.nodes[0], &keys[2]).jailed
+        })
+        .unwrap();
+    assert!(slashed);
+    assert_eq!(evidence_count(&mut sim.nodes[0]), 2);
+    // Neither offence is recorded or punished again, by transaction or in a proposal.
+    let rotation_evidence = ThresholdEvidence {
+        kind: offence::ROTATION,
+        key_set: 0,
+        index: p.index,
+        signature: p.signature,
+        subject: [&0u64.to_be_bytes()[..], &wrong].concat(),
+    };
+    assert_eq!(
+        sim.submit(0, &report(1, &rotation_evidence)),
+        Err(SubmitError::Rejected(reason::STAKING_ACTION))
+    );
+    let epoch = status(&mut sim.nodes[0]).epoch;
+    let again = envelope_of(&keys[0], epoch, envelope::EVIDENCE, evidence.to_bytes());
+    for i in 0..4 {
+        sim.nodes[i]
+            .deliver(validator_id(&keys[0]), TOPIC, again.to_bytes())
+            .unwrap();
+    }
+    let height = sim.nodes[0].finalized_height().unwrap();
+    assert!(
+        sim.run_until(40 * SLOT_MS, |s| s.nodes[0].finalized_height().unwrap()
+            >= height + 4)
+            .unwrap()
+    );
+    assert_eq!(evidence_count(&mut sim.nodes[0]), 2);
+    assert_eq!(record_of(&mut sim.nodes[0], &keys[3]).stake, after.stake);
+    assert_agreement(&sim);
+}
+
+#[test]
+fn checks_that_need_a_pairing_spend_a_block_budget() {
+    // A leader puts staking transactions that fail a pairing check into its proposal:
+    // they use no gas, but each costs every node a pairing, so they draw on a budget of
+    // the block gas limit (spec 15 §3.3). Here the check is register's key check.
+    let keys = keys(2);
+    let genesis = genesis(&keys, &[0], &[STAKE], &staking(16, 0));
+    let mut node = Node::open(kernel_module(), &genesis, at(10_000)).unwrap();
+    let bad = |variant: u8| {
+        let register = StakingAction::Register {
+            dkg_key: vec![0x80 | variant; 48],
+        };
+        tx_with_gas(
+            &keys[1],
+            0,
+            STAKING_ADDRESS,
+            0,
+            &register.encode(),
+            15_000_000,
+        )
+    };
+    let rekey = |nonce: u64, to: &SigningKey| {
+        let register = StakingAction::Register {
+            dkg_key: encryption_key(to).to_vec(),
+        };
+        action(&keys[0], nonce, 0, &register)
+    };
+    let execute = |node: &mut Node, height: u64, txs: Vec<Vec<u8>>| {
+        let header = BlockHeader {
+            height,
+            timestamp_ms: 10_000 + height * SLOT_MS,
+            ..BlockHeader::default()
+        };
+        node.apply_effect(Effect::ExecuteBlock {
+            block: Block {
+                header: header.to_bytes(),
+                txs: Seq(txs),
+                participation: Vec::new(),
+            },
+        })
+        .unwrap();
+        // The running sum never reaches committed state.
+        assert!(node.state_get(b"stake/pairing_gas").is_none());
+    };
+    let receipt = |node: &mut Node, raw: &[u8]| node.receipt(&keccak256(raw)).unwrap().unwrap();
+    // Half the budget spent on a failing check leaves room for a valid one.
+    let first = rekey(0, &keys[1]);
+    execute(&mut node, 1, vec![bad(1), first.clone()]);
+    assert_eq!(receipt(&mut node, &bad(1)).gas_used, 0);
+    assert_eq!(receipt(&mut node, &first).status, 1);
+    assert_eq!(
+        record_of(&mut node, &keys[0]).dkg_key,
+        encryption_key(&keys[1]).to_vec()
+    );
+    // The whole budget spent: the valid one after it cannot run, and nothing changes.
+    let second = rekey(1, &keys[0]);
+    execute(&mut node, 2, vec![bad(2), bad(3), second.clone()]);
+    let r = receipt(&mut node, &second);
+    assert_eq!((r.status, r.gas_used), (0, 0));
+    assert_eq!(
+        record_of(&mut node, &keys[0]).dkg_key,
+        encryption_key(&keys[1]).to_vec()
+    );
+    // The budget is per block: alone in the next block it runs.
+    execute(&mut node, 3, vec![second.clone()]);
+    assert_eq!(receipt(&mut node, &second).status, 1);
+    assert_eq!(
+        record_of(&mut node, &keys[0]).dkg_key,
+        encryption_key(&keys[0]).to_vec()
+    );
+}
+
+/// The newest adopted key set's id in `node`'s chain state.
+fn newest_adopted(node: &Node) -> u64 {
+    u64::from_bytes(&node.state_get(rotation::keys::ADOPTED).unwrap()).unwrap()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_key_hands_off_only_once_its_shareholders_sign_and_only_to_the_newest_key() {
+    // Four genesis validators hold key 0. Two of them unbond and two newcomers take their
+    // seats in epoch 1, then the two leavers stop their nodes.
+    let keys = keys(6);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, &[0, 1, 2, 3], &[STAKE; 4], &staking(24, 4));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    let done = sim
+        .run_until(80 * SLOT_MS, |s| adopted(s, &[0, 1, 2, 3, 4, 5], 0))
+        .unwrap();
+    assert!(done, "{:?}", sim.finalized_heights().unwrap());
+    for i in [4, 5] {
+        let register = StakingAction::Register {
+            dkg_key: encryption_key(&keys[i]).to_vec(),
+        };
+        sim.submit(i, &action(&keys[i], 0, u128::from(STAKE) * GWEI, &register))
+            .unwrap();
+    }
+    for i in [2, 3] {
+        let unbond = StakingAction::Unbond {
+            amount: u128::from(STAKE) * GWEI,
+        };
+        sim.submit(i, &action(&keys[i], 0, 0, &unbond)).unwrap();
+    }
+    let next = sim
+        .run_until(160 * SLOT_MS, |s| {
+            s.nodes[0].finalized_height().unwrap() >= 25
+        })
+        .unwrap();
+    assert!(next, "{:?}", sim.finalized_heights().unwrap());
+    let mut set = set_of(&mut sim.nodes[0], 1).unwrap();
+    set.sort_unstable();
+    let mut newcomers = ids_of(&[
+        keys[0].clone(),
+        keys[1].clone(),
+        keys[4].clone(),
+        keys[5].clone(),
+    ]);
+    newcomers.sort_unstable();
+    assert_eq!(set, newcomers);
+    sim.crash(2);
+    sim.crash(3);
+    // Epochs 1 and 2 each adopt a fresh key among the new set, but only two of key 0's
+    // four shareholders are left to sign a handoff, below its threshold of three: key 0
+    // stays active, whichever newer key is the target.
+    let stalled = sim
+        .run_until(400 * SLOT_MS, |s| key_set(&s.nodes[0], 2).is_some())
+        .unwrap();
+    assert!(stalled, "{:?}", sim.finalized_heights().unwrap());
+    let height = sim.nodes[0].finalized_height().unwrap();
+    assert!(
+        sim.run_until(40 * SLOT_MS, |s| s.nodes[0].finalized_height().unwrap()
+            >= height + 4)
+            .unwrap()
+    );
+    assert!(key_set(&sim.nodes[0], 1).is_some());
+    assert_eq!(status(&mut sim.nodes[0]).active.unwrap().id, 0);
+    assert!(handoff(&mut sim.nodes[0], 0).is_none());
+    assert!(newest_adopted(&sim.nodes[0]) >= 2);
+    // A handoff from key 0 to key set 1, validly signed by three of its shareholders, is
+    // never recorded: key set 1 was superseded before its handoff, and the active key
+    // only ever moves to the newest adopted key (spec 15 §6.6).
+    let older = key_set(&sim.nodes[0], 1).unwrap();
+    let message = rotation_message(CHAIN_ID, 1, &older.key_set[..96]);
+    let partials = (0..3)
+        .map(|i| partial_of(&sim.nodes[0], &keys[i], 0, &message))
+        .collect();
+    let combine = KeystoreRequest::Combine {
+        key_set: key_set(&sim.nodes[0], 0).unwrap().key_set,
+        message: message.clone(),
+        partials: Seq(partials),
+    };
+    let signature = Keystore::default()
+        .handle(None, &combine.to_bytes())
+        .unwrap();
+    let first = key_set(&sim.nodes[0], 0).unwrap();
+    let point = solo_bls::Signature::from_bytes(&signature.clone().try_into().unwrap()).unwrap();
+    assert!(public_key(&first).verify(&message, &point));
+    let certificate = RotationCertificate {
+        from: 0,
+        to: 1,
+        signature,
+    };
+    let epoch = status(&mut sim.nodes[0]).epoch;
+    let m = envelope_of(&keys[0], epoch, envelope::HANDOFF, certificate.to_bytes());
+    for i in [0, 1, 4, 5] {
+        sim.nodes[i]
+            .deliver(validator_id(&keys[0]), TOPIC, m.to_bytes())
+            .unwrap();
+    }
+    let height = sim.nodes[0].finalized_height().unwrap();
+    assert!(
+        sim.run_until(40 * SLOT_MS, |s| s.nodes[0].finalized_height().unwrap()
+            >= height + 4)
+            .unwrap()
+    );
+    assert!(handoff(&mut sim.nodes[0], 0).is_none());
+    assert_eq!(status(&mut sim.nodes[0]).active.unwrap().id, 0);
+    assert!(height_of(&sim.nodes[0], rotation::keys::ACTIVATED, 1).is_none());
+    // The leavers come back and sign: key 0 hands off to the newest adopted key, and key
+    // set 1 is never activated.
+    sim.revive(2, kernel, &genesis).unwrap();
+    sim.revive(3, kernel, &genesis).unwrap();
+    let handed = sim
+        .run_until(400 * SLOT_MS, |s| handoff(&mut s.nodes[0], 0).is_some())
+        .unwrap();
+    assert!(handed, "{:?}", sim.finalized_heights().unwrap());
+    let h = handoff(&mut sim.nodes[0], 0).unwrap();
+    assert!(h.to >= 2, "{h:?}");
+    assert_eq!(
+        height_of(&sim.nodes[0], rotation::keys::ACTIVATED, h.to),
+        Some(h.height)
+    );
+    assert!(height_of(&sim.nodes[0], rotation::keys::ACTIVATED, 1).is_none());
+    assert_eq!(status(&mut sim.nodes[0]).active.unwrap().id, h.to);
     assert_agreement(&sim);
 }

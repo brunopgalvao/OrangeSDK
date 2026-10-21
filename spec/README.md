@@ -17,12 +17,12 @@ This directory is normative. An implementation that disagrees with it is wrong; 
 | 09 | [Peer-to-peer transport](09-p2p.md) — TCP framing, handshake, mapping between frames and driver inputs and effects | draft |
 | 10 | [State commitment](10-state-commitment.md) — the binary Merkle trie behind `storage_commit`, its proofs and their verification | draft |
 | 11 | [Telemetry](11-telemetry.md) — metrics endpoint and names, emitted metrics, status document, alert and health semantics | draft |
-| 12 | [Threshold certificates](12-threshold-certificates.md) — threshold BLS over BLS12-381, the DKG and resharing, the finality certificate and its verification on Ethereum | draft |
+| 12 | [Threshold certificates](12-threshold-certificates.md) — threshold BLS over BLS12-381, the DKG and resharing, the finality certificate (versions 1 and 2), the rotation message, and their verification on Ethereum | draft |
 | 13 | [Kernel upgrades and feature gates](13-upgrades.md) — the upgrade address and its actions, the upgrade timeline, feature-gate signalling, lock-in and activation | draft |
 | 14 | [Mempool](14-mempool.md) — host policy: per-sender nonce queues, pending and queued, replacement, limits and eviction, the block-ordered take, gossip | draft |
-| 15 | [Staking, epochs, slashing and the threshold key](15-staking.md) — the staking address, epochs and validator sets, slashing, the DKG runs, their messages in blocks, key-set adoption, the host's threshold keystore | draft |
+| 15 | [Staking, epochs, slashing and the threshold key](15-staking.md) — the staking address, epochs and validator sets, slashing for equivocation and threshold misbehaviour, the DKG runs for a fresh key each epoch, their messages in blocks, key-set adoption, handoffs from one key to the next, key age and unbonding, the host's threshold keystore | draft |
 | 16 | [Kernel modules and native contracts](16-modules.md) — the module interface, capabilities, genesis and governance installs, block hooks, native contracts called from the EVM (`0xEF02` designators), the native gas rate | draft |
-| 17 | [Bridge to Ethereum](17-bridge-out.md) — the outbox system address and its messages in state, the proposal anchor that certificates vouch for, the Ethereum light client and inbox with delay, rate limits, guardian and owner, relaying, the `finality_proof` query and the `solo_getFinalityProof` and `solo_getOutboxProof` RPC methods | draft |
+| 17 | [Bridge to Ethereum](17-bridge-out.md) — the outbox system address and its messages in state, the proposal anchor that certificates vouch for, the Ethereum light clients (a fixed key, and a rotating key with a trusting period) and inbox with delay, rate limits, guardian and owner, relaying, the `finality_proof` and `handoff` queries and the `solo_getFinalityProof`, `solo_getOutboxProof` and `solo_getRotation` RPC methods | draft |
 | 18 | [Ethereum to Solo](18-bridge-in.md) — the sync-committee light client of Ethereum, the outbox on Ethereum, message proofs, the message verifier and the inbox, delay, rate limit and pause, admission | draft |
 
 ## Conventions

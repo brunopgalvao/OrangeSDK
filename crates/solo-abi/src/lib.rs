@@ -13,6 +13,7 @@ pub mod chain;
 pub mod codec;
 pub mod conformance;
 pub mod modules;
+pub mod rotation;
 pub mod staking;
 pub mod types;
 

@@ -4,7 +4,8 @@
 //! against the reference kernel's EVM: sending every transaction type,
 //! receipts with logs, blocks, `eth_call` and gas estimation, code and
 //! storage, log filters, fee history and the `txpool` namespace, and the
-//! bridge relayer's `solo_getFinalityProof` and `solo_getOutboxProof`.
+//! bridge relayer's `solo_getFinalityProof`, `solo_getOutboxProof` and
+//! `solo_getRotation`.
 //! Responses take geth's shapes and error codes. Quantities are `0x` hex
 //! without leading zeros, data is `0x` hex, addresses are lowercase.
 

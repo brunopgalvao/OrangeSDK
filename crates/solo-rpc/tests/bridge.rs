@@ -1,8 +1,8 @@
 //! The bridge relayer's methods (spec 17 §7) on a one-validator chain that
 //! generates its threshold key: no certificate before the key, then a
 //! certificate with its proposal and `submit` calldata, the proof of an
-//! outbox slot against the anchored state root, and the outbox's
-//! rejection text.
+//! outbox slot against the anchored state root, the outbox's rejection
+//! text, and the handoffs of a key that rotates every epoch.
 
 mod common;
 
@@ -19,11 +19,13 @@ use solo_node::{Node, NodeConfig, PROOF_HISTORY, validator_id};
 use solo_rpc::Rpc;
 use solo_rpc::methods::{data, parse_hex, parse_quantity};
 
-fn staking_node(alice: &Wallet) -> Node {
+fn staking_node(alice: &Wallet, epoch_blocks: u64) -> Node {
     let key = node_key();
     let staking = StakingParams {
-        epoch_blocks: 1_000,
+        epoch_blocks,
         dkg_phase_blocks: 2,
+        max_key_age: 2,
+        unbonding_epochs: 4,
         keys: Seq(vec![ValidatorKey {
             id: validator_id(&key),
             dkg_key: encryption_key(&key).to_vec(),
@@ -72,7 +74,7 @@ fn quantity_of(v: &Value) -> u64 {
 #[allow(clippy::too_many_lines)]
 fn a_relayer_gets_certificates_and_outbox_proofs() {
     let alice = Wallet::new(1);
-    let mut rpc = Rpc::new(staking_node(&alice));
+    let mut rpc = Rpc::new(staking_node(&alice, 1_000));
     let mut now = 1_000;
     let mut tick = |rpc: &mut Rpc, blocks: u64| {
         for _ in 0..blocks {
@@ -123,13 +125,14 @@ fn a_relayer_gets_certificates_and_outbox_proofs() {
         json!([format!("{head:#x}")]),
     );
     assert_eq!(quantity_of(&proof["height"]), head);
+    assert_eq!(quantity_of(&proof["keyId"]), 0);
     let anchor = quantity_of(&proof["anchorHeight"]);
     assert!(anchor >= sent_at && anchor < head, "{proof}");
     assert_eq!(
         parse_hex(proof["certificate"].as_str().unwrap())
             .unwrap()
             .len(),
-        89
+        97
     );
     assert_eq!(
         parse_hex(proof["signature"].as_str().unwrap())
@@ -169,6 +172,11 @@ fn a_relayer_gets_certificates_and_outbox_proofs() {
     );
     assert_eq!(err(&mut rpc, "solo_getOutboxProof", json!([])).0, -32602);
     assert_eq!(err(&mut rpc, "solo_getFinalityProof", json!([])).0, -32602);
+    // No key has rotated within the first epoch.
+    assert_eq!(
+        ok(&mut rpc, "solo_getRotation", json!(["0x0"])),
+        Value::Null
+    );
     // Nor has a height the node no longer keeps, once PROOF_HISTORY blocks have passed it.
     tick(&mut rpc, PROOF_HISTORY as u64 + 1);
     assert_eq!(
@@ -179,4 +187,48 @@ fn a_relayer_gets_certificates_and_outbox_proofs() {
         ),
         Value::Null
     );
+}
+
+#[test]
+fn a_relayer_gets_the_handoffs_of_a_rotating_key() {
+    // One validator in epochs of 16 blocks: its key rotates every epoch, the old key
+    // handing off to the new one.
+    let alice = Wallet::new(1);
+    let mut rpc = Rpc::new(staking_node(&alice, 16));
+    let mut now = 1_000;
+    let mut rotation = Value::Null;
+    for _ in 0..80 {
+        now += SLOT_MS;
+        rpc.node_mut().tick(now).unwrap();
+        rotation = ok(&mut rpc, "solo_getRotation", json!(["0x0"]));
+        if !rotation.is_null() {
+            break;
+        }
+    }
+    assert!(!rotation.is_null());
+    assert_eq!(quantity_of(&rotation["from"]), 0);
+    assert_eq!(quantity_of(&rotation["to"]), 1);
+    assert!(quantity_of(&rotation["height"]) > 16);
+    let key = parse_hex(rotation["key"].as_str().unwrap()).unwrap();
+    assert_eq!(key.len(), 96);
+    assert_eq!(
+        parse_hex(rotation["keyEip2537"].as_str().unwrap()).unwrap(),
+        solo_bridge::group_key(&key).unwrap().to_vec()
+    );
+    assert_eq!(
+        parse_hex(rotation["signature"].as_str().unwrap())
+            .unwrap()
+            .len(),
+        128
+    );
+    let calldata = parse_hex(rotation["calldata"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        calldata[..4],
+        solo_bridge::abi::selector("rotate(uint64,bytes,bytes)")
+    );
+    assert_eq!(
+        ok(&mut rpc, "solo_getRotation", json!(["0x63"])),
+        Value::Null
+    );
+    assert_eq!(err(&mut rpc, "solo_getRotation", json!([])).0, -32602);
 }
