@@ -1,9 +1,12 @@
 //! Ethereum transactions as the reference kernel accepts them: legacy
-//! (pre-EIP-155 and EIP-155), EIP-2930 access-list and EIP-1559 dynamic-fee
-//! transactions. Decoding, the bytes each signature covers, signature-value
-//! checks, and the Osaka intrinsic-gas rules. Signature *recovery* is left to
-//! the caller, which in the kernel is a host function. Also the logs bloom.
-//! `no_std`, shared by the kernel guest and the RPC server.
+//! (pre-EIP-155 and EIP-155), EIP-2930 access-list, EIP-1559 dynamic-fee and
+//! EIP-7702 set-code transactions. Decoding, the bytes each signature (and
+//! each authorization's) covers, signature-value checks, and the Osaka
+//! intrinsic-gas rules. Signature *recovery* is left to the caller, which in
+//! the kernel is a host function. Also the logs bloom, the Ethereum block
+//! header and receipt encodings ([`header`]) and Merkle-Patricia roots
+//! ([`mpt`]) (spec 20). `no_std`, shared by the kernel guest and the RPC
+//! server.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
@@ -13,6 +16,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use solo_rlp::{Item, decode as rlp_decode, encode_bytes, encode_item, encode_list, encode_uint};
+
+pub mod header;
+pub mod mpt;
 
 /// Gas every transaction pays.
 pub const TX_BASE_GAS: u64 = 21_000;
@@ -34,6 +40,14 @@ pub const ACCESS_KEY_GAS: u64 = 1_900;
 pub const FLOOR_TOKEN_GAS: u64 = 10;
 /// Largest gas limit of one transaction (EIP-7825).
 pub const MAX_TX_GAS: u64 = 1 << 24;
+/// Intrinsic gas per authorization of a set-code transaction (EIP-7702's
+/// `PER_EMPTY_ACCOUNT_COST`); the EVM refunds part of it for an authority
+/// that already exists.
+pub const AUTHORIZATION_GAS: u64 = 25_000;
+/// The byte an authorization's signed message starts with (EIP-7702's `MAGIC`).
+pub const AUTHORIZATION_MAGIC: u8 = 0x05;
+/// The type byte of a set-code transaction (EIP-7702).
+pub const SET_CODE_TX_TYPE: u8 = 4;
 
 /// Half the secp256k1 group order: the largest `s` EIP-2 allows.
 const HALF_ORDER: [u8; 32] = [
@@ -46,7 +60,7 @@ const HALF_ORDER: [u8; 32] = [
 pub enum Error {
     /// Not a well-formed transaction of a supported type.
     Malformed,
-    /// A transaction type this kernel does not execute (blob, set-code, unknown).
+    /// A transaction type this kernel does not execute (blob, unknown).
     Unsupported,
     /// `r` or `s` out of range, `s` above half the order, or a bad `v`.
     BadSignature,
@@ -61,10 +75,66 @@ pub struct AccessItem {
     pub keys: Vec<[u8; 32]>,
 }
 
+/// One entry of a set-code transaction's authorization list (EIP-7702): the
+/// account at the signer's address is to run `address`'s code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authorization {
+    /// Chain id, big-endian: the chain's own, or 0 for every chain.
+    pub chain_id: [u8; 32],
+    /// The account whose code the authority delegates to.
+    pub address: [u8; 20],
+    /// The authority's nonce this authorization is valid at.
+    pub nonce: u64,
+    /// Signature y parity, as on the wire (any byte; only 0 and 1 recover).
+    pub y_parity: u8,
+    /// Signature `r`.
+    pub r: [u8; 32],
+    /// Signature `s`.
+    pub s: [u8; 32],
+}
+
+impl Authorization {
+    /// The bytes whose `keccak256` the authority signed:
+    /// `0x05 ‖ rlp([chain_id, address, nonce])`.
+    #[must_use]
+    pub fn signing_payload(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        encode_bytes(trim(&self.chain_id), &mut body);
+        encode_bytes(&self.address, &mut body);
+        encode_uint(u128::from(self.nonce), &mut body);
+        let mut out = alloc::vec![AUTHORIZATION_MAGIC];
+        encode_list(&body, &mut out);
+        out
+    }
+
+    /// `r ‖ s ‖ y parity` for `secp256k1_recover`, or `None` when the
+    /// signature can name no authority: a parity other than 0 or 1, `r` or
+    /// `s` zero, or `s` above half the group order (EIP-7702 requires low
+    /// `s`). Such an authorization is skipped, not the transaction refused.
+    #[must_use]
+    pub fn signature(&self) -> Option<[u8; 65]> {
+        if self.y_parity > 1 || self.r == [0; 32] || self.s == [0; 32] || self.s > HALF_ORDER {
+            return None;
+        }
+        let mut out = [0u8; 65];
+        out[..32].copy_from_slice(&self.r);
+        out[32..64].copy_from_slice(&self.s);
+        out[64] = self.y_parity;
+        Some(out)
+    }
+}
+
+/// A big-endian integer without its leading zero bytes, as RLP encodes it.
+#[must_use]
+pub fn trim(value: &[u8]) -> &[u8] {
+    let zeros = value.iter().take_while(|b| **b == 0).count();
+    &value[zeros..]
+}
+
 /// A decoded transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tx {
-    /// 0 legacy, 1 access list, 2 dynamic fee.
+    /// 0 legacy, 1 access list, 2 dynamic fee, 4 set code.
     pub tx_type: u8,
     /// Chain id; `None` only for a pre-EIP-155 legacy transaction.
     pub chain_id: Option<u64>,
@@ -84,6 +154,8 @@ pub struct Tx {
     pub input: Vec<u8>,
     /// Access list (empty for legacy).
     pub access_list: Vec<AccessItem>,
+    /// Authorization list of a set-code transaction; empty for every other type.
+    pub authorization_list: Vec<Authorization>,
     /// `v` as on the wire for legacy, the y parity for typed transactions.
     pub v: u64,
     /// Signature `r`.
@@ -132,6 +204,31 @@ fn access_list(item: &Item<'_>) -> Result<Vec<AccessItem>, Error> {
     Ok(out)
 }
 
+fn authorization_list(item: &Item<'_>) -> Result<Vec<Authorization>, Error> {
+    let entries = item.list().ok().ok_or(Error::Malformed)?;
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let fields = entry.list().ok().ok_or(Error::Malformed)?;
+        let [chain_id, address, nonce, y_parity, r, s] = fields else {
+            return Err(Error::Malformed);
+        };
+        out.push(Authorization {
+            chain_id: chain_id.u256().ok().ok_or(Error::Malformed)?,
+            address: address.array().ok().ok_or(Error::Malformed)?,
+            nonce: u64_of(nonce)?,
+            y_parity: u8::try_from(u64_of(y_parity)?)
+                .ok()
+                .ok_or(Error::Malformed)?,
+            r: r.u256().ok().ok_or(Error::Malformed)?,
+            s: s.u256().ok().ok_or(Error::Malformed)?,
+        });
+    }
+    if out.is_empty() {
+        return Err(Error::Malformed);
+    }
+    Ok(out)
+}
+
 fn signature_values(r: &Item<'_>, s: &Item<'_>) -> Result<([u8; 32], [u8; 32]), Error> {
     let r = r.u256().ok().ok_or(Error::Malformed)?;
     let s = s.u256().ok().ok_or(Error::Malformed)?;
@@ -165,6 +262,7 @@ pub fn decode(raw: &[u8]) -> Result<Tx, Error> {
         None => Err(Error::Malformed),
         Some(0x01) => typed(1, &raw[1..]),
         Some(0x02) => typed(2, &raw[1..]),
+        Some(0x04) => typed(SET_CODE_TX_TYPE, &raw[1..]),
         Some(0x00..=0x7F) => Err(Error::Unsupported),
         Some(_) => legacy(raw),
     }
@@ -198,6 +296,7 @@ fn legacy(raw: &[u8]) -> Result<Tx, Error> {
         value: u128_of(value)?,
         input: input.bytes().ok().ok_or(Error::Malformed)?.to_vec(),
         access_list: Vec::new(),
+        authorization_list: Vec::new(),
         v,
         r,
         s,
@@ -208,7 +307,8 @@ fn legacy(raw: &[u8]) -> Result<Tx, Error> {
 fn typed(tx_type: u8, body: &[u8]) -> Result<Tx, Error> {
     let item = rlp_decode(body).ok().ok_or(Error::Malformed)?;
     let fields = item.list().ok().ok_or(Error::Malformed)?;
-    // Both types share a layout once the dynamic-fee type's priority fee is set aside.
+    // Every type shares a layout once the dynamic-fee types' priority fee and
+    // the set-code type's authorization list are set aside.
     let (chain_id, nonce, priority_fee, gas_price, rest, unsigned) = match (tx_type, fields) {
         (1, [chain_id, nonce, gas_price, rest @ ..]) if rest.len() == 8 => {
             (chain_id, nonce, None, gas_price, rest, 8)
@@ -216,11 +316,27 @@ fn typed(tx_type: u8, body: &[u8]) -> Result<Tx, Error> {
         (2, [chain_id, nonce, priority, max_fee, rest @ ..]) if rest.len() == 8 => {
             (chain_id, nonce, Some(priority), max_fee, rest, 9)
         }
+        (SET_CODE_TX_TYPE, [chain_id, nonce, priority, max_fee, rest @ ..]) if rest.len() == 9 => {
+            (chain_id, nonce, Some(priority), max_fee, rest, 10)
+        }
         _ => return Err(Error::Malformed),
     };
-    // Both arms checked that exactly eight fields remain.
-    let (gas_limit, to, value, input) = (&rest[0], &rest[1], &rest[2], &rest[3]);
-    let (list, parity, r, s) = (&rest[4], &rest[5], &rest[6], &rest[7]);
+    // The arms checked that eight fields remain, nine with an authorization list.
+    let (gas_limit, to, value, input, list) = (&rest[0], &rest[1], &rest[2], &rest[3], &rest[4]);
+    let (parity, r, s) = (
+        &rest[rest.len() - 3],
+        &rest[rest.len() - 2],
+        &rest[rest.len() - 1],
+    );
+    let (authorizations, to) = if tx_type == SET_CODE_TX_TYPE {
+        // A set-code transaction cannot create a contract.
+        (
+            authorization_list(&rest[5])?,
+            Some(to.array().ok().ok_or(Error::Malformed)?),
+        )
+    } else {
+        (Vec::new(), to_field(to)?)
+    };
     let v = u64_of(parity)?;
     if v > 1 {
         return Err(Error::BadSignature);
@@ -233,10 +349,11 @@ fn typed(tx_type: u8, body: &[u8]) -> Result<Tx, Error> {
         gas_price: u128_of(gas_price)?,
         priority_fee: priority_fee.map(|p| u128_of(p)).transpose()?,
         gas_limit: u64_of(gas_limit)?,
-        to: to_field(to)?,
+        to,
         value: u128_of(value)?,
         input: input.bytes().ok().ok_or(Error::Malformed)?.to_vec(),
         access_list: access_list(list)?,
+        authorization_list: authorizations,
         v,
         r,
         s,
@@ -292,7 +409,7 @@ impl Tx {
         for item in &self.access_list {
             gas += ACCESS_ADDRESS_GAS + ACCESS_KEY_GAS * item.keys.len() as u64;
         }
-        gas
+        gas + AUTHORIZATION_GAS * self.authorization_list.len() as u64
     }
 
     /// The least gas the transaction is charged (EIP-7623 floor).

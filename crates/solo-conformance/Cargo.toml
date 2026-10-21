@@ -16,6 +16,7 @@ bench = false
 solo-abi = { path = "../solo-abi" }
 solo-host = { path = "../solo-host" }
 solo-recompile = { path = "../solo-recompile" }
+solo-eth = { path = "../solo-eth" }
 solo-rlp = { path = "../solo-rlp" }
 solo-vm = { path = "../solo-vm" }
 serde_json = "1"

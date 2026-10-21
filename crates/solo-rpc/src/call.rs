@@ -2,17 +2,21 @@
 //! intrinsic gas a message needs, and the error a failed message becomes.
 
 use serde_json::{Map, Value};
-use solo_abi::chain::{AccessItem, CallRequest, CallResult, call_status};
+use solo_abi::chain::{AccessItem, CallRequest, CallResult, SignedAuthorization, call_status};
 use solo_abi::codec::Seq;
 use solo_eth::Tx;
 
 use crate::RpcError;
 use crate::hex::{
-    data, parse_address, parse_big, parse_hash, parse_hex, parse_quantity, quantity_be,
+    data, parse_address, parse_big, parse_hash, parse_hex, parse_quantity, parse_word, quantity_be,
 };
 
 /// The error for an `accessList` that is not a list of entries.
 const BAD_ACCESS_LIST: &str = "accessList must be a list of objects with address and storageKeys";
+
+/// The error for an `authorizationList` that is not a list of authorizations.
+const BAD_AUTHORIZATION_LIST: &str =
+    "authorizationList must be a list of objects with chainId, address, nonce, yParity, r and s";
 
 /// geth's texts for the `Panic(uint256)` codes the Solidity compiler emits.
 const PANIC_REASONS: [(u8, &str); 10] = [
@@ -72,11 +76,46 @@ fn access_list(value: Option<&Value>) -> Result<Vec<AccessItem>, RpcError> {
     }
 }
 
+/// One `authorizationList` entry, every field required as in geth; `v` is
+/// accepted for `yParity`.
+fn authorization(item: &Value) -> Result<SignedAuthorization, RpcError> {
+    let Value::Object(object) = item else {
+        return Err(RpcError::invalid_params(BAD_AUTHORIZATION_LIST));
+    };
+    let required = |name: &str| -> Result<&str, RpcError> {
+        field(object, name)?.ok_or_else(|| RpcError::invalid_params(BAD_AUTHORIZATION_LIST))
+    };
+    let parity = match field(object, "yParity")? {
+        Some(p) => p,
+        None => required("v")?,
+    };
+    Ok(SignedAuthorization {
+        chain_id: parse_word(required("chainId")?)?,
+        address: parse_address(required("address")?)?,
+        nonce: parse_quantity(required("nonce")?)?,
+        y_parity: u8::try_from(parse_quantity(parity)?)
+            .map_err(|_| RpcError::invalid_params(BAD_AUTHORIZATION_LIST))?,
+        r: parse_word(required("r")?)?,
+        s: parse_word(required("s")?)?,
+    })
+}
+
+/// A call object's `authorizationList`: absent or null is empty.
+fn authorization_list(value: Option<&Value>) -> Result<Vec<SignedAuthorization>, RpcError> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(list)) => list.iter().map(authorization).collect(),
+        Some(_) => Err(RpcError::invalid_params(BAD_AUTHORIZATION_LIST)),
+    }
+}
+
 /// Reads a call object (`from`, `to`, `gas`, `value`, `input` or `data`,
-/// `accessList`). Fee fields are accepted and ignored: messages run at a gas
-/// price of zero. A missing `gas` is zero, which the kernel reads as its cap.
-/// The access list is charged and warmed as in an EIP-2930 transaction, so
-/// an estimate made with one covers a transaction sent with it.
+/// `accessList`, `authorizationList`). Fee fields are accepted and ignored:
+/// messages run at a gas price of zero. A missing `gas` is zero, which the
+/// kernel reads as its cap. The access list is charged and warmed as in an
+/// EIP-2930 transaction, and an authorization list makes the message an
+/// EIP-7702 one, so an estimate made with them covers a transaction sent
+/// with them.
 ///
 /// # Errors
 /// Invalid params if the object is missing or a field does not parse.
@@ -103,11 +142,13 @@ pub fn call_request(value: Option<&Value>) -> Result<CallRequest, RpcError> {
         data: bytes.unwrap_or_default(),
         gas: gas.unwrap_or_default(),
         access_list: Seq(access_list(object.get("accessList"))?),
+        authorization_list: Seq(authorization_list(object.get("authorizationList"))?),
     })
 }
 
-/// The least gas `request` can run with: the intrinsic cost, access list
-/// included, or the EIP-7623 calldata floor, whichever is higher.
+/// The least gas `request` can run with: the intrinsic cost, access and
+/// authorization lists included, or the EIP-7623 calldata floor, whichever
+/// is higher.
 #[must_use]
 pub fn min_gas(request: &CallRequest) -> u64 {
     Tx {
@@ -129,12 +170,31 @@ pub fn min_gas(request: &CallRequest) -> u64 {
                 keys: item.keys.0.clone(),
             })
             .collect(),
+        authorization_list: request
+            .authorization_list
+            .0
+            .iter()
+            .map(eth_authorization)
+            .collect(),
         v: 0,
         r: [0; 32],
         s: [0; 32],
         signing_payload: Vec::new(),
     }
     .min_gas_limit()
+}
+
+/// A call's authorization as `solo-eth` reads one from a transaction.
+#[must_use]
+pub fn eth_authorization(auth: &SignedAuthorization) -> solo_eth::Authorization {
+    solo_eth::Authorization {
+        chain_id: auth.chain_id,
+        address: auth.address,
+        nonce: auth.nonce,
+        y_parity: auth.y_parity,
+        r: auth.r,
+        s: auth.s,
+    }
 }
 
 /// A big-endian ABI word as a `usize`, if it fits.

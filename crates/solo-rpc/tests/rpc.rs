@@ -285,7 +285,10 @@ fn transactions_blocks_and_receipts() {
         genesis["sha3Uncles"],
         "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"
     );
-    assert_eq!(genesis["transactionsRoot"], data(&keccak256(&[])));
+    // Empty Merkle-Patricia tries (spec 20 §3.1).
+    let empty_trie = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421";
+    assert_eq!(genesis["transactionsRoot"], empty_trie);
+    assert_eq!(genesis["receiptsRoot"], empty_trie);
     assert_eq!(
         ok(&mut rpc, "eth_getBlockByNumber", json!(["latest"])),
         genesis
@@ -335,7 +338,9 @@ fn transactions_blocks_and_receipts() {
     assert_eq!(by_number["number"], "0x1");
     assert_eq!(by_number["parentHash"], data(&[0; 32]));
     assert_eq!(by_number["transactions"], json!([hash_hex]));
-    assert_eq!(by_number["transactionsRoot"], data(&keccak256(&hash)));
+    // The Merkle-Patricia root of the one raw transaction (spec 20 §3.2).
+    let root = alloy_trie::root::ordered_trie_root_encoded(std::slice::from_ref(&raw));
+    assert_eq!(by_number["transactionsRoot"], data(&root.0));
     assert_eq!(by_number["gasUsed"], "0x5208");
     assert_eq!(by_number["logsBloom"], data(&[0; 256]));
     assert_eq!(

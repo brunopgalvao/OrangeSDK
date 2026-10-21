@@ -36,7 +36,7 @@ use solo_abi::chain::Log;
 use solo_abi::rotation::{Handoff, query as rotation_query, threshold_certificate};
 use solo_abi::types::{Address, Hash};
 use solo_abi::{Decode, Encode};
-use solo_node::{Node, NodeError, PROOF_HISTORY};
+use solo_node::{Node, NodeError};
 use solo_trie::{Proof, Terminal, bit, branch_hash, keccak256, leaf_hash};
 
 use crate::abi::Value;
@@ -457,7 +457,7 @@ pub fn finality_proof(node: &mut Node, height: u64) -> Result<Option<FinalityPro
 
 /// The submission with the highest anchor among the finalized heights of
 /// `node` whose anchor is at least `height` and that `node` can still prove
-/// state against (the last [`PROOF_HISTORY`] heights); `None` if none is.
+/// state against (the last [`Node::state_history`] heights); `None` if none is.
 ///
 /// # Errors
 /// [`Error::Node`] if a query fails.
@@ -485,7 +485,7 @@ fn covering(
 ) -> Result<Option<Submission>, Error> {
     let top = node.finalized_height().map_err(Error::Node)?;
     let mut best: Option<Submission> = None;
-    for h in (height + 1..=top).rev().take(PROOF_HISTORY) {
+    for h in (height + 1..=top).rev().take(node.state_history) {
         let candidate = finality_proof(node, h)?
             .and_then(|p| Submission::new(&p).ok())
             .filter(|s| key_id.is_none() || s.key_id == key_id);
@@ -499,7 +499,7 @@ fn covering(
 
 /// The proof of message `nonce`'s outbox slot against the state root of
 /// `height`; `None` if `node` does not hold that height's state (older than
-/// [`solo_node::PROOF_HISTORY`] blocks, or not executed yet).
+/// [`Node::state_history`] blocks, or not executed yet).
 ///
 /// # Errors
 /// [`Error::NotCommitted`] if the message is not in that state,

@@ -45,8 +45,8 @@ fn committed_subset_passes_on_both_backends() {
     assert_eq!(
         report.total(),
         Counts {
-            passed: 490,
-            expected: 31,
+            passed: 534,
+            expected: 22,
             failed: 0
         }
     );
@@ -71,8 +71,8 @@ fn committed_subset_passes_with_gate_2_on_both_backends() {
     assert_eq!(
         report.total(),
         Counts {
-            passed: 490,
-            expected: 31,
+            passed: 534,
+            expected: 22,
             failed: 0
         }
     );
@@ -111,7 +111,7 @@ fn command_runs_a_directory_on_both_backends() {
     let total = stdout.lines().find(|l| l.starts_with("total")).unwrap();
     assert_eq!(
         total.split_whitespace().collect::<Vec<_>>(),
-        ["total", "3", "2", "0"],
+        ["total", "4", "1", "0"],
         "{stdout}"
     );
 }

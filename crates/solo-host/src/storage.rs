@@ -16,6 +16,12 @@
 //! a proof is O(depth) per key written since the last one: never a pass over
 //! the state, and never every pending write again. A layer merged into the
 //! base hands its trie over rather than having its writes hashed twice.
+//!
+//! A [`MemStorage`] can also keep its history: the value every committed key
+//! held before each numbered *version* changed it, so that it reads as it was
+//! when a version was sealed ([`MemStorage::set_view`]). A node seals one
+//! version per executed block and serves historical state from it (spec 20
+//! §5).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -96,11 +102,47 @@ pub trait Storage {
     }
 }
 
-/// An in-memory store that keeps the trie of its committed entries current.
+/// The history of a [`MemStorage`]'s committed entries.
+#[derive(Debug, Default, Clone)]
+struct History {
+    /// The value each key written since the last seal held at that seal.
+    pending: Writes,
+    /// For each key written since the oldest version kept, by the version
+    /// whose span (from the version before's seal to its own) first wrote
+    /// it, the value it held before that span.
+    versions: BTreeMap<Vec<u8>, BTreeMap<u64, Option<Vec<u8>>>>,
+    /// The keys each sealed version wrote, to prune by.
+    written: BTreeMap<u64, Vec<Vec<u8>>>,
+    /// The oldest version the store can read as.
+    oldest: u64,
+    /// The latest version sealed.
+    latest: u64,
+    /// The version reads see, if not the current state.
+    view: Option<u64>,
+}
+
+impl History {
+    /// The value `key` held when version `at` was sealed, given `current`,
+    /// the value it holds now.
+    fn at(&self, key: &[u8], at: u64, current: Option<Vec<u8>>) -> Option<Vec<u8>> {
+        let later = self
+            .versions
+            .get(key)
+            .and_then(|v| v.range(at + 1..).next());
+        match later.map(|(_, old)| old).or_else(|| self.pending.get(key)) {
+            Some(old) => old.clone(),
+            None => current,
+        }
+    }
+}
+
+/// An in-memory store that keeps the trie of its committed entries current,
+/// and their history once [`MemStorage::keep_history`] starts it.
 #[derive(Debug, Default, Clone)]
 pub struct MemStorage {
     map: BTreeMap<Vec<u8>, Vec<u8>>,
     trie: Trie,
+    history: Option<History>,
 }
 
 impl MemStorage {
@@ -112,7 +154,147 @@ impl MemStorage {
         MemStorage {
             map: BTreeMap::new(),
             trie: Trie::with_hasher(hash),
+            history: None,
         }
+    }
+
+    /// Starts keeping history, the current state being version `version`.
+    pub fn keep_history(&mut self, version: u64) {
+        self.history = Some(History {
+            oldest: version,
+            latest: version,
+            ..History::default()
+        });
+    }
+
+    /// Ends the current version's span: what was written since the last seal
+    /// becomes version `version`'s, which must be above every version sealed
+    /// before. Without history, does nothing.
+    pub fn seal(&mut self, version: u64) {
+        let Some(history) = self.history.as_mut() else {
+            return;
+        };
+        let pending = std::mem::take(&mut history.pending);
+        let mut keys = Vec::with_capacity(pending.len());
+        for (key, old) in pending {
+            history
+                .versions
+                .entry(key.clone())
+                .or_default()
+                .insert(version, old);
+            keys.push(key);
+        }
+        history.written.insert(version, keys);
+        history.latest = version;
+    }
+
+    /// Forgets what reading as a version below `oldest` needs, which can no
+    /// longer be read. Without history, does nothing.
+    pub fn prune(&mut self, oldest: u64) {
+        let Some(history) = self.history.as_mut() else {
+            return;
+        };
+        let oldest = oldest.min(history.latest);
+        if oldest <= history.oldest {
+            return;
+        }
+        // Reading as version v needs the versions above v: those up to
+        // `oldest` go.
+        let kept = history.written.split_off(&(oldest + 1));
+        for (version, keys) in std::mem::replace(&mut history.written, kept) {
+            for key in keys {
+                // Every key a version wrote has that version's entry.
+                let emptied = history.versions.get_mut(&key).is_some_and(|versions| {
+                    versions.remove(&version);
+                    versions.is_empty()
+                });
+                if emptied {
+                    history.versions.remove(&key);
+                }
+            }
+        }
+        history.oldest = oldest;
+    }
+
+    /// How many key writes the history holds: reading as the oldest version
+    /// needs the old value of every key each later version wrote, once per
+    /// version. What history costs grows with it. 0 without history.
+    #[must_use]
+    pub fn history_keys(&self) -> usize {
+        self.history
+            .as_ref()
+            .map_or(0, |h| h.written.values().map(Vec::len).sum())
+    }
+
+    /// The oldest version the store can still read as while holding at most
+    /// `keys` key writes of history ([`MemStorage::history_keys`]), from
+    /// what each sealed version wrote: the oldest kept version when all fit,
+    /// the latest when its own writes are already more. Pruning to it keeps
+    /// history within `keys`. 0 without history.
+    #[must_use]
+    pub fn oldest_within(&self, keys: usize) -> u64 {
+        let Some(history) = self.history.as_ref() else {
+            return 0;
+        };
+        let mut held = 0usize;
+        for (version, written) in history.written.iter().rev() {
+            held += written.len();
+            if held > keys {
+                return *version;
+            }
+        }
+        history.oldest
+    }
+
+    /// The versions the store can read as, oldest and latest; `None` without
+    /// history.
+    #[must_use]
+    pub fn versions(&self) -> Option<(u64, u64)> {
+        self.history.as_ref().map(|h| (h.oldest, h.latest))
+    }
+
+    /// Makes reads ([`Storage::get`], [`Storage::scan`]) see the committed
+    /// entries as they were when `version` was sealed, or the current state
+    /// for `None`. Keys outside the commitment read as they are. Writes must
+    /// not reach the store while a view is set: a node reads historical
+    /// state through an overlay layer it discards.
+    ///
+    /// # Errors
+    /// The versions the store can read as, when `version` is not among them
+    /// or the store keeps no history.
+    pub fn set_view(&mut self, version: Option<u64>) -> Result<(), Option<(u64, u64)>> {
+        let range = self.versions();
+        match (self.history.as_mut(), version) {
+            (Some(history), Some(v)) if (history.oldest..=history.latest).contains(&v) => {
+                history.view = Some(v);
+                Ok(())
+            }
+            (Some(history), None) => {
+                history.view = None;
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            _ => Err(range),
+        }
+    }
+
+    /// Records the value `key` holds before a write, the first time it is
+    /// written since the last seal.
+    fn note(&mut self, key: &[u8]) {
+        if let Some(history) = self.history.as_mut()
+            && committed(key)
+            && !history.pending.contains_key(key)
+        {
+            history
+                .pending
+                .insert(key.to_vec(), self.map.get(key).cloned());
+        }
+    }
+
+    /// The version reads see, if a view is set.
+    fn viewed(&self) -> Option<(&History, u64)> {
+        let history = self.history.as_ref()?;
+        Some((history, history.view?))
     }
 
     /// Number of keys.
@@ -130,15 +312,21 @@ impl MemStorage {
 
 impl Storage for MemStorage {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.map.get(key).cloned()
+        let current = self.map.get(key).cloned();
+        match self.viewed() {
+            Some((history, at)) if committed(key) => history.at(key, at, current),
+            _ => current,
+        }
     }
 
     fn set(&mut self, key: &[u8], value: &[u8]) {
+        self.note(key);
         self.map.insert(key.to_vec(), value.to_vec());
         apply(&mut self.trie, key, Some(value));
     }
 
     fn delete(&mut self, key: &[u8]) -> bool {
+        self.note(key);
         let existed = self.map.remove(key).is_some();
         if existed {
             apply(&mut self.trie, key, None);
@@ -147,10 +335,37 @@ impl Storage for MemStorage {
     }
 
     fn scan(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.map
+        let current = self
+            .map
             .range(prefix.to_vec()..)
             .take_while(|(k, _)| k.starts_with(prefix))
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (k.clone(), v.clone()));
+        let Some((history, at)) = self.viewed() else {
+            return current.collect();
+        };
+        // The current entries, then every key written since the version
+        // read as, with the value it held then.
+        let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+            current.map(|(k, v)| (k, Some(v))).collect();
+        let written = history
+            .versions
+            .range(prefix.to_vec()..)
+            .map(|(k, _)| k)
+            .take_while(|k| k.starts_with(prefix))
+            .chain(
+                history
+                    .pending
+                    .range(prefix.to_vec()..)
+                    .map(|(k, _)| k)
+                    .take_while(|k| k.starts_with(prefix)),
+            );
+        for key in written {
+            let current = merged.get(key).cloned().flatten();
+            merged.insert(key.clone(), history.at(key, at, current));
+        }
+        merged
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
             .collect()
     }
 
@@ -161,6 +376,9 @@ impl Storage for MemStorage {
 
     /// Writes the map and adopts `trie`, which already holds the writes.
     fn merge_layer(&mut self, writes: Writes, trie: Trie) {
+        for key in writes.keys() {
+            self.note(key);
+        }
         for (key, value) in writes {
             match value {
                 Some(value) => {
@@ -232,6 +450,12 @@ impl<S: Storage> Overlay<S> {
     /// The base store.
     pub fn base(&self) -> &S {
         &self.base
+    }
+
+    /// The base store, mutably: for a host that manages it (history,
+    /// views) between calls, with no layer open.
+    pub fn base_mut(&mut self) -> &mut S {
+        &mut self.base
     }
 
     /// Consumes the overlay, returning the base store. Open layers are dropped.
@@ -567,6 +791,111 @@ mod tests {
             expected.insert(k, v);
         }
         assert_eq!(o.commitment(), expected.root());
+    }
+
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn history_reads_every_sealed_version() {
+        let mut s = MemStorage::default();
+        s.set(b"a", b"0");
+        s.set(b"local/x", b"0");
+        // No history yet: sealing, pruning and clearing a view do nothing.
+        s.seal(1);
+        s.prune(1);
+        assert_eq!(s.versions(), None);
+        assert_eq!(s.set_view(None), Ok(()));
+        assert_eq!(s.set_view(Some(0)), Err(None));
+        s.keep_history(0);
+        // Version 1 writes a, b and a local key; version 2 deletes a, through
+        // a merged layer; version 3 writes nothing; c is written after the
+        // last seal.
+        s.set(b"a", b"1");
+        s.set(b"a", b"1b");
+        s.set(b"b", b"1");
+        s.set(b"local/x", b"1");
+        s.seal(1);
+        let mut o = Overlay::new(s);
+        o.push();
+        assert!(o.delete(b"a"));
+        o.set(b"b", b"2");
+        o.commit();
+        let mut s = o.into_base();
+        s.seal(2);
+        s.seal(3);
+        s.set(b"c", b"later");
+        assert_eq!(s.versions(), Some((0, 3)));
+        let read = |s: &mut MemStorage, v: u64| {
+            s.set_view(Some(v)).unwrap();
+            let out = (s.get(b"a"), s.get(b"b"), s.get(b"c"), s.scan(b""));
+            s.set_view(None).unwrap();
+            out
+        };
+        let (a, b, c, all) = read(&mut s, 0);
+        assert_eq!((a, b, c), (Some(b"0".to_vec()), None, None));
+        // Local keys read as they are, whatever the view.
+        assert_eq!(
+            all,
+            vec![
+                (b"a".to_vec(), b"0".to_vec()),
+                (b"local/x".to_vec(), b"1".to_vec())
+            ]
+        );
+        let (a, b, c, _) = read(&mut s, 1);
+        assert_eq!((a, b, c), (Some(b"1b".to_vec()), Some(b"1".to_vec()), None));
+        let (a, b, c, all) = read(&mut s, 2);
+        assert_eq!((a, b, c), (None, Some(b"2".to_vec()), None));
+        assert_eq!(all.len(), 2);
+        assert_eq!(read(&mut s, 3).0, None);
+        // Prefix scans see only their keys.
+        s.set_view(Some(1)).unwrap();
+        assert_eq!(s.scan(b"b"), vec![(b"b".to_vec(), b"1".to_vec())]);
+        assert_eq!(s.get(b"local/x"), Some(b"1".to_vec()));
+        s.set_view(None).unwrap();
+        assert_eq!(s.get(b"c"), Some(b"later".to_vec()));
+        // Out of range.
+        assert_eq!(s.set_view(Some(4)), Err(Some((0, 3))));
+        // Pruning below version 2 forgets what versions 0 and 1 needed.
+        s.prune(2);
+        assert_eq!(s.versions(), Some((2, 3)));
+        assert_eq!(s.set_view(Some(1)), Err(Some((2, 3))));
+        assert_eq!(read(&mut s, 2).1, Some(b"2".to_vec()));
+        // Pruning again at or below the oldest changes nothing; above the
+        // latest prunes to it.
+        s.prune(1);
+        assert_eq!(s.versions(), Some((2, 3)));
+        s.prune(9);
+        assert_eq!(s.versions(), Some((3, 3)));
+        assert_eq!(read(&mut s, 3).2, None);
+    }
+
+    #[test]
+    fn history_keys_bound_the_versions_kept() {
+        let mut s = MemStorage::default();
+        // Without history there is nothing to hold.
+        assert_eq!((s.history_keys(), s.oldest_within(0)), (0, 0));
+        s.keep_history(0);
+        // Version 1 writes three keys, version 2 one key twice and a local
+        // key, which history leaves out, and version 3 two.
+        for key in [&b"a"[..], b"b", b"c"] {
+            s.set(key, b"1");
+        }
+        s.seal(1);
+        s.set(b"a", b"2");
+        s.set(b"a", b"2b");
+        s.set(b"local/x", b"2");
+        s.seal(2);
+        s.set(b"a", b"3");
+        assert!(s.delete(b"b"));
+        s.seal(3);
+        assert_eq!(s.history_keys(), 6);
+        // Reading as version v needs what every version above v wrote.
+        for (keys, oldest) in [(6, 0), (5, 1), (3, 1), (2, 2), (1, 3), (0, 3)] {
+            assert_eq!(s.oldest_within(keys), oldest, "{keys}");
+        }
+        // Pruning to it keeps the history within the bound.
+        s.prune(s.oldest_within(2));
+        assert_eq!((s.versions(), s.history_keys()), (Some((2, 3)), 2));
+        assert_eq!(s.oldest_within(usize::MAX), 2);
     }
 
     #[test]

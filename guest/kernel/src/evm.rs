@@ -5,7 +5,8 @@ use core::convert::Infallible;
 
 use revm::bytecode::Bytecode;
 use revm::context::result::{ExecutionResult, Output};
-use revm::context::transaction::{AccessList, AccessListItem};
+use revm::context::either::Either;
+use revm::context::transaction::{AccessList, AccessListItem, Authorization as RAuthorization, RecoveredAuthority, RecoveredAuthorization};
 use revm::context::{BlockEnv, Context, TxEnv};
 use revm::handler::{EthPrecompiles, MainnetContext, PrecompileProvider};
 use revm::interpreter::InterpreterResult;
@@ -127,9 +128,11 @@ fn commit<P: Precompiles>(changes: impl IntoIterator<Item = (RAddress, RAccount)
             continue;
         }
         let code_hash = if info.code_hash == KECCAK_EMPTY { [0; 32] } else { info.code_hash.0 };
+        // Code enters state by a creation, or as the delegation designator an
+        // EIP-7702 authorization writes, which revm sets without creating.
         if let Some(code) = &info.code
             && code_hash != [0; 32]
-            && account.is_created()
+            && (account.is_created() || is_delegation(code.original_byte_slice()))
         {
             state::set_raw(&state::code_key(&code_hash), code.original_byte_slice());
         }
@@ -176,6 +179,9 @@ pub struct Message {
     pub nonce: Option<u64>,
     /// Access list.
     pub access_list: Vec<solo_eth::AccessItem>,
+    /// Authorizations of a set-code transaction, each with the authority its
+    /// signature names (`tx::authority`); empty for every other type.
+    pub authorization_list: Vec<(solo_eth::Authorization, Option<Address>)>,
 }
 
 /// What a message did.
@@ -283,6 +289,7 @@ pub fn run_in<P: Precompiles>(message: Message, env: &Env, commit_state: bool) -
                 .collect(),
         ),
         gas_priority_fee: message.priority_fee,
+        authorization_list: message.authorization_list.into_iter().map(recovered).collect(),
         ..TxEnv::default()
     };
     let mut block_env = BlockEnv {
@@ -331,6 +338,14 @@ pub fn run_in<P: Precompiles>(message: Message, env: &Env, commit_state: bool) -
         .map(|l| Log { address: l.address.0.0, topics: Seq(l.data.topics().iter().map(|t| t.0).collect()), data: l.data.data.to_vec() })
         .collect();
     Outcome { status, gas_used, output, logs, contract }
+}
+
+/// An authorization as revm applies it: recovered by the kernel through the
+/// host, so revm needs no signature code of its own (spec 20 §2.2).
+fn recovered((auth, authority): (solo_eth::Authorization, Option<Address>)) -> Either<revm::context::transaction::SignedAuthorization, RecoveredAuthorization> {
+    let inner = RAuthorization { chain_id: U256::from_be_bytes(auth.chain_id), address: RAddress::from(auth.address), nonce: auth.nonce };
+    let authority = authority.map_or(RecoveredAuthority::Invalid, |a| RecoveredAuthority::Valid(RAddress::from(a)));
+    Either::Right(RecoveredAuthorization::new_unchecked(inner, authority))
 }
 
 /// The order of the secp256k1 group.

@@ -18,8 +18,9 @@ const HELLO: &str = concat!(
     "/../solo-recompile/tests/fixtures/hello.elf"
 );
 
-/// A kernel gas budget that lets the driver start (about 69k) but not produce a block
-/// (about 261k) with the pinned kernel fixture; rebuilding the fixture may move both numbers.
+/// A kernel gas budget that lets the driver start (69 378) but not produce a block
+/// (259 512) with the pinned kernel fixture, bisected on 2026-10-21; rebuilding the fixture
+/// may move both numbers.
 const STARVED_GAS: &str = "80000";
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4,
@@ -235,6 +236,7 @@ fn genesis_accounts() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn argument_and_file_errors() {
     assert_eq!(run(&args(&[])).unwrap_err(), USAGE);
     assert_eq!(run(&args(&["start"])).unwrap_err(), USAGE);
@@ -302,6 +304,18 @@ fn argument_and_file_errors() {
         run(&dev_args(&good, &["--query-gas", "-1"])).unwrap_err(),
         "--query-gas must be a number"
     );
+    assert_eq!(
+        run(&dev_args(&good, &["--state-history", "x"])).unwrap_err(),
+        "--state-history must be a number"
+    );
+    assert_eq!(
+        run(&dev_args(&good, &["--state-history", "0"])).unwrap_err(),
+        "--state-history must be at least 1"
+    );
+    assert_eq!(
+        run(&dev_args(&good, &["--archive", "--state-history", "8"])).unwrap_err(),
+        "--archive and --state-history exclude each other"
+    );
     // A guest without the kernel entrypoints fails to boot.
     let message = run(&dev_args(&good, &[])
         .iter()
@@ -341,6 +355,21 @@ fn in_process_node_stops_on_blocks_and_on_request() {
         &["--blocks", "1", "--query-gas", "100000000"],
     ))
     .unwrap();
+    // The node keeps the state history the flags ask for: its own window,
+    // every block as an archive node, or the default.
+    for (flags, expected) in [
+        (&["--state-history", "8"][..], 8),
+        (&["--archive"][..], solo_node::ARCHIVE),
+        (&[][..], solo_node::STATE_HISTORY),
+    ] {
+        let mut kept = None;
+        run_until(&dev_args(&good, flags), |rpc| {
+            kept = Some(rpc.node().state_history);
+            false
+        })
+        .unwrap();
+        assert_eq!(kept, Some(expected), "{flags:?}");
+    }
     // A starved kernel fails every slot; the caller's condition ends the loop after enough ticks.
     let mut iterations = 0;
     run_until(

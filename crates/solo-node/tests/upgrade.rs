@@ -180,7 +180,10 @@ fn a_node_switches_kernels_at_the_activation_height() {
     // The chain goes on from the same state, finalizing as before.
     let at_h = node.block_by_number(h).unwrap().unwrap();
     let after = node.block_by_number(h + 1).unwrap().unwrap();
-    assert_eq!(after.parent_hash, keccak256(&at_h.to_bytes()));
+    assert_eq!(
+        after.parent_hash,
+        solo_eth::header::block_hash(&at_h, keccak256)
+    );
     assert!(node.finalized.contains(&h) && node.finalized.contains(&(h + 2)));
     assert_eq!(
         node.finalized_height().unwrap(),
@@ -283,7 +286,7 @@ fn a_switch_that_cannot_complete_halts_the_node() {
     let parent = node.block_by_number(h).unwrap().unwrap();
     let header = BlockHeader {
         height: h + 1,
-        parent_hash: keccak256(&parent.to_bytes()),
+        parent_hash: solo_eth::header::block_hash(&parent, keccak256),
         timestamp_ms: parent.timestamp_ms + SLOT_MS,
         ..BlockHeader::default()
     };
@@ -381,7 +384,7 @@ fn the_reference_migrate_accepts_only_its_predecessor_at_the_activation_height()
     let parent = node.block_by_number(h - 1).unwrap().unwrap();
     let header = BlockHeader {
         height: h,
-        parent_hash: keccak256(&parent.to_bytes()),
+        parent_hash: solo_eth::header::block_hash(&parent, keccak256),
         timestamp_ms: parent.timestamp_ms + SLOT_MS,
         ..BlockHeader::default()
     };

@@ -410,6 +410,7 @@ impl Chain {
             data: data.to_vec(),
             gas,
             access_list: Seq(Vec::new()),
+            authorization_list: Seq(Vec::new()),
         };
         self.query(query::CALL, &request.to_bytes())
     }

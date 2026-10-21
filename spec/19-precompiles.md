@@ -74,15 +74,15 @@ MODEXP's worst case is a modulus of at most 32 bytes, which EIP-7883 prices at a
 | `SLOAD`, warm | 13 000 | 345 200 | 26.5 |
 | `SSTORE`, warm | 13 000 | 490 749 | 37.7 |
 | `TSTORE`, `TLOAD` | 23 400 | 543 284 | 23.2 |
-| `BALANCE`, cold | 263 000 | 1 158 565 | 4.4 |
-| `EXTCODEHASH`, cold | 263 000 | 1 239 765 | 4.7 |
+| `BALANCE`, cold | 263 000 | 1 153 502 | 4.3 |
+| `EXTCODEHASH`, cold | 263 000 | 1 234 702 | 4.6 |
 | `BLOCKHASH`, block with 1 000 transactions | 5 000 | 673 700 | 134.7 |
 | `SELFBALANCE` | 3 300 | 278 600 | 84.4 |
 | `STATICCALL` of an empty account | 14 100 | 1 001 000 | 70.9 |
 | `STATICCALL` of the identity precompile | 15 600 | 982 000 | 62.9 |
 | `STATICCALL` of itself | 423 700 | 36 181 300 | 85.3 |
-| `LOG0`, empty | 40 500 | 278 554 | 6.8 |
-| `CREATE`, empty | 3 203 400 | 2 779 351 | 0.8 |
+| `LOG0`, empty | 40 500 | 277 954 | 6.8 |
+| `CREATE`, empty | 3 203 400 | 2 779 241 | 0.8 |
 
 Before this change `KECCAK256` cost 945 (32 B) and 1 974 (1 KiB) VM gas per EVM gas, the guest hashing in software, and `BLOCKHASH` 274 for an empty block and 17 469 for one of 1 000 transactions, the kernel decoding, re-encoding and hashing the stored header on every call (§4).
 
@@ -176,11 +176,11 @@ Every other operation is within the bound in the guest (table 2.1) and is never 
 
 With the bound of §2 and the budget, a block of the reference kernel takes at most the budget (2^34, 1.72 · 10^10), plus 256 VM gas per EVM gas of the block gas limit (30 000 000, so 7.68 · 10^9), plus what every block and transaction costs outside the EVM (decoding, signature recovery, receipts, hooks, the state commitment; about 4 · 10^5 per transaction): `solo_node::BLOCK_KERNEL_GAS` = 2^35 VM gas covers it with room to spare. The pairings of staking admission checks that fail during execution, which no EVM gas pays for, are bounded separately by the pairing budget of 15 §3.3 and fit in that room: their transactions' gas limits sum to at most the block gas limit, and each of at least the 21 000 intrinsic gas costs the kernel one `bls12381_pairing_check` of one pair or one `bls12381_verify` (05 §4.3, at most 120 000 VM gas plus 6 per 32 bytes of message), so fewer than 1 430 of them add under 1.8 · 10^8. Both budgets apply whatever gate 2's state: the kernel's own BLS checks call the version 1 functions of 05 §4.3 directly, never the precompile module. A node whose kernel gas per call (`NodeConfig::kernel_gas`, `solo dev --kernel-gas`) is below it can fail to execute a valid block and stall; the default, `KERNEL_GAS` = 2^40, is far above.
 
-`crates/solo-node/tests/precompiles.rs` runs a single validator with exactly 2^35, on the native backend, and fills blocks with two transactions of 14 900 000 gas, each making 240 point evaluations of 60 000 gas. Before gate 2 the block executes in 17 113 387 906 VM gas, the evaluations stopping at the budget; once the gate is active, all 480 of a block succeed in 56 478 272 VM gas; every block finalizes and the chain goes on.
+`crates/solo-node/tests/precompiles.rs` runs a single validator with exactly 2^35, on the native backend, and fills blocks with two transactions of 14 900 000 gas, each making 240 point evaluations of 60 000 gas. Before gate 2 the block executes in 17 113 557 604 VM gas, the evaluations stopping at the budget; once the gate is active, all 480 of a block succeed in 56 647 984 VM gas; every block finalizes and the chain goes on.
 
 ## 6. Conformance
 
-The committed subset (07 §4.2) passes with gate 2 active as without it, 490 passed, 31 expected failures, 0 failures, on both backends (`committed_subset_passes_with_gate_2_on_both_backends`), each case also run without the gate and required to agree. The `solo-conformance` command takes `--gated` for the same run over any fixtures. The full pinned set does not regress either way (§6.1).
+The committed subset (07 §4.2) passes with gate 2 active as without it, 534 passed, 22 expected failures, 0 failures, on both backends (`committed_subset_passes_with_gate_2_on_both_backends`), each case also run without the gate and required to agree. The `solo-conformance` command takes `--gated` for the same run over any fixtures. The full pinned set does not regress either way (§6.1).
 
 ### 6.1 Full pinned set
 
@@ -190,6 +190,8 @@ fusaka-devnet-5 v2.1.0, 5 571 cases, native backend, run locally on 2026-10-21 (
 |---|---|---|---|
 | gate 2 inactive | 4 223 | 1 348 | 0 |
 | gate 2 active | 4 223 | 1 348 | 0 |
+
+With set-code transactions accepted (spec 20 §6), rerun on 2026-10-21 on both backends (`solo-conformance --both [--gated]`): 4 767 passed, 804 expected, 0 failed, with the gate inactive and active alike.
 
 A budget of 2^31, tried first, failed two cases with the gate inactive, single transactions of 129 and 454 BLS12-381 pairs whose bounds exceed it; hence 2^34.
 

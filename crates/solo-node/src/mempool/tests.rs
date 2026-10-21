@@ -23,6 +23,7 @@ fn sized(sender: u8, nonce: u64, fee: u128, size: usize) -> PoolTx {
         tip_cap: fee,
         gas: GAS,
         cost: u128::from(GAS).saturating_mul(fee),
+        authorities: Vec::new(),
         priority: u64::try_from(fee).unwrap_or(u64::MAX),
         arrival: 0,
         announced: false,
@@ -85,6 +86,14 @@ fn defaults_and_texts() {
     assert_eq!(
         PoolError::Overdraft.to_string(),
         "insufficient funds for gas * price + value"
+    );
+    assert_eq!(
+        PoolError::InflightLimit.to_string(),
+        "in-flight transaction limit reached for delegated accounts"
+    );
+    assert_eq!(
+        PoolError::AuthorityReserved.to_string(),
+        "authority already reserved"
     );
     let invalid = ValidateResult::Invalid { reason: 4 };
     assert_eq!(rejection(&invalid), 4);
@@ -429,13 +438,96 @@ fn reset_follows_the_account() {
     assert_eq!(pool.status(), (1, 1));
     assert_eq!(pool.pending_nonce(&[1; 20]), Some(3));
     assert_eq!(pool.account(&[1; 20]), Some(&funded(2, cost + cost / 2)));
-    // Code appearing at the sender drops all it has.
-    let coded = Account {
+    // A delegation appearing at the sender keeps what it has: a delegated
+    // account still sends.
+    let delegated = Account {
         code_hash: [7; 32],
         ..funded(2, u128::MAX)
     };
-    assert_eq!(pool.reset(&[1; 20], coded), vec![txs[2].hash, far.hash]);
-    assert!(pool.is_empty());
+    assert!(pool.reset(&[1; 20], delegated).is_empty());
+    assert_eq!(pool.status(), (1, 1));
+}
+
+#[test]
+fn delegated_senders_and_authorities_are_limited_as_geth_limits_them() {
+    let mut pool = Mempool::default();
+    let delegated = Account {
+        code_hash: [7; 32],
+        ..rich(0)
+    };
+    // A delegated sender: the first transaction enters, a second with
+    // another nonce does not, a replacement does.
+    pool.insert(tx(1, 0, 10), delegated.clone()).unwrap();
+    assert_eq!(pool.check(&tx(1, 1, 10)), Err(PoolError::InflightLimit));
+    assert_eq!(
+        pool.insert(tx(1, 1, 10), delegated),
+        Err(PoolError::InflightLimit)
+    );
+    assert!(pool.insert(tx(1, 0, 20), rich(0)).is_ok());
+    // A set-code transaction naming sender 2 as authority makes sender 2
+    // delegated for the pool, until it leaves.
+    let set_code = PoolTx {
+        authorities: vec![[2; 20]],
+        ..tx(3, 0, 10)
+    };
+    add(&mut pool, &set_code).unwrap();
+    add(&mut pool, &tx(2, 0, 10)).unwrap();
+    assert_eq!(add(&mut pool, &tx(2, 1, 10)), Err(PoolError::InflightLimit));
+    // Replacing the set-code transaction with one naming nobody frees sender 2.
+    add(&mut pool, &tx(3, 0, 20)).unwrap();
+    add(&mut pool, &tx(2, 1, 10)).unwrap();
+    // Sender 2 now holds two: a set-code transaction naming it is refused.
+    let naming_two = PoolTx {
+        authorities: vec![[2; 20], [9; 20]],
+        ..tx(4, 0, 10)
+    };
+    assert_eq!(
+        add(&mut pool, &naming_two),
+        Err(PoolError::AuthorityReserved)
+    );
+    // An authority with one transaction may be named, which limits it to
+    // that one. Sender 5 has no code, so only the naming holds it: removing
+    // the set-code transaction (which names it twice) frees it.
+    add(&mut pool, &tx(5, 0, 10)).unwrap();
+    let naming_one = PoolTx {
+        authorities: vec![[5; 20], [5; 20]],
+        ..tx(4, 0, 10)
+    };
+    add(&mut pool, &naming_one).unwrap();
+    assert_eq!(add(&mut pool, &tx(5, 1, 10)), Err(PoolError::InflightLimit));
+    assert!(pool.remove(&naming_one.hash).is_some());
+    add(&mut pool, &tx(5, 1, 10)).unwrap();
+    // The delegated sender stays limited by its code.
+    assert_eq!(add(&mut pool, &tx(1, 1, 20)), Err(PoolError::InflightLimit));
+}
+
+#[test]
+fn a_take_leaves_out_senders_that_an_authorization_ahead_names() {
+    let everything =
+        |pool: &Mempool, skip: &[[u8; 32]]| nonces(pool, &pool.take(usize::MAX, u64::MAX, skip));
+    // Sender 3's set-code transaction names sender 2 and comes first in the
+    // order (same priority, earlier arrival): its authorization can move
+    // 2's nonce, so 2's transaction is left out. Sender 1 is not named.
+    let mut pool = Mempool::default();
+    let set_code = PoolTx {
+        authorities: vec![[2; 20]],
+        ..tx(3, 0, 10)
+    };
+    add(&mut pool, &set_code).unwrap();
+    add(&mut pool, &tx(2, 0, 10)).unwrap();
+    add(&mut pool, &tx(1, 0, 10)).unwrap();
+    assert_eq!(everything(&pool, &[]), [(3, 0), (1, 0)]);
+    // Ahead of it, 2's transaction runs first, and then the authorization
+    // is stale: both are taken.
+    let mut pool = Mempool::default();
+    add(&mut pool, &set_code).unwrap();
+    add(&mut pool, &tx(2, 0, 20)).unwrap();
+    assert_eq!(everything(&pool, &[]), [(2, 0), (3, 0)]);
+    // A set-code transaction in `skip` runs before anything taken, whatever
+    // its priority: 2 is left out. A skipped hash the pool does not hold
+    // names nobody.
+    assert!(everything(&pool, &[set_code.hash]).is_empty());
+    assert_eq!(everything(&pool, &[[9; 32]]), [(2, 0), (3, 0)]);
 }
 
 #[test]
@@ -537,4 +629,36 @@ proptest! {
             check(&pool);
         }
     }
+}
+
+#[test]
+fn authorities_come_from_the_authorization_signatures() {
+    use k256::ecdsa::SigningKey;
+    let key = SigningKey::from_slice(&[1; 32]).unwrap();
+    let point = key.verifying_key().to_encoded_point(false);
+    let address: Address = keccak256(&point.as_bytes()[1..])[12..].try_into().unwrap();
+    let mut auth = solo_eth::Authorization {
+        chain_id: [0; 32],
+        address: [9; 20],
+        nonce: 3,
+        y_parity: 0,
+        r: [0; 32],
+        s: [0; 32],
+    };
+    let (sig, id) = key
+        .sign_prehash_recoverable(&keccak256(&auth.signing_payload()))
+        .unwrap();
+    // EIP-7702 takes the low-s form; normalizing s flips the parity.
+    let normalized = sig.normalize_s();
+    auth.y_parity = id.to_byte() ^ u8::from(normalized.is_some());
+    let sig = normalized.unwrap_or(sig);
+    auth.r = sig.r().to_bytes().into();
+    auth.s = sig.s().to_bytes().into();
+    assert_eq!(authority(&auth), Some(address));
+    // A parity other than 0 or 1 names no one, and the pool ignores it.
+    let unsigned = solo_eth::Authorization {
+        y_parity: 2,
+        ..auth
+    };
+    assert_eq!(authority(&unsigned), None);
 }

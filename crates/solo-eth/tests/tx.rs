@@ -185,7 +185,8 @@ fn malformations() {
     let cases: Vec<(Vec<u8>, Error)> = vec![
         (vec![], Error::Malformed),
         (vec![0x03, 0xC0], Error::Unsupported),
-        (vec![0x04], Error::Unsupported),
+        (vec![0x04], Error::Malformed),
+        (vec![0x05, 0xC0], Error::Unsupported),
         (vec![0x01, 0xC0], Error::Malformed),
         (vec![0x02, 0xC0], Error::Malformed),
         (vec![0x01, 0x80], Error::Malformed),
@@ -331,6 +332,7 @@ fn gas_rules() {
         value: 5,
         input: vec![],
         access_list: vec![],
+        authorization_list: vec![],
         v: 0,
         r: [1; 32],
         s: [1; 32],

@@ -2,7 +2,6 @@
 
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use serde_json::{Value, json};
-use solo_abi::Encode;
 use solo_abi::chain::{
     BASE_FEE, BLOCK_GAS_LIMIT, BlockHeader, CallRequest, CallResult, Receipt, call_status, reason,
 };
@@ -16,6 +15,7 @@ pub use crate::hex::{
     data, parse_address, parse_big, parse_hash, parse_hex, parse_quantity, parse_word, quantity,
     quantity_be,
 };
+use crate::proof;
 use crate::views::{self, Destination, Position, created_address, decode_or_blank};
 
 /// Default widest block range one `eth_getLogs` request may search
@@ -34,6 +34,11 @@ pub type Background = Box<dyn FnMut(&mut Node)>;
 
 /// Most blocks one `eth_feeHistory` request reports, as in geth.
 pub const MAX_FEE_HISTORY: u64 = 1024;
+
+/// Most storage keys one `eth_getProof` request may ask for (spec 20 §4.1):
+/// each costs a kernel query and a proof on the thread that drives
+/// consensus.
+pub const MAX_PROOF_KEYS: usize = 1024;
 
 /// Gas a call with value forwards for free; part of geth's first guess in
 /// gas estimation.
@@ -210,8 +215,9 @@ fn rewards(receipts: &[Receipt], gas_used: u64, percentiles: &[f64]) -> Vec<Stri
 /// Requests run on the caller's thread, which also drives the node, so what
 /// one request can make the node compute is bounded: each kernel query by
 /// the node's query budget ([`Node::query_gas`]), and the requests that
-/// make many queries (batches, gas estimation, log and fee-history scans)
-/// hand the node its [`Background`] work between them.
+/// make many queries (batches, gas estimation, log and fee-history scans,
+/// the storage keys of a proof) hand the node its [`Background`] work
+/// between them.
 pub struct Rpc {
     node: Node,
     background: Option<Background>,
@@ -248,8 +254,9 @@ impl Rpc {
 
     /// Runs the background work once, if any is set. The HTTP server calls
     /// this between connections; requests call it between batch entries,
-    /// between gas-estimation runs and between the blocks of a log or
-    /// fee-history scan, so the node keeps voting while they are served.
+    /// between gas-estimation runs, between the blocks of a log or
+    /// fee-history scan and between the storage keys of `eth_getProof`, so
+    /// the node keeps voting while they are served.
     /// The head can move during such a request.
     pub fn run_background(&mut self) {
         if let Some(work) = self.background.as_mut() {
@@ -325,16 +332,18 @@ impl Rpc {
         })
     }
 
-    /// Checks the block parameter of a state method. The node keeps the
-    /// state at the head only, so the parameter must name the head: a tag
-    /// (`latest`, `pending`, `safe` and `finalized` all name it, spec 08
-    /// section 8), its number or its hash, directly or as an EIP-1898 object
-    /// with `blockHash` or `blockNumber`. A block above the head does not
-    /// exist and one below it has no state left, as on a pruned geth node;
-    /// both are errors rather than answers from another block's state.
-    fn check_block(&mut self, param: Option<&Value>) -> Result<(), RpcError> {
+    /// The height a state method's block parameter names: a tag (`latest`,
+    /// `pending`, `safe` and `finalized` all name the head, spec 08 section
+    /// 8; `earliest` is the genesis), a number or a hash, directly or as an
+    /// EIP-1898 object with `blockHash` or `blockNumber`. `None` is the head,
+    /// served from the current state; an older height is served from the
+    /// node's state history (spec 20 §5). A block above the head does not
+    /// exist, and one whose state the node no longer keeps is refused as a
+    /// pruned geth node refuses it, rather than answered from another
+    /// block's state.
+    fn state_at(&mut self, param: Option<&Value>) -> Result<Option<u64>, RpcError> {
         let height = match param {
-            None | Some(Value::Null) => return Ok(()),
+            None | Some(Value::Null) => return Ok(None),
             Some(Value::String(hash)) if hash.len() == 66 => self.hash_height(hash)?,
             Some(Value::String(tag)) => self.state_height(tag)?,
             Some(Value::Object(object)) => {
@@ -351,12 +360,14 @@ impl Rpc {
         if height > head {
             return Err(RpcError::server("header not found"));
         }
-        if height < head {
-            return Err(RpcError::server(format!(
-                "historical state not available: block {height}, the node keeps the state of block {head} only"
-            )));
+        if height == head {
+            return Ok(None);
         }
-        Ok(())
+        if height < self.node.oldest_state() {
+            let (header, _) = self.header_at(height)?.unwrap_or_default();
+            return Err(self.unavailable(&header.state_root, height));
+        }
+        Ok(Some(height))
     }
 
     /// The height a state method's block tag or number names; every tag but
@@ -369,11 +380,30 @@ impl Rpc {
         }
     }
 
+    /// The height the block parameter of `eth_getProof` names, the head
+    /// included.
+    fn proof_height(&mut self, param: Option<&Value>) -> Result<u64, RpcError> {
+        match self.state_at(param)? {
+            Some(height) => Ok(height),
+            None => self.block_number(),
+        }
+    }
+
     fn hash_height(&mut self, hash: &str) -> Result<u64, RpcError> {
-        match self.node.block_by_hash(&parse_hash(hash)?)? {
+        match self.header_by_hash(&parse_hash(hash)?)? {
             Some(header) => Ok(header.height),
             None => Err(RpcError::server("header for hash not found")),
         }
+    }
+
+    /// The header of the block whose hash is `hash`. The zero hash names
+    /// the synthetic genesis, whose hash it is (spec 20 §3.1); the kernel
+    /// indexes every other block by its hash.
+    fn header_by_hash(&mut self, hash: &[u8; 32]) -> Result<Option<BlockHeader>, RpcError> {
+        if *hash == [0; 32] {
+            return Ok(self.header_at(0)?.map(|(header, _)| header));
+        }
+        Ok(self.node.block_by_hash(hash)?)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -393,34 +423,35 @@ impl Rpc {
             "eth_accounts" => json!([]),
             "eth_getBalance" => {
                 let address = address_param(params, 0)?;
-                self.check_block(params.get(1))?;
-                json!(quantity(self.node.account(&address)?.balance))
+                let at = self.state_at(params.get(1))?;
+                json!(quantity(self.node.account_at(&address, at)?.balance))
             }
             "eth_getTransactionCount" => {
                 let address = address_param(params, 0)?;
-                self.check_block(params.get(1))?;
+                let at = self.state_at(params.get(1))?;
                 let nonce = if params.get(1).and_then(Value::as_str) == Some("pending") {
                     self.node.pending_nonce(&address)?
                 } else {
-                    self.node.account(&address)?.nonce
+                    self.node.account_at(&address, at)?.nonce
                 };
                 json!(quantity(u128::from(nonce)))
             }
             "eth_getCode" => {
                 let address = address_param(params, 0)?;
-                self.check_block(params.get(1))?;
-                json!(data(&self.node.code(&address)?))
+                let at = self.state_at(params.get(1))?;
+                json!(data(&self.node.code_at(&address, at)?))
             }
             "eth_getStorageAt" => {
                 let address = address_param(params, 0)?;
                 let slot = parse_word(param_str(params, 1)?)?;
-                self.check_block(params.get(2))?;
-                json!(data(&self.node.storage(&address, &slot)?))
+                let at = self.state_at(params.get(2))?;
+                json!(data(&self.node.storage_at(&address, &slot, at)?))
             }
+            "eth_getProof" => self.proof(params)?,
             "eth_call" => {
                 let request = call_request(params.first())?;
-                self.check_block(params.get(1))?;
-                let result = self.run(&request)?;
+                let at = self.state_at(params.get(1))?;
+                let result = self.run(&request, at)?;
                 if result.status != call_status::SUCCESS {
                     return Err(call_error(&result));
                 }
@@ -428,8 +459,8 @@ impl Rpc {
             }
             "eth_estimateGas" => {
                 let request = call_request(params.first())?;
-                self.check_block(params.get(1))?;
-                json!(quantity(u128::from(self.estimate_gas(request)?)))
+                let at = self.state_at(params.get(1))?;
+                json!(quantity(u128::from(self.estimate_gas(request, at)?)))
             }
             "eth_sendRawTransaction" => {
                 let raw = parse_hex(param_str(params, 0)?)?;
@@ -458,7 +489,7 @@ impl Rpc {
             "eth_getBlockByHash" => {
                 let hash = hash_param(params, 0)?;
                 let full = params.get(1).and_then(Value::as_bool).unwrap_or(false);
-                match self.node.block_by_hash(&hash)? {
+                match self.header_by_hash(&hash)? {
                     Some(header) => self.block_json(&header, &hash, full)?,
                     None => Value::Null,
                 }
@@ -467,7 +498,7 @@ impl Rpc {
                 let block = param_str(params, 0)?;
                 let found = if block.len() == 66 {
                     let hash = parse_hash(block)?;
-                    self.node.block_by_hash(&hash)?.map(|header| (header, hash))
+                    self.header_by_hash(&hash)?.map(|header| (header, hash))
                 } else {
                     let height = self.resolve_block(block)?;
                     self.header_at(height)?
@@ -537,9 +568,70 @@ impl Rpc {
         Ok(RpcError::server(message))
     }
 
+    /// `eth_getProof(address, slots, block)`: the account and the slots with
+    /// their spec 10 proofs against the block's state root (spec 20 §4), at
+    /// most [`MAX_PROOF_KEYS`] slots. Each slot is a kernel query, so the
+    /// node's background work runs before each; the head can move meanwhile,
+    /// and every read names the height the request resolved to.
+    fn proof(&mut self, params: &[Value]) -> Result<Value, RpcError> {
+        let address = address_param(params, 0)?;
+        let Some(Value::Array(keys)) = params.get(1) else {
+            return Err(RpcError::invalid_params("missing storage keys"));
+        };
+        if keys.len() > MAX_PROOF_KEYS {
+            return Err(RpcError::invalid_params(format!(
+                "too many storage keys: {}, the limit is {MAX_PROOF_KEYS}",
+                keys.len()
+            )));
+        }
+        let mut slots = Vec::with_capacity(keys.len());
+        for key in keys {
+            let key = key.as_str().unwrap_or_default();
+            slots.push((key.to_owned(), parse_word(key)?));
+        }
+        let height = self.proof_height(params.get(2))?;
+        let (header, _) = self.header_at(height)?.unwrap_or_default();
+        // `proof_height` refused a height whose state is gone, and the node
+        // keeps a height's trie as long as its state: this error is the
+        // same, should the two ever disagree.
+        let unavailable = self.unavailable(&header.state_root, height);
+        let key = proof::account_key(&address);
+        let account_proof = self.node.state_proof_at(height, &key).ok_or(unavailable)?;
+        let account = self.node.account_at(&address, Some(height))?;
+        let present = matches!(account_proof.terminal,
+            solo_trie::Terminal::Leaf { path, .. } if path == keccak256(&key));
+        let mut storage = Vec::with_capacity(slots.len());
+        for (requested, slot) in &slots {
+            self.run_background();
+            // The background work can execute blocks and prune the height,
+            // its trie with its state: the proof is looked up first, so the
+            // error is the pruned-state one.
+            let unavailable = self.unavailable(&header.state_root, height);
+            let slot_proof = self
+                .node
+                .state_proof_at(height, &proof::slot_key(&address, slot))
+                .ok_or(unavailable)?;
+            let value = self.node.storage_at(&address, slot, Some(height))?;
+            storage.push(proof::storage_entry(requested, &value, &slot_proof));
+        }
+        Ok(proof::response(
+            &address,
+            present.then_some(&account),
+            &header.state_root,
+            &account_proof,
+            &storage,
+        ))
+    }
+
+    /// The error for `height`, whose header carries `root`, once the node no
+    /// longer keeps its state (spec 20 §5.3).
+    fn unavailable(&self, root: &[u8; 32], height: u64) -> RpcError {
+        RpcError::server(missing_state(root, height, self.node.oldest_state()))
+    }
+
     /// Runs a message, first checking what the kernel would refuse it for so
     /// the error can say why.
-    fn run(&mut self, request: &CallRequest) -> Result<CallResult, RpcError> {
+    fn run(&mut self, request: &CallRequest, at: Option<u64>) -> Result<CallResult, RpcError> {
         let needed = min_gas(request);
         if request.gas != 0 && request.gas < needed {
             return Err(RpcError::server(format!(
@@ -554,7 +646,7 @@ impl Rpc {
             )));
         }
         if request.value > 0 {
-            let balance = self.node.account(&request.from)?.balance;
+            let balance = self.node.account_at(&request.from, at)?.balance;
             if balance < request.value {
                 return Err(RpcError::server(format!(
                     "insufficient funds for gas * price + value: address {} have {balance} want {}",
@@ -563,13 +655,13 @@ impl Rpc {
                 )));
             }
         }
-        self.execute(request)
+        self.execute(request, at)
     }
 
     /// Runs a message in the kernel. One that computes past the node's query
     /// budget is aborted, as geth aborts a call past its RPC timeout.
-    fn execute(&mut self, request: &CallRequest) -> Result<CallResult, RpcError> {
-        match self.node.call(request) {
+    fn execute(&mut self, request: &CallRequest, at: Option<u64>) -> Result<CallResult, RpcError> {
+        match self.node.call_at(request, at) {
             Err(e) if e.is_out_of_gas() => Err(RpcError::server(
                 "execution aborted: the message ran past the node's query budget",
             )),
@@ -583,13 +675,14 @@ impl Rpc {
     fn narrow(
         &mut self,
         request: &mut CallRequest,
+        at: Option<u64>,
         gas: u64,
-        lo: &mut u64,
-        hi: &mut u64,
+        bounds: (&mut u64, &mut u64),
     ) -> Result<(), RpcError> {
+        let (lo, hi) = bounds;
         self.run_background();
         request.gas = gas;
-        if self.execute(request)?.status == call_status::SUCCESS {
+        if self.execute(request, at)?.status == call_status::SUCCESS {
             *hi = gas;
         } else {
             *lo = gas;
@@ -600,13 +693,13 @@ impl Rpc {
     /// geth's gas estimation: run at the cap (or the requested gas), then
     /// search between what the message used and the cap for the least gas it
     /// succeeds with, stopping within 1.5% above the answer.
-    fn estimate_gas(&mut self, mut request: CallRequest) -> Result<u64, RpcError> {
+    fn estimate_gas(&mut self, mut request: CallRequest, at: Option<u64>) -> Result<u64, RpcError> {
         let mut hi = match request.gas {
             0 => MAX_TX_GAS,
             gas => gas.min(MAX_TX_GAS),
         };
         request.gas = hi;
-        let first = self.run(&request)?;
+        let first = self.run(&request, at)?;
         if first.status == call_status::HALT {
             return Err(RpcError::server(format!(
                 "gas required exceeds allowance ({hi})"
@@ -620,30 +713,40 @@ impl Rpc {
         let used = first.gas_used;
         let mut lo = used.max(min_gas(&request)) - 1;
         if used < hi {
-            self.narrow(&mut request, used, &mut lo, &mut hi)?;
+            self.narrow(&mut request, at, used, (&mut lo, &mut hi))?;
         }
         // Refunds and the 63/64 rule can need more; geth's first guess.
         let optimistic = (used + CALL_STIPEND) * 64 / 63;
         if lo + 1 < hi && optimistic < hi {
-            self.narrow(&mut request, optimistic, &mut lo, &mut hi)?;
+            self.narrow(&mut request, at, optimistic, (&mut lo, &mut hi))?;
         }
         while lo + 1 < hi && (hi - lo) * 1000 >= hi * 15 {
             // Most messages need little more than they used: bisect towards the low side.
             let mid = lo.midpoint(hi).min(lo * 2);
-            self.narrow(&mut request, mid, &mut lo, &mut hi)?;
+            self.narrow(&mut request, at, mid, (&mut lo, &mut hi))?;
         }
         Ok(hi)
     }
 
     /// The header at `height` with its hash. Height 0 is the genesis, which
-    /// the kernel does not store: an empty header whose hash is zero, the
-    /// parent hash of block 1.
+    /// the kernel does not store: a header of the genesis state root, empty
+    /// tries and the chain's gas limit and base fee, whose hash is zero, the
+    /// parent hash of block 1 (spec 20 §3.1).
     fn header_at(&mut self, height: u64) -> Result<Option<(BlockHeader, [u8; 32])>, RpcError> {
         if height == 0 {
-            return Ok(Some((BlockHeader::default(), [0; 32])));
+            let genesis = BlockHeader {
+                state_root: self.node.genesis_state_root(),
+                transactions_root: solo_eth::mpt::EMPTY_ROOT,
+                receipts_root: solo_eth::mpt::EMPTY_ROOT,
+                logs_bloom: vec![0; 256],
+                gas_limit: BLOCK_GAS_LIMIT,
+                base_fee: BASE_FEE,
+                ..BlockHeader::default()
+            };
+            return Ok(Some((genesis, [0; 32])));
         }
         Ok(self.node.block_by_number(height)?.map(|header| {
-            let hash = keccak256(&header.to_bytes());
+            let hash = solo_eth::header::block_hash(&header, keccak256);
             (header, hash)
         }))
     }
@@ -744,11 +847,10 @@ impl Rpc {
         full: bool,
     ) -> Result<Value, RpcError> {
         let receipts = self.receipts_of(header)?;
-        let mut size = header.to_bytes().len();
+        let mut raws = Vec::with_capacity(receipts.len());
         let mut transactions = Vec::with_capacity(receipts.len());
         for (tx_hash, receipt) in header.tx_hashes.0.iter().zip(&receipts) {
             let raw = self.node.transaction(tx_hash)?.unwrap_or_default();
-            size += raw.len();
             transactions.push(if full {
                 let position = Position {
                     block_hash: *hash,
@@ -760,21 +862,16 @@ impl Rpc {
             } else {
                 json!(data(tx_hash))
             });
+            raws.push(raw);
         }
-        let logs: Vec<_> = receipts.iter().flat_map(|r| r.logs.0.iter()).collect();
-        Ok(views::block(
-            header,
-            hash,
-            &transactions,
-            &views::bloom(&logs),
-            size,
-        ))
+        let size = views::block_size(header, &raws);
+        Ok(views::block(header, hash, &transactions, size))
     }
 
     /// The heights a filter covers, within the chain and the range limit.
     fn filter_heights(&mut self, blocks: &Blocks) -> Result<(u64, u64), RpcError> {
         match blocks {
-            Blocks::Hash(hash) => match self.node.block_by_hash(hash)? {
+            Blocks::Hash(hash) => match self.header_by_hash(hash)? {
                 Some(header) => Ok((header.height, header.height)),
                 None => Err(RpcError::server("unknown block")),
             },
@@ -867,6 +964,15 @@ impl Rpc {
         }
         Ok(history)
     }
+}
+
+/// The error for a height whose state the node does not keep, in the words
+/// of a pruned geth node (spec 20 §5).
+fn missing_state(root: &[u8; 32], height: u64, oldest: u64) -> String {
+    format!(
+        "missing trie node {} (path ) state of block {height} is not available, the node keeps the state from block {oldest}",
+        &data(root)[2..]
+    )
 }
 
 fn error_response(id: &Value, error: &RpcError) -> Value {

@@ -140,4 +140,4 @@ b600ff7b28e7cb984a9a124e17ac49a2a76d6474e0a7ff4a1ebcd147fe7d9ce8
 
 ## 8. Not in version 0
 
-Proofs of several keys sharing siblings, compression of empty siblings in proofs, historical roots (a proof is always against the state as it stands when `storage_proof` is called), and a mapping to Ethereum's `eth_getProof`, whose proofs are Merkle-Patricia proofs over a different trie.
+Proofs of several keys sharing siblings, compression of empty siblings in proofs, and historical roots for `storage_proof` (a proof from inside an instance is always against the state as it stands when it is called). The reference node keeps the tries of its recent blocks' roots and serves this format through `eth_getProof` (spec 20 §4), in place of Ethereum's Merkle-Patricia proofs over a different trie.

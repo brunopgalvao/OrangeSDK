@@ -241,6 +241,39 @@ impl Wallet {
         Self::tail(f, access, &mut fields);
         self.typed(2, &fields)
     }
+
+    /// This wallet's EIP-7702 authorization of `address` at `nonce`, as an
+    /// RLP list item.
+    pub fn authorization(&self, chain_id: u64, address: [u8; 20], nonce: u64) -> Vec<u8> {
+        let mut body = Vec::new();
+        encode_uint(u128::from(chain_id), &mut body);
+        encode_bytes(&address, &mut body);
+        encode_uint(u128::from(nonce), &mut body);
+        let mut message = vec![0x05];
+        encode_list(&body, &mut message);
+        let (sig, rid) = self
+            .key
+            .sign_prehash_recoverable(&keccak256(&message))
+            .unwrap();
+        encode_uint(u128::from(rid.to_byte()), &mut body);
+        encode_bytes(strip(&sig.r().to_bytes()), &mut body);
+        encode_bytes(strip(&sig.s().to_bytes()), &mut body);
+        let mut out = Vec::new();
+        encode_list(&body, &mut out);
+        out
+    }
+
+    /// An EIP-7702 set-code transaction carrying the encoded `auths`.
+    pub fn set_code(&self, f: &Fields<'_>, max_fee: u128, tip: u128, auths: &[Vec<u8>]) -> Vec<u8> {
+        let mut fields = Vec::new();
+        encode_uint(u128::from(CHAIN_ID), &mut fields);
+        encode_uint(u128::from(f.nonce), &mut fields);
+        encode_uint(tip, &mut fields);
+        encode_uint(max_fee, &mut fields);
+        Self::tail(f, &[], &mut fields);
+        encode_list(&auths.concat(), &mut fields);
+        self.typed(4, &fields)
+    }
 }
 
 /// The node's consensus key; the single validator.

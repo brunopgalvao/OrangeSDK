@@ -101,8 +101,9 @@ record! {
 }
 
 record! {
-    /// A block header as the kernel stores it. The block hash is `keccak256`
-    /// of this encoding.
+    /// A block header as the kernel stores it. The block hash is not of this
+    /// encoding but of the Ethereum header derived from it
+    /// (`solo_eth::header`, spec 20 §3.1).
     BlockHeader {
         /// Height.
         height: u64,
@@ -110,9 +111,10 @@ record! {
         parent_hash: Hash,
         /// Timestamp in milliseconds.
         timestamp_ms: u64,
-        /// State root after execution.
+        /// State root after execution (spec 10).
         state_root: Hash,
-        /// Receipts root.
+        /// Root of the Merkle-Patricia trie of the block's receipts, each in
+        /// its Ethereum encoding under `rlp(index)` (spec 20 §3.2).
         receipts_root: Hash,
         /// Hashes of the transactions the block records, in order: each has its
         /// receipt here. A transaction that cannot run and already has a
@@ -120,6 +122,17 @@ record! {
         tx_hashes: Seq<Hash>,
         /// Gas used.
         gas_used: u64,
+        /// Root of the Merkle-Patricia trie of the recorded transactions, each
+        /// as received under `rlp(index)` (spec 20 §3.2).
+        transactions_root: Hash,
+        /// Bloom of every log of the block: 256 bytes, empty in a template.
+        logs_bloom: Vec<u8>,
+        /// Block gas limit.
+        gas_limit: u64,
+        /// Base fee per gas.
+        base_fee: u64,
+        /// Fee recipient.
+        beneficiary: Address,
     }
 }
 
@@ -204,6 +217,28 @@ record! {
         /// Access list: charged as intrinsic gas and warm from the start, as
         /// in an EIP-2930 transaction.
         access_list: Seq<AccessItem>,
+        /// Authorization list: when not empty the message runs as an EIP-7702
+        /// set-code transaction, its authorizations charged and applied.
+        authorization_list: Seq<SignedAuthorization>,
+    }
+}
+
+record! {
+    /// An EIP-7702 authorization as signed: the authority, recovered from the
+    /// signature, is to run `address`'s code from its nonce `nonce` on.
+    SignedAuthorization {
+        /// Chain id, big-endian; 0 for every chain.
+        chain_id: Hash,
+        /// The account whose code the authority delegates to.
+        address: Address,
+        /// The authority's nonce.
+        nonce: u64,
+        /// Signature y parity.
+        y_parity: u8,
+        /// Signature `r`, big-endian.
+        r: Hash,
+        /// Signature `s`, big-endian.
+        s: Hash,
     }
 }
 
@@ -897,6 +932,11 @@ mod tests {
             receipts_root: [5; 32],
             tx_hashes: Seq(vec![[6; 32]]),
             gas_used: 21_000,
+            transactions_root: [7; 32],
+            logs_bloom: vec![8; 256],
+            gas_limit: 30_000_000,
+            base_fee: 9,
+            beneficiary: [10; 20],
         });
         roundtrip(&Receipt {
             status: 1,
@@ -929,6 +969,14 @@ mod tests {
             access_list: Seq(vec![AccessItem {
                 address: [5; 20],
                 keys: Seq(vec![[6; 32], [7; 32]]),
+            }]),
+            authorization_list: Seq(vec![SignedAuthorization {
+                chain_id: [8; 32],
+                address: [9; 20],
+                nonce: 10,
+                y_parity: 1,
+                r: [11; 32],
+                s: [12; 32],
             }]),
         });
         roundtrip(&CallResult {

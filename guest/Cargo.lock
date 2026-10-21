@@ -1301,6 +1301,7 @@ version = "0.0.1"
 name = "solo-eth"
 version = "0.0.1"
 dependencies = [
+ "solo-abi",
  "solo-rlp",
 ]
 

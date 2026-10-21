@@ -1,6 +1,7 @@
 //! The mempool (spec 14): per-sender queues ordered by nonce, the pending
 //! (executable) and queued (gapped) split, replacement by price bump, limits
-//! with eviction, and the block-ordered take.
+//! with eviction, the block-ordered take, and geth's rules for delegated
+//! accounts and EIP-7702 authorities.
 //!
 //! The pool is policy, not validity: the node admits a transaction only once
 //! the kernel's `kernel_stf_validate_tx` accepts it against the sender's
@@ -78,6 +79,12 @@ pub enum PoolError {
     /// A replacement whose cost, with the sender's other pending
     /// transactions, exceeds the sender's balance.
     Overdraft,
+    /// A delegated sender, or one that a pool transaction's authorization
+    /// names, already has a transaction in the pool with another nonce.
+    InflightLimit,
+    /// A set-code transaction names an authority that has more than one
+    /// transaction in the pool.
+    AuthorityReserved,
 }
 
 impl fmt::Display for PoolError {
@@ -87,6 +94,10 @@ impl fmt::Display for PoolError {
             PoolError::Full => "txpool is full",
             PoolError::Oversized => "oversized data",
             PoolError::Overdraft => "insufficient funds for gas * price + value",
+            PoolError::InflightLimit => {
+                "in-flight transaction limit reached for delegated accounts"
+            }
+            PoolError::AuthorityReserved => "authority already reserved",
         })
     }
 }
@@ -112,6 +123,9 @@ pub struct PoolTx {
     pub gas: u64,
     /// Value plus the gas limit at the fee cap: the most it can cost.
     pub cost: u128,
+    /// The authorities a set-code transaction's authorizations name, those
+    /// whose signatures recover; empty for every other type.
+    pub authorities: Vec<Address>,
     /// Ordering priority, as the kernel's validation reported it.
     pub priority: u64,
     /// Order of arrival, which breaks priority ties.
@@ -127,18 +141,13 @@ impl PoolTx {
     #[must_use]
     pub fn parse(raw: &[u8]) -> Option<PoolTx> {
         let tx = solo_eth::decode(raw).ok()?;
-        let sig = tx.signature();
-        let signature = Signature::from_slice(&sig[..64]).ok()?;
-        let id = RecoveryId::from_byte(sig[64])?;
-        let digest = keccak256(&tx.signing_payload);
-        let key = VerifyingKey::recover_from_prehash(&digest, &signature, id).ok()?;
-        let point = key.to_encoded_point(false);
-        let mut sender = [0u8; 20];
-        sender.copy_from_slice(&keccak256(&point.as_bytes()[1..])[12..]);
+        let sender = recover(&tx.signing_payload, &tx.signature())?;
+        let authorities = tx.authorization_list.iter().filter_map(authority).collect();
         Some(PoolTx {
             hash: keccak256(raw),
             raw: raw.to_vec(),
             sender,
+            authorities,
             nonce: tx.nonce,
             fee_cap: tx.gas_price,
             tip_cap: tx.priority_fee.unwrap_or(tx.gas_price),
@@ -159,6 +168,22 @@ impl PoolTx {
         let threshold = |fee: u128| fee.saturating_add(bump(fee));
         self.fee_cap >= threshold(old.fee_cap) && self.tip_cap >= threshold(old.tip_cap)
     }
+}
+
+/// The authority an EIP-7702 authorization names: the signer of its
+/// payload, `None` when its signature names none (spec 20 §2.2).
+fn authority(auth: &solo_eth::Authorization) -> Option<Address> {
+    recover(&auth.signing_payload(), &auth.signature()?)
+}
+
+/// The address whose key signed `keccak256(payload)` with `sig`
+/// (`r ‖ s ‖ recovery id`).
+fn recover(payload: &[u8], sig: &[u8; 65]) -> Option<Address> {
+    let signature = Signature::from_slice(&sig[..64]).ok()?;
+    let id = RecoveryId::from_byte(sig[64])?;
+    let key = VerifyingKey::recover_from_prehash(&keccak256(payload), &signature, id).ok()?;
+    let point = key.to_encoded_point(false);
+    keccak256(&point.as_bytes()[1..])[12..].try_into().ok()
 }
 
 /// The reason code of a validation result the pool could not use: the
@@ -234,6 +259,9 @@ impl Queue {
 pub struct Mempool {
     queues: BTreeMap<Address, Queue>,
     index: HashMap<[u8; 32], (Address, u64)>,
+    /// For each authority a pool transaction's authorization names, how
+    /// many pool transactions name it.
+    authorities: HashMap<Address, usize>,
     bytes: usize,
     arrivals: u64,
     /// Capacity; see [`PoolLimits`].
@@ -337,20 +365,34 @@ impl Mempool {
     }
 
     /// The checks of a newcomer that need no kernel (spec 14 §2): its size,
-    /// and for a replacement the price bump and that the sender's pending
-    /// transactions stay funded with it in place of the one it replaces
-    /// (geth's overdraft check).
+    /// geth's limits for delegated accounts and authorities, and for a
+    /// replacement the price bump and that the sender's pending transactions
+    /// stay funded with it in place of the one it replaces (geth's overdraft
+    /// check).
     ///
     /// # Errors
-    /// [`PoolError::Oversized`], [`PoolError::Underpriced`] or
+    /// [`PoolError::Oversized`], [`PoolError::InflightLimit`],
+    /// [`PoolError::AuthorityReserved`], [`PoolError::Underpriced`] or
     /// [`PoolError::Overdraft`].
     pub fn check(&self, tx: &PoolTx) -> Result<(), PoolError> {
         if tx.raw.len() > self.limits.max_tx_bytes {
             return Err(PoolError::Oversized);
         }
+        let held = |address: &Address| self.queues.get(address).map_or(0, |q| q.txs.len());
+        if tx.authorities.iter().any(|authority| held(authority) > 1) {
+            return Err(PoolError::AuthorityReserved);
+        }
         let Some(queue) = self.queues.get(&tx.sender) else {
             return Ok(());
         };
+        // A delegated account's code can spend its balance outside its own
+        // transactions, so the pool holds at most one of them at a time, as
+        // geth does; a replacement of it is still allowed.
+        let delegated =
+            queue.account.code_hash != [0; 32] || self.authorities.contains_key(&tx.sender);
+        if delegated && !queue.txs.contains_key(&tx.nonce) {
+            return Err(PoolError::InflightLimit);
+        }
         let Some(old) = queue.txs.get(&tx.nonce) else {
             return Ok(());
         };
@@ -419,15 +461,32 @@ impl Mempool {
     /// displaced.
     fn put(&mut self, tx: PoolTx) -> Option<PoolTx> {
         let (sender, nonce, hash, len) = (tx.sender, tx.nonce, tx.hash, tx.raw.len());
+        for authority in &tx.authorities {
+            *self.authorities.entry(*authority).or_default() += 1;
+        }
         let queue = self.queues.get_mut(&sender)?;
         let old = queue.txs.insert(nonce, tx);
         if let Some(old) = &old {
             self.index.remove(&old.hash);
             self.bytes -= old.raw.len();
+            self.unname(&old.authorities);
         }
         self.index.insert(hash, (sender, nonce));
         self.bytes += len;
         old
+    }
+
+    /// Forgets that a transaction leaving the pool named `authorities`.
+    fn unname(&mut self, authorities: &[Address]) {
+        if authorities.is_empty() {
+            return;
+        }
+        // Every authority of a pool transaction is counted.
+        for authority in authorities {
+            let count = self.authorities.entry(*authority).or_default();
+            *count = count.saturating_sub(1);
+        }
+        self.authorities.retain(|_, count| *count > 0);
     }
 
     /// Removes the transaction of `sender` with `nonce`, and the sender's
@@ -440,6 +499,7 @@ impl Mempool {
         }
         self.index.remove(&tx.hash);
         self.bytes -= tx.raw.len();
+        self.unname(&tx.authorities);
         Some(tx)
     }
 
@@ -500,11 +560,10 @@ impl Mempool {
     /// Brings `sender`'s queue up to its account after a block (spec 14 §5):
     /// drops the transactions whose nonce the account has passed, the first
     /// pending one whose cost, with those before it, exceeds the balance,
-    /// and every queued one that alone exceeds it. A sender whose code hash
-    /// changed loses every transaction: the reference kernel's transactions
-    /// cannot set code at a sender's address (it decodes no EIP-7702
-    /// transaction), so the kernel accepted them for an account in a state
-    /// that cannot recur. Returns the hashes dropped.
+    /// and every queued one that alone exceeds it. A sender whose code
+    /// changed keeps its transactions: an account that can send has no code
+    /// or a delegation designator, which only EIP-7702 authorizations change,
+    /// and a delegated account can still send. Returns the hashes dropped.
     pub fn reset(&mut self, sender: &Address, account: Account) -> Vec<[u8; 32]> {
         let Some(queue) = self.queues.get_mut(sender) else {
             return Vec::new();
@@ -512,7 +571,6 @@ impl Mempool {
         if queue.account == account {
             return Vec::new();
         }
-        let code_changed = queue.account.code_hash != account.code_hash;
         queue.account = account;
         let pending_end = queue.pending_end();
         let mut spent = 0u128;
@@ -526,7 +584,7 @@ impl Mempool {
             spent = spent.saturating_add(if pending { tx.cost } else { 0 });
             let over = if pending { spent } else { tx.cost } > balance;
             unfunded |= pending && over;
-            if code_changed || stale || over {
+            if stale || over {
                 drop.push(tx.nonce);
             }
         }
@@ -561,10 +619,19 @@ impl Mempool {
     /// the ones before it, contributes nothing more. A transaction in `skip`
     /// counts as already taken: it is left out and uses none of the budget,
     /// but its cost counts against its sender's balance and the sender's
-    /// later transactions may follow it. The pool keeps what it hands out
-    /// until a block includes it.
+    /// later transactions may follow it. A sender that an authorization of a
+    /// transaction ahead of it names, one in `skip` or one taken before,
+    /// contributes nothing more: the authorization can move its nonce when
+    /// it runs. The pool keeps what it hands out until a block includes it.
     #[must_use]
     pub fn take(&self, max_bytes: usize, max_gas: u64, skip: &[[u8; 32]]) -> Vec<Vec<u8>> {
+        // What `skip` carries runs before anything taken now, whatever its
+        // priority.
+        let mut named: HashSet<&Address> = skip
+            .iter()
+            .filter_map(|hash| self.get(hash))
+            .flat_map(|tx| &tx.authorities)
+            .collect();
         let skip: HashSet<&[u8; 32]> = skip.iter().collect();
         let runs: Vec<(Vec<&PoolTx>, u128)> = self
             .queues
@@ -588,6 +655,9 @@ impl Mempool {
         let mut taken = Vec::new();
         while let Some((_, _, run, at)) = heap.pop() {
             let tx = runs[run].0[at];
+            if named.contains(&tx.sender) {
+                continue;
+            }
             let cost = spent[run].saturating_add(tx.cost);
             let skipped = skip.contains(&tx.hash);
             let (len, used) = if skipped {
@@ -604,6 +674,7 @@ impl Mempool {
             if !skipped {
                 taken.push(tx.raw.clone());
             }
+            named.extend(&tx.authorities);
             push(&mut heap, run, at + 1);
         }
         taken

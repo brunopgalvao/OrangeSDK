@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use common::{Wallet, node};
 use solo_rpc::Rpc;
-use solo_rpc::http::{Request, bind, read_request, response, serve, serve_connection};
+use solo_rpc::http::{MAX_BODY, Request, bind, read_request, response, serve, serve_connection};
 
 #[test]
 fn request_parsing() {
@@ -51,6 +51,25 @@ fn request_parsing() {
         ))
         .unwrap_err()
         .contains("fill whole buffer")
+    );
+    // A body over the limit is refused from its length alone, a body at the
+    // limit is read.
+    let over = format!(
+        "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        MAX_BODY + 1
+    );
+    assert_eq!(
+        read_request(&mut Cursor::new(over.into_bytes())).unwrap_err(),
+        format!(
+            "body too large: {} bytes, the limit is {MAX_BODY}",
+            MAX_BODY + 1
+        )
+    );
+    let mut at = format!("POST / HTTP/1.1\r\nContent-Length: {MAX_BODY}\r\n\r\n").into_bytes();
+    at.resize(at.len() + MAX_BODY, b'x');
+    assert_eq!(
+        read_request(&mut Cursor::new(at)).unwrap().body.len(),
+        MAX_BODY
     );
     let clone = Request {
         method: "A".into(),

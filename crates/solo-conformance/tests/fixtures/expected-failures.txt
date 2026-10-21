@@ -6,5 +6,4 @@
 # goes); `prefix*` and `type:N` entries cover a class of cases and must excuse
 # at least one failure in the committed subset. Format: `<entry> | <reason>`.
 
-type:3 | EIP-4844 blob transactions are not accepted: the reference kernel takes legacy, EIP-2930 and EIP-1559 transactions (solo-eth decodes type 3 as Unsupported, so the kernel refuses it before execution). A solochain has no blob data-availability layer for them to pay for. Cases whose fixture expects the transaction to be rejected pass.
-type:4 | EIP-7702 set-code transactions are not accepted yet: solo-eth decodes type 4 as Unsupported, so the kernel refuses it before execution. Accounts that hold a delegation designator from genesis do run delegated code. Cases whose fixture expects the transaction to be rejected pass.
+type:3 | EIP-4844 blob transactions are not accepted: the reference kernel takes legacy, EIP-2930, EIP-1559 and EIP-7702 transactions (solo-eth decodes type 3 as Unsupported, so the kernel refuses it before execution). A solochain has no blob data-availability layer for them to pay for. Cases whose fixture expects the transaction to be rejected pass.
