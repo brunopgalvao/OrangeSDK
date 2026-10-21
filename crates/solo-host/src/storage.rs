@@ -203,11 +203,13 @@ impl MemStorage {
         let kept = history.written.split_off(&(oldest + 1));
         for (version, keys) in std::mem::replace(&mut history.written, kept) {
             for key in keys {
-                if let Some(versions) = history.versions.get_mut(&key) {
+                // Every key a version wrote has that version's entry.
+                let emptied = history.versions.get_mut(&key).is_some_and(|versions| {
                     versions.remove(&version);
-                    if versions.is_empty() {
-                        history.versions.remove(&key);
-                    }
+                    versions.is_empty()
+                });
+                if emptied {
+                    history.versions.remove(&key);
                 }
             }
         }

@@ -477,11 +477,13 @@ impl Mempool {
     /// Forgets that a transaction leaving the pool named `authorities`.
     fn unname(&mut self, authorities: &[Address]) {
         for authority in authorities {
-            if let Some(count) = self.authorities.get_mut(authority) {
+            // Every authority of a pool transaction is counted.
+            let emptied = self.authorities.get_mut(authority).is_some_and(|count| {
                 *count -= 1;
-                if *count == 0 {
-                    self.authorities.remove(authority);
-                }
+                *count == 0
+            });
+            if emptied {
+                self.authorities.remove(authority);
             }
         }
     }
