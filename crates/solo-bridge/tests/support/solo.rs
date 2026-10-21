@@ -49,10 +49,23 @@ pub fn tx(
     data: &[u8],
     gas: u64,
 ) -> Vec<u8> {
+    tx_priced(key, nonce, to, value, data, gas, 1_000_000_000)
+}
+
+/// A legacy EIP-155 transaction from `key` at gas price `price`.
+pub fn tx_priced(
+    key: &SigningKey,
+    nonce: u64,
+    to: Option<[u8; 20]>,
+    value: u128,
+    data: &[u8],
+    gas: u64,
+    price: u128,
+) -> Vec<u8> {
     let to: &[u8] = to.as_ref().map_or(&[], |t| &t[..]);
     let fields = |out: &mut Vec<u8>| {
         encode_uint(u128::from(nonce), out);
-        encode_uint(1_000_000_000, out);
+        encode_uint(price, out);
         encode_uint(u128::from(gas), out);
         encode_bytes(to, out);
         encode_uint(value, out);

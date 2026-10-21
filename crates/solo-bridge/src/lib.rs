@@ -19,6 +19,10 @@
 //!   names its key set, and [`submission_covering_key`] picks one under the
 //!   key set a light client holds.
 //!
+//! - **Tokens.** [`tokens`] holds what the canonical token bridge of spec 21
+//!   adds on top of both channels: its messages, the addresses of wrapped
+//!   tokens, and the calls of users, owners and relayers.
+//!
 //! [`verifier_args`], [`light_client_args`], [`verifier_v2_args`],
 //! [`light_client_v2_args`] and [`InboxConfig`] encode the constructor
 //! arguments of the contracts in `contracts/`.
@@ -26,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub mod abi;
+pub mod tokens;
 
 use std::fmt;
 
