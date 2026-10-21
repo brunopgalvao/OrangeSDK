@@ -102,14 +102,14 @@ interface ISoloModules {
 
 Calldata is an install only if it is the canonical encoding a Solidity encoder produces: the address word's high 12 bytes and the `uint64` word's high 24 bytes are zero, the offset word of `init` is 128, `init` is at most 4 096 bytes, padded with zero bytes to a multiple of 32, and nothing follows.
 
-A transaction to the module address *can run* if it is signed for this chain (a typed transaction, or a legacy one with an EIP-155 chain id), carries no value, its calldata is an install, and its sender is the `governance` account of spec 13 §1.1, which must be non-zero. Admission rejects one that cannot run with reason 12 (`SYSTEM_ACTION`), at the point spec 13 §2.3 checks the upgrade address. In `kernel_stf_execute_block` one that cannot run changes nothing and gets a failed receipt. One that can run first runs through the EVM as a plain call to the module address (intrinsic gas, fees, nonce); if that succeeded, the install is applied, and the receipt has status 0 with nothing else changed if any check below fails:
+An install is a governance action (spec 13 §9). Under the key track, a transaction to the module address *can run* if it is signed for this chain (a typed transaction, or a legacy one with an EIP-155 chain id), carries no value, its calldata is an install, and its sender is the governance key of spec 13 §1.1, which must be non-zero. Under the stake track no transaction to the module address can run: an install is proposed with `submit(moduleAddress, install(…))` to the governance address and applied, as below, when the passed proposal executes (13 §9.5). Admission rejects a transaction that cannot run with reason 12 (`SYSTEM_ACTION`), at the point spec 13 §2.3 checks the upgrade address. In `kernel_stf_execute_block` one that cannot run changes nothing and gets a failed receipt. One that can run first runs through the EVM as a plain call to the module address (intrinsic gas, fees, nonce); if that succeeded, the install is applied, and the receipt has status 0 with nothing else changed if any check below fails:
 
 - `capabilities` has a bit other than `HOOKS`;
 - `target` is in the system range, has code or a non-zero nonce, or has a module record;
 - the module's bytes are not in state and the code staged under `codeHash` with the upgrade address's `stage` action (spec 13 §3: chunks from 0 up to the first missing one, concatenated) is empty, longer than 65 536 bytes, or does not hash to `codeHash`; otherwise the kernel stores it under `code/` ‖ `codeHash`;
 - the install fails (§4, step 2); code the step before stored is removed again.
 
-On success the receipt carries the log `ModuleInstalled(target, codeHash, capabilities)` from the module address, and `installed_at` is the block's height. `eth_call` sees only the plain call.
+On success the receipt (of the transaction, or of the `execute` that ran the proposal) carries the log `ModuleInstalled(target, codeHash, capabilities)` from the module address, and `installed_at` is the block's height. `eth_call` sees only the plain call.
 
 ### 4.3 Queries
 

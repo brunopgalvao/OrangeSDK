@@ -18,7 +18,7 @@ The code is `solo-ethlc` (the protocol, the proofs and both modules' logic over 
 ## 2. Trust and limits
 
 - **Sync committees.** The light client accepts what a supermajority of the current (or, across a period boundary, next) sync committee signs. A dishonest supermajority of 512 randomly sampled validators can make it accept any header, as it can every Ethereum light client. Value that enters Solo through this bridge inherits that trust, which is why deliveries are delayed and rate limited (§6.3, §6.4) and can be paused (§6.4).
-- **Recovery.** A root accepted from a dishonest committee stays stored, at whatever execution block number the forged header named. Governance recovers in two steps: `pause` the verifier, then `setCheckpoint` with an honest checkpoint, which starts a new checkpoint epoch and so revokes every root stored before it, honest or not (§5.1); then `unpause`. Messages not yet delivered are proven again against roots of the new epoch, which hold the same outbox storage. Nonces a forged root already marked delivered stay delivered: the delay exists so that governance pauses before any is.
+- **Recovery.** A root accepted from a dishonest committee stays stored, at whatever execution block number the forged header named. Governance recovers in two steps: `pause` the verifier, then `setCheckpoint` with an honest checkpoint, which starts a new checkpoint epoch and so revokes every root stored before it, honest or not (§5.1); then `unpause`. Under the stake track of spec 13 §9 the guardian pauses at once, or a majority of stake does on the fast track, and proposals install the checkpoint and unpause. Messages not yet delivered are proven again against roots of the new epoch, which hold the same outbox storage. Nonces a forged root already marked delivered stay delivered: the delay exists so that governance pauses before any is.
 - **Finality only.** Only finalized headers are stored, and an update is applied at once or refused: there is no optimistic header and no pending best update (§3.6).
 - **Liveness.** Each sync-committee period (256 epochs, about 27 hours on mainnet) the client must learn the next committee, from an update attested in the period. A client that misses a whole period can no longer verify any signature and stalls; governance then installs a new checkpoint (§5.1, `setCheckpoint`). Relayers keep the client live; anyone can relay.
 - **Ethereum forks.** The client is pinned to the Electra container formats, which Fulu keeps (§3.1). A later fork that changes the light-client containers or the generalized indices (Gloas, for instance) needs a new light-client module; until it is installed, by a kernel upgrade (spec 13), updates signed after the fork fail their signature check or do not decode, and the client stalls rather than accepting anything.
@@ -147,7 +147,7 @@ An empty `light_client` leaves the bridge off and nothing below happens. Otherwi
 3. writes the light client's namespace: `config` = `{ config, governance, delay }` and the installed checkpoint, whose state root is usable from time `delay`;
 4. writes the verifier's namespace: `config` = `{ outbox, chain id, governance, window, max_messages }`.
 
-`governance` is the governance account of spec 13 §1.1 (zero: nobody governs the bridge). The stored `meta/params` leaves `bridge_in` out: the driver reads the parameters on every step and the namespaces hold the bridge's state. The `solo` command reads the parameters from a `"bridgeIn"` object (see `solo-cli`'s `bridge` module).
+`governance` is the governance authority of spec 13 §9.5: the governance key under the key track (zero: nobody governs the bridge), the governance address itself under the stake track, where only the kernel, executing a passed proposal or the guardian's pause, calls the governed functions; the switch of 13 §9.6 renames it in both namespaces. The stored `meta/params` leaves `bridge_in` out: the driver reads the parameters on every step and the namespaces hold the bridge's state. The `solo` command reads the parameters from a `"bridgeIn"` object (see `solo-cli`'s `bridge` module).
 
 ### 4.2 Namespaces
 
@@ -192,7 +192,7 @@ Calldata to the native contracts is the Solidity ABI of `contracts/IEthereumLigh
 | `executionRoot(uint64 blockNumber)` | `0xe4779daa` | view | `(bytes32 stateRoot, bytes32 blockHash, uint64 slot, uint64 usableAt)`, zeros if not held or stored in an earlier checkpoint epoch |
 | `delay()` | `0x6a42b8f8` | view | the delay in seconds |
 
-A governance function called by any other account, or with no governance account, reverts `NotGovernance()`. `module_query` (spec 16 §4.3) answers the views.
+A governance function called by any other account, or with no governance account, reverts `NotGovernance()`; under the stake track the governance account is the governance address, which nobody signs for, so the functions are reached only through a passed proposal or the guardian's pause (spec 13 §9.5), which call the module with `ACTION_GAS` VM gas as the governance address. `module_query` (spec 16 §4.3) answers the views.
 
 ### 5.2 The message verifier (EM)
 
