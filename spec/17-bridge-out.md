@@ -159,7 +159,7 @@ and otherwise makes `(newKeyId, newKey)` the current key set and logs `KeyRotate
 | guardian | `pause()`; `veto(nonce)` of a pending message, which then never executes | unpause, change any parameter, deliver anything |
 | owner | `pause()`, `unpause()`, `setGuardian`, `setDelay` (≤ `MAX_DELAY`), `setRateLimit` (window non-zero), `transferOwnership` (never to zero) | deliver, alter or replay a message, prove without a root, change the light client, the source chain or `firstNonce` |
 
-Pausing stops `prove` and `execute`. The delay exists so that the guardian can pause and veto a message proven from a certificate that faulty shareholders forged before it executes; the owner (a timelock or multisig) sets how long that window is and how much can move per window, which bounds what a forged certificate can deliver. Neither role is needed for an honest message to arrive: while the inbox is not paused and the message fits a window, anyone can prove and execute it.
+Pausing stops `prove` and `execute`. The delay exists so that the guardian can pause and veto a message proven from a certificate that faulty shareholders forged before it executes; the owner (a timelock or multisig) sets how long that window is and how much can move per window, which bounds what a forged certificate can deliver. The value limit counts only the value messages carry: a recipient that holds value itself and moves it on a message's word, as a token gateway does (spec 21 §6.2), is bounded by the message limit and its own caps, not by `maxValuePerWindow`. Neither role is needed for an honest message to arrive: while the inbox is not paused and the message fits a window, anyone can prove and execute it.
 
 ### 6.4 Deployment and succession
 

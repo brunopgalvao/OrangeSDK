@@ -111,7 +111,7 @@ Others get `NotGuardian()` and `NotOwner()`. Pausing stops deposits, deliveries 
 
 ### 5.7 Deployment
 
-Both gateways are deployed by ordinary transactions, the one on Solo by any account, not placed by the kernel at genesis like the inbox of spec 18 §4. Each gateway needs the other's address in its constructor; both are known in advance from their deployers' nonces (`CREATE`), so the deployers deploy them in either order. The pair of addresses a chain publishes is its canonical bridge.
+Both gateways are deployed by ordinary transactions, the one on Solo by any account, not placed by the kernel at genesis like the inbox of spec 18 §4. Each gateway needs the other's address in its constructor; both are known in advance from their deployers' nonces (`CREATE`). Either may be deployed first, but tokens may be listed (§6.2) only once both exist: **neither owner sets a lock cap until the paired gateway has been deployed at its predicted address and its code and constructor arguments checked.** On the Solo side this is what keeps value from being lost. `SoloInbox` delivers a message to an address without code as a success and consumes its nonce (spec 17 §6.1), so a `MINT` executed on Ethereum before the gateway exists there does nothing and can never be delivered again, and the currency or tokens it locked on Solo stay locked for ever; the same holds for good if the Ethereum deployer spends the predicted nonce on another transaction. In the other direction nothing is lost at once: the inbox refuses a delivery to an address without code and the message stays deliverable (spec 18 §6.5), but it waits for the Solo gateway, for ever if that is never deployed at its predicted address. The pair of addresses a chain publishes is its canonical bridge.
 
 Genesis placement would give every Solo chain the gateway at one reserved address, but it would put the gateway's code in the kernel (the inbox's runtime is embedded in it) and its configuration in genesis, make any change to it a kernel upgrade, and require a storage layout written without a constructor. Nothing about the gateway needs the kernel: it holds no privilege, calls the outbox and is called by the inbox as any contract is, and authenticates its peer by address. Unlike the inbox, which every Solo contract must be able to trust at a fixed address, a gateway is trusted only by the holders of its own tokens.
 
@@ -132,7 +132,7 @@ so `minted ≤ locked` always: a `MINT` is sent only after its tokens are locked
 
 `lockCap[token]` bounds what the gateway may hold locked of a native token, and a token whose cap is zero cannot be deposited at all: a token is *listed* on a gateway when its lock cap is non-zero, and the owner lists only tokens that behave (§6.3). `mintCap[origin]` bounds the supply of a wrapped token on the receiving side. A cap lowered below what is outstanding refuses new deposits or mints, never touches what exists, and a mint over its cap waits in its channel until the owner raises the cap.
 
-The mint cap is what bounds a forgery. If a channel delivers a message the paired gateway never sent (a dishonest sync-committee supermajority, or a threshold of shareholders certifying a false root), the receiving gateway mints at most up to the cap of each wrapped token, or releases what is locked; the channel's delay, rate limit and pause (spec 17 §6.2, spec 18 §6.3, §6.4) bound how fast. Owners size caps to the value they accept at the channel's trust.
+The caps are what bound a forgery. If a channel delivers a message the paired gateway never sent (a dishonest sync-committee supermajority, or a threshold of shareholders certifying a false root), the receiving gateway mints at most up to the cap of each wrapped token, or releases what is locked, which the lock cap bounds. The caps are the only bounds on value: every gateway message carries value 0, so `SoloInbox`'s `maxValuePerWindow` (spec 17 §6.2) never counts bridged tokens, and the channels' rate limits (spec 17 §6.2, spec 18 §6.4) count messages, not amounts. One forged `RELEASE` can take everything locked of a token, and one forged `MINT` can mint a wrapped token up to its cap. What the channels add against a forgery is time: the delay of `SoloInbox` (spec 17 §6.2), during which its guardian can pause it and veto the message (spec 17 §6.3), and the delay of Solo's light client (spec 18 §6.3), during which governance can pause deliveries and revoke the root (spec 18 §2); and the limit on how many messages a window delivers. Owners size caps to the value they accept at the channel's trust.
 
 ### 6.3 Tokens
 
@@ -144,7 +144,7 @@ The mint cap is what bounds a forgery. If a channel delivers a message the paire
 
 ### 6.4 What the gateways add, and what they do not change
 
-The gateways add per-token caps, their own pause, refusal of unlisted and fee-taking tokens, and owed releases. They change nothing in the channels: the light clients, the inboxes' delays, rate limits, pauses and vetoes, and the roles that govern them apply to token messages as to any other. A `SoloInbox` veto of a token message drops it for ever: a vetoed `RELEASE` leaves its wrapped tokens burned and the origin locked, a vetoed `MINT` leaves its tokens locked. Both keep the invariant (`minted ≤ locked`), and recovering such value is for the owners to decide.
+The gateways add per-token caps, their own pause, refusal of unlisted and fee-taking tokens, and owed releases. They change nothing in the channels: the light clients, the inboxes' delays, rate limits, pauses and vetoes, and the roles that govern them apply to token messages as to any other. A channel's limit on value per window does not reach tokens, whose messages carry value 0; its limit on messages per window does (§6.2). A `SoloInbox` veto of a token message drops it for ever: a vetoed `RELEASE` leaves its wrapped tokens burned and the origin locked, a vetoed `MINT` leaves its tokens locked. Both keep the invariant (`minted ≤ locked`), and recovering such value is for the owners to decide.
 
 ## 7. Relaying
 
@@ -185,6 +185,8 @@ The gateways and the wrapped token are in `contracts/tokens/`; the test contract
 - **Metadata is fixed** at creation (§4); a token that changes its name keeps the old one on the other side.
 - **The owner of the Ethereum gateway can change its inbox** (§5.6), which is needed to follow a `SoloInbox` succession but is a power over value; a timelock is the protection.
 - **Vetoed messages** (§6.4) leave value locked; nothing retires them.
+- **No limit on value per window.** The gateways bound value only by their caps (§6.2); a forged message takes up to a whole cap at once, and only the channels' delays, pauses, vetoes and message counts stand in its way.
+- **Deployment order is a rule, not a check** (§5.7): a gateway cannot see whether its peer exists on the other chain, so its owner must not list a token before it does.
 - `TokenMessage` decodes amounts up to `2^128 − 1`; a larger amount is valid on chain but does not decode in the helper.
 
 ## 11. Rationale (non-normative)
