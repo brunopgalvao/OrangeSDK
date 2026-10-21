@@ -354,21 +354,17 @@ fn init(args: &[String]) -> Result<String, String> {
         }));
     }
     let manifest = json!({"chainId": chain_id, "nodes": nodes});
-    write(
-        &dir.join(MANIFEST),
-        serde_json::to_string_pretty(&manifest)
-            .expect("json")
-            .as_bytes(),
-    )?;
+    let manifest = serde_json::to_string_pretty(&manifest).expect("json");
+    write(&dir.join(MANIFEST), manifest.as_bytes())?;
     Ok(report)
 }
 
 /// The `solo` binary to start nodes with: `SOLO_BIN`, or this executable.
-fn solo_binary() -> Result<PathBuf, String> {
-    std::env::var_os("SOLO_BIN")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok())
-        .ok_or_else(|| "cannot find the solo binary: set SOLO_BIN".to_owned())
+fn solo_binary() -> PathBuf {
+    std::env::var_os("SOLO_BIN").map_or_else(
+        || std::env::current_exe().unwrap_or_default(),
+        PathBuf::from,
+    )
 }
 
 /// Starts node `index` as a process; its pid goes to `node-<i>/pid`, its
@@ -380,13 +376,14 @@ fn spawn(devnet: &Devnet, index: usize) -> Result<Child, String> {
     }
     let node_dir = devnet.node_dir(index);
     let log_path = node_dir.join("log");
+    let fail = |e: std::io::Error| io(&log_path, &e);
     let log = File::options()
         .create(true)
         .append(true)
         .open(&log_path)
-        .map_err(|e| io(&log_path, &e))?;
-    let stderr = log.try_clone().map_err(|e| io(&log_path, &e))?;
-    let binary = solo_binary()?;
+        .map_err(fail)?;
+    let stderr = log.try_clone().map_err(fail)?;
+    let binary = solo_binary();
     let child = Command::new(&binary)
         .args(["devnet", "node", "--dir"])
         .arg(&devnet.dir)
@@ -407,11 +404,9 @@ fn stop_node(devnet: &Devnet, index: usize) -> Result<String, String> {
     if client::call(&node.rpc, "solo_stop", &json!([])).is_err() {
         return Ok(format!("node {index} is not running"));
     }
-    poll_until(
-        NODE_TIMEOUT,
-        &format!("node {index} did not stop"),
-        &mut || client::status(&node.rpc).is_err(),
-    )?;
+    let what = format!("node {index} did not stop");
+    let rpc = &node.rpc;
+    poll_until(NODE_TIMEOUT, &what, &mut || client::status(rpc).is_err())?;
     Ok(format!("node {index} stopped"))
 }
 
@@ -428,11 +423,8 @@ fn start_node(devnet: &Devnet, index: usize) -> Result<String, String> {
     let rpc = devnet.node(index)?.rpc.clone();
     // The process outlives this command; nothing waits for it.
     drop(spawn(devnet, index)?);
-    poll_until(
-        NODE_TIMEOUT,
-        &format!("node {index} did not answer on {rpc}"),
-        &mut || client::status(&rpc).is_ok(),
-    )?;
+    let what = format!("node {index} did not answer on {rpc}");
+    poll_until(NODE_TIMEOUT, &what, &mut || client::status(&rpc).is_ok())?;
     Ok(format!("node {index} started on {rpc}"))
 }
 

@@ -119,11 +119,8 @@ pub fn submit(
     }
     let min_delay = status["params"]["minDelay"].as_u64().unwrap_or(0);
     let chain_id = quantity(&call(rpc, "eth_chainId", &json!([]))?)?;
-    let mut nonce = quantity(&call(
-        rpc,
-        "eth_getTransactionCount",
-        &json!([data(&sender), "pending"]),
-    )?)?;
+    let account = json!([data(&sender), "pending"]);
+    let mut nonce = quantity(&call(rpc, "eth_getTransactionCount", &account)?)?;
     let code_hash = keccak256(code);
     let chunks: Vec<&[u8]> = code.chunks(CHUNK_SIZE).collect();
     let mut hashes = Vec::with_capacity(chunks.len());

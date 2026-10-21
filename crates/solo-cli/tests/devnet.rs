@@ -339,6 +339,18 @@ fn init_writes_a_reproducible_devnet_and_names_mistakes() {
         KERNEL,
     ]);
     assert!(text.contains("kernel.solo"), "{text}");
+    let taken = scratch("init-taken");
+    std::fs::create_dir_all(&taken).unwrap();
+    std::fs::write(taken.join("node-0"), "x").unwrap();
+    let text = err(&[
+        "devnet",
+        "init",
+        "--dir",
+        str_of(&taken),
+        "--kernel",
+        KERNEL,
+    ]);
+    assert!(text.contains("node-0"), "{text}");
 }
 
 /// A server on a free port answering each connection with `reply` once per
@@ -543,7 +555,15 @@ fn manifest_and_argument_errors() {
         .unwrap();
     let text = String::from_utf8(out.stderr).unwrap();
     assert!(text.contains("cannot start node 0"), "{text}");
-    // A node that dies at once (no kernel in this directory) fails `up`.
+    // `up` fails when a node cannot start, and when one dies at once (no
+    // kernel in this directory).
+    let out = Command::new(SOLO)
+        .args(["devnet", "up", "--dir", d])
+        .env("SOLO_BIN", "/nonexistent/solo")
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stderr).unwrap();
+    assert!(text.contains("cannot start node 0"), "{text}");
     let text = err(&["devnet", "up", "--dir", d]);
     assert!(text.contains("node 0 exited with exit status: 2"), "{text}");
     let log = std::fs::read_to_string(dir.join("node-0/log")).unwrap();
@@ -552,7 +572,14 @@ fn manifest_and_argument_errors() {
     let status = http(
         r#"{"version":"0","chainId":7,"head":5,"headAgeSeconds":0.1,"finalized":4,"p2p":true,"peers":1,"mempool":0,"uptimeSeconds":1,"validator":null,"upgradeAlert":null,"missingGates":[],"kernelVersion":1,"kernelHash":"0x0000000000000000000000000000000000000000000000000000000000000000","activeGates":[],"pendingUpgrade":null}"#,
     );
-    let fake = fake_node(vec!["HTTP/1.1 500 No\r\n\r\n"; 8], Some(status));
+    // Its JSON-RPC answers one upgrade status and four finality proofs with
+    // 500, then upgrade statuses with nothing signalled or locked in.
+    let unsignalled = http(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"validators":[{"id":"0x01","weight":1,"signal":null}],"gates":{"nextEpoch":0,"lockedIn":[],"records":[]}}}"#,
+    );
+    let mut replies = vec!["HTTP/1.1 500 No\r\n\r\n"; 5];
+    replies.extend([unsignalled; 3]);
+    let fake = fake_node(replies, Some(status));
     let conditions = Conditions::parse(
         &[
             "solo",
@@ -577,6 +604,26 @@ fn manifest_and_argument_errors() {
     assert_eq!(
         conditions.to_string(),
         "gates 0 signalled by every validator, 1 threshold certificates above 0"
+    );
+    let gates = Conditions::parse(
+        &[
+            "solo",
+            "devnet",
+            "wait",
+            "--signalled",
+            "0",
+            "--locked-in",
+            "0",
+        ]
+        .map(str::to_owned),
+    )
+    .unwrap();
+    assert_eq!(
+        gates.unmet(&fake, 4),
+        vec![
+            "1 validators have not signalled".to_owned(),
+            "locked in []".to_owned()
+        ]
     );
     let all = Conditions::parse(
         &[
@@ -609,9 +656,13 @@ fn manifest_and_argument_errors() {
             "00".repeat(32)
         )
     );
-    // Met by the fake's status but for the lock-in, which it cannot answer.
+    // Met by the fake's status but for the lock-in; and, with the furthest
+    // node far ahead, it has not caught up either.
     let unmet = all.unmet(&fake, 4);
-    assert_eq!(unmet.len(), 1, "{unmet:?}");
+    assert_eq!(unmet, vec!["locked in []".to_owned()]);
+    let unmet = all.unmet(&fake, 100);
+    assert_eq!(unmet.len(), 2, "{unmet:?}");
+    assert!(unmet[0].contains("finalized 4 behind 100"), "{unmet:?}");
     assert!(all.unmet("127.0.0.1:1", 0)[0].contains("unreachable"));
 }
 
@@ -672,7 +723,7 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
     // Started again, alone and from nothing, it runs; a second start is refused.
     assert!(ok(&["devnet", "start", "--dir", d, "--node", "0"]).contains("node 0 started"));
     assert!(err(&["devnet", "start", "--dir", d, "--node", "0"]).contains("already running"));
-    // Conditions not met yet: no peers, no signal recorded, no gate, no certificate.
+    // Conditions not met yet: no peers, no gate, no certificate, not that high.
     let text = err(&[
         "devnet",
         "wait",
@@ -680,15 +731,13 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
         d,
         "--peers",
         "1",
-        "--signalled",
-        "0,1,2",
-        "--locked-in",
-        "0",
         "--active-gates",
         "2",
         "--certified",
         "1",
         "--above",
+        "1000000",
+        "--head",
         "1000000",
         "--finalized",
         "1000000",
@@ -697,10 +746,9 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
     ]);
     for missing in [
         "peers 0 < 1",
-        "have not signalled",
-        "locked in",
         "active gates",
         "0 threshold certificates above 1000000",
+        "head",
         "finalized",
     ] {
         assert!(text.contains(missing), "{missing}: {text}");
