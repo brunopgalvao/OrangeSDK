@@ -969,12 +969,12 @@ fn a_proposal_upgrades_the_kernel_across_four_validators() {
         index,
         chunk: vec![0xFF],
     };
-    for action in [spoil(stages.len() as u32), spoil(0)] {
+    for action in [spoil(u32::try_from(stages.len()).unwrap()), spoil(0)] {
         let raw = val[3].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &action.encode());
         assert_eq!(sim_include(&mut sim, &raw).status, 0);
     }
-    let staged = sim.nodes[0].query(query::CODE, &code_hash).unwrap();
-    assert_eq!(Vec::<u8>::from_bytes(&staged.body).unwrap(), code);
+    let served = sim.nodes[0].query(query::CODE, &code_hash).unwrap();
+    assert_eq!(Vec::<u8>::from_bytes(&served.body).unwrap(), code);
     let last = stages.len() - 1;
     let raw = val[0].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &stages[last].encode());
     assert_eq!(sim_include(&mut sim, &raw).status, 1);
@@ -1303,6 +1303,7 @@ fn one_validator_meets_the_bounds_and_the_gas() {
         &v0.tx(GOVERNANCE_ADDRESS, 0, 3_000_000, &calldata),
     );
     assert_eq!(r.status, 1);
+    #[allow(clippy::naive_bytecount)]
     let zeros = calldata.iter().filter(|b| **b == 0).count() as u64;
     let floor = 21_000 + 10 * (zeros + 4 * (calldata.len() as u64 - zeros));
     assert_eq!(r.gas_used, floor + GOVERNANCE_GAS);
