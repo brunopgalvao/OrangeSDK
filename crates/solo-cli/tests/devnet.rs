@@ -865,14 +865,18 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
     let log = std::fs::read_to_string(devnet.node_dir(0).join("log")).unwrap();
     assert!(log.contains("block 2 0x"), "{log}");
     assert!(log.contains("new, from view 1"), "{log}");
+    let ran = last_block(&log);
+    assert!(ran >= 2, "{log}");
     assert!(ok(&["devnet", "status", "--dir", d]).contains("node 0  down"));
     assert!(devnet.node_dir(0).join("driver.state").exists());
-    // Started again, it resumes the view its driver state records and runs
-    // on; a second start is refused.
+    // Started again, alone, it resumes the view its driver state records,
+    // re-executes every block it had from its tables and runs on; a second
+    // start is refused.
     assert!(ok(&["devnet", "start", "--dir", d, "--node", "0"]).contains("node 0 started"));
     assert!(err(&["devnet", "start", "--dir", d, "--node", "0"]).contains("already running"));
     let log = std::fs::read_to_string(devnet.node_dir(0).join("log")).unwrap();
     assert!(log.contains("resumed in view "), "{log}");
+    assert_eq!(replayed(&log), ran, "{log}");
     // Conditions not met yet: no peers, no gate, no certificate, not that high.
     let text = err(&[
         "devnet",
@@ -1127,7 +1131,9 @@ fn the_rehearsal_passes_on_a_four_validator_devnet() {
     }
     assert!(up.finish());
     // Every node's log shows the kernel switch and no error; the two that
-    // restarted resumed the driver state they had left on disk.
+    // restarted resumed the driver state they had left on disk and
+    // re-executed, before asking any peer, every block they had executed
+    // before they stopped (the log holds both runs).
     for i in 0..4 {
         let log = std::fs::read_to_string(dir.join(format!("node-{i}/log"))).unwrap();
         assert!(!log.contains("node error"), "node {i}: {log}");
@@ -1136,7 +1142,29 @@ fn the_rehearsal_passes_on_a_four_validator_devnet() {
             "node {i}: {log}"
         );
         assert_eq!(log.contains("resumed in view "), i >= 2, "node {i}: {log}");
+        if i >= 2 {
+            let (before, _) = log.split_once("resumed in view ").unwrap();
+            let ran = last_block(before);
+            assert!(ran > 0, "node {i}: {log}");
+            assert_eq!(replayed(&log), ran, "node {i}: {log}");
+        }
     }
+}
+
+/// The height of the last `block <n> 0x…` line a node logged in `log`.
+fn last_block(log: &str) -> u64 {
+    log.lines()
+        .filter_map(|line| line.strip_prefix("block "))
+        .filter_map(|rest| rest.split(' ').next()?.parse().ok())
+        .next_back()
+        .unwrap_or(0)
+}
+
+/// How many blocks the node says it re-executed from its tables on resume.
+fn replayed(log: &str) -> u64 {
+    let (_, rest) = log.split_once("resumed in view ").unwrap();
+    let (_, count) = rest.split_once(", ").unwrap();
+    count.split(' ').next().unwrap().parse().unwrap()
 }
 
 #[test]

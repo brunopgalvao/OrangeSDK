@@ -30,7 +30,7 @@ DEVNET_DRIVER=compose RPCS=127.0.0.1:8545,127.0.0.1:8546,127.0.0.1:8547,127.0.0.
   tools/rehearse-upgrade.sh compose crates/solo-node/tests/fixtures/kernel_v2.elf
 ```
 
-The compose driver stops and starts validators with `docker compose stop` and `start`; a restarted container resumes the view its driver state on the volume records, so it never votes twice in one view (spec 08 §7), and syncs its chain state from its peers, as a restarted process does. `cargo test -p solo-cli --test devnet` runs the compose rehearsal only when `SOLO_DOCKER` is set.
+The compose driver stops and starts validators with `docker compose stop` and `start`; a restarted container resumes the view its driver state on the volume records, so it never votes twice in one view, re-executes the chain it had finalized from its own tables and syncs the rest from its peers (spec 08 §7), as a restarted process does; `docker compose stop` and `start` of the whole stack brings the chain back where it was. `cargo test -p solo-cli --test devnet` runs the compose rehearsal only when `SOLO_DOCKER` is set.
 
 ## Prometheus and Grafana by hand
 

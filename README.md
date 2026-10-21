@@ -65,7 +65,7 @@ solo node --kernel kernel.elf --genesis genesis.json --key <seed 1> --data-dir n
 solo node --kernel kernel.elf --genesis genesis.json --key <seed 2> --data-dir node-2 --listen 127.0.0.1:30302 --rpc 127.0.0.1:8546 --peer 127.0.0.1:30301
 ```
 
-A node without `--key` follows the chain as an observer. A validator keeps its driver state in `--data-dir` (`driver.state`, the latest persisted state, and `persist.log`, a journal of the driver's node-local writes), written before anything it signs leaves the node, so a restarted validator resumes the view it left and never votes twice in one view (spec 08 §7). Chain state is not kept: a node that restarts or falls behind syncs the finalized blocks it misses from its peers.
+A node without `--key` follows the chain as an observer. A validator keeps its driver state in `--data-dir` (`driver.state`, the latest persisted state, and `persist.log`, a journal of the driver's node-local writes), written before anything it signs leaves the node, so a restarted validator resumes the view it left and never votes twice in one view (spec 08 §7). Chain state is not kept: a restarted node re-executes the blocks it had finalized from the proposals in its data directory, and a node that falls behind syncs the finalized blocks it misses from its peers.
 
 Watch it: every node serves Prometheus metrics at `GET /metrics` and a JSON status at `GET /status` on its JSON-RPC address (spec 11), and `solo doctor` turns both into a verdict, exiting non-zero when the node is unhealthy. `ops/` has the alert rules, a Prometheus configuration and a Grafana dashboard:
 

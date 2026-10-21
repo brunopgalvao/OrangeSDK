@@ -45,6 +45,9 @@ const FUTURE_PER_SIGNER: usize = 4;
 /// Whether the outstanding sync request was sent for a message nobody
 /// known signed, so any verified trigger may replace it.
 const WEAK_SYNC_KEY: &[u8] = b"simplex/weak_sync";
+/// The height a restarted node re-executes its own finalized blocks up to
+/// (spec 08 §7), while it does; 0 or absent otherwise.
+const REPLAY_KEY: &[u8] = b"simplex/replay";
 const ZERO: Hash = [0; 32];
 
 /// The anchor a leader puts in its proposal (spec 08 §5): its executed
@@ -927,10 +930,55 @@ impl Ctx {
                 persist::set_raw(&key(b"bcert/", &[&p.height.to_le_bytes()]), bytes);
             }
             self.s.finalized_height = p.height;
-            let header = BlockHeader { height: p.height, parent_hash: p.parent, timestamp_ms: p.timestamp_ms, ..BlockHeader::default() };
-            let participation = Participation { evidence: p.evidence, dkg: p.dkg }.to_bytes();
-            self.effects.push(Effect::ExecuteBlock { block: Block { header: header.to_bytes(), txs: p.txs, participation } });
+            self.execute(p);
         }
+    }
+
+    /// Asks the host to execute finalized proposal `p`.
+    fn execute(&mut self, p: Proposal) {
+        let header = BlockHeader { height: p.height, parent_hash: p.parent, timestamp_ms: p.timestamp_ms, ..BlockHeader::default() };
+        let participation = Participation { evidence: p.evidence, dkg: p.dkg }.to_bytes();
+        self.effects.push(Effect::ExecuteBlock { block: Block { header: header.to_bytes(), txs: p.txs, participation } });
+    }
+
+    /// Begins re-executing, from the proposals and certificates this node
+    /// persisted, the blocks it had finalized up to `remembered` above the
+    /// `executed` height its chain state holds: a node that lost its chain
+    /// state but kept its tables needs no peer to come back (spec 08 §7).
+    /// One block per step, so that no step outgrows its budget however long
+    /// the chain; the target outlives a restart in the middle.
+    fn start_replay(&mut self, executed: u64, remembered: u64) {
+        if remembered > executed {
+            persist::set(REPLAY_KEY, &remembered);
+        }
+        self.replay_next();
+    }
+
+    /// The next block of a replay, the one above the chain state (the truth
+    /// about what was executed, whichever kernel did it), when it is within
+    /// the target and the tables hold it; the target, or a gap, ends the
+    /// replay, and what the tables lack the node syncs (spec 08 §7a).
+    fn replay_next(&mut self) {
+        let target: u64 = persist::get(REPLAY_KEY).unwrap_or(0);
+        if target == 0 {
+            return;
+        }
+        let next = state::height().unwrap_or(0) + 1;
+        match Self::finalized_proposal(next).filter(|_| next <= target) {
+            Some(p) => {
+                self.s.finalized_height = self.s.finalized_height.max(next);
+                self.execute(p);
+            }
+            None => persist::set(REPLAY_KEY, &0u64),
+        }
+    }
+
+    /// The proposal this node finalized at `height`, when its tables hold
+    /// it with the certificate the host finalizes it under.
+    fn finalized_proposal(height: u64) -> Option<Proposal> {
+        let hash: Hash = persist::get(&key(b"final/", &[&height.to_le_bytes()]))?;
+        persist::get_raw(&key(b"cert/", &[&height.to_le_bytes()]))?;
+        Self::proposal(&hash).filter(|p| p.height == height)
     }
 
     fn finalized_hash(&self) -> Hash {
@@ -1064,6 +1112,24 @@ impl Ctx {
         if self.epoch_end(self.epoch).is_some_and(|end| height >= end) {
             self.catch_up_epoch();
         }
+        self.rejoin();
+        self.replay_next();
+    }
+
+    /// A node whose chain state has just reached its view's epoch, by
+    /// re-executing its own blocks or by syncing (spec 08 §3a, §7), learns
+    /// its index in that epoch's set and arms its view again, so that as
+    /// leader it proposes now rather than after a timeout; its flags still
+    /// say what it did in the view. The epoch itself it took up at `open`
+    /// ([`Ctx::load_set`]), its view being there already. A node outside
+    /// the set finds no index.
+    fn rejoin(&mut self) {
+        if self.s.me.is_none() && self.view_epoch(self.s.view) == self.epoch {
+            self.s.me = self.identify();
+            if self.s.me.is_some() {
+                self.arm();
+            }
+        }
     }
 
     /// Prunes the envelope pool and sends this node's DKG message for the
@@ -1096,10 +1162,13 @@ pub fn step(input: &Input) -> Seq<Effect> {
                 c.s = restored;
             }
             c.s.now_ms = *now_ms;
-            // Chain state is the truth about what has been executed; a node that
-            // lost it syncs the rest instead of executing on the wrong parent.
+            // Chain state is the truth about what has been executed. A node that
+            // lost it re-executes what it had finalized from its own tables and
+            // syncs the rest, instead of executing on the wrong parent; a replay
+            // a restart cut short goes on to where it was headed.
             let executed = state::height().unwrap_or(0);
-            if c.s.finalized_height > executed {
+            let remembered = c.s.finalized_height.max(persist::get(REPLAY_KEY).unwrap_or(0));
+            if remembered > executed {
                 c.s.finalized_height = executed;
             }
             c.load_set();
@@ -1111,6 +1180,7 @@ pub fn step(input: &Input) -> Seq<Effect> {
             c.catch_up_epoch();
             c.arm();
             c.dkg_step(executed);
+            c.start_replay(executed, remembered);
         }
         Input::TimerFired { timer_id, now_ms } => c.on_timer(*timer_id, *now_ms),
         Input::MempoolContents { txs } => c.on_mempool(&txs.0),

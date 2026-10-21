@@ -35,8 +35,9 @@
 //! does not answer, and a fresh process. A node keeps its driver state in
 //! `node-<i>` (`driver.state` and `persist.log`, [`solo_node::DriverStore`]),
 //! so a restarted node resumes the view it left and never votes twice in
-//! it (spec 08 §3 and §7); its chain state it syncs again from its peers
-//! (spec 08 §7a). `status` prints one line per node from `GET /status`.
+//! it, re-executes the chain it had finalized from its own tables and syncs
+//! what it lacks from its peers (spec 08 §7). `status` prints one line per
+//! node from `GET /status`.
 //! `wait` polls until every selected node meets every condition given, or
 //! the timeout passes (default 600 s):
 //!

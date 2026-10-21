@@ -10,8 +10,9 @@
 //! ([`solo_node::DriverStore`]): a node started again over the same
 //! directory resumes the view it left with the votes it cast there, so it
 //! never votes twice in one view (spec 08 §3 and §7); `solo node` requires
-//! it for a validator. Chain state is not kept: a restarted node replays
-//! the chain from its peers.
+//! it for a validator. Chain state is not kept: a restarted node re-executes
+//! the chain it had finalized from its tables and syncs the rest from its
+//! peers.
 //! The genesis file is
 //! JSON: `{"chainId": 1337, "slotMs": 400, "maxTxs": 64,
 //! "alloc": {"0x<address>": "<wei>"}, "validators": ["0x<32-byte id>"]}`.
@@ -509,15 +510,21 @@ fn open_store(args: &[String], validator: bool) -> Result<Opened, CliError> {
     Ok((Some(store), persisted, resumed))
 }
 
-/// Says where the driver's state lives and which view it started in.
+/// Says where the driver's state lives, which view it started in and, on a
+/// resume, how many of its own finalized blocks it re-executed from its
+/// tables before anything else happened (spec 08 §7).
 fn report_driver_state(node: &solo_node::Node, resuming: bool) {
     if let Some(store) = node.store() {
         let view = node.simplex_state().map_or(0, |s| s.view);
-        let how = if resuming { "resumed in" } else { "new, from" };
-        eprintln!(
-            "driver state in {}: {how} view {view}",
-            store.dir().display()
-        );
+        let how = if resuming {
+            format!(
+                "resumed in view {view}, {} blocks re-executed from its tables",
+                node.executed.len()
+            )
+        } else {
+            format!("new, from view {view}")
+        };
+        eprintln!("driver state in {}: {how}", store.dir().display());
     }
 }
 

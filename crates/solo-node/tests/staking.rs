@@ -476,6 +476,126 @@ fn assert_agreement(sim: &Sim) {
 }
 
 #[test]
+fn validators_restarted_from_their_tables_replay_their_own_chain() {
+    // Epochs of 8 blocks with a threshold key, well into epoch 2: the views
+    // carry an epoch that no fresh chain state knows (spec 08 §3a).
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, &[0, 1, 2, 3], &[1, 1, 1, 1], &staking(8, 2));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    let past = |s: &mut Sim| {
+        s.nodes
+            .iter_mut()
+            .all(|n| n.finalized_height().unwrap() >= 18)
+    };
+    assert!(sim.run_until(300 * SLOT_MS, past).unwrap());
+    let heights = sim.finalized_heights().unwrap();
+    let executed: Vec<Vec<(u64, [u8; 32])>> =
+        sim.nodes.iter().map(|n| n.executed.clone()).collect();
+    let views: Vec<u64> = sim
+        .nodes
+        .iter()
+        .map(|n| n.simplex_state().unwrap().view)
+        .collect();
+    // Every validator stops, so no peer holds the chain for any other; each
+    // comes back with its tables, re-executes its own finalized chain at
+    // once and is back in the view it left (spec 08 §7).
+    for i in 0..4 {
+        sim.crash(i);
+    }
+    sim.advance(5 * SLOT_MS).unwrap();
+    for i in 0..4 {
+        sim.revive(i, kernel, &genesis).unwrap();
+        let node = &mut sim.nodes[i];
+        assert_eq!(node.finalized_height().unwrap(), heights[i], "node {i}");
+        assert_eq!(node.executed, executed[i], "node {i}");
+        assert_eq!(node.simplex_state().unwrap().view, views[i], "node {i}");
+    }
+    // They go on finalizing together, nobody having voted twice.
+    let target = heights.iter().max().unwrap() + 3;
+    let resumed = sim
+        .run_until(60 * SLOT_MS, |s| {
+            s.finalized_heights().unwrap().iter().all(|h| *h >= target)
+        })
+        .unwrap();
+    let after: Vec<(u64, u64, bool, bool, Option<u32>)> = sim
+        .nodes
+        .iter()
+        .map(|n| {
+            let s = n.simplex_state().unwrap();
+            (s.view, s.tip_height, s.voted, s.timed_out, s.me)
+        })
+        .collect();
+    assert!(
+        resumed,
+        "{:?} from {heights:?}, views {views:?}, now {after:?}",
+        sim.finalized_heights().unwrap()
+    );
+    for node in &sim.nodes {
+        assert!(
+            !node
+                .metrics
+                .iter()
+                .any(|(name, _)| name == b"equivocations"),
+            "an equivocation was recorded"
+        );
+    }
+    let shortest = sim.nodes.iter().map(|n| n.executed.len()).min().unwrap();
+    for node in &sim.nodes[1..] {
+        assert_eq!(node.executed[..shortest], sim.nodes[0].executed[..shortest]);
+    }
+}
+
+#[test]
+fn a_lone_validator_comes_back_from_its_tables_past_the_first_epoch() {
+    // One validator in epochs of 8 blocks: nobody holds the chain but
+    // itself, and past epoch 0 its view is in an epoch no fresh chain state
+    // knows, so without its tables it could never propose again.
+    let keys = keys(1);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, &[0], &[STAKE], &staking(8, 0));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    let past = |s: &mut Sim| s.nodes[0].finalized_height().unwrap() >= 10;
+    assert!(sim.run_until(60 * SLOT_MS, past).unwrap());
+    let height = sim.nodes[0].finalized_height().unwrap();
+    let state = sim.nodes[0].simplex_state().unwrap();
+    assert_eq!(view_epoch(state.view), 1);
+    let tables = sim.nodes[0].persisted();
+    let executed = sim.nodes[0].executed.clone();
+    sim.crash(0);
+    sim.advance(5 * SLOT_MS).unwrap();
+    sim.revive(0, kernel, &genesis).unwrap();
+    assert_eq!(sim.nodes[0].executed[..executed.len()], executed[..]);
+    assert!(sim.nodes[0].simplex_state().unwrap().view >= state.view);
+    // Back in its view's epoch it is the leader again and proposes at once,
+    // not after the view timeout of three slots (spec 08 §3, §7).
+    let resumed = sim
+        .run_until(2 * SLOT_MS, |s| {
+            s.nodes[0].finalized_height().unwrap() > height
+        })
+        .unwrap();
+    assert!(resumed, "{:?}", sim.nodes[0].simplex_state());
+    // A replay that a restart cut short goes on to where it was headed: a
+    // state record behind its tables re-executes up to the target the
+    // tables still hold; without the target, what the record says.
+    let mut cut = state;
+    cut.finalized_height = 3;
+    let replayed = |tables: std::collections::BTreeMap<Vec<u8>, Vec<u8>>| {
+        let config = NodeConfig {
+            persisted: tables,
+            ..at(1_000_000)
+        };
+        let mut node = Node::open(kernel, &genesis, config).unwrap();
+        node.start(Some(cut.to_bytes())).unwrap();
+        node.executed.len()
+    };
+    let mut headed = tables.clone();
+    headed.insert(b"simplex/replay".to_vec(), height.to_bytes());
+    assert_eq!(replayed(headed), usize::try_from(height).unwrap());
+    assert_eq!(replayed(tables), 3);
+}
+
+#[test]
 fn quorums_weigh_stake() {
     // Four validators with 40, 30, 20 and 10 percent of the stake; no epochs.
     let keys = keys(4);
