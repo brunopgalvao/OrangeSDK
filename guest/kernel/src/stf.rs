@@ -55,7 +55,6 @@ fn check(raw: &[u8]) -> Result<Signed, u32> {
     well_formed(&s)?;
     crate::governance::admit(&s)?;
     crate::staking::admit(&s)?;
-    crate::modules::admit(&s)?;
     crate::outbox::admit(&s)?;
     crate::bridge::admit(&s)?;
     Ok(s)
@@ -177,9 +176,9 @@ fn run_tx(raw: &[u8], chain_id: u64, block: BlockFields, index: u32, cumulative:
     };
     let outcome = if crate::staking::is_staking(&s) {
         crate::staking::run(&s, block.number, message, block)
-    } else if s.tx.to == Some(solo_abi::modules::MODULE_ADDRESS) {
-        crate::modules::run(&s, block.number, message, block)
     } else {
+        // Governance serves the governance and module addresses, and every
+        // other message as a plain EVM transaction.
         crate::governance::run(&s, block.number, message, block)
     };
     if outcome.status == call_status::INVALID {
