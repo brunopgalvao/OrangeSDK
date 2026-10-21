@@ -18,13 +18,22 @@
 //! `"upgradeDelay"` in blocks) or a non-zero `"epochBlocks"`. Kernel modules
 //! installed at genesis (spec 16) are listed under `"modules"`; see [`modules`].
 //! The Ethereum-to-Solo bridge (spec 18) is configured under `"bridgeIn"`;
-//! see [`bridge`].
+//! see [`bridge`]. Staking, epochs and the threshold key (spec 15) under
+//! `"staking"`; see [`staking`].
+//!
+//! `solo upgrade` stages and proposes a kernel upgrade through governance
+//! (see [`upgrade`]), and `solo devnet` runs a network of validator
+//! processes on one machine and watches it (see [`devnet`]).
 
 #![forbid(unsafe_code)]
 
 pub mod bridge;
+pub mod client;
+pub mod devnet;
 pub mod doctor;
 pub mod modules;
+pub mod staking;
+pub mod upgrade;
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -78,9 +87,17 @@ pub const DEFAULT_RPC: &str = "127.0.0.1:8545";
 /// Usage line printed on a command-line mistake.
 pub const USAGE: &str = "usage:
   solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
-  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex>] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
+  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
   solo key  <64 hex>
-  solo doctor [--rpc 127.0.0.1:8545] [--max-head-age <s>] [--max-finality-lag <blocks>] [--min-peers <n>] [--max-mempool <txs>] [--max-call-ms <ms>]";
+  solo doctor [--rpc 127.0.0.1:8545] [--max-head-age <s>] [--max-finality-lag <blocks>] [--min-peers <n>] [--max-mempool <txs>] [--max-call-ms <ms>]
+  solo upgrade --kernel <kernel.elf|kernel.solo> (--key <64 hex> | --key-file <path>) [--rpc 127.0.0.1:8545] [--delay <blocks>] [--required-gates <g,g,...>] [--timeout <s>]
+  solo devnet init --dir <dir> --kernel <kernel.elf|kernel.solo> [--validators 4] [--chain-id 1337] [--slot-ms 400] [--epoch-blocks 20] [--dkg-phase-blocks 5] [--upgrade-delay 2] [--host 127.0.0.1] [--p2p-port 30301] [--rpc-port 8545] [--seed <64 hex>] [--governance-key <64 hex>] [--force]
+  solo devnet up --dir <dir> [--blocks <n>]
+  solo devnet down --dir <dir>
+  solo devnet stop|start --dir <dir> --node <i>
+  solo devnet status (--dir <dir> | --rpc <addr,...>) [--json]
+  solo devnet wait (--dir <dir> | --rpc <addr,...>) [--nodes <i,...>] [--timeout <s>] [--head <n>] [--finalized <n>] [--peers <n>] [--kernel-version <v>] [--kernel-hash <0x...>] [--active-gates <g,...>] [--signalled <g,...>] [--locked-in <g,...>] [--certified <n> --above <height>] [--caught-up]
+  solo devnet node --dir <dir> --index <i> [solo node options]";
 
 /// Where `solo node` listens for peers unless `--listen` says otherwise.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:30333";
@@ -119,8 +136,8 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
             .ok_or("genesis: maxTxs too large")?,
         allocations: Seq(allocations),
         upgrades: parse_upgrades(&v)?,
+        staking: staking::parse_staking(&v)?,
         bridge_in: bridge::parse_bridge(&v)?,
-        ..GenesisParams::default()
     };
     let mut validators = Vec::new();
     match v.get("validators") {
@@ -212,7 +229,7 @@ fn parse_account(address: [u8; 20], entry: &Value) -> Result<Allocation, String>
 }
 
 /// A balance: a decimal or `0x` hex string, or a JSON number.
-fn parse_balance(value: &Value) -> Result<u128, String> {
+pub(crate) fn parse_balance(value: &Value) -> Result<u128, String> {
     Ok(match value {
         Value::String(s) => {
             parse_number_text(s).ok_or("genesis: balance must be a decimal or 0x hex string")?
@@ -292,15 +309,35 @@ pub fn parse_key(text: &str) -> Result<k256::ecdsa::SigningKey, String> {
         .ok_or_else(|| "key: not a valid secp256k1 secret key".to_owned())
 }
 
-/// What `solo key` prints: the validator id for genesis and the Ethereum address.
+/// What `solo key` prints: the validator id for genesis, the Ethereum
+/// address, and the DKG encryption key to list under `staking.keys` (spec
+/// 15 §2).
 #[must_use]
 pub fn describe_key(key: &k256::ecdsa::SigningKey) -> String {
     let id = solo_node::validator_id(key);
     format!(
-        "validator {}\naddress   {}",
+        "validator {}\naddress   {}\ndkg       {}",
         solo_rpc::methods::data(&id),
-        solo_rpc::methods::data(&id[12..])
+        solo_rpc::methods::data(&id[12..]),
+        solo_rpc::methods::data(&solo_node::keystore::encryption_key(key))
     )
+}
+
+/// The consensus key named by `--key <hex>` or `--key-file <path>`, if either
+/// is given.
+///
+/// # Errors
+/// A message if both are given, the file cannot be read, or the key does not parse.
+pub fn key_argument(args: &[String]) -> Result<Option<k256::ecdsa::SigningKey>, String> {
+    match (arg(args, "--key"), arg(args, "--key-file")) {
+        (Some(_), Some(_)) => Err("--key and --key-file exclude each other".to_owned()),
+        (Some(hex), None) => parse_key(&hex).map(Some),
+        (None, Some(path)) => match std::fs::read_to_string(&path) {
+            Ok(text) => parse_key(text.trim()).map(Some),
+            Err(e) => Err(format!("{path}: {e}")),
+        },
+        (None, None) => Ok(None),
+    }
 }
 
 /// Every value following an occurrence of `name` in `args`.
@@ -342,7 +379,7 @@ pub fn load_kernel(path: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-fn parse_number(args: &[String], name: &str) -> Result<Option<u64>, String> {
+pub(crate) fn parse_number(args: &[String], name: &str) -> Result<Option<u64>, String> {
     match arg(args, name) {
         Some(text) => match text.parse() {
             Ok(n) => Ok(Some(n)),
@@ -418,7 +455,29 @@ fn parse_peers(args: &[String]) -> Result<Vec<std::net::SocketAddr>, String> {
         .collect()
 }
 
-fn run_inner(
+/// The peer-to-peer transport of `solo node`, bound to `--listen`.
+fn bind_transport(
+    args: &[String],
+    node: &solo_node::Node,
+    chain_id: u64,
+    peers: Vec<std::net::SocketAddr>,
+) -> Result<solo_node::Transport, CliError> {
+    let listen_arg = arg(args, "--listen");
+    let listen = listen_arg.as_deref().unwrap_or(DEFAULT_LISTEN);
+    // An observer still needs an identity for its peers; a hash of its address will do.
+    let id = node
+        .validator_id()
+        .unwrap_or_else(|| solo_host::hash::keccak256(listen.as_bytes()));
+    let t = match solo_node::Transport::bind(listen, id, chain_id, peers) {
+        Ok(t) => t,
+        Err(e) => return Err(format!("{listen}: {e}").into()),
+    };
+    let bound = t.local_addr().map_or(listen.to_owned(), |a| a.to_string());
+    eprintln!("p2p listening on {bound}");
+    Ok(t)
+}
+
+pub(crate) fn run_inner(
     args: &[String],
     keep_going: &mut dyn FnMut(&solo_rpc::Rpc) -> bool,
 ) -> Result<(), CliError> {
@@ -431,6 +490,13 @@ fn run_inner(
     if command == "doctor" {
         println!("{}", doctor::run(args)?);
         return Ok(());
+    }
+    if command == "upgrade" {
+        println!("{}", upgrade::run(args)?);
+        return Ok(());
+    }
+    if command == "devnet" {
+        return devnet::run(args, keep_going).map_err(CliError);
     }
     if command != "dev" && command != "node" {
         return Err(USAGE.into());
@@ -451,7 +517,7 @@ fn run_inner(
     let key = if command == "dev" {
         Some(dev_key())
     } else {
-        arg(args, "--key").map(|k| parse_key(&k)).transpose()?
+        key_argument(args)?
     };
     let peers = parse_peers(args)?;
     let start = Instant::now();
@@ -470,22 +536,11 @@ fn run_inner(
     )?;
     let chain_id = node.chain_id().unwrap_or(0);
     node.start(None)?;
-    let mut transport = None;
-    if command == "node" {
-        let listen_arg = arg(args, "--listen");
-        let listen = listen_arg.as_deref().unwrap_or(DEFAULT_LISTEN);
-        // An observer still needs an identity for its peers; a hash of its address will do.
-        let id = node
-            .validator_id()
-            .unwrap_or_else(|| solo_host::hash::keccak256(listen.as_bytes()));
-        let t = match solo_node::Transport::bind(listen, id, chain_id, peers) {
-            Ok(t) => t,
-            Err(e) => return Err(format!("{listen}: {e}").into()),
-        };
-        let bound = t.local_addr().map_or(listen.to_owned(), |a| a.to_string());
-        eprintln!("p2p listening on {bound}");
-        transport = Some(t);
-    }
+    let mut transport = if command == "node" {
+        Some(bind_transport(args, &node, chain_id, peers)?)
+    } else {
+        None
+    };
     let mut rpc = solo_rpc::Rpc::new(node);
     let listener = match solo_rpc::http::bind(rpc_addr) {
         Ok(listener) => listener,

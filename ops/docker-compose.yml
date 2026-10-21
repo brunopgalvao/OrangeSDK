@@ -1,0 +1,178 @@
+# A four-validator Solo devnet with Prometheus and Grafana: the topology of
+# `solo devnet init --validators 4` as containers, one image built once from
+# ops/Dockerfile. See ops/README.md.
+#
+#   docker compose -f ops/docker-compose.yml up --build -d
+#   docker compose -f ops/docker-compose.yml down -v
+#
+# JSON-RPC: 127.0.0.1:8545 to 8548 (node 0 to 3). Prometheus: 9090. Grafana:
+# 3000, anonymous admin, the Solo dashboard provisioned.
+#
+# `init` runs once and writes the genesis, the kernel module and the keys to
+# the `devnet` volume; it leaves them alone on later runs, so a restart keeps
+# the chain's identities. The nodes reach each other by fixed addresses on
+# the `solo` network, every node dialling the ones before it, as
+# `solo devnet` does on one machine.
+name: solo-devnet
+
+x-node: &node
+  image: solo:devnet
+  depends_on:
+    init:
+      condition: service_completed_successfully
+  volumes:
+    - devnet:/devnet
+  restart: unless-stopped
+
+services:
+  init:
+    build:
+      context: ..
+      dockerfile: ops/Dockerfile
+    image: solo:devnet
+    command:
+      - devnet
+      - init
+      - --dir
+      - /devnet
+      - --kernel
+      - /solo/kernel.elf
+      - --validators
+      - "4"
+      - --epoch-blocks
+      - ${SOLO_EPOCH_BLOCKS:-20}
+      - --dkg-phase-blocks
+      - ${SOLO_DKG_PHASE_BLOCKS:-5}
+      - --governance-key
+      - ${SOLO_GOVERNANCE_KEY:-6060606060606060606060606060606060606060606060606060606060606060}
+    volumes:
+      - devnet:/devnet
+
+  solo-0:
+    <<: *node
+    command:
+      - node
+      - --kernel
+      - /devnet/kernel.solo
+      - --genesis
+      - /devnet/genesis.json
+      - --key-file
+      - /devnet/node-0/key
+      - --listen
+      - 0.0.0.0:30333
+      - --rpc
+      - 0.0.0.0:8545
+    networks:
+      solo:
+        ipv4_address: 172.28.0.10
+    ports:
+      - "8545:8545"
+
+  solo-1:
+    <<: *node
+    command:
+      - node
+      - --kernel
+      - /devnet/kernel.solo
+      - --genesis
+      - /devnet/genesis.json
+      - --key-file
+      - /devnet/node-1/key
+      - --listen
+      - 0.0.0.0:30333
+      - --rpc
+      - 0.0.0.0:8545
+      - --peer
+      - 172.28.0.10:30333
+    networks:
+      solo:
+        ipv4_address: 172.28.0.11
+    ports:
+      - "8546:8545"
+
+  solo-2:
+    <<: *node
+    command:
+      - node
+      - --kernel
+      - /devnet/kernel.solo
+      - --genesis
+      - /devnet/genesis.json
+      - --key-file
+      - /devnet/node-2/key
+      - --listen
+      - 0.0.0.0:30333
+      - --rpc
+      - 0.0.0.0:8545
+      - --peer
+      - 172.28.0.10:30333
+      - --peer
+      - 172.28.0.11:30333
+    networks:
+      solo:
+        ipv4_address: 172.28.0.12
+    ports:
+      - "8547:8545"
+
+  solo-3:
+    <<: *node
+    command:
+      - node
+      - --kernel
+      - /devnet/kernel.solo
+      - --genesis
+      - /devnet/genesis.json
+      - --key-file
+      - /devnet/node-3/key
+      - --listen
+      - 0.0.0.0:30333
+      - --rpc
+      - 0.0.0.0:8545
+      - --peer
+      - 172.28.0.10:30333
+      - --peer
+      - 172.28.0.11:30333
+      - --peer
+      - 172.28.0.12:30333
+    networks:
+      solo:
+        ipv4_address: 172.28.0.13
+    ports:
+      - "8548:8545"
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./prometheus-devnet.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+    networks:
+      - solo
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana-solo.json:/var/lib/grafana/dashboards/solo.json:ro
+    depends_on:
+      - prometheus
+    networks:
+      - solo
+    ports:
+      - "3000:3000"
+
+volumes:
+  devnet: {}
+
+networks:
+  solo:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

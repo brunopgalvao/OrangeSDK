@@ -519,10 +519,17 @@ fn keys() {
     let text = solo_cli::describe_key(&key);
     // The all-ones key is the README's funded account.
     assert!(
-        text.ends_with("address   0x1a642f0e3c3af545e7acbd38b07251b3990914f1"),
+        text.contains("\naddress   0x1a642f0e3c3af545e7acbd38b07251b3990914f1\n"),
         "{text}"
     );
     assert!(text.starts_with("validator 0x"));
+    // The DKG encryption key to list under staking.keys: 48 bytes of hex.
+    let dkg = text.rsplit("dkg       ").next().unwrap();
+    assert_eq!(dkg.len(), 2 + 96, "{text}");
+    assert_eq!(
+        dkg,
+        solo_rpc::methods::data(&solo_node::keystore::encryption_key(&key))
+    );
     run(&args(&["key", hex])).unwrap();
     assert!(run(&args(&["key"])).unwrap_err().contains("64 hex"));
     assert!(run(&args(&["key", "xyz"])).unwrap_err().contains("64 hex"));

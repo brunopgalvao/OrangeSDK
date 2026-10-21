@@ -1,0 +1,9 @@
+.git
+.claude
+.conformance
+.downloads
+coverage
+design
+target
+guest/target
+lcov.info

@@ -2923,7 +2923,9 @@ dependencies = [
  "solo-metrics",
  "solo-node",
  "solo-recompile",
+ "solo-rlp",
  "solo-rpc",
+ "solo-upgrade",
 ]
 
 [[package]]

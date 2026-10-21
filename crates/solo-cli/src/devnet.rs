@@ -1,0 +1,882 @@
+//! `solo devnet`: a network of validator processes on one machine, with the
+//! staking, epochs and threshold keys of spec 15 on, governed kernel
+//! upgrades and feature gates of spec 13 on, and the bridges off; the
+//! tooling to watch it; and the primitives a rehearsal of a kernel upgrade
+//! needs (`tools/rehearse-upgrade.sh`).
+//!
+//! ```text
+//! solo devnet init --dir <dir> --kernel <kernel.elf|kernel.solo> [--validators 4] [--chain-id 1337]
+//!                  [--slot-ms 400] [--epoch-blocks 20] [--dkg-phase-blocks 5] [--upgrade-delay 2]
+//!                  [--host 127.0.0.1] [--p2p-port 30301] [--rpc-port 8545] [--seed <64 hex>]
+//!                  [--governance-key <64 hex>] [--force]
+//! solo devnet up --dir <dir> [--blocks <n>]
+//! solo devnet down --dir <dir>
+//! solo devnet stop|start --dir <dir> --node <i>
+//! solo devnet status (--dir <dir> | --rpc <addr,...>) [--json]
+//! solo devnet wait (--dir <dir> | --rpc <addr,...>) [--nodes <i,...>] [--timeout <s>] <conditions>
+//! solo devnet node --dir <dir> --index <i> [solo node options]
+//! ```
+//!
+//! `init` derives the validator keys and the governance key from a seed
+//! (random unless `--seed` is given, so a devnet is reproducible when it
+//! has to be), recompiles the kernel once into `<dir>/kernel.solo`, writes
+//! `<dir>/genesis.json`, `<dir>/governance.key`, one `<dir>/node-<i>/key`
+//! per validator and the manifest `<dir>/devnet.json`: each node's
+//! peer-to-peer and JSON-RPC addresses (port 0 picks free ports) and its
+//! peers, every node dialling the ones before it. The genesis funds the
+//! account of the README's key `0x01…01`. A second `init` leaves an
+//! initialized directory alone unless `--force`.
+//!
+//! `up` starts every node as a `solo devnet node` process, its output in
+//! `<dir>/node-<i>/log` and its pid in `<dir>/node-<i>/pid`, and waits for
+//! them; with `--blocks` it stops them once every node has executed that
+//! many blocks. `down` stops every node, `stop` and `start` one, through
+//! `solo_stop` and a fresh process; a restarted node has no state on disk
+//! and syncs from its peers (spec 08 §7a). `status` prints one line per
+//! node from `GET /status`. `wait` polls until every selected node meets
+//! every condition given, or the timeout passes (default 600 s):
+//!
+//! - `--head <n>`, `--finalized <n>`, `--peers <n>`: at least that;
+//! - `--kernel-version <v>`: at least that; `--kernel-hash <0x…>`: exactly that;
+//! - `--active-gates <g,…>`: those gates active for the next block;
+//! - `--signalled <g,…>`: every validator's latest signal names exactly those gates;
+//! - `--locked-in <g,…>`: those gates locked in (spec 13 §8.4);
+//! - `--certified <n> --above <h>`: at least `n` finalized heights above `h`,
+//!   among the latest 64, carry a threshold certificate (spec 12 §7);
+//! - `--caught-up`: finalized within two blocks of the furthest node.
+//!
+//! `status` and `wait` take `--rpc <addr,...>` instead of `--dir` for nodes
+//! that run elsewhere, such as the compose stack in `ops/`.
+
+use std::fmt::Write as _;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use k256::ecdsa::SigningKey;
+use serde_json::{Value, json};
+use solo_host::hash::keccak256;
+use solo_metrics::Status;
+use solo_rpc::methods::data;
+
+use crate::client::{self, poll_until};
+use crate::upgrade::parse_gates;
+use crate::{CliError, arg, load_kernel, parse_genesis, parse_key};
+
+/// The manifest `init` writes and the other subcommands read.
+pub const MANIFEST: &str = "devnet.json";
+
+/// The account the devnet genesis funds: the README's key `0x01…01`.
+pub const FUNDED: &str = "0x1a642f0e3c3af545e7acbd38b07251b3990914f1";
+
+/// Its balance, in wei: one million ether.
+pub const FUNDING: &str = "1000000000000000000000000";
+
+/// How long `start` waits for a node to answer, and `stop` for it to go.
+pub const NODE_TIMEOUT: Duration = Duration::from_mins(2);
+
+/// One node of the manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeSpec {
+    /// Validator id, `0x` hex.
+    pub validator: String,
+    /// Peer-to-peer listen address.
+    pub listen: String,
+    /// JSON-RPC address.
+    pub rpc: String,
+    /// Peers it dials.
+    pub peers: Vec<String>,
+}
+
+/// A devnet directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Devnet {
+    /// The directory.
+    pub dir: PathBuf,
+    /// Chain id.
+    pub chain_id: u64,
+    /// The nodes, validator `i` in `node-<i>`.
+    pub nodes: Vec<NodeSpec>,
+}
+
+fn io(path: &Path, e: &std::io::Error) -> String {
+    format!("{}: {e}", path.display())
+}
+
+fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    fs::write(path, bytes).map_err(|e| io(path, &e))
+}
+
+fn text_of(v: &Value, key: &str) -> Result<String, String> {
+    v.get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{MANIFEST}: {key} missing"))
+}
+
+impl Devnet {
+    /// Reads the manifest of `dir`.
+    ///
+    /// # Errors
+    /// If the manifest is missing or malformed.
+    pub fn load(dir: &Path) -> Result<Devnet, String> {
+        let path = dir.join(MANIFEST);
+        let text = fs::read_to_string(&path).map_err(|e| io(&path, &e))?;
+        let v: Value = serde_json::from_str(&text)
+            .ok()
+            .ok_or_else(|| format!("{}: not valid JSON", path.display()))?;
+        let mut nodes = Vec::new();
+        for node in v
+            .get("nodes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("{MANIFEST}: nodes missing"))?
+        {
+            let peers = node
+                .get("peers")
+                .and_then(Value::as_array)
+                .map(|p| {
+                    p.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            nodes.push(NodeSpec {
+                validator: text_of(node, "validator")?,
+                listen: text_of(node, "listen")?,
+                rpc: text_of(node, "rpc")?,
+                peers,
+            });
+        }
+        Ok(Devnet {
+            dir: dir.to_path_buf(),
+            chain_id: v.get("chainId").and_then(Value::as_u64).unwrap_or(0),
+            nodes,
+        })
+    }
+
+    /// `<dir>/kernel.solo`, the recompiled kernel every node starts from.
+    #[must_use]
+    pub fn kernel(&self) -> PathBuf {
+        self.dir.join("kernel.solo")
+    }
+
+    /// `<dir>/genesis.json`.
+    #[must_use]
+    pub fn genesis(&self) -> PathBuf {
+        self.dir.join("genesis.json")
+    }
+
+    /// `<dir>/governance.key`: the governance account's key, hex.
+    #[must_use]
+    pub fn governance_key(&self) -> PathBuf {
+        self.dir.join("governance.key")
+    }
+
+    /// `<dir>/node-<i>`.
+    #[must_use]
+    pub fn node_dir(&self, index: usize) -> PathBuf {
+        self.dir.join(format!("node-{index}"))
+    }
+
+    /// Node `index`.
+    ///
+    /// # Errors
+    /// If there is no such node.
+    pub fn node(&self, index: usize) -> Result<&NodeSpec, String> {
+        self.nodes.get(index).ok_or_else(|| {
+            format!(
+                "no node {index}: the devnet has {} nodes",
+                self.nodes.len()
+            )
+        })
+    }
+}
+
+fn number(args: &[String], name: &str, default: u64) -> Result<u64, String> {
+    Ok(crate::parse_number(args, name)?.unwrap_or(default))
+}
+
+fn flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
+fn dir_argument(args: &[String]) -> Result<PathBuf, String> {
+    arg(args, "--dir")
+        .map(PathBuf::from)
+        .ok_or_else(|| "--dir is required".to_owned())
+}
+
+fn node_argument(args: &[String]) -> Result<usize, String> {
+    crate::parse_number(args, "--node")?
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| "--node <i> is required".to_owned())
+}
+
+/// A key derived from the devnet seed: `keccak256(label ‖ seed ‖ index)`.
+fn derive(seed: &[u8; 32], label: &[u8], index: u64) -> SigningKey {
+    let digest = keccak256(&[label, seed, &index.to_be_bytes()].concat());
+    SigningKey::from_slice(&digest).expect("a hash is a scalar, bar a negligible chance")
+}
+
+/// `n` ports from `base`, or `n` free ports of `host` when `base` is 0.
+fn ports(host: &str, base: u64, n: usize) -> Result<Vec<u16>, String> {
+    if base != 0 {
+        return (0..n)
+            .map(|i| {
+                u16::try_from(base + i as u64)
+                    .ok()
+                    .ok_or_else(|| format!("port {base} + {i} is above 65535"))
+            })
+            .collect();
+    }
+    let listeners: Vec<std::net::TcpListener> = (0..n)
+        .map(|_| std::net::TcpListener::bind((host, 0)))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("{host}: cannot pick a free port: {e}"))?;
+    Ok(listeners
+        .iter()
+        .map(|l| l.local_addr().map_or(0, |a| a.port()))
+        .collect())
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// `solo devnet init`.
+#[allow(clippy::too_many_lines)]
+fn init(args: &[String]) -> Result<String, String> {
+    let dir = dir_argument(args)?;
+    if dir.join(MANIFEST).exists() && !flag(args, "--force") {
+        return Ok(format!(
+            "{}: already initialized (--force starts over)",
+            dir.display()
+        ));
+    }
+    let kernel = load_kernel(&arg(args, "--kernel").ok_or("--kernel is required")?)?;
+    let validators = usize::try_from(number(args, "--validators", 4)?)
+        .ok()
+        .filter(|n| (1..=256).contains(n))
+        .ok_or("--validators must be 1 to 256")?;
+    let chain_id = number(args, "--chain-id", 1337)?;
+    let slot_ms = number(args, "--slot-ms", 400)?;
+    let epoch_blocks = number(args, "--epoch-blocks", 20)?;
+    let dkg_phase_blocks = number(args, "--dkg-phase-blocks", 5)?;
+    let upgrade_delay = number(args, "--upgrade-delay", 2)?;
+    let host = arg(args, "--host").unwrap_or_else(|| "127.0.0.1".to_owned());
+    let seed: [u8; 32] = match arg(args, "--seed") {
+        Some(hex) => parse_key(&hex)?.to_bytes().into(),
+        None => keccak256(&[dir.as_os_str().as_encoded_bytes(), &unix_ms().to_be_bytes()].concat()),
+    };
+    let keys: Vec<SigningKey> = (0..validators as u64)
+        .map(|i| derive(&seed, b"solo devnet validator", i))
+        .collect();
+    let governance = match arg(args, "--governance-key") {
+        Some(hex) => parse_key(&hex)?,
+        None => derive(&seed, b"solo devnet governance", 0),
+    };
+    let p2p = ports(&host, number(args, "--p2p-port", 30301)?, validators)?;
+    let rpc = ports(&host, number(args, "--rpc-port", 8545)?, validators)?;
+    let ids: Vec<String> = keys
+        .iter()
+        .map(|k| data(&solo_node::validator_id(k)))
+        .collect();
+    let mut genesis = json!({
+        "chainId": chain_id,
+        "slotMs": slot_ms,
+        "maxTxs": 64,
+        "alloc": {FUNDED: FUNDING},
+        "validators": ids,
+        "governance": data(&client::address(&governance)),
+        "upgradeDelay": upgrade_delay,
+        "epochBlocks": epoch_blocks,
+    });
+    if epoch_blocks != 0 {
+        let dkg_keys: serde_json::Map<String, Value> = keys
+            .iter()
+            .zip(&ids)
+            .map(|(k, id)| {
+                (
+                    id.clone(),
+                    Value::from(data(&solo_node::keystore::encryption_key(k))),
+                )
+            })
+            .collect();
+        genesis["staking"] = json!({
+            "epochBlocks": epoch_blocks,
+            "dkgPhaseBlocks": dkg_phase_blocks,
+            "unbondingEpochs": 4,
+            "maxKeyAge": 2,
+            "keys": dkg_keys,
+        });
+    }
+    let genesis_text = serde_json::to_string_pretty(&genesis).expect("json");
+    // What the node will read; a combination the kernel refuses fails here.
+    parse_genesis(&genesis_text)?;
+    fs::create_dir_all(&dir).map_err(|e| io(&dir, &e))?;
+    let devnet = Devnet {
+        dir: dir.clone(),
+        chain_id,
+        nodes: (0..validators)
+            .map(|i| NodeSpec {
+                validator: ids[i].clone(),
+                listen: format!("{host}:{}", p2p[i]),
+                rpc: format!("{host}:{}", rpc[i]),
+                peers: (0..i).map(|j| format!("{host}:{}", p2p[j])).collect(),
+            })
+            .collect(),
+    };
+    write(&devnet.kernel(), &kernel)?;
+    write(&devnet.genesis(), genesis_text.as_bytes())?;
+    let hex = |k: &SigningKey| data(&k.to_bytes())[2..].to_owned();
+    write(&devnet.governance_key(), hex(&governance).as_bytes())?;
+    let mut report = format!(
+        "devnet initialized in {}\n  chain id {chain_id}, {validators} validators, slot {slot_ms} ms, epochs of {epoch_blocks} blocks, DKG phases of {dkg_phase_blocks} blocks, upgrade delay {upgrade_delay} blocks\n  governance {} (key in governance.key)",
+        dir.display(),
+        data(&client::address(&governance))
+    );
+    let mut nodes = Vec::new();
+    for (i, node) in devnet.nodes.iter().enumerate() {
+        let node_dir = devnet.node_dir(i);
+        fs::create_dir_all(&node_dir).map_err(|e| io(&node_dir, &e))?;
+        write(&node_dir.join("key"), hex(&keys[i]).as_bytes())?;
+        let _ = write!(
+            report,
+            "\n  node {i}  p2p {}  rpc {}  validator {}",
+            node.listen, node.rpc, node.validator
+        );
+        nodes.push(json!({
+            "validator": node.validator,
+            "listen": node.listen,
+            "rpc": node.rpc,
+            "peers": node.peers,
+        }));
+    }
+    let manifest = json!({"chainId": chain_id, "nodes": nodes});
+    write(
+        &dir.join(MANIFEST),
+        serde_json::to_string_pretty(&manifest)
+            .expect("json")
+            .as_bytes(),
+    )?;
+    Ok(report)
+}
+
+/// The `solo` binary to start nodes with: `SOLO_BIN`, or this executable.
+fn solo_binary() -> Result<PathBuf, String> {
+    std::env::var_os("SOLO_BIN")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())
+        .ok_or_else(|| "cannot find the solo binary: set SOLO_BIN".to_owned())
+}
+
+/// Starts node `index` as a process; its pid goes to `node-<i>/pid`, its
+/// output to `node-<i>/log`.
+fn spawn(devnet: &Devnet, index: usize) -> Result<Child, String> {
+    let node = devnet.node(index)?;
+    if client::status(&node.rpc).is_ok() {
+        return Err(format!("node {index} is already running on {}", node.rpc));
+    }
+    let node_dir = devnet.node_dir(index);
+    let log_path = node_dir.join("log");
+    let log = File::options()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| io(&log_path, &e))?;
+    let stderr = log.try_clone().map_err(|e| io(&log_path, &e))?;
+    let binary = solo_binary()?;
+    let child = Command::new(&binary)
+        .args(["devnet", "node", "--dir"])
+        .arg(&devnet.dir)
+        .arg("--index")
+        .arg(index.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .map_err(|e| format!("cannot start node {index} with {}: {e}", binary.display()))?;
+    write(&node_dir.join("pid"), child.id().to_string().as_bytes())?;
+    Ok(child)
+}
+
+/// Stops node `index` through `solo_stop` and waits for it to go.
+fn stop_node(devnet: &Devnet, index: usize) -> Result<String, String> {
+    let node = devnet.node(index)?;
+    if client::call(&node.rpc, "solo_stop", &json!([])).is_err() {
+        return Ok(format!("node {index} is not running"));
+    }
+    poll_until(
+        NODE_TIMEOUT,
+        &format!("node {index} did not stop"),
+        &mut || client::status(&node.rpc).is_err(),
+    )?;
+    Ok(format!("node {index} stopped"))
+}
+
+/// Stops every node; one line per node.
+fn stop_all(devnet: &Devnet) -> Result<String, String> {
+    let lines: Vec<String> = (0..devnet.nodes.len())
+        .map(|i| stop_node(devnet, i))
+        .collect::<Result<_, _>>()?;
+    Ok(lines.join("\n"))
+}
+
+/// `solo devnet start --node <i>`: a fresh process, answering its RPC.
+fn start_node(devnet: &Devnet, index: usize) -> Result<String, String> {
+    let rpc = devnet.node(index)?.rpc.clone();
+    // The process outlives this command; nothing waits for it.
+    drop(spawn(devnet, index)?);
+    poll_until(
+        NODE_TIMEOUT,
+        &format!("node {index} did not answer on {rpc}"),
+        &mut || client::status(&rpc).is_ok(),
+    )?;
+    Ok(format!("node {index} started on {rpc}"))
+}
+
+/// `solo devnet up`.
+fn up(args: &[String]) -> Result<String, String> {
+    let devnet = Devnet::load(&dir_argument(args)?)?;
+    let blocks = crate::parse_number(args, "--blocks")?;
+    let mut children: Vec<(usize, Child, Option<std::process::ExitStatus>)> = Vec::new();
+    for i in 0..devnet.nodes.len() {
+        match spawn(&devnet, i) {
+            Ok(child) => children.push((i, child, None)),
+            Err(e) => {
+                // Leave nothing behind: the nodes started so far go down.
+                let _ = stop_all(&devnet);
+                return Err(e);
+            }
+        }
+    }
+    eprintln!(
+        "devnet: {} nodes started; `solo devnet down --dir {}` stops them",
+        children.len(),
+        devnet.dir.display()
+    );
+    let mut stopping = false;
+    loop {
+        for (_, child, exit) in &mut children {
+            if exit.is_none() {
+                *exit = child.try_wait().ok().flatten();
+            }
+        }
+        if children.iter().all(|(_, _, exit)| exit.is_some()) {
+            break;
+        }
+        if !stopping
+            && let Some(n) = blocks
+            && devnet
+                .nodes
+                .iter()
+                .all(|node| client::status(&node.rpc).is_ok_and(|s| s.head >= n))
+        {
+            stopping = true;
+            eprintln!("devnet: every node has {n} blocks; stopping");
+            let _ = stop_all(&devnet);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let failed: Vec<String> = children
+        .iter()
+        .filter(|(_, _, exit)| !exit.is_some_and(|s| s.success()))
+        .map(|(i, _, exit)| format!("node {i} exited with {:?}", exit.map(|s| s.code())))
+        .collect();
+    if failed.is_empty() {
+        Ok("devnet: every node stopped".to_owned())
+    } else {
+        Err(failed.join("\n"))
+    }
+}
+
+/// The nodes a command addresses, as `(label, rpc)`: `--rpc <a,b,...>`, or
+/// the manifest's, narrowed by `--nodes <i,...>`.
+fn targets(args: &[String]) -> Result<Vec<(String, String)>, String> {
+    let all: Vec<(String, String)> = match arg(args, "--rpc") {
+        Some(list) => list
+            .split(',')
+            .filter(|a| !a.is_empty())
+            .enumerate()
+            .map(|(i, a)| (i.to_string(), a.trim().to_owned()))
+            .collect(),
+        None => Devnet::load(&dir_argument(args)?)?
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (i.to_string(), n.rpc.clone()))
+            .collect(),
+    };
+    let Some(selected) = arg(args, "--nodes") else {
+        return Ok(all);
+    };
+    selected
+        .split(',')
+        .map(|i| {
+            all.iter()
+                .find(|(label, _)| label == i.trim())
+                .cloned()
+                .ok_or_else(|| format!("--nodes: no node {i}"))
+        })
+        .collect()
+}
+
+/// One node's row of `solo devnet status`.
+fn row(label: &str, rpc: &str) -> Value {
+    match client::status(rpc) {
+        Ok(s) => json!({
+            "node": label,
+            "rpc": rpc,
+            "up": true,
+            "head": s.head,
+            "finalized": s.finalized,
+            "peers": s.peers,
+            "kernelVersion": s.kernel_version,
+            "kernelHash": data(&s.kernel_hash),
+            "activeGates": solo_rpc::telemetry::gates(s.active_gates),
+            "pendingUpgrade": s.pending_upgrade.as_ref().map(|p| p.activation_height),
+            "upgradeAlert": s.upgrade_alert,
+        }),
+        Err(e) => json!({"node": label, "rpc": rpc, "up": false, "error": e}),
+    }
+}
+
+fn status(args: &[String]) -> Result<String, String> {
+    let rows: Vec<Value> = targets(args)?
+        .iter()
+        .map(|(label, rpc)| row(label, rpc))
+        .collect();
+    if flag(args, "--json") {
+        return Ok(serde_json::to_string_pretty(&rows).expect("json"));
+    }
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            if r["up"] == true {
+                format!(
+                    "node {}  up    head {}  finalized {}  peers {}  kernel v{} {}  gates {}  pending {}  alert {}",
+                    r["node"].as_str().unwrap_or_default(),
+                    r["head"],
+                    r["finalized"],
+                    r["peers"],
+                    r["kernelVersion"],
+                    &r["kernelHash"].as_str().unwrap_or_default()[..10],
+                    r["activeGates"],
+                    r["pendingUpgrade"],
+                    r["upgradeAlert"]
+                )
+            } else {
+                format!(
+                    "node {}  down  {}",
+                    r["node"].as_str().unwrap_or_default(),
+                    r["error"].as_str().unwrap_or_default()
+                )
+            }
+        })
+        .collect();
+    Ok(lines.join("\n"))
+}
+
+/// What `solo devnet wait` waits for.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Conditions {
+    /// `--head`.
+    pub head: Option<u64>,
+    /// `--finalized`.
+    pub finalized: Option<u64>,
+    /// `--peers`.
+    pub peers: Option<u64>,
+    /// `--kernel-version`.
+    pub kernel_version: Option<u64>,
+    /// `--kernel-hash`.
+    pub kernel_hash: Option<Vec<u8>>,
+    /// `--active-gates`, as a bit set.
+    pub active_gates: Option<u64>,
+    /// `--signalled`, as a bit set.
+    pub signalled: Option<u64>,
+    /// `--locked-in`, as a bit set.
+    pub locked_in: Option<u64>,
+    /// `--certified <n> --above <h>`.
+    pub certified: Option<(u64, u64)>,
+    /// `--caught-up`.
+    pub caught_up: bool,
+}
+
+impl std::fmt::Display for Conditions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let gates = |mask: u64| {
+            solo_rpc::telemetry::gates(mask)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let mut parts = Vec::new();
+        if let Some(n) = self.head {
+            parts.push(format!("head >= {n}"));
+        }
+        if let Some(n) = self.finalized {
+            parts.push(format!("finalized >= {n}"));
+        }
+        if let Some(n) = self.peers {
+            parts.push(format!("peers >= {n}"));
+        }
+        if let Some(v) = self.kernel_version {
+            parts.push(format!("kernel version >= {v}"));
+        }
+        if let Some(h) = &self.kernel_hash {
+            parts.push(format!("kernel hash {}", data(h)));
+        }
+        if let Some(g) = self.active_gates {
+            parts.push(format!("gates {} active", gates(g)));
+        }
+        if let Some(g) = self.signalled {
+            parts.push(format!("gates {} signalled by every validator", gates(g)));
+        }
+        if let Some(g) = self.locked_in {
+            parts.push(format!("gates {} locked in", gates(g)));
+        }
+        if let Some((n, above)) = self.certified {
+            parts.push(format!("{n} threshold certificates above {above}"));
+        }
+        if self.caught_up {
+            parts.push("caught up".to_owned());
+        }
+        f.write_str(&parts.join(", "))
+    }
+}
+
+impl Conditions {
+    /// Reads the conditions from the arguments.
+    ///
+    /// # Errors
+    /// If a value does not parse or no condition is given.
+    pub fn parse(args: &[String]) -> Result<Conditions, String> {
+        let n = |name: &str| crate::parse_number(args, name);
+        let gates = |name: &str| arg(args, name).map(|g| parse_gates(&g)).transpose();
+        let c = Conditions {
+            head: n("--head")?,
+            finalized: n("--finalized")?,
+            peers: n("--peers")?,
+            kernel_version: n("--kernel-version")?,
+            kernel_hash: arg(args, "--kernel-hash")
+                .map(|h| {
+                    solo_rpc::methods::parse_hex(&h)
+                        .ok()
+                        .filter(|b| b.len() == 32)
+                        .ok_or("--kernel-hash must be 32 bytes of 0x hex")
+                })
+                .transpose()?,
+            active_gates: gates("--active-gates")?,
+            signalled: gates("--signalled")?,
+            locked_in: gates("--locked-in")?,
+            certified: match (n("--certified")?, n("--above")?) {
+                (None, _) => None,
+                (Some(count), above) => Some((count, above.unwrap_or(0))),
+            },
+            caught_up: flag(args, "--caught-up"),
+        };
+        if c == Conditions::default() {
+            return Err("wait: give at least one condition".to_owned());
+        }
+        Ok(c)
+    }
+
+    /// The features of a signal or a gate list, as a bit set.
+    fn mask(list: &Value) -> u64 {
+        list.as_array().map_or(0, |gates| {
+            gates
+                .iter()
+                .filter_map(Value::as_u64)
+                .filter(|g| *g < 64)
+                .fold(0, |m, g| m | 1 << g)
+        })
+    }
+
+    /// Every condition node `rpc` does not meet; `top` is the furthest
+    /// finalized height among the nodes, for `--caught-up`.
+    #[must_use]
+    pub fn unmet(&self, rpc: &str, top: u64) -> Vec<String> {
+        let mut unmet = Vec::new();
+        let s: Status = match client::status(rpc) {
+            Ok(s) => s,
+            Err(e) => return vec![format!("unreachable: {e}")],
+        };
+        if let Some(n) = self.head
+            && s.head < n
+        {
+            unmet.push(format!("head {} < {n}", s.head));
+        }
+        if let Some(n) = self.finalized
+            && s.finalized < n
+        {
+            unmet.push(format!("finalized {} < {n}", s.finalized));
+        }
+        if let Some(n) = self.peers
+            && s.peers < n
+        {
+            unmet.push(format!("peers {} < {n}", s.peers));
+        }
+        if let Some(v) = self.kernel_version
+            && u64::from(s.kernel_version) < v
+        {
+            unmet.push(format!("kernel version {} < {v}", s.kernel_version));
+        }
+        if let Some(h) = &self.kernel_hash
+            && s.kernel_hash != h.as_slice()
+        {
+            unmet.push(format!("kernel hash {}", data(&s.kernel_hash)));
+        }
+        if let Some(g) = self.active_gates
+            && s.active_gates & g != g
+        {
+            unmet.push(format!(
+                "active gates {:?}",
+                solo_rpc::telemetry::gates(s.active_gates)
+            ));
+        }
+        if self.caught_up && s.finalized + 2 < top {
+            unmet.push(format!("finalized {} behind {top}", s.finalized));
+        }
+        if self.signalled.is_some() || self.locked_in.is_some() {
+            match client::call(rpc, "solo_upgradeStatus", &json!([])) {
+                Ok(u) => {
+                    if let Some(g) = self.signalled {
+                        let validators = u["validators"].as_array().cloned().unwrap_or_default();
+                        let missing = validators
+                            .iter()
+                            .filter(|v| Self::mask(&v["signal"]["features"]) != g)
+                            .count();
+                        if missing != 0 || validators.is_empty() {
+                            unmet.push(format!("{missing} validators have not signalled"));
+                        }
+                    }
+                    if let Some(g) = self.locked_in
+                        && Self::mask(&u["gates"]["lockedIn"]) & g != g
+                    {
+                        unmet.push(format!("locked in {}", u["gates"]["lockedIn"]));
+                    }
+                }
+                Err(e) => unmet.push(e),
+            }
+        }
+        if let Some((count, above)) = self.certified {
+            let from = (above + 1).max(s.finalized.saturating_sub(63));
+            let certified = (from..=s.finalized)
+                .filter(|h| {
+                    client::call(rpc, "solo_getFinalityProof", &json!([format!("{h:#x}")]))
+                        .is_ok_and(|p| !p["keyId"].is_null())
+                })
+                .count() as u64;
+            if certified < count {
+                unmet.push(format!(
+                    "{certified} threshold certificates above {above} (finalized {})",
+                    s.finalized
+                ));
+            }
+        }
+        unmet
+    }
+}
+
+/// `solo devnet wait`.
+fn wait(args: &[String]) -> Result<String, String> {
+    let conditions = Conditions::parse(args)?;
+    let targets = targets(args)?;
+    let timeout = Duration::from_secs(number(args, "--timeout", 600)?);
+    let started = Instant::now();
+    let mut last = String::new();
+    let mut check = || {
+        let top = targets
+            .iter()
+            .filter_map(|(_, rpc)| client::status(rpc).ok())
+            .map(|s| s.finalized)
+            .max()
+            .unwrap_or(0);
+        let unmet: Vec<String> = targets
+            .iter()
+            .filter_map(|(label, rpc)| {
+                let reasons = conditions.unmet(rpc, top);
+                (!reasons.is_empty()).then(|| format!("node {label}: {}", reasons.join(", ")))
+            })
+            .collect();
+        last = unmet.join("; ");
+        unmet.is_empty()
+    };
+    let what = format!("timeout waiting for {conditions}");
+    poll_until(timeout, &what, &mut check).map_err(|e| format!("{e}: {last}"))?;
+    Ok(format!(
+        "ok after {:.1}s: {conditions}",
+        started.elapsed().as_secs_f64()
+    ))
+}
+
+/// `solo devnet node --dir <dir> --index <i> [options]`: runs node `i` of the
+/// manifest in this process, as `solo node` would with the manifest's
+/// addresses, the key file and the peers, plus any other `solo node` option.
+fn node(args: &[String], keep_going: &mut dyn FnMut(&solo_rpc::Rpc) -> bool) -> Result<(), String> {
+    let devnet = Devnet::load(&dir_argument(args)?)?;
+    let index = crate::parse_number(args, "--index")?
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or("--index <i> is required")?;
+    let spec = devnet.node(index)?;
+    let path = |p: PathBuf| p.to_string_lossy().into_owned();
+    let mut line: Vec<String> = [
+        "solo",
+        "node",
+        "--kernel",
+        &path(devnet.kernel()),
+        "--genesis",
+        &path(devnet.genesis()),
+        "--key-file",
+        &path(devnet.node_dir(index).join("key")),
+        "--listen",
+        &spec.listen,
+        "--rpc",
+        &spec.rpc,
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    for peer in &spec.peers {
+        line.extend(["--peer".to_owned(), peer.clone()]);
+    }
+    // Everything after `solo devnet node` but the two options read here.
+    let mut rest = args.iter().skip(3);
+    while let Some(a) = rest.next() {
+        if a == "--dir" || a == "--index" {
+            rest.next();
+        } else {
+            line.push(a.clone());
+        }
+    }
+    crate::run_inner(&line, keep_going).map_err(|CliError(m)| m)
+}
+
+/// Runs `solo devnet <subcommand>`; every subcommand but `node` prints its
+/// report and returns, `node` runs a node until `keep_going` says otherwise.
+///
+/// # Errors
+/// A message naming the first problem.
+pub fn run(
+    args: &[String],
+    keep_going: &mut dyn FnMut(&solo_rpc::Rpc) -> bool,
+) -> Result<(), String> {
+    let report = match args.get(2).map_or("", String::as_str) {
+        "init" => init(args)?,
+        "up" => up(args)?,
+        "down" => stop_all(&Devnet::load(&dir_argument(args)?)?)?,
+        "stop" => stop_node(&Devnet::load(&dir_argument(args)?)?, node_argument(args)?)?,
+        "start" => start_node(&Devnet::load(&dir_argument(args)?)?, node_argument(args)?)?,
+        "status" => status(args)?,
+        "wait" => wait(args)?,
+        "node" => return node(args, keep_going),
+        _ => return Err(crate::USAGE.to_owned()),
+    };
+    println!("{report}");
+    Ok(())
+}

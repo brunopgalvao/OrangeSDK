@@ -1,0 +1,19 @@
+# The Prometheus configuration of docker-compose.yml: the four devnet nodes
+# by service name, the alert rules of alerts.yml. prometheus.yml is the
+# single-node configuration for a node on this machine.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: solo
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - solo-0:8545
+          - solo-1:8545
+          - solo-2:8545
+          - solo-3:8545
