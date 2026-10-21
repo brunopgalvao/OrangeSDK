@@ -128,8 +128,10 @@ fn write_secret(path: &Path, bytes: &[u8]) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    let mut file = options.open(path).map_err(|e| io(path, &e))?;
-    file.write_all(bytes).map_err(|e| io(path, &e))
+    let written = options
+        .open(path)
+        .and_then(|mut file| file.write_all(bytes));
+    written.map_err(|e| io(path, &e))
 }
 
 fn text_of(v: &Value, key: &str) -> Result<String, String> {
@@ -368,10 +370,14 @@ fn init(args: &[String]) -> Result<String, String> {
         let node_dir = devnet.node_dir(i);
         // A node directory of an earlier devnet holds that chain's driver
         // state, log and pid: `--force` starts over from nothing.
-        if node_dir.exists() {
-            fs::remove_dir_all(&node_dir).map_err(|e| io(&node_dir, &e))?;
-        }
-        fs::create_dir_all(&node_dir).map_err(|e| io(&node_dir, &e))?;
+        let cleared = if node_dir.exists() {
+            fs::remove_dir_all(&node_dir)
+        } else {
+            Ok(())
+        };
+        cleared
+            .and_then(|()| fs::create_dir_all(&node_dir))
+            .map_err(|e| io(&node_dir, &e))?;
         write_secret(&node_dir.join("key"), hex(&keys[i]).as_bytes())?;
         let _ = write!(
             report,

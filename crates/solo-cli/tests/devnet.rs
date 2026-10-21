@@ -27,6 +27,11 @@ const KERNEL_V2: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../solo-node/tests/fixtures/kernel_v2.elf"
 );
+/// A module that recompiles like a kernel but is not one.
+const COUNTER: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../solo-node/tests/fixtures/counter.elf"
+);
 const REHEARSAL: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/rehearse-upgrade.sh"
@@ -390,6 +395,23 @@ fn init_writes_a_reproducible_devnet_and_names_mistakes() {
         KERNEL,
     ]);
     assert!(text.contains("node-0"), "{text}");
+    // A key file that cannot be created is named: something sits where
+    // governance.key goes.
+    let held = scratch("init-held");
+    std::fs::create_dir_all(held.join("governance.key")).unwrap();
+    let text = err(&["devnet", "init", "--dir", str_of(&held), "--kernel", KERNEL]);
+    assert!(text.contains("governance.key"), "{text}");
+    // What `kernel_init` refuses beyond what the genesis checks foresee is
+    // still caught at init, by running it once: a module that is no kernel.
+    let text = err(&[
+        "devnet",
+        "init",
+        "--dir",
+        str_of(&scratch("init-no-kernel")),
+        "--kernel",
+        COUNTER,
+    ]);
+    assert!(text.contains("the kernel refuses this genesis"), "{text}");
 }
 
 /// A server on a free port answering each connection with `reply` once per
