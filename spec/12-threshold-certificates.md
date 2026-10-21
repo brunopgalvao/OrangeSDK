@@ -2,11 +2,11 @@
 
 ## 1. Overview
 
-This document specifies the finality certificate that codex ADR 0008 calls for and the cryptography behind it: BLS signatures over BLS12-381, a `t`-of-`n` threshold key shared among the validators, the dealerless key generation (DKG) that creates the key, the resharing that hands it to a new validator set without changing it, and the procedure an Ethereum contract follows to verify a certificate with the EIP-2537 precompiles. The decisions behind it are recorded in codex ADR 0017.
+This document specifies the finality certificate that codex ADR 0008 calls for and the cryptography behind it: BLS signatures over BLS12-381, a `t`-of-`n` threshold key shared among the validators, the dealerless key generation (DKG) that creates the key, the resharing that hands a key to a new validator set without changing it, the rotation message with which one key hands off to the next, and the procedure an Ethereum contract follows to verify a certificate and a rotation with the EIP-2537 precompiles. The decisions behind it are recorded in codex ADRs 0017 and 0031.
 
-A certificate is 89 bytes and verifies with one pairing check against a group public key that never changes, so a light client on Ethereum (codex ADR 0013, tier 2) stores the key once and verifies every certificate for about 115 000 gas of precompile calls.
+A certificate verifies with one pairing check against the group public key of the key set that signed it, for about 115 000 gas of precompile calls on Ethereum. The reference kernel generates a fresh key every epoch and the old key hands off to it (spec 15 §6.6), so a version-2 certificate (97 bytes) names the key set that signed it, and a light client on Ethereum (codex ADR 0013, tier 2) follows the chain of rotation messages from the key it trusts. The 89-byte version-1 certificate of a key that never changes stays decodable.
 
-The reference implementation is `crates/solo-bls`. The Simplex driver (08 §6a) produces these certificates once the validators of an epoch have generated a key; spec 15 §6 specifies how the DKG runs inside the reference kernel, with its messages carried in blocks, its phases at fixed heights and the secret halves in the host's keystore.
+The reference implementation is `crates/solo-bls`. The Simplex driver (08 §6a) produces these certificates once the validators of an epoch have generated a key; spec 15 §6 specifies how the DKG runs inside the reference kernel, with its messages carried in blocks, its phases at fixed heights and the secret halves in the host's keystore, and how keys hand off.
 
 Numbers in this document are big-endian wherever they are part of a signed message or a certificate, because Ethereum contracts rebuild them with `abi.encodePacked`. DKG messages use the canonical encoding of 06 §2 like every other driver message.
 
@@ -27,9 +27,9 @@ The curve is BLS12-381 with its standard generators `g1` and `g2` (draft-irtf-cf
 | Two-pair pairing check | 102 900 | 102 900 |
 | Total of BLS precompiles | **114 275** | 151 100 |
 | Signature in calldata | 128 bytes | 256 bytes |
-| Group key | 256 bytes, a contract constant | 128 bytes, a contract constant |
+| Group key | 256 bytes | 128 bytes |
 
-The larger key costs nothing at verification time because resharing (§6) keeps it fixed, so a contract holds it as immutable code constants.
+The larger key costs little: a verifier of a key that never changes holds it as immutable code constants (version 1), and a light client of a rotating key (version 2, spec 17 §5.3) keeps it in eight storage words that it reads once per certificate and writes once per rotation.
 
 **Point encoding.** A point is encoded compressed in the format of draft-irtf-cfrg-pairing-friendly-curves-11 Appendix C (the format Zcash and the Ethereum consensus layer use): a G1 point is 48 bytes, the big-endian `x`; a G2 point is 96 bytes, `x.c1 ‖ x.c0` for `x = x.c0 + x.c1·u`. The three most significant bits of the first byte are flags: bit 7 is set (compressed), bit 6 marks the identity (then every other bit is zero), bit 5 is set when `y` is the lexicographically larger of the two roots. A decoder MUST reject an encoding whose flags are inconsistent, whose `x` is not below `p`, which is not on the curve, or whose point is not in the subgroup of order `r`.
 
@@ -84,7 +84,7 @@ When every `σ_i` is valid, `σ = a_0 · H(m, DST_SIG)`: the unique signature of
 
 ## 5. Key generation
 
-The DKG is synchronous Joint-Feldman (Pedersen's DKG) with complaints. It is a pure state machine: each participant's machine consumes broadcast messages and phase boundaries and produces broadcast messages and, at the end, its output.
+The DKG is synchronous Joint-Feldman (Pedersen's DKG) with complaints. It is a pure state machine: each participant's machine consumes broadcast messages and phase boundaries and produces broadcast messages and, at the end, its output. The reference kernel runs it for a fresh key every epoch (spec 15 §6.1).
 
 **Assumptions.** Senders are authenticated by the transport (the driver's signed consensus messages). Every honest participant processes the same messages in the same phase and ends each phase at the same point, as when the messages are carried in finalized blocks and phases end at fixed heights. Fewer than `t` participants are faulty (for a resharing, fewer than the previous threshold among the dealers). Under these assumptions every honest participant computes the same qualified set and the same public key set.
 
@@ -137,41 +137,59 @@ A resharing hands an existing key to a new set of recipients, with a new thresho
 C   = Σ_{i ∈ QUAL} λ_i · C_i        s'_j = Σ_{i ∈ QUAL} λ_i · s_ij
 ```
 
-Because every `C_{i,0} = s_i · g2` and `|QUAL|` is at least the previous threshold, `C_0 = Σ λ_i · s_i · g2 = PK`: the group key is unchanged, so certificates from the new set verify under the key an Ethereum contract already holds. The new shares are a fresh sharing of the same secret; previous shareholders erase their old shares once the new set is active.
+Because every `C_{i,0} = s_i · g2` and `|QUAL|` is at least the previous threshold, `C_0 = Σ λ_i · s_i · g2 = PK`: the group key is unchanged, so certificates from the new set verify under the key an Ethereum contract already holds. The new shares are a fresh sharing of the same secret; previous shareholders are asked to erase their old shares once the new set is active, but nothing can enforce it, and old shares still combine into signatures under the same key. That is why the reference kernel no longer reshares (codex ADR 0031): it generates a fresh key each epoch and hands off to it (spec 15 §6.6), so that a key's shareholders can be held to it while their stake is bonded. Resharing stays specified and implemented for chains that want a key that never changes and accept that its former shareholders are trusted for ever.
 
 ## 7. Certificates
 
-**Message.** The message signed for the block with hash `block_hash` at `height` on the chain with id `chain_id` is 62 bytes:
+**Messages.** The message signed for the block with hash `block_hash` at `height` on the chain with id `chain_id` is, in version 1, 62 bytes and, in version 2, 70 bytes that also name `key_id`, the id of the key set that signs (the epoch whose DKG made it, spec 15 §6.1):
 
 ```
-message = "SOLO-FINALITY" (13 ASCII bytes) ‖ version (1 byte, 1) ‖ chain_id (u64) ‖ height (u64) ‖ block_hash (32 bytes)
+message_v1 = "SOLO-FINALITY" (13 ASCII bytes) ‖ 1 ‖ chain_id (u64) ‖ height (u64) ‖ block_hash (32 bytes)
+message_v2 = "SOLO-FINALITY" (13 ASCII bytes) ‖ 2 ‖ chain_id (u64) ‖ key_id (u64) ‖ height (u64) ‖ block_hash (32 bytes)
 ```
 
-**Format.** A version-1 certificate is 89 bytes:
+**Formats.**
 
 ```
-certificate = version (1 byte, 1) ‖ height (u64) ‖ block_hash (32 bytes) ‖ signature (48 bytes, compressed G1)
+certificate_v1 = 1 ‖ height (u64) ‖ block_hash (32 bytes) ‖ signature (48 bytes, compressed G1)            (89 bytes)
+certificate_v2 = 2 ‖ key_id (u64) ‖ height (u64) ‖ block_hash (32 bytes) ‖ signature (48 bytes)            (97 bytes)
 ```
 
-A decoder MUST reject a first byte other than 1 (an unknown version), a length other than 89, and a signature that does not decode. A later signature scheme gets a new version byte, a new message tag and its own Ethereum verifier.
+A decoder MUST reject a first byte other than 1 or 2 (an unknown version), a length other than 89 for version 1 or 97 for version 2, and a signature that does not decode. The reference driver produces version 2 only; version 1 stays decodable and its verifier (§8, Appendix A) stays deployed for chains whose key never changes. A later signature scheme gets a new version byte, a new message tag and its own Ethereum verifier.
 
-**Producing.** Each validator signs `message` with its share; any `t` partial signatures combine into the group signature (§4). The combiner verifies the combined signature before emitting the certificate, so an invalid partial never yields an invalid certificate; when that check fails, the driver verifies the partials one by one, drops the invalid ones and combines again.
+**Producing.** Each shareholder of key set `key_id` signs `message_v2` with its share; any `t` partial signatures combine into the group signature (§4). The combiner verifies the combined signature before emitting the certificate, so an invalid partial never yields an invalid certificate; when that check fails, the driver verifies the partials one by one, drops the invalid ones and combines again.
 
-**Verifying.** A certificate is valid for `chain_id` under the group key `PK` when its signature verifies (§3) over the message rebuilt from `chain_id`, its height and its block hash. Inside a kernel this is the host function `bls12381_verify` (05 §4.3) with arguments `message`, `DST_SIG`, the signature and `PK`.
+**Verifying.** A certificate is valid for `chain_id` under the group key `PK` of the key set it names (version 2) or of the chain (version 1) when its signature verifies (§3) over the message rebuilt from `chain_id`, its key id, its height and its block hash. Inside a kernel this is the host function `bls12381_verify` (05 §4.3) with arguments `message`, `DST_SIG`, the signature and `PK`. Which key sets a verifier accepts for which heights is the verifier's rule: a full node's is spec 08 §7a, a light client's spec 17 §5.3.
 
-**Relationship to 08.** A driver that adopts these certificates carries the 89 bytes in `FinalizeBlock.certificate`. Their first byte, 1, never equals the kind byte 2 that opens a spec 08 finalize certificate, so the two formats are distinguishable. A certificate does not say which validators signed; participation is recorded separately (ADR 0008).
+**Rotation.** The active key set hands off to the key set `key_id` with group key `key` (compressed, 96 bytes) by signing, with the same tag `DST_SIG`, the 124-byte rotation message
+
+```
+rotation_message = "SOLO-ROTATE" (11 ASCII bytes) ‖ 1 ‖ chain_id (u64) ‖ key_id (u64) ‖ key (96 bytes)
+```
+
+Its group signature over it is a *rotation certificate*. The version byte 1 lets a later rotation format coexist; the tag differs from the certificate tag in its sixth byte, so no rotation message is a certificate message and no certificate message a rotation message, and both are signed under one `DST_SIG` without ambiguity. A rotation message names the new key, not the old: the old key is whoever signs it, and a verifier checks it against the key it holds.
+
+**Relationship to 08.** A driver that adopts these certificates carries them in `FinalizeBlock.certificate`. A spec 08 finalize certificate opens with its kind byte 2 too, but its encoding is `42 + 69·n` bytes for `n` votes (one byte more from 128 votes on), never 97, and never 89, so a decoder tells the three formats apart by the first byte and the length. A certificate does not say which validators signed; participation is recorded separately (ADR 0008).
 
 ## 8. Verification on Ethereum
 
-A verifier contract for version 1 holds as constants the chain id, `PK` in EIP-2537 encoding (256 bytes), `−g2` in EIP-2537 encoding, `DST_SIG` and `p`. A relayer decodes a certificate and submits `height`, `block_hash` and the signature decompressed into EIP-2537 encoding (128 bytes). The contract:
+A verifier contract for version 1 holds as constants the chain id, `PK` in EIP-2537 encoding (256 bytes), `−g2` in EIP-2537 encoding, `DST_SIG` and `p`. A relayer decodes a certificate and submits `height`, `block_hash` and the signature decompressed into EIP-2537 encoding (128 bytes). A verifier for version 2 holds the same constants but no key: the caller, a light client that holds the key set in force, passes `PK` and `key_id` with each certificate. The contract:
 
-1. builds `message` (§7), e.g. `abi.encodePacked(bytes13("SOLO-FINALITY"), uint8(1), chainId, height, blockHash)`;
+1. builds `message` (§7), e.g. `abi.encodePacked(bytes13("SOLO-FINALITY"), uint8(1), chainId, height, blockHash)`, or for version 2 `abi.encodePacked(bytes13("SOLO-FINALITY"), uint8(2), chainId, keyId, height, blockHash)`;
 2. computes `uniform = expand_message_xmd(message, DST_SIG, 128)` with the SHA-256 precompile (`0x02`): `b_0 = SHA-256(64 zero bytes ‖ message ‖ 0x0080 ‖ 0x00 ‖ DST_SIG ‖ 0x32)`, `b_1 = SHA-256(b_0 ‖ 0x01 ‖ DST_SIG ‖ 0x32)`, `b_i = SHA-256((b_0 ⊕ b_{i−1}) ‖ i ‖ DST_SIG ‖ 0x32)` for `i = 2, 3, 4`, `uniform = b_1 ‖ b_2 ‖ b_3 ‖ b_4`;
 3. reduces each 64-byte half modulo `p` with MODEXP (`0x05`), input `I2OSP(64, 32) ‖ I2OSP(1, 32) ‖ I2OSP(48, 32) ‖ half ‖ 0x01 ‖ p`, and left-pads each 48-byte result with 16 zero bytes, giving `u_0`, `u_1`;
 4. calls `BLS12_MAP_FP_TO_G1` (`0x10`) on `u_0` and on `u_1` and `BLS12_G1ADD` (`0x0b`) on the two results, giving `H(message, DST_SIG)` (the map precompile clears the cofactor, and cofactor clearing is linear, so map–map–add equals `hash_to_curve`);
 5. calls `BLS12_PAIRING_CHECK` (`0x0f`) on `signature ‖ (−g2) ‖ H ‖ PK` (768 bytes) and accepts exactly when it returns 32 bytes ending in `0x01`. The precompile checks that the signature is on the curve and in the subgroup.
 
-The BLS precompiles cost 114 275 gas; SHA-256 adds 516 and MODEXP 2 × 200 (2 × 500 once EIP-7883 is active). The reference contract of Appendix A spends 126 705 gas of execution per `verify` call on an Osaka EVM (spec 17 §8). ADR 0013 makes the verifier immutable per certificate version. Spec 17 builds the light client on it: a certificate signs a proposal hash, and the proposal's anchor carries the state root the certificate vouches for (17 §4).
+The BLS precompiles cost 114 275 gas; SHA-256 adds 516 and MODEXP 2 × 200 (2 × 500 once EIP-7883 is active). The reference contract of Appendix A spends 126 705 gas of execution per `verify` call on an Osaka EVM, and the version-2 verifier, which receives the key as calldata, 127 264 (spec 17 §8). ADR 0013 makes the verifier immutable per certificate version. Spec 17 builds the light client on it: a certificate signs a proposal hash, and the proposal's anchor carries the state root the certificate vouches for (17 §4).
+
+**Rotations.** A rotation certificate verifies the same way over `rotation_message`, which binds the new key compressed. A light client receives the new key in EIP-2537 encoding, because it needs the uncompressed point for its own pairing checks and cannot decompress cheaply, so it checks the point and compresses it itself:
+
+1. the key is 256 bytes, is not the identity, and comes back unchanged from `BLS12_G2MSM` (`0x0e`) with scalar 1, which rejects points off the curve, outside the subgroup or not canonically encoded;
+2. with the key's four 64-byte field elements `x.c0 ‖ x.c1 ‖ y.c0 ‖ y.c1`, each 16 zero bytes and a 48-byte value, the compressed key is the value of `x.c1` followed by the value of `x.c0` (96 bytes), with bit 7 of the first byte set and bit 5 set exactly when `y` is the lexicographically larger root: when `y.c1 > (p − 1) / 2`, or `y.c1 = 0` and `y.c0 > (p − 1) / 2` (§2);
+3. it builds `abi.encodePacked(bytes11("SOLO-ROTATE"), uint8(1), chainId, keyId, compressed)` and runs steps 2 to 5 above under the key it currently holds.
+
+The reference version-2 verifier spends 129 098 gas of execution on a rotation (spec 17 §8).
 
 ## 9. Worked examples
 
@@ -235,9 +253,20 @@ Combining partials 1, 2, 4 (or 4, 3, 2) gives the certificate of §9.1.
 
 The implementation also passes the RFC 9380 vectors of Appendices J.9.1 (`BLS12381G1_XMD:SHA-256_SSWU_RO_`, including the `u` values, through the EIP-2537 encoding), J.10.1 (`BLS12381G2_XMD:SHA-256_SSWU_RO_`) and K.1 (`expand_message_xmd` with SHA-256), and the four master-key vectors of EIP-2333 for `KeyGen`.
 
+### 9.5 Version 2 and a rotation
+
+The key of §9.1 as key set 3 certifies the block of §9.1, and hands off to the group key of §9.3 as key set 4.
+
+| Item | Value |
+|---|---|
+| `message_v2` (key set 3) | `534f4c4f2d46494e414c49545902000000000000053900000000000000030000000000000001abababababababababababababababababababababababababababababababab` |
+| `certificate_v2` | `0200000000000000030000000000000001ababababababababababababababababababababababababababababababababac8b3147a6f437a1f32f35433f4b579f94758b24c9ccae8b19cf19243d17b6cf5aa1491b59a2513432e34f8b9153e6e4` |
+| `rotation_message` (to key set 4) | `534f4c4f2d524f544154450100000000000005390000000000000004822bbc35275c08f014e718c9f66fe0ac83943afc0cdc3fd07316cb86bdc358d1b69ccc36c50f0ba06f9d2a5c47c18ee81889cd077e07f0854856cfa804d50e210008424da41554c2e4409d089aceae7298f898636df1836bf31b5af73ff64b66` |
+| rotation certificate's signature | `9890904bd14581711fa00553e5a4447d9b2135a5fe02c4cbe3e0ae5989599a9c32c7827f27711ccd8d6d258624d7006a` |
+
 ## 10. Limits of this version
 
-- The reference kernel's DKG (15 §6) carries messages in blocks, ends phases at fixed heights and adopts a key set only when more than two thirds of the stake confirm the same public outcome, which is how it checks that every participant derived the same key set. Partial signatures ride on finalize votes and are combined in the host's keystore (05 §4.3), natively, rather than in the interpreter.
+- The reference kernel's DKG (15 §6) carries messages in blocks, ends phases at fixed heights and adopts a key set only when more than two thirds of the stake confirm the same public outcome, which is how it checks that every participant derived the same key set. Partial signatures ride on finalize votes, rotation partials on their own envelopes (15 §6.6), and both are combined in the host's keystore (05 §4.3), natively, rather than in the interpreter.
 - The threshold counts shareholders, not stake (15 §9).
 - `bls12381_verify` covers this scheme only. The Ethereum consensus layer's signatures (keys in G1, signatures in G2), which the sync-committee light client of spec 18 checks, have their own host function, `bls12381_fast_aggregate_verify`, behind feature gate 1 (05 §4.3).
 - The DKG is synchronous; a run whose messages are not delivered to everyone alike can end with different outputs at different participants. In the reference kernel every participant reads the same messages from chain state, and a key set is adopted only once more than two thirds of the stake confirm it.
@@ -245,3 +274,5 @@ The implementation also passes the RFC 9380 vectors of Appendices J.9.1 (`BLS123
 ## Appendix A. Reference verifier (informative)
 
 The reference verifier is `contracts/SoloFinalityVerifierV1.sol`, compiled by `tools/build-contracts.sh` with solc 0.8.28 (spec 17 §9). It follows §8 step by step: the constructor takes the chain id and `PK` in EIP-2537 encoding, checks the key with `BLS12_G2MSM` and keeps it in eight immutable words; `verify(height, blockHash, signature)` builds `message` with `abi.encodePacked`, expands it with five SHA-256 calls into four words, reduces each 64-byte half with MODEXP, maps both with `BLS12_MAP_FP_TO_G1`, adds them with `BLS12_G1ADD` and runs `BLS12_PAIRING_CHECK` on `signature ‖ −g2 ‖ H ‖ PK`. `crates/solo-bridge/tests/contracts.rs` runs it on revm at Osaka against the example of §9.1: `verify(1, 0xabab…ab, signature)` returns true for 126 705 gas of execution, and false for another height, block or chain id, a signature by another key, or a signature off the curve; a signature that is not 128 bytes reverts. An earlier draft of this appendix copied the halves of `uniform` byte by byte and spent 152 755 gas on a Prague EVM.
+
+The version-2 verifier is `contracts/SoloFinalityVerifierV2.sol`: the same steps with the key and its id as arguments, `isValidKey` and `compress` of the rotation procedure above, and `verifyRotation(key, keyId, newKey, signature)`. `crates/solo-bridge/tests/contracts_v2.rs` runs it against §9.5: the certificate verifies as key set 3 and not as key set 4, the rotation verifies to key set 4 and not to 5, and `compress` agrees with the compressed encoding of twelve keys, with both values of the sort flag among them.

@@ -346,6 +346,7 @@ pub fn query(args: &QueryArgs) -> QueryResult {
             Err(_) => bad_params(),
         },
         _ => crate::staking::query(method, &args.params)
+            .or_else(|| crate::rotation::query(method, &args.params))
             .or_else(|| crate::modules::query(method, &args.params))
             .unwrap_or_else(|| crate::governance::query(method, &args.params)),
     }

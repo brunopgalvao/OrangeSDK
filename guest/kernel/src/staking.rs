@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use solo_abi::chain::consensus::signing_preimage;
 use solo_abi::chain::{Account, Evidence, Log, Validator, ValidatorSet, call_status, reason};
 use solo_abi::codec::Seq;
+use solo_abi::rotation::{HANDOFF_EPOCHS, REPORT_GAS, ThresholdEvidence};
 use solo_abi::staking::{
     DkgEnvelope, DkgRun, G1_LENGTH, G2_LENGTH, GWEI, KIND_DKG, KeySetRecord, KeySetVote, MAX_DKG, MAX_REGISTERED, SLASH_BPS, STAKING_ADDRESS,
     StakeEntry, StakeRecord, StakingAction, StakingParams, StakingStatus, dkg_header, dkg_threshold, envelope, epoch_of, epoch_start, event, keys,
@@ -19,9 +20,9 @@ use solo_abi::types::{Address, Genesis, Hash, QueryResult};
 use solo_abi::{Decode, Encode};
 use solo_guest::host;
 
-use crate::evm::{BlockFields, Message, Outcome};
-use crate::state;
+use crate::evm::{BASE_FEE, BlockFields, Message, Outcome};
 use crate::tx::{self, Signed};
+use crate::{rotation, state};
 
 /// The genesis staking parameters.
 pub fn params() -> StakingParams {
@@ -187,13 +188,18 @@ fn debit(address: &Address, amount: u128) {
 /// as stake, the staking address holds that stake, epoch 0's set is the
 /// genesis set and epoch 0's DKG run is scheduled. Traps on parameters that
 /// cannot work: four DKG phases longer than an epoch, too many validators,
-/// or an encryption key that is not a point.
+/// an encryption key that is not a point, or, with threshold keys, a key age
+/// of zero or an unbonding period that does not outlast the key age and the
+/// handoff latency (spec 15 §6.7).
 pub fn init(genesis: &Genesis) {
     let p = params();
     if p.epoch_blocks == 0 {
         return;
     }
     if p.dkg_phase_blocks.saturating_mul(4) > p.epoch_blocks {
+        solo_guest::trap();
+    }
+    if p.dkg_phase_blocks != 0 && (p.max_key_age == 0 || p.unbonding_epochs <= p.max_key_age.saturating_add(HANDOFF_EPOCHS)) {
         solo_guest::trap();
     }
     let set = ValidatorSet::from_bytes(&genesis.validators).unwrap_or_else(|_| solo_guest::trap());
@@ -262,6 +268,16 @@ fn action_of(s: &Signed, height: u64) -> Option<(StakingAction, Hash)> {
             let (id, r) = registered?;
             (value == 0 && r.unbonding > 0 && epoch_of(height, p.epoch_blocks) >= r.release_epoch).then_some(id)?
         }
+        StakingAction::Report { evidence } => {
+            if value != 0 || s.tx.gas_limit < s.tx.min_gas_limit().saturating_add(REPORT_GAS) {
+                return None;
+            }
+            let evidence = ThresholdEvidence::from_bytes(evidence).ok()?;
+            if rotation::on_record(&evidence) {
+                return None;
+            }
+            rotation::offender(&evidence, height)?
+        }
     };
     Some((action, id))
 }
@@ -285,9 +301,13 @@ pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Out
     let Some((action, id)) = action_of(s, height) else {
         return Outcome { status: call_status::INVALID, gas_used: 0, output: Vec::new(), logs: Vec::new(), contract: None };
     };
+    let report = matches!(action, StakingAction::Report { .. });
     let mut outcome = crate::native::run(message, block, true);
     if outcome.status == call_status::SUCCESS {
         outcome.logs.extend(apply(action, &id, s, height));
+        if report {
+            outcome.gas_used += REPORT_GAS;
+        }
     }
     outcome
 }
@@ -300,6 +320,9 @@ fn log(topic: Hash, address: &Address, data: Vec<u8>) -> Log {
 
 fn apply(action: StakingAction, id: &Hash, s: &Signed, height: u64) -> Vec<Log> {
     let p = params();
+    if let StakingAction::Report { evidence } = &action {
+        return report(evidence, id, s);
+    }
     let mut r = record(id).unwrap_or_default();
     let logs = match action {
         StakingAction::Register { dkg_key } => {
@@ -332,9 +355,23 @@ fn apply(action: StakingAction, id: &Hash, s: &Signed, height: u64) -> Vec<Log> 
             credit(&s.from, amount);
             vec![log(event::WITHDRAWN, &s.from, word(amount).to_vec())]
         }
+        StakingAction::Report { .. } => Vec::new(),
     };
     put_record(id, &r);
     logs
+}
+
+/// A `report` that can run (spec 15 §5.2): records the evidence and slashes
+/// its offender `id`, and charges the sender `REPORT_GAS` on top of the
+/// plain call, paid to the zero address like every fee.
+fn report(evidence: &[u8], id: &Hash, s: &Signed) -> Vec<Log> {
+    let evidence = ThresholdEvidence::from_bytes(evidence).unwrap_or_default();
+    rotation::put_evidence(&evidence, id);
+    let fee = u128::from(REPORT_GAS) * s.tx.effective_gas_price(u128::from(BASE_FEE)).unwrap_or(0);
+    debit(&s.from, fee);
+    credit(&[0; 20], fee);
+    let address = record(id).map_or_else(|| address_of(id), |r| r.address);
+    vec![log(event::REPORTED, &address, [word(u128::from(evidence.kind)), word(u128::from(evidence.key_set))].concat())]
 }
 
 /// `x · SLASH_BPS / 10 000` without overflow.
@@ -354,9 +391,16 @@ pub fn slash(evidence: &Evidence) {
     }
     let Some(set) = set_of(view_epoch(evidence.view)) else { return };
     let Some(v) = set.validators.0.get(evidence.validator as usize) else { return };
-    let mut r = record(&v.id).unwrap_or_else(|| {
-        let address = address_of(&v.id);
-        state::set(&concat(&[keys::BY_ADDRESS, &address]), &v.id);
+    slash_id(&v.id);
+}
+
+/// Slashes and jails validator `id` unless it is jailed already: the
+/// punishment of every recorded offence, equivocation (spec 08 §9) or
+/// threshold misbehaviour (spec 15 §5.1).
+pub fn slash_id(id: &Hash) {
+    let mut r = record(id).unwrap_or_else(|| {
+        let address = address_of(id);
+        state::set(&concat(&[keys::BY_ADDRESS, &address]), id);
         StakeRecord { address, ..StakeRecord::default() }
     });
     if r.jailed {
@@ -366,7 +410,7 @@ pub fn slash(evidence: &Evidence) {
     r.stake -= from_stake;
     r.unbonding -= from_unbonding;
     r.jailed = true;
-    put_record(&v.id, &r);
+    put_record(id, &r);
     debit(&STAKING_ADDRESS, from_stake + from_unbonding);
     credit(&[0; 20], from_stake + from_unbonding);
 }
@@ -400,9 +444,10 @@ fn select(p: &StakingParams) -> Option<ValidatorSet> {
     (!validators.is_empty()).then_some(ValidatorSet { validators: Seq(validators) })
 }
 
-/// Schedules epoch `epoch`'s DKG run for `set`: a resharing of the active
-/// key set when there is one, a fresh key otherwise. The recipients are the
-/// members with an encryption key; with none there is no run.
+/// Schedules epoch `epoch`'s DKG run for `set`: always a fresh key among
+/// the set (spec 15 §6.1), which the active key hands off to once it is
+/// adopted. The recipients, who are also the dealers, are the members with
+/// an encryption key; with none there is no run.
 fn schedule_run(epoch: u64, set: &ValidatorSet) {
     let mut recipients = Vec::new();
     let mut keys_of = Vec::new();
@@ -417,16 +462,14 @@ fn schedule_run(epoch: u64, set: &ValidatorSet) {
     if recipients.is_empty() {
         return;
     }
-    let previous = active();
-    let dealers = previous.as_ref().map_or_else(|| recipients.clone(), |k| k.shareholders.0.clone());
     let run = DkgRun {
         epoch,
         session: state::keccak256(&session_preimage(state::chain_id(), epoch)),
         threshold: dkg_threshold(recipients.len()) as u32,
-        dealers: Seq(dealers),
+        dealers: Seq(recipients.clone()),
         recipients: Seq(recipients),
         keys: Seq(keys_of),
-        previous: previous.map(|k| k.id),
+        previous: None,
     };
     state::set(&run_key(epoch), &run);
 }
@@ -495,7 +538,9 @@ pub fn record_dkg(envelopes: &[Vec<u8>], height: u64) {
         let signer = state::keccak256(&pubkey);
         match env.kind {
             envelope::MESSAGE => record_message(&run, &env.body, &signer, phase),
-            envelope::CONFIRM if phase == 3 => confirm(&run, &env.body, &signer),
+            envelope::CONFIRM if phase == 3 => confirm(&run, &env.body, &signer, height),
+            envelope::HANDOFF => rotation::record_handoff(&env.body, height),
+            envelope::EVIDENCE => rotation::record_evidence_body(&env.body, height),
             _ => {}
         }
     }
@@ -516,7 +561,7 @@ fn record_message(run: &DkgRun, body: &[u8], signer: &Hash, now: u64) {
     }
 }
 
-fn confirm(run: &DkgRun, body: &[u8], signer: &Hash) {
+fn confirm(run: &DkgRun, body: &[u8], signer: &Hash, height: u64) {
     let epoch = run.epoch;
     if key_set(epoch).is_some() || has_vote(epoch, signer) {
         return;
@@ -531,26 +576,23 @@ fn confirm(run: &DkgRun, body: &[u8], signer: &Hash) {
     let tally = state::get::<u128>(&k).unwrap_or(0) + weight;
     state::set(&k, &tally);
     if tally * 3 > total * 2 {
-        adopt(run, vote);
+        adopt(run, vote, height);
     }
 }
 
-/// Adopts a confirmed key set when its shape fits the run and, for a
-/// resharing, its group key is the one the chain already has.
-fn adopt(run: &DkgRun, vote: KeySetVote) {
+/// Adopts a confirmed key set when its shape fits the run. The first key
+/// set becomes active at once; a later one waits for the active key to hand
+/// off to it (spec 15 §6.6).
+fn adopt(run: &DkgRun, vote: KeySetVote, height: u64) {
     let shaped = vote.key_set.len() == run.threshold as usize * G2_LENGTH
         && vote.public_shares.0.len() == run.recipients.0.len()
         && vote.public_shares.0.iter().all(|s| s.len() == G2_LENGTH);
-    let group = &vote.key_set[..G2_LENGTH.min(vote.key_set.len())];
-    if !shaped || group_key().is_some_and(|g| g != group) {
+    if !shaped {
         return;
-    }
-    if group_key().is_none() {
-        state::set_raw(keys::GROUP_KEY, group);
     }
     let record = KeySetRecord { id: run.epoch, key_set: vote.key_set, public_shares: vote.public_shares, shareholders: run.recipients.clone() };
     state::set(&key_set_key(run.epoch), &record);
-    state::set(keys::ACTIVE, &run.epoch);
+    rotation::adopted(&record, height);
 }
 
 fn status() -> StakingStatus {

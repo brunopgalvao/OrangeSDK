@@ -28,6 +28,7 @@ pub fn finality_proof(node: &mut Node, params: &[Value]) -> Result<Value, RpcErr
     };
     let s = solo_bridge::Submission::new(&proof).map_err(failed)?;
     Ok(json!({
+        "keyId": s.key_id.map(|id| quantity(u128::from(id))),
         "height": quantity(u128::from(s.height)),
         "blockHash": data(&s.block_hash),
         "anchorHeight": quantity(u128::from(s.anchor_height)),
@@ -36,6 +37,28 @@ pub fn finality_proof(node: &mut Node, params: &[Value]) -> Result<Value, RpcErr
         "proposal": data(&proof.proposal),
         "signature": data(&s.signature),
         "calldata": data(&s.calldata()),
+    }))
+}
+
+/// `solo_getRotation(fromKeyId)`: the handoff out of key set `fromKeyId`
+/// that the chain recorded, with the new key and the signature in EIP-2537
+/// encoding and the light client's `rotate` calldata; `null` if none.
+///
+/// # Errors
+/// Invalid params, or a server error if the node fails.
+pub fn rotation(node: &mut Node, params: &[Value]) -> Result<Value, RpcError> {
+    let from = parse_quantity(param_str(params, 0)?)?;
+    let Some(r) = solo_bridge::rotation(node, from).map_err(failed)? else {
+        return Ok(Value::Null);
+    };
+    Ok(json!({
+        "from": quantity(u128::from(r.from)),
+        "to": quantity(u128::from(r.to)),
+        "height": quantity(u128::from(r.height)),
+        "key": data(&r.key),
+        "keyEip2537": data(&r.key_eip2537),
+        "signature": data(&r.signature),
+        "calldata": data(&r.calldata()),
     }))
 }
 

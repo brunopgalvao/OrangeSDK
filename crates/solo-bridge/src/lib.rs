@@ -12,8 +12,16 @@
 //!   the state root of a recent height, and [`SlotProof::prove_calldata`] and
 //!   [`execute_calldata`] build the inbox's `prove` and `execute` calls.
 //!
-//! [`verifier_args`], [`light_client_args`] and [`InboxConfig`] encode the
-//! constructor arguments of the three contracts in `contracts/`.
+//! - **Key rotations.** Solo's group key rotates (spec 15 §6.6): [`rotation`]
+//!   and [`rotations_from`] read the handoffs the chain recorded, and
+//!   [`Rotation::calldata`] builds `SoloLightClientV2.rotate`, which moves a
+//!   light client from one key set to the next. A version-2 certificate
+//!   names its key set, and [`submission_covering_key`] picks one under the
+//!   key set a light client holds.
+//!
+//! [`verifier_args`], [`light_client_args`], [`verifier_v2_args`],
+//! [`light_client_v2_args`] and [`InboxConfig`] encode the constructor
+//! arguments of the contracts in `contracts/`.
 
 #![forbid(unsafe_code)]
 
@@ -21,12 +29,13 @@ pub mod abi;
 
 use std::fmt;
 
-use solo_abi::Encode;
 use solo_abi::bridge::{
     FinalityProof, Message, OUTBOX_ADDRESS, anchor, message_key, message_slot, query,
 };
 use solo_abi::chain::Log;
+use solo_abi::rotation::{Handoff, query as rotation_query, threshold_certificate};
 use solo_abi::types::{Address, Hash};
+use solo_abi::{Decode, Encode};
 use solo_node::{Node, NodeError, PROOF_HISTORY};
 use solo_trie::{Proof, Terminal, bit, branch_hash, keccak256, leaf_hash};
 
@@ -72,6 +81,8 @@ fn le64(bytes: &[u8], at: usize) -> u64 {
 /// What a relayer submits to the light client for one certificate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Submission {
+    /// The key set a version-2 certificate names; `None` for version 1.
+    pub key_id: Option<u64>,
     /// The certified proposal's height.
     pub height: u64,
     /// The certified proposal's hash, the certificate's block hash.
@@ -95,8 +106,9 @@ impl Submission {
     /// [`Error::ProposalMismatch`] for a proposal it does not certify,
     /// [`Error::NoAnchor`] for one without an anchor.
     pub fn new(proof: &FinalityProof) -> Result<Submission, Error> {
-        let certificate =
-            solo_bls::Certificate::from_bytes(&proof.certificate).map_err(Error::Bls)?;
+        let certificate = threshold_certificate(&proof.certificate)
+            .ok_or(Error::Bls(solo_bls::Error::UnsupportedVersion))?;
+        let signature = signature_point(certificate.signature)?;
         let p = &proof.proposal;
         if keccak256(p) != certificate.block_hash
             || p.len() < anchor::MIN_LENGTH
@@ -109,6 +121,7 @@ impl Submission {
             return Err(Error::NoAnchor);
         }
         Ok(Submission {
+            key_id: (certificate.version == 2).then_some(certificate.key_id),
             height: certificate.height,
             block_hash: certificate.block_hash,
             anchor_height,
@@ -116,7 +129,7 @@ impl Submission {
                 .try_into()
                 .unwrap_or_default(),
             proposal: p.clone(),
-            signature: solo_bls::evm::encode_g1(certificate.signature.point()),
+            signature: solo_bls::evm::encode_g1(signature.point()),
         })
     }
 
@@ -131,6 +144,15 @@ impl Submission {
             ],
         )
     }
+}
+
+/// A compressed signature (48 bytes) as a point.
+fn signature_point(bytes: &[u8]) -> Result<solo_bls::Signature, Error> {
+    let bytes: [u8; 48] = bytes
+        .try_into()
+        .ok()
+        .ok_or(Error::Bls(solo_bls::Error::InvalidLength))?;
+    solo_bls::Signature::from_bytes(&bytes).map_err(Error::Bls)
 }
 
 /// The EIP-2537 encoding of a chain's compressed 96-byte group key, as the
@@ -163,6 +185,116 @@ pub fn verifier_args(chain_id: u64, group_key: &[u8; 256]) -> Vec<u8> {
 #[must_use]
 pub fn light_client_args(verifier: &Address) -> Vec<u8> {
     abi::encode(&[Value::address(verifier)])
+}
+
+/// Constructor arguments of `SoloFinalityVerifierV2(uint64 chainId)`.
+#[must_use]
+pub fn verifier_v2_args(chain_id: u64) -> Vec<u8> {
+    abi::encode(&[Value::uint(u128::from(chain_id))])
+}
+
+/// Constructor arguments of `SoloLightClientV2(address verifier, uint64
+/// keyId, bytes key, uint64 epochBlocks, uint64 maxKeyAge)`: the trusted key
+/// set to start from, in EIP-2537 encoding, and the chain's epoch length and
+/// key age.
+#[must_use]
+pub fn light_client_v2_args(
+    verifier: &Address,
+    key_id: u64,
+    key: &[u8; 256],
+    epoch_blocks: u64,
+    max_key_age: u64,
+) -> Vec<u8> {
+    abi::encode(&[
+        Value::address(verifier),
+        Value::uint(u128::from(key_id)),
+        Value::Bytes(key.to_vec()),
+        Value::uint(u128::from(epoch_blocks)),
+        Value::uint(u128::from(max_key_age)),
+    ])
+}
+
+/// A recorded handoff, ready for `SoloLightClientV2.rotate`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rotation {
+    /// The key set handed off from.
+    pub from: u64,
+    /// The key set handed off to.
+    pub to: u64,
+    /// Its group key, compressed.
+    pub key: Vec<u8>,
+    /// Its group key in EIP-2537 encoding.
+    pub key_eip2537: [u8; 256],
+    /// The group signature of `from` in EIP-2537 encoding.
+    pub signature: [u8; 128],
+    /// The Solo height that recorded the handoff.
+    pub height: u64,
+}
+
+impl Rotation {
+    /// The rotation of a recorded handoff, with its key and signature
+    /// decompressed.
+    ///
+    /// # Errors
+    /// [`Error::Bls`] for a key or signature that does not decode.
+    pub fn new(handoff: &Handoff) -> Result<Rotation, Error> {
+        let signature = signature_point(&handoff.signature)?;
+        Ok(Rotation {
+            from: handoff.from,
+            to: handoff.to,
+            key: handoff.key.clone(),
+            key_eip2537: group_key(&handoff.key)?,
+            signature: solo_bls::evm::encode_g1(signature.point()),
+            height: handoff.height,
+        })
+    }
+
+    /// The light client's `rotate(uint64,bytes,bytes)` calldata.
+    #[must_use]
+    pub fn calldata(&self) -> Vec<u8> {
+        abi::call(
+            "rotate(uint64,bytes,bytes)",
+            &[
+                Value::uint(u128::from(self.to)),
+                Value::Bytes(self.key_eip2537.to_vec()),
+                Value::Bytes(self.signature.to_vec()),
+            ],
+        )
+    }
+}
+
+/// The handoff out of key set `from` that `node`'s chain recorded; `None` if
+/// none was.
+///
+/// # Errors
+/// [`Error::Node`] if the query fails, [`Error::Bls`] for a record that
+/// does not decode.
+pub fn rotation(node: &mut Node, from: u64) -> Result<Option<Rotation>, Error> {
+    let r = node
+        .query(rotation_query::HANDOFF, &from.to_bytes())
+        .map_err(Error::Node)?;
+    if r.status != 0 {
+        return Ok(None);
+    }
+    let handoff = Handoff::from_bytes(&r.body)
+        .ok()
+        .ok_or(Error::Node(NodeError::Decode(rotation_query::HANDOFF)))?;
+    Rotation::new(&handoff).map(Some)
+}
+
+/// Every handoff from key set `from` on, in order: what a light client
+/// holding `from` submits to reach the chain's active key set.
+///
+/// # Errors
+/// As [`rotation`].
+pub fn rotations_from(node: &mut Node, from: u64) -> Result<Vec<Rotation>, Error> {
+    let mut out = Vec::new();
+    let mut at = from;
+    while let Some(r) = rotation(node, at)? {
+        at = r.to;
+        out.push(r);
+    }
+    Ok(out)
 }
 
 /// The configuration a `SoloInbox` is deployed with (spec 17 §6.4).
@@ -330,10 +462,33 @@ pub fn finality_proof(node: &mut Node, height: u64) -> Result<Option<FinalityPro
 /// # Errors
 /// [`Error::Node`] if a query fails.
 pub fn submission_covering(node: &mut Node, height: u64) -> Result<Option<Submission>, Error> {
+    covering(node, height, None)
+}
+
+/// [`submission_covering`] among the version-2 certificates of key set
+/// `key_id`, the key set a light client holds.
+///
+/// # Errors
+/// [`Error::Node`] if a query fails.
+pub fn submission_covering_key(
+    node: &mut Node,
+    height: u64,
+    key_id: u64,
+) -> Result<Option<Submission>, Error> {
+    covering(node, height, Some(key_id))
+}
+
+fn covering(
+    node: &mut Node,
+    height: u64,
+    key_id: Option<u64>,
+) -> Result<Option<Submission>, Error> {
     let top = node.finalized_height().map_err(Error::Node)?;
     let mut best: Option<Submission> = None;
     for h in (height + 1..=top).rev().take(PROOF_HISTORY) {
-        let candidate = finality_proof(node, h)?.and_then(|p| Submission::new(&p).ok());
+        let candidate = finality_proof(node, h)?
+            .and_then(|p| Submission::new(&p).ok())
+            .filter(|s| key_id.is_none() || s.key_id == key_id);
         let floor = height.max(best.as_ref().map_or(0, |b| b.anchor_height + 1));
         if let Some(s) = candidate.filter(|s| s.anchor_height >= floor) {
             best = Some(s);
@@ -443,6 +598,72 @@ mod tests {
             }),
             Err(Error::Bls(_))
         ));
+    }
+
+    #[test]
+    fn version_two_submissions_and_rotations() {
+        let sk = solo_bls::SecretKey::generate(&[3; 32], b"").unwrap();
+        let mut proposal = vec![0u8; 120];
+        proposal[8..16].copy_from_slice(&9u64.to_le_bytes());
+        proposal[56..64].copy_from_slice(&8u64.to_le_bytes());
+        let hash = keccak256(&proposal);
+        let signature = sk.sign(&solo_bls::certificate::message_v2(1, 4, 9, &hash));
+        let certificate = solo_bls::certificate::CertificateV2 {
+            key_id: 4,
+            height: 9,
+            block_hash: hash,
+            signature,
+        };
+        let proof = FinalityProof {
+            certificate: certificate.to_bytes().to_vec(),
+            proposal: proposal.clone(),
+        };
+        let s = Submission::new(&proof).unwrap();
+        assert_eq!((s.key_id, s.height, s.anchor_height), (Some(4), 9, 8));
+        let mut bad = proof.clone();
+        bad.certificate[49..].fill(0xFF);
+        assert!(matches!(
+            Submission::new(&bad),
+            Err(Error::Bls(solo_bls::Error::InvalidPoint))
+        ));
+        let next = solo_bls::SecretKey::generate(&[4; 32], b"")
+            .unwrap()
+            .public_key();
+        let handoff = Handoff {
+            from: 4,
+            to: 5,
+            key: next.to_bytes().to_vec(),
+            signature: sk
+                .sign(&solo_bls::certificate::rotation_message(1, 5, &next))
+                .to_bytes()
+                .to_vec(),
+            height: 30,
+        };
+        let r = Rotation::new(&handoff).unwrap();
+        assert_eq!((r.from, r.to, r.height), (4, 5, 30));
+        assert_eq!(r.key_eip2537, solo_bls::evm::encode_g2(next.point()));
+        assert_eq!(
+            &r.calldata()[..4],
+            &keccak256(b"rotate(uint64,bytes,bytes)")[..4]
+        );
+        let short = Handoff {
+            signature: vec![1; 47],
+            ..handoff.clone()
+        };
+        assert!(matches!(
+            Rotation::new(&short),
+            Err(Error::Bls(solo_bls::Error::InvalidLength))
+        ));
+        let bad_key = Handoff {
+            key: vec![0; 96],
+            ..handoff
+        };
+        assert!(matches!(Rotation::new(&bad_key), Err(Error::Bls(_))));
+        assert_eq!(verifier_v2_args(7), abi::encode(&[Value::uint(7)]));
+        assert_eq!(
+            light_client_v2_args(&[1; 20], 2, &[3; 256], 16, 2).len(),
+            32 * 5 + 32 + 256
+        );
     }
 
     #[test]

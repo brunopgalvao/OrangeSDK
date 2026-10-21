@@ -68,7 +68,7 @@ fn anchored(p: &Proposal) -> bool {
 /// node stored for `height` and the encoded proposal it certifies.
 pub fn finality_proof(height: u64) -> Option<FinalityProof> {
     let certificate = persist::get_raw(&key(b"bcert/", &[&height.to_le_bytes()]))?;
-    let (_, hash, _) = solo_abi::staking::certificate_parts(&certificate)?;
+    let hash = solo_abi::rotation::threshold_certificate(&certificate)?.block_hash;
     let proposal = persist::get_raw(&key(b"prop/", &[&hash]))?;
     Some(FinalityProof { certificate, proposal })
 }
@@ -555,7 +555,11 @@ impl Ctx {
             ConsensusMessage::Finalize { view, hash, signature } => self.on_finalize(view, hash, signature, None),
             ConsensusMessage::FinalizeShare { view, hash, signature, partial } => self.on_finalize(view, hash, signature, Some(partial)),
             ConsensusMessage::Certificate { certificate, proposal } => self.on_certificate(certificate, proposal),
-            ConsensusMessage::Dkg { envelope } => dkg::pool_add(self.chain_id, envelope),
+            ConsensusMessage::Dkg { envelope } => {
+                for envelope in dkg::receive(self.chain_id, envelope) {
+                    self.broadcast(&ConsensusMessage::Dkg { envelope });
+                }
+            }
         }
     }
 
@@ -571,6 +575,12 @@ impl Ctx {
         if let Some(partial) = partial
             && dkg::belongs(&partial, &self.set[validator as usize].0)
         {
+            // A partial no honest shareholder signs is evidence (spec 15 §5.1).
+            if let Some(p) = Self::proposal(&hash) {
+                for envelope in dkg::inspect(self.chain_id, &partial, &p) {
+                    self.broadcast(&ConsensusMessage::Dkg { envelope });
+                }
+            }
             Self::add_partial(view, &hash, partial);
         }
         Self::add_vote(b"fin/", view, &hash, SignedVote { validator, signature });
@@ -1012,7 +1022,7 @@ impl Ctx {
         if !self.verified(KIND_FINALIZE, certificate.view, &certificate.hash, &certificate.votes.0) {
             return;
         }
-        let threshold = !self.is_suffix(last) && dkg::certifies(self.chain_id, &response.threshold, last.height, &certificate.hash);
+        let threshold = !self.is_suffix(last) && dkg::certifies(self.chain_id, &response.threshold, last, &certificate.hash);
         let current = self.view_epoch(certificate.view) == self.epoch;
         let mut parent = self.finalized_hash();
         let mut height = self.s.finalized_height;
@@ -1057,16 +1067,19 @@ impl Ctx {
     }
 
     /// Prunes the envelope pool and sends this node's DKG message for the
-    /// phase after the block at `executed`, if it has one.
+    /// phase after the block at `executed`, if it has one, and what it has
+    /// for key rotation: its rotation share, a handoff, evidence.
     fn dkg_step(&mut self, executed: u64) {
         if self.params.staking.epoch_blocks == 0 || self.params.staking.dkg_phase_blocks == 0 {
             return;
         }
         dkg::pool_prune(executed);
-        if let Some(me) = dkg::my_id(self.chain_id)
-            && let Some(envelope) = dkg::duties(self.chain_id, &me, executed)
-        {
+        let Some(me) = dkg::my_id(self.chain_id) else { return };
+        if let Some(envelope) = dkg::duties(self.chain_id, &me, executed) {
             dkg::pool_add(self.chain_id, envelope.clone());
+            self.broadcast(&ConsensusMessage::Dkg { envelope });
+        }
+        for envelope in dkg::rotation_step(self.chain_id, &me) {
             self.broadcast(&ConsensusMessage::Dkg { envelope });
         }
     }

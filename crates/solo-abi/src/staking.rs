@@ -1,6 +1,6 @@
 //! Records of the reference kernel's validator lifecycle (spec 15): staking
 //! through the staking address, epochs, slashing, the threshold key that the
-//! validators of each epoch generate or reshare, and the keystore requests a
+//! validators of each epoch generate afresh, and the keystore requests a
 //! driver makes of its host for the secret halves of that key (spec 05 §4.3).
 
 use alloc::vec::Vec;
@@ -67,6 +67,13 @@ pub mod envelope {
     pub const MESSAGE: u8 = 0;
     /// The body is a [`KeySetVote`](super::KeySetVote).
     pub const CONFIRM: u8 = 1;
+    /// The body is a [`RotationShare`](crate::rotation::RotationShare):
+    /// gossip only, never carried in a proposal.
+    pub const ROTATION_SHARE: u8 = 2;
+    /// The body is a [`RotationCertificate`](crate::rotation::RotationCertificate).
+    pub const HANDOFF: u8 = 3;
+    /// The body is a [`ThresholdEvidence`](crate::rotation::ThresholdEvidence).
+    pub const EVIDENCE: u8 = 4;
 }
 
 /// Query method names (spec 15 §8).
@@ -88,6 +95,8 @@ pub mod selector {
     pub const UNBOND: [u8; 4] = [0x27, 0xde, 0x9e, 0x32];
     /// `withdraw()`.
     pub const WITHDRAW: [u8; 4] = [0x3c, 0xcf, 0xd6, 0x0b];
+    /// `report(bytes)`.
+    pub const REPORT: [u8; 4] = [0xb5, 0x76, 0x71, 0x66];
 }
 
 /// Event topics of the staking interface: `keccak256` of each event signature.
@@ -117,6 +126,12 @@ pub mod event {
         0x70, 0x84, 0xf5, 0x47, 0x66, 0x18, 0xd8, 0xe6, 0x0b, 0x11, 0xef, 0x0d, 0x7d, 0x3f, 0x06,
         0x91, 0x46, 0x55, 0xad, 0xb8, 0x79, 0x3e, 0x28, 0xff, 0x7f, 0x01, 0x8d, 0x4c, 0x76, 0xd5,
         0x05, 0xd5,
+    ];
+    /// `Reported(address,uint8,uint64)`.
+    pub const REPORTED: Hash = [
+        0x6c, 0x00, 0x70, 0xf6, 0x7c, 0xd1, 0x94, 0x46, 0xdb, 0xdc, 0x0b, 0x7a, 0x4a, 0xeb, 0xa0,
+        0x70, 0xd5, 0xa9, 0x8e, 0x17, 0xee, 0xbc, 0x23, 0x15, 0x8c, 0xbf, 0xd8, 0xa9, 0xfb, 0x98,
+        0x1c, 0xfe,
     ];
 }
 
@@ -184,7 +199,7 @@ pub mod keys {
     pub const KEY_SET: &[u8] = b"dkg/keyset/";
     /// `dkg/active` → u64, the id of the key set validators sign with.
     pub const ACTIVE: &[u8] = b"dkg/active";
-    /// `dkg/group_key` → the 96-byte group public key, fixed once created.
+    /// `dkg/group_key` → the 96-byte group public key of the active key set.
     pub const GROUP_KEY: &[u8] = b"dkg/group_key";
 }
 
@@ -204,6 +219,10 @@ record! {
         /// Blocks per DKG phase; zero disables threshold keys. Four phases
         /// must fit an epoch.
         dkg_phase_blocks: u64,
+        /// Most epochs past its own that a key set is trusted by light
+        /// clients (spec 15 §6.7); at least 1 with threshold keys, and
+        /// `unbonding_epochs` must exceed it plus the handoff latency.
+        max_key_age: u64,
         /// DKG encryption keys of genesis validators, by validator id.
         keys: Seq<ValidatorKey>,
     }
@@ -248,7 +267,8 @@ record! {
 }
 
 record! {
-    /// One epoch's DKG run (spec 15 §6.1): a fresh key, or a resharing of
+    /// One epoch's DKG run (spec 15 §6.1): a fresh key (the reference
+    /// kernel's only kind since key rotation), or a resharing of
     /// the active one.
     DkgRun {
         /// The epoch it runs in; also the id of the key set it makes.
@@ -263,7 +283,8 @@ record! {
         recipients: Seq<Hash>,
         /// Recipient `j`'s encryption key is `keys[j − 1]`.
         keys: Seq<Vec<u8>>,
-        /// The key set being reshared, by id; `None` for a fresh key.
+        /// The key set being reshared, by id; `None` for a fresh key, as
+        /// in every run the reference kernel schedules.
         previous: Option<u64>,
     }
 }
@@ -439,6 +460,28 @@ pub enum StakingAction {
     },
     /// Pays out released unbonded stake.
     Withdraw,
+    /// Reports threshold misbehaviour: an encoded
+    /// [`ThresholdEvidence`](crate::rotation::ThresholdEvidence).
+    Report {
+        /// The encoded evidence.
+        evidence: Vec<u8>,
+    },
+}
+
+/// The canonical ABI encoding of one `bytes` argument of at most
+/// [`MAX_REPORT`](crate::rotation::MAX_REPORT) bytes: offset word 32, length
+/// word, the bytes, zero padding to a whole word, and nothing after.
+fn decode_bytes(body: &[u8]) -> Option<Vec<u8>> {
+    let (head, rest) = body.split_at_checked(64)?;
+    let length = u128::from_be_bytes(head[48..].try_into().ok()?);
+    let n = usize::try_from(length)
+        .ok()
+        .filter(|n| *n <= crate::rotation::MAX_REPORT)?;
+    let canonical = head[..32] == word(32)
+        && head[32..48].iter().all(|b| *b == 0)
+        && rest.len() == n.next_multiple_of(32)
+        && rest[n..].iter().all(|b| *b == 0);
+    canonical.then(|| rest[..n].to_vec())
 }
 
 /// A 32-byte big-endian ABI word holding `value`.
@@ -471,6 +514,16 @@ impl StakingAction {
                 out.extend_from_slice(&word(*amount));
             }
             StakingAction::Withdraw => out.extend_from_slice(&selector::WITHDRAW),
+            StakingAction::Report { evidence } => {
+                out.extend_from_slice(&selector::REPORT);
+                out.extend_from_slice(&word(32));
+                out.extend_from_slice(&word(evidence.len() as u128));
+                out.extend_from_slice(evidence);
+                out.resize(
+                    out.len() + evidence.len().next_multiple_of(32) - evidence.len(),
+                    0,
+                );
+            }
         }
         out
     }
@@ -498,6 +551,9 @@ impl StakingAction {
                 })
             }
             selector::WITHDRAW if body.is_empty() => Some(StakingAction::Withdraw),
+            selector::REPORT => {
+                decode_bytes(body).map(|evidence| StakingAction::Report { evidence })
+            }
             _ => None,
         }
     }
@@ -663,6 +719,7 @@ mod tests {
             min_stake: GWEI,
             max_validators: 4,
             dkg_phase_blocks: 4,
+            max_key_age: 2,
             keys: Seq(vec![ValidatorKey {
                 id: [1; 32],
                 dkg_key: vec![2; 48],
@@ -740,6 +797,15 @@ mod tests {
         );
         assert_eq!((envelope::MESSAGE, envelope::CONFIRM), (0, 1));
         assert_eq!(
+            (
+                envelope::ROTATION_SHARE,
+                envelope::HANDOFF,
+                envelope::EVIDENCE
+            ),
+            (2, 3, 4)
+        );
+        assert_ne!(event::REPORTED, event::WITHDRAWN);
+        assert_eq!(
             (query::STAKING, query::STAKING_SET),
             ("staking", "staking_set")
         );
@@ -810,6 +876,10 @@ mod tests {
             StakingAction::Bond,
             StakingAction::Unbond { amount: 5 * GWEI },
             StakingAction::Withdraw,
+            StakingAction::Report {
+                evidence: vec![9; 40],
+            },
+            StakingAction::Report { evidence: vec![] },
         ];
         for action in &actions {
             assert_eq!(
@@ -843,6 +913,21 @@ mod tests {
         withdraw.push(0);
         assert_eq!(StakingAction::decode(&withdraw), None);
         assert_eq!(StakingAction::decode(&[1, 2, 3, 4]), None);
+        // A report is the canonical encoding of one `bytes` argument.
+        let report = actions[4].encode();
+        assert_eq!(report.len(), 4 + 64 + 64);
+        for (at, value) in [(4 + 31, 64u8), (4 + 40, 1), (4 + 63, 65), (131, 1)] {
+            let mut bad = report.clone();
+            bad[at] = value;
+            assert_eq!(StakingAction::decode(&bad), None, "{at}");
+        }
+        assert_eq!(StakingAction::decode(&report[..60]), None);
+        let mut long = report.clone();
+        long.extend_from_slice(&[0; 32]);
+        assert_eq!(StakingAction::decode(&long), None);
+        let mut huge = report[..68].to_vec();
+        huge[4 + 60] = 0x10;
+        assert_eq!(StakingAction::decode(&huge), None);
         assert_eq!(StakingAction::decode(&[1, 2]), None);
     }
 

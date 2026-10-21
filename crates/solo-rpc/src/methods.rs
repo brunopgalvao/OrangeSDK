@@ -483,6 +483,7 @@ impl Rpc {
             "txpool_content" => crate::txpool::content(self.node.mempool()),
             "solo_getFinalityProof" => crate::bridge::finality_proof(&mut self.node, params)?,
             "solo_getOutboxProof" => crate::bridge::outbox_proof(&mut self.node, params)?,
+            "solo_getRotation" => crate::bridge::rotation(&mut self.node, params)?,
             other => {
                 return Err(RpcError::with_code(
                     -32601,
