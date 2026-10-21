@@ -156,7 +156,8 @@ fn gov_encodes_every_call() {
 #[test]
 fn gov_names_every_mistake() {
     let target = format!("0x{}", "45".repeat(20));
-    let too_big = "f".repeat(40);
+    // 160 bits of hex: every digit valid, the amount past a `u128`.
+    let too_big = format!("0x{}", "f".repeat(40));
     let errors = [
         (vec![], "subcommand missing"),
         (vec!["submit"], "target missing"),
