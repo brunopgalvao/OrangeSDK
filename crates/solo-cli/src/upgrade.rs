@@ -62,7 +62,13 @@ pub fn parse_gates(text: &str) -> Result<u64, String> {
 /// address carrying `action`, with gas price zero (the reference kernel's
 /// base fee is zero, so actions cost the governance account nothing).
 #[must_use]
-pub fn action_tx(key: &SigningKey, chain_id: u64, nonce: u64, gas: u64, action: &Action) -> Vec<u8> {
+pub fn action_tx(
+    key: &SigningKey,
+    chain_id: u64,
+    nonce: u64,
+    gas: u64,
+    action: &Action,
+) -> Vec<u8> {
     legacy_tx(
         key,
         chain_id,
@@ -80,10 +86,7 @@ fn landed(receipt: &Value, what: &str) -> Result<u64, String> {
     if receipt.get("status").and_then(Value::as_str) != Some("0x1") {
         return Err(format!("{what} reverted: {receipt}"));
     }
-    receipt
-        .get("blockNumber")
-        .map(quantity)
-        .ok_or_else(|| format!("{what}: receipt without a block number"))?
+    quantity(&receipt["blockNumber"])
 }
 
 /// Stages `code` and proposes it; see the module documentation.
@@ -151,12 +154,7 @@ pub fn submit(
     };
     let raw = action_tx(key, chain_id, nonce, PROPOSE_GAS, &propose);
     let hash = call(rpc, "eth_sendRawTransaction", &json!([data(&raw)]))?;
-    let receipt = wait_receipt(
-        rpc,
-        hash.as_str().unwrap_or_default(),
-        "proposal",
-        deadline,
-    )?;
+    let receipt = wait_receipt(rpc, hash.as_str().unwrap_or_default(), "proposal", deadline)?;
     let proposed_at = landed(&receipt, "proposal")?;
     Ok(format!(
         "code hash  {}\nstaged     {} chunks ({} bytes) in blocks {}..{}\nproposed   block {proposed_at}\nactivation {activation_height}",

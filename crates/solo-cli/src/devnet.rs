@@ -185,12 +185,9 @@ impl Devnet {
     /// # Errors
     /// If there is no such node.
     pub fn node(&self, index: usize) -> Result<&NodeSpec, String> {
-        self.nodes.get(index).ok_or_else(|| {
-            format!(
-                "no node {index}: the devnet has {} nodes",
-                self.nodes.len()
-            )
-        })
+        self.nodes
+            .get(index)
+            .ok_or_else(|| format!("no node {index}: the devnet has {} nodes", self.nodes.len()))
     }
 }
 
@@ -484,8 +481,10 @@ fn up(args: &[String]) -> Result<String, String> {
     }
     let failed: Vec<String> = children
         .iter()
-        .filter(|(_, _, exit)| !exit.is_some_and(|s| s.success()))
-        .map(|(i, _, exit)| format!("node {i} exited with {:?}", exit.map(|s| s.code())))
+        .filter_map(|(i, _, exit)| {
+            exit.filter(|s| !s.success())
+                .map(|s| format!("node {i} exited with {s}"))
+        })
         .collect();
     if failed.is_empty() {
         Ok("devnet: every node stopped".to_owned())
@@ -825,27 +824,10 @@ fn node(args: &[String], keep_going: &mut dyn FnMut(&solo_rpc::Rpc) -> bool) -> 
         .ok_or("--index <i> is required")?;
     let spec = devnet.node(index)?;
     let path = |p: PathBuf| p.to_string_lossy().into_owned();
-    let mut line: Vec<String> = [
-        "solo",
-        "node",
-        "--kernel",
-        &path(devnet.kernel()),
-        "--genesis",
-        &path(devnet.genesis()),
-        "--key-file",
-        &path(devnet.node_dir(index).join("key")),
-        "--listen",
-        &spec.listen,
-        "--rpc",
-        &spec.rpc,
-    ]
-    .iter()
-    .map(ToString::to_string)
-    .collect();
-    for peer in &spec.peers {
-        line.extend(["--peer".to_owned(), peer.clone()]);
-    }
-    // Everything after `solo devnet node` but the two options read here.
+    let mut line: Vec<String> = vec!["solo".to_owned(), "node".to_owned()];
+    // Everything after `solo devnet node` but the two options read here,
+    // ahead of the manifest's options: the first occurrence of an option
+    // counts, so what the caller gives wins.
     let mut rest = args.iter().skip(3);
     while let Some(a) = rest.next() {
         if a == "--dir" || a == "--index" {
@@ -853,6 +835,25 @@ fn node(args: &[String], keep_going: &mut dyn FnMut(&solo_rpc::Rpc) -> bool) -> 
         } else {
             line.push(a.clone());
         }
+    }
+    line.extend(
+        [
+            "--kernel",
+            &path(devnet.kernel()),
+            "--genesis",
+            &path(devnet.genesis()),
+            "--key-file",
+            &path(devnet.node_dir(index).join("key")),
+            "--listen",
+            &spec.listen,
+            "--rpc",
+            &spec.rpc,
+        ]
+        .iter()
+        .map(ToString::to_string),
+    );
+    for peer in &spec.peers {
+        line.extend(["--peer".to_owned(), peer.clone()]);
     }
     crate::run_inner(&line, keep_going).map_err(|CliError(m)| m)
 }

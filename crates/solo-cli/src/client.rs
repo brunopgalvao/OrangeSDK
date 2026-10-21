@@ -177,7 +177,9 @@ pub fn poll_until(
     }
 }
 
-/// Waits for the receipt of transaction `hash` and returns it.
+/// Waits for the receipt of transaction `hash` and returns it. A deadline
+/// already passed means no waiting at all: the error comes before the
+/// first request.
 ///
 /// # Errors
 /// A transport or node error, or `what` when no receipt arrives in time.
@@ -188,12 +190,12 @@ pub fn wait_receipt(
     deadline: Instant,
 ) -> Result<Value, String> {
     loop {
+        if Instant::now() >= deadline {
+            return Err(format!("{what}: no receipt for {hash} before the timeout"));
+        }
         let receipt = call(addr, "eth_getTransactionReceipt", &json!([hash]))?;
         if !receipt.is_null() {
             return Ok(receipt);
-        }
-        if Instant::now() >= deadline {
-            return Err(format!("{what}: no receipt for {hash} before the timeout"));
         }
         std::thread::sleep(Duration::from_millis(200));
     }

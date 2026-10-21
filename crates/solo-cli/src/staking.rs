@@ -114,10 +114,7 @@ mod tests {
         let threshold =
             parse_staking(&serde_json::json!({"staking": {"epochBlocks": 8, "dkgPhaseBlocks": 2}}))
                 .unwrap();
-        assert_eq!(
-            (threshold.max_key_age, threshold.unbonding_epochs),
-            (2, 4)
-        );
+        assert_eq!((threshold.max_key_age, threshold.unbonding_epochs), (2, 4));
         let id = format!("0x{}", "11".repeat(32));
         let key = format!("0x{}", "22".repeat(48));
         let full = parse_staking(&serde_json::json!({"staking": {
@@ -145,7 +142,10 @@ mod tests {
     #[test]
     fn each_mistake_is_named() {
         let cases = [
-            (serde_json::json!({"staking": 1}), "staking must be an object"),
+            (
+                serde_json::json!({"staking": 1}),
+                "staking must be an object",
+            ),
             (
                 serde_json::json!({"staking": {}}),
                 "staking.epochBlocks missing",

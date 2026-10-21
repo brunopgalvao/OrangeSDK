@@ -10,7 +10,8 @@
 # usage: tools/rehearse-upgrade.sh <devnet dir> [kernel_v2.elf|kernel_v2.solo]
 #
 # The devnet is one `solo devnet init` made and `solo devnet up` runs, or the
-# compose stack of ops/docker-compose.yml. Environment:
+# compose stack of ops/docker-compose.yml (then the first argument is unused
+# and RPCS names the nodes). Environment:
 #   SOLO              the solo binary (default: solo on PATH)
 #   DEVNET_DRIVER     process (default): the nodes are the processes of <devnet dir>;
 #                     compose: the services of ops/docker-compose.yml, reached at RPCS
