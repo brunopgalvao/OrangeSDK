@@ -8,7 +8,7 @@
 mod support;
 
 use solo_abi::Encode;
-use solo_abi::chain::{Allocation, GenesisParams, Receipt};
+use solo_abi::chain::{Allocation, CallRequest, GenesisParams, Receipt, call_status};
 use solo_abi::codec::Seq;
 use solo_abi::types::Genesis;
 use solo_host::Backend;
@@ -199,4 +199,59 @@ fn blocks_of_point_evaluations_execute_within_the_kernel_gas() {
         n.finalized.last().is_some_and(|h| *h > height)
     });
     println!("kernel gas per block: {blocks:?}");
+}
+
+/// A call query served once gate 2 is active, before any block has installed
+/// the module, writes nothing (spec 06 §6, spec 19 §3.2): the node that
+/// served it holds the same state as one that did not, and both spend the
+/// same kernel gas on the next block, which installs the module on both.
+#[test]
+fn a_call_query_at_the_gate_leaves_no_trace() {
+    let open = || {
+        let config = NodeConfig {
+            now_ms: 1_000,
+            key: Some(keys(1)[0].clone()),
+            ..NodeConfig::default()
+        };
+        let mut node = Node::open(v1(), &genesis(), config).unwrap();
+        node.start(None).unwrap();
+        node
+    };
+    let (mut a, mut b) = (open(), open());
+    let (mut gas_a, mut gas_b) = (Vec::new(), Vec::new());
+    for _ in 0..40 {
+        if a.upgrades().active() >> 2 & 1 == 1 {
+            break;
+        }
+        tick(&mut a, &mut gas_a);
+        tick(&mut b, &mut gas_b);
+    }
+    assert_eq!(a.upgrades().active() >> 2 & 1, 1, "gate 2 never activated");
+    assert_eq!(b.upgrades().active(), a.upgrades().active());
+    let module = include_bytes!("../../../guest/kernel/precompiles.solo");
+    let key = [&b"code/"[..], &keccak256(module)].concat();
+    assert!(a.state_get(&key).is_none());
+    let root = a.state_root();
+
+    let outcome = a
+        .call(&CallRequest {
+            from: alice().address,
+            to: Some([0xEE; 20]),
+            ..CallRequest::default()
+        })
+        .unwrap();
+    assert_eq!(outcome.status, call_status::SUCCESS);
+    assert!(a.state_get(&key).is_none());
+    assert_eq!(a.state_root(), root);
+
+    let (height_a, height_b) = (a.executed.len(), b.executed.len());
+    while a.executed.len() == height_a {
+        tick(&mut a, &mut gas_a);
+    }
+    while b.executed.len() == height_b {
+        tick(&mut b, &mut gas_b);
+    }
+    assert_eq!(gas_a.last(), gas_b.last());
+    assert_eq!(a.state_root(), b.state_root());
+    assert_eq!(a.state_get(&key).as_deref(), Some(&module[..]));
 }

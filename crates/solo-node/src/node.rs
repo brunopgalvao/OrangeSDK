@@ -675,7 +675,14 @@ impl Node {
             at: None,
         };
         let gas = self.query_gas.min(self.kernel_gas);
-        let r = self.call_with(exports::QUERY, &args.to_bytes(), gas)?;
+        // A query changes nothing (spec 06 §6): whatever the kernel writes,
+        // such as the precompile module of spec 19 §3.2, goes into a layer
+        // dropped afterwards, so chain state and the kernel gas of the next
+        // block never depend on which queries this node served.
+        self.exec.state_mut().push();
+        let r = self.call_with(exports::QUERY, &args.to_bytes(), gas);
+        self.exec.state_mut().discard();
+        let r = r?;
         QueryResult::from_bytes(&r.output)
             .ok()
             .ok_or(NodeError::Decode(exports::QUERY))
