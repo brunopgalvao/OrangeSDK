@@ -2,8 +2,9 @@
 //! validators an account delegates to a contract and calls itself, runs the
 //! contract's code in its own context, and keeps sending as a delegated
 //! account; authorizations that name no authority, or the wrong chain, are
-//! skipped; the pool holds one transaction of a delegated account at a time;
-//! and every node agrees on the headers that record it.
+//! skipped; the pool holds one transaction of a delegated account at a time,
+//! and leaves out of a proposal a transaction that an authorization ahead of
+//! it would make stale; and every node agrees on the headers that record it.
 
 mod support;
 
@@ -15,7 +16,7 @@ use solo_host::hash::keccak256;
 use solo_node::mempool::PoolError;
 use solo_node::{NodeConfig, Sim, SubmitError};
 use solo_rlp::{encode_bytes, encode_list, encode_uint};
-use support::{CHAIN_ID, ETHER, SLOT_MS, Wallet, include, keys, v1};
+use support::{CHAIN_ID, ETHER, SLOT_MS, Wallet, include, keys, run_until, v1};
 
 /// `slot0 += 1; slot1 = CALLER; LOG1(topic ADDRESS)`: what the delegated
 /// account runs, in its own storage.
@@ -341,4 +342,57 @@ fn a_delegated_account_may_have_one_transaction_in_the_pool() {
         node.submit(&[0x04, 0xC0]),
         Err(SubmitError::Rejected(reason::MALFORMED))
     );
+}
+
+#[test]
+fn a_block_leaves_out_what_an_earlier_authorization_made_stale() {
+    let alice = Wallet::new(0x77);
+    let bob = Wallet::new(0x78);
+    let carol = Wallet::new(0x79);
+    let validators = keys(1);
+    let genesis = genesis(&validators, &[alice.address, bob.address]);
+    let mut node = solo_node::Node::open(
+        v1(),
+        &genesis,
+        NodeConfig {
+            key: Some(validators[0].clone()),
+            now_ms: 1_000,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    node.start(None).unwrap();
+    // Alice's set-code transaction carries Bob's authorization at his
+    // current nonce, and Bob's transfer at that nonce arrives after it: both
+    // are admitted (Bob holds one transaction), and the transfer comes second
+    // in the block's order.
+    let delegate_bob = set_code_tx(
+        &alice,
+        0,
+        alice.address,
+        &[authorization(&bob, CHAIN_ID, DELEGATE, 0)],
+        &[],
+    );
+    let first = node.submit(&delegate_bob).unwrap();
+    let second = node
+        .submit(&bob.tx(0, carol.address, ETHER, 21_000, &[]))
+        .unwrap();
+    run_until(&mut node, 10, &mut |n| n.receipt(&first).unwrap().is_some());
+    // The pool's take left Bob's transfer out of the proposal, the
+    // authorization ahead of it naming him (spec 14 §3), rather than have
+    // the block record it as failed; the authorization moved his nonce, and
+    // the pool then dropped the transfer, its nonce used.
+    let receipt = node.receipt(&first).unwrap().unwrap();
+    assert_eq!(receipt.status, 1);
+    let block = node.block_by_number(receipt.height).unwrap().unwrap();
+    assert_eq!(block.tx_hashes.0, vec![first]);
+    assert_eq!(node.receipt(&second).unwrap(), None);
+    assert!(node.mempool().get(&second).is_none());
+    assert_eq!(node.code(&bob.address).unwrap(), designator(DELEGATE));
+    assert_eq!(node.account(&bob.address).unwrap().nonce, 1);
+    assert_eq!(node.account(&carol.address).unwrap().balance, 0);
+    // At his next nonce Bob sends, delegated.
+    let receipt = include(&mut node, &bob.tx(1, carol.address, ETHER, 21_000, &[]));
+    assert_eq!(receipt.status, 1);
+    assert_eq!(node.account(&carol.address).unwrap().balance, ETHER);
 }

@@ -502,6 +502,35 @@ fn delegated_senders_and_authorities_are_limited_as_geth_limits_them() {
 }
 
 #[test]
+fn a_take_leaves_out_senders_that_an_authorization_ahead_names() {
+    let everything =
+        |pool: &Mempool, skip: &[[u8; 32]]| nonces(pool, &pool.take(usize::MAX, u64::MAX, skip));
+    // Sender 3's set-code transaction names sender 2 and comes first in the
+    // order (same priority, earlier arrival): its authorization can move
+    // 2's nonce, so 2's transaction is left out. Sender 1 is not named.
+    let mut pool = Mempool::default();
+    let set_code = PoolTx {
+        authorities: vec![[2; 20]],
+        ..tx(3, 0, 10)
+    };
+    add(&mut pool, &set_code).unwrap();
+    add(&mut pool, &tx(2, 0, 10)).unwrap();
+    add(&mut pool, &tx(1, 0, 10)).unwrap();
+    assert_eq!(everything(&pool, &[]), [(3, 0), (1, 0)]);
+    // Ahead of it, 2's transaction runs first, and then the authorization
+    // is stale: both are taken.
+    let mut pool = Mempool::default();
+    add(&mut pool, &set_code).unwrap();
+    add(&mut pool, &tx(2, 0, 20)).unwrap();
+    assert_eq!(everything(&pool, &[]), [(2, 0), (3, 0)]);
+    // A set-code transaction in `skip` runs before anything taken, whatever
+    // its priority: 2 is left out. A skipped hash the pool does not hold
+    // names nobody.
+    assert!(everything(&pool, &[set_code.hash]).is_empty());
+    assert_eq!(everything(&pool, &[[9; 32]]), [(2, 0), (3, 0)]);
+}
+
+#[test]
 fn parse_reads_a_signed_transaction() {
     use k256::ecdsa::SigningKey;
     use solo_rlp::{encode_bytes, encode_list, encode_uint};

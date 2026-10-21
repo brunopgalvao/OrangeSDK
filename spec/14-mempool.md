@@ -31,6 +31,8 @@ Checks 2 to 5 need no kernel and run before check 6.
 
 `skip` lists the hashes of transactions to treat as already taken: those carried by the blocks the driver builds on but the host has not executed yet, which the pool still holds. A skipped transaction is not in the answer and uses none of `max_bytes` or `max_gas`, but its cost counts against its sender's balance and its sender's later transactions may follow it. Without this, a block built on an unexecuted parent would spend its budget on the parent's transactions, which the driver then leaves out, and under load every other block would be empty.
 
+A sender that an authorization of a set-code transaction ahead of it names (spec 20 §2.4) contributes nothing more to the answer. Ahead means in `skip`, whose transactions run before the answer's whatever their priority, or taken earlier in the answer. The authorization can move the sender's nonce when it runs, and the sender's pending transaction could then no longer run.
+
 Taking does not remove anything: transactions stay until a block includes them or they become invalid, so a proposal that never finalizes loses nothing.
 
 ## 4. Limits and eviction

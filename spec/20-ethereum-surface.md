@@ -39,7 +39,6 @@ The kernel stores a designator as it stores any code, under its `keccak256` at `
 **Native contracts.** A designator of spec 16 (`0xEF02 ‖ code hash`) and a delegation do not mix. An authorization writes only `0xEF0100 ‖ address`, so it cannot create a native contract. An account holding a native-contract designator is skipped as an authority (its code is neither empty nor a delegation) and cannot send. A call to an account that delegates to a native contract fails without running the module (16 §5.3).
 
 **Senders.** The admission check of reason 11 (`SENDER_NOT_EOA`, EIP-3607) refuses a sender whose code is neither empty nor a delegation designator: a delegated account keeps sending, its nonce, balance and fees as before.
-
 ### 2.3 Calls and estimates
 
 A call object (`eth_call`, `eth_estimateGas`) may carry `authorizationList`, a list of `{chainId, address, nonce, yParity, r, s}` (geth's names; `v` is accepted for `yParity`), every field required. It reaches the kernel as `CallRequest.authorization_list` (`SignedAuthorization` records), and a call with a non-empty list runs as a set-code transaction: authorities recovered as in §2.2, the list's intrinsic gas charged and its authorizations applied. A wallet that estimates a set-code transaction with its list therefore gets the gas the transaction needs.
@@ -52,6 +51,8 @@ The reference host's pool (spec 14) applies geth's two rules for delegation:
 - **Reserved authorities.** A set-code transaction whose authorizations name an authority holding more than one transaction in the pool is refused with `authority already reserved`.
 
 The authorities come from the pool's own recovery of each authorization's signature; one that names no authority is ignored. After a block, a sender whose code changed keeps its transactions (14 §5).
+
+geth's builder runs each transaction and drops one that fails; the reference driver proposes the pool's take without running anything (06 §5.1), so the take adds a third rule. **Authorities ahead.** Once a set-code transaction is in a take's order, carried in `skip` or taken, the senders its authorizations name contribute nothing more to that answer (14 §3): the authorization can move such a sender's nonce when it runs, after which the sender's pending transaction could not. The transaction stays in the pool; after the block it is dropped if its nonce was used and taken again otherwise. A sender whose transaction comes before the set-code transaction is taken as usual, and the authorization then finds its nonce moved and is skipped. What a delegated account's code does during other senders' transactions stays unforeseen (06 §5.1).
 
 ### 2.5 RPC views
 

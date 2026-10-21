@@ -619,10 +619,19 @@ impl Mempool {
     /// the ones before it, contributes nothing more. A transaction in `skip`
     /// counts as already taken: it is left out and uses none of the budget,
     /// but its cost counts against its sender's balance and the sender's
-    /// later transactions may follow it. The pool keeps what it hands out
-    /// until a block includes it.
+    /// later transactions may follow it. A sender that an authorization of a
+    /// transaction ahead of it names, one in `skip` or one taken before,
+    /// contributes nothing more: the authorization can move its nonce when
+    /// it runs. The pool keeps what it hands out until a block includes it.
     #[must_use]
     pub fn take(&self, max_bytes: usize, max_gas: u64, skip: &[[u8; 32]]) -> Vec<Vec<u8>> {
+        // What `skip` carries runs before anything taken now, whatever its
+        // priority.
+        let mut named: HashSet<&Address> = skip
+            .iter()
+            .filter_map(|hash| self.get(hash))
+            .flat_map(|tx| &tx.authorities)
+            .collect();
         let skip: HashSet<&[u8; 32]> = skip.iter().collect();
         let runs: Vec<(Vec<&PoolTx>, u128)> = self
             .queues
@@ -646,6 +655,9 @@ impl Mempool {
         let mut taken = Vec::new();
         while let Some((_, _, run, at)) = heap.pop() {
             let tx = runs[run].0[at];
+            if named.contains(&tx.sender) {
+                continue;
+            }
             let cost = spent[run].saturating_add(tx.cost);
             let skipped = skip.contains(&tx.hash);
             let (len, used) = if skipped {
@@ -662,6 +674,7 @@ impl Mempool {
             if !skipped {
                 taken.push(tx.raw.clone());
             }
+            named.extend(&tx.authorities);
             push(&mut heap, run, at + 1);
         }
         taken
