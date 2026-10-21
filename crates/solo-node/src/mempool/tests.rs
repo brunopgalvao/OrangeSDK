@@ -87,6 +87,14 @@ fn defaults_and_texts() {
         PoolError::Overdraft.to_string(),
         "insufficient funds for gas * price + value"
     );
+    assert_eq!(
+        PoolError::InflightLimit.to_string(),
+        "in-flight transaction limit reached for delegated accounts"
+    );
+    assert_eq!(
+        PoolError::AuthorityReserved.to_string(),
+        "authority already reserved"
+    );
     let invalid = ValidateResult::Invalid { reason: 4 };
     assert_eq!(rejection(&invalid), 4);
     let valid = ValidateResult::Valid {
