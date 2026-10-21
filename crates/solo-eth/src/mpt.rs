@@ -163,7 +163,8 @@ mod tests {
         assert_eq!(ordered_root(&[], keccak), EMPTY_ROOT);
     }
 
-    /// Vectors from ethereum/tests `TrieTests/trietest.json` and `trieanyorder.json`.
+    /// Vectors from ethereum/tests `TrieTests/trietest.json` and
+    /// `trieanyorder.json`, by their names there.
     #[test]
     fn known_roots() {
         assert_eq!(
@@ -190,14 +191,46 @@ mod tests {
             .to_vec(),
             h("5991bb8c6514148a29db676a14ac506cd2cd5775ace63c30a4fe457715e9ac84")
         );
-        // An odd-length leaf path after a branch, and a key that ends at the root branch.
+        // A key that ends at a branch below an extension ("testy"), short
+        // values inlined in a branch ("smallValues"), a single item.
         assert_eq!(
-            trie(&[("a", "A"), ("b", "B")]),
-            trie(&[("b", "B"), ("a", "A")])
+            trie(&[("test", "test"), ("te", "testy")]).to_vec(),
+            h("8452568af70d8d140f58d941338542f645fcca50094b20f3c3d8c3df49337928")
         );
         assert_eq!(
-            trie(&[("", "root"), ("a", "A")]),
-            trie(&[("a", "A"), ("", "root")])
+            trie(&[("be", "e"), ("dog", "puppy"), ("bed", "d")]).to_vec(),
+            h("3f67c7a47520f79faa29255d2d3c084a7a6df0453116ed7232ff10277a8be68b")
+        );
+        assert_eq!(
+            trie(&[("A", &"a".repeat(50))]).to_vec(),
+            h("d23786fb4a010da3ce639d66d5e904a11dbc02746d1ce25029e53290cabf28ab")
+        );
+        // Keys given in hex ("hex"), and the final state of "branch-value-update".
+        let hex = [("0045", "0123456789"), ("4500", "9876543210")]
+            .iter()
+            .map(|(k, v)| (h(k), h(v)))
+            .collect();
+        assert_eq!(
+            root(&hex, keccak).to_vec(),
+            h("285505fcabe84badc8aa310e2aae17eddc7d120aabec8a476902c8184b3a3503")
+        );
+        assert_eq!(
+            trie(&[("abc", "abc"), ("abcd", "abcd")]).to_vec(),
+            h("7a320748f780ad9ad5b0837302075ce0eeba6c26e3d8562c67ccc0f1b273298a")
+        );
+        // Keys that end at branches whose other children are hashed
+        // ("insert-middle-leaf").
+        assert_eq!(
+            trie(&[
+                ("key1aa", "0123456789012345678901234567890123456789xxx"),
+                ("key1", "0123456789012345678901234567890123456789Very_Long"),
+                ("key2bb", "aval3"),
+                ("key2", "short"),
+                ("key3cc", "aval3"),
+                ("key3", "1234567890123456789012345678901"),
+            ])
+            .to_vec(),
+            h("cb65032e2f76c48b82b5c24b3db8f670ce73982869d38cd39a624f23d62a9e89")
         );
     }
 

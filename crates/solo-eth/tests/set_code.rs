@@ -191,13 +191,22 @@ fn list(items: &[Vec<u8>]) -> Vec<u8> {
 }
 
 fn entry(chain_id: &[u8], address: &[u8], nonce: &[u8], parity: &[u8]) -> Vec<u8> {
+    signed_entry(chain_id, address, nonce, parity, &[1], &[1])
+}
+
+/// An authorization entry with every field given as its encoded string.
+fn signed_entry(
+    chain_id: &[u8],
+    address: &[u8],
+    nonce: &[u8],
+    parity: &[u8],
+    r: &[u8],
+    s: &[u8],
+) -> Vec<u8> {
     let mut body = Vec::new();
-    encode_bytes(chain_id, &mut body);
-    encode_bytes(address, &mut body);
-    encode_bytes(nonce, &mut body);
-    encode_bytes(parity, &mut body);
-    encode_uint(1, &mut body);
-    encode_uint(1, &mut body);
+    for field in [chain_id, address, nonce, parity, r, s] {
+        encode_bytes(field, &mut body);
+    }
     let mut out = Vec::new();
     encode_list(&body, &mut out);
     out
@@ -211,6 +220,14 @@ fn malformations() {
     let tx = decode(&set_code(&to, &list(std::slice::from_ref(&good)), 0)).unwrap();
     assert_eq!(tx.authorization_list[0].y_parity, 1);
     assert_eq!(tx.authorization_list[0].chain_id[31], 1);
+    // An r and an s of 32 bytes decode, and a short one is left-padded.
+    let full = signed_entry(&[1], &[3; 20], &[], &[1], &[0xFF; 32], &[0x7F; 3]);
+    let auth = &decode(&set_code(&to, &list(&[full]), 0))
+        .unwrap()
+        .authorization_list[0];
+    let mut s = [0; 32];
+    s[29..].copy_from_slice(&[0x7F; 3]);
+    assert_eq!((auth.r, auth.s), ([0xFF; 32], s));
     // A parity byte above one decodes; it only names no authority.
     let odd = entry(&[], &[3; 20], &[], &[0x7F]);
     assert_eq!(
@@ -250,6 +267,23 @@ fn malformations() {
         ),
         (
             set_code(&to, &list(&[entry(&[1], &[3; 20], &[], &[1, 0])]), 0),
+            Error::Malformed,
+        ),
+        // An r or an s over 32 bytes.
+        (
+            set_code(
+                &to,
+                &list(&[signed_entry(&[1], &[3; 20], &[], &[], &[1; 33], &[1])]),
+                0,
+            ),
+            Error::Malformed,
+        ),
+        (
+            set_code(
+                &to,
+                &list(&[signed_entry(&[1], &[3; 20], &[], &[], &[1], &[1; 33])]),
+                0,
+            ),
             Error::Malformed,
         ),
         // The transaction's own parity is checked as for every typed transaction.
