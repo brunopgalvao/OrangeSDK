@@ -139,6 +139,8 @@ mod tests {
     fn constants_and_keys() {
         assert_eq!(UPGRADE_ADDRESS[18..], [0x50, 0x10]);
         assert!(UPGRADE_ADDRESS[..18].iter().all(|b| *b == 0));
+        // The governance address of spec 13 §9 is this address.
+        assert_eq!(UPGRADE_ADDRESS, solo_abi::governance::GOVERNANCE_ADDRESS);
         // A chunk transaction still fits a 64 KiB storage value with room for its envelope.
         const { assert!(CHUNK_SIZE + 1024 < 65_536) };
         assert_eq!(MAX_CHUNKS as usize * CHUNK_SIZE, 15 << 19);

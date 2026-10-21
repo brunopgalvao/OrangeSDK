@@ -90,7 +90,7 @@ fn encodings() {
         (reason::SENDER_NOT_EOA, "sender not an eoa"),
         (
             reason::SYSTEM_ACTION,
-            "not a valid system action (upgrade or module install)",
+            "not a valid system action (governance, upgrade or module install)",
         ),
         (reason::STAKING_ACTION, "not a valid staking action"),
         (reason::OUTBOX_MESSAGE, "not a valid outbox message"),
