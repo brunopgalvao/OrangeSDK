@@ -187,5 +187,6 @@ The execution-spec state tests run set-code transactions through the kernel's ow
 
 - The genesis block's hash is zero, not the hash of a header: a tool that hashes block 0 finds a mismatch, and a header chain verifies from block 1.
 - `stateRoot` is not an Ethereum state root (§3.3), and `eth_getProof` answers in Solo's proof format, which Ethereum's verifiers do not read.
-- History is kept in memory beside the state; a node has no history from before it started.
-- The pool's rules for delegation are geth's; a pool of another host may differ without affecting consensus (14 §1).
+- History is kept in memory beside the state; a node has no history from before it started, and while blocks write heavily its window is shorter than `state_history` (§5.1).
+- The pool's rules for delegation are geth's, plus the take's rule for authorities ahead (§2.4); a pool of another host may differ without affecting consensus (14 §1).
+- Proposals are not run before they are made: a delegated account's code can spend the account's balance, or move its nonce by creating a contract, during another sender's transaction, and a later transaction of that account in the same block is then recorded as failed (06 §5.1) where a geth builder would have left it out.
