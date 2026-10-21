@@ -10,19 +10,17 @@ use solo_node::Node;
 use crate::hex::{data, parse_quantity, quantity};
 use crate::methods::{RpcError, param_str};
 
+/// The mode's name; the kernel admits no third.
 fn mode_text(m: u8) -> &'static str {
-    match m {
-        mode::KEY => "key",
-        mode::STAKE => "stake",
-        _ => "unknown",
-    }
+    if m == mode::STAKE { "stake" } else { "key" }
 }
 
+/// A status's name; the kernel keeps no third.
 fn status_text(s: u8) -> &'static str {
-    match s {
-        status::VOTING => "voting",
-        status::PASSED => "passed",
-        _ => "unknown",
+    if s == status::PASSED {
+        "passed"
+    } else {
+        "voting"
     }
 }
 
@@ -67,12 +65,11 @@ fn proposal_json(v: &ProposalView) -> Value {
 /// open) from a kernel that does not serve the query.
 fn status_of(node: &mut Node) -> Result<GovernanceStatus, RpcError> {
     let r = node.query(query::GOVERNANCE, &[])?;
-    if r.status != 0 {
-        return Ok(GovernanceStatus::default());
-    }
-    GovernanceStatus::from_bytes(&r.body)
-        .ok()
-        .ok_or_else(|| RpcError::server("the kernel's governance status does not decode"))
+    let status = (r.status == 0).then(|| GovernanceStatus::from_bytes(&r.body));
+    status
+        .transpose()
+        .map(Option::unwrap_or_default)
+        .map_err(|_| RpcError::server("the kernel's governance status does not decode"))
 }
 
 /// `solo_getGovernance()`: the mode, the key, the guardian, the proposal
@@ -105,7 +102,9 @@ pub fn governance(node: &mut Node) -> Result<Value, RpcError> {
 /// A server error if the node fails.
 pub fn proposals(node: &mut Node) -> Result<Value, RpcError> {
     let s = status_of(node)?;
-    Ok(Value::Array(s.proposals.0.iter().map(proposal_json).collect()))
+    Ok(Value::Array(
+        s.proposals.0.iter().map(proposal_json).collect(),
+    ))
 }
 
 /// `solo_getProposal(id)`: one open proposal, or `null` once it is executed,
@@ -121,6 +120,6 @@ pub fn proposal(node: &mut Node, params: &[Value]) -> Result<Value, RpcError> {
     }
     let view = ProposalView::from_bytes(&r.body)
         .ok()
-        .ok_or_else(|| RpcError::server("the kernel's proposal does not decode"))?;
+        .ok_or(RpcError::server("the kernel's proposal does not decode"))?;
     Ok(proposal_json(&view))
 }

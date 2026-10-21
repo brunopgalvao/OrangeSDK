@@ -9,7 +9,9 @@ use solo_cli::{parse_genesis, run};
 
 fn governance(text: &str) -> GovernanceParams {
     let genesis = parse_genesis(text).unwrap();
-    GenesisParams::from_bytes(&genesis.params).unwrap().governance
+    GenesisParams::from_bytes(&genesis.params)
+        .unwrap()
+        .governance
 }
 
 fn words(list: &[&str]) -> Vec<String> {
@@ -40,7 +42,10 @@ fn governance_parameters() {
         governance(r#"{"chainId": 1, "proposalDeposit": "0x10"}"#).deposit,
         16
     );
-    assert_eq!(governance(r#"{"chainId": 1, "proposalDeposit": 7}"#).deposit, 7);
+    assert_eq!(
+        governance(r#"{"chainId": 1, "proposalDeposit": 7}"#).deposit,
+        7
+    );
     let cases = [
         (
             r#"{"chainId": 1, "governanceMode": "multisig"}"#,
@@ -138,7 +143,9 @@ fn gov_encodes_every_call() {
         let call = parse(&words(&args)).unwrap();
         assert_eq!(call, expected, "{args:?}");
         let text = describe(&call);
-        assert!(text.starts_with("to       0x0000000000000000000000000000000000005010\ncalldata 0x"));
+        assert!(
+            text.starts_with("to       0x0000000000000000000000000000000000005010\ncalldata 0x")
+        );
         assert!(text.ends_with(&solo_rpc::methods::data(&call.encode())));
         let mut full = vec!["solo".to_owned(), "gov".to_owned()];
         full.extend(words(&args));
@@ -176,7 +183,10 @@ fn gov_names_every_mistake() {
             vec!["set-params", "1", "2", "3", &too_big],
             "deposit must be a decimal or 0x hex amount in wei",
         ),
-        (vec!["set-params", "a", "2", "3", "4"], "voting blocks must be a number"),
+        (
+            vec!["set-params", "a", "2", "3", "4"],
+            "voting blocks must be a number",
+        ),
         (vec!["dance"], "unknown subcommand dance"),
     ];
     for (args, expected) in errors {

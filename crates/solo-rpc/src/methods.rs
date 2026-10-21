@@ -108,7 +108,9 @@ pub fn reason_text(code: u32) -> &'static str {
         reason::GAS_LIMIT_TOO_HIGH => "transaction gas limit too high",
         reason::INITCODE_TOO_LARGE => "max initcode size exceeded",
         reason::SENDER_NOT_EOA => "sender not an eoa",
-        reason::SYSTEM_ACTION => "not a valid system action (governance, upgrade or module install)",
+        reason::SYSTEM_ACTION => {
+            "not a valid system action (governance, upgrade or module install)"
+        }
         reason::STAKING_ACTION => "not a valid staking action",
         reason::OUTBOX_MESSAGE => "not a valid outbox message",
         reason::BRIDGE_CALL => "not a valid bridge call",

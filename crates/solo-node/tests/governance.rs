@@ -43,7 +43,9 @@ const COUNTER_ELF: &[u8] = include_bytes!("fixtures/counter.elf");
 const LIGHT_CLIENT_ELF: &[u8] = include_bytes!("fixtures/eth-light-client.elf");
 const VERIFIER_ELF: &[u8] = include_bytes!("fixtures/eth-message-verifier.elf");
 
-const VOTING: u64 = 3;
+/// Blocks a proposal takes votes for: room for a vote per block from each
+/// of the four validators, and one changing its mind.
+const VOTING: u64 = 6;
 const TIMELOCK: u64 = 2;
 const QUORUM: u64 = 5_000;
 const DEPOSIT: u128 = ETHER;
@@ -161,8 +163,13 @@ impl Sender {
 
     /// The same call without using up a nonce: for transactions admission refuses.
     fn peek(&self, call: &Call, value: u128) -> Vec<u8> {
-        self.wallet
-            .tx(self.nonce, GOVERNANCE_ADDRESS, value, STAGE_GAS, &call.encode())
+        self.wallet.tx(
+            self.nonce,
+            GOVERNANCE_ADDRESS,
+            value,
+            STAGE_GAS,
+            &call.encode(),
+        )
     }
 
     fn address(&self) -> [u8; 20] {
@@ -231,7 +238,9 @@ fn sim_include(sim: &mut Sim, raw: &[u8]) -> Receipt {
 /// Runs the network until node 0 has executed block `height`.
 fn sim_reach(sim: &mut Sim, height: u64) {
     let reached = sim
-        .run_until(200 * SLOT_MS, |s| s.nodes[0].block_number().unwrap() >= height)
+        .run_until(200 * SLOT_MS, |s| {
+            s.nodes[0].block_number().unwrap() >= height
+        })
         .unwrap();
     assert!(reached, "height {height} not reached");
 }
@@ -257,7 +266,14 @@ fn assert_agreement(sim: &mut Sim) {
 }
 
 /// The proposal record `submit` at `height` makes under the test rules.
-fn expected(id: u64, proposer: [u8; 20], deposit: u128, target: [u8; 20], data: &[u8], height: u64) -> Proposal {
+fn expected(
+    id: u64,
+    proposer: [u8; 20],
+    deposit: u128,
+    target: [u8; 20],
+    data: &[u8],
+    height: u64,
+) -> Proposal {
     let voting_end = height + VOTING;
     Proposal {
         id,
@@ -328,7 +344,10 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
         alice.peek(&submit(GOVERNANCE_ADDRESS, &guardian_action), DEPOSIT),
         val[0].peek(&submit(GOVERNANCE_ADDRESS, &guardian_action), 0),
         key.peek(&submit(alice.address(), &abi::PAUSE), 0),
-        key.peek(&submit(GOVERNANCE_ADDRESS, &Action::Signal { features: 1 }.encode()), 0),
+        key.peek(
+            &submit(GOVERNANCE_ADDRESS, &Action::Signal { features: 1 }.encode()),
+            0,
+        ),
         key.peek(&submit(GOVERNANCE_ADDRESS, &guardian_action), 1),
         too_little,
     ] {
@@ -336,7 +355,10 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
     }
     // The key names the guardian ahead of the switch and pauses, then
     // unpauses, the inbox at once, each a submission executed on the spot.
-    let r = sim_include(&mut sim, &key.call(&submit(GOVERNANCE_ADDRESS, &guardian_action), 0));
+    let r = sim_include(
+        &mut sim,
+        &key.call(&submit(GOVERNANCE_ADDRESS, &guardian_action), 0),
+    );
     assert_eq!(r.status, 1);
     assert_eq!(
         r.logs.0,
@@ -345,16 +367,30 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
             gov::guardian_log(&guardian.address()),
         ]
     );
-    assert_eq!(gov_status(&mut sim.nodes[0]).guardian, [0; 20], "no guardian under the key");
+    assert_eq!(
+        gov_status(&mut sim.nodes[0]).guardian,
+        [0; 20],
+        "no guardian under the key"
+    );
     assert!(!paused(&mut sim.nodes[0]));
-    let r = sim_include(&mut sim, &key.call(&submit(VERIFIER_ADDRESS, &abi::PAUSE), 0));
+    let r = sim_include(
+        &mut sim,
+        &key.call(&submit(VERIFIER_ADDRESS, &abi::PAUSE), 0),
+    );
     assert_eq!((r.status, r.gas_used > GOVERNANCE_GAS), (1, true));
     assert_eq!(
         r.logs.0,
-        vec![gov::enacted_log(&key.address(), &VERIFIER_ADDRESS, &abi::PAUSE)]
+        vec![gov::enacted_log(
+            &key.address(),
+            &VERIFIER_ADDRESS,
+            &abi::PAUSE
+        )]
     );
     assert!(paused(&mut sim.nodes[0]));
-    let r = sim_include(&mut sim, &key.call(&submit(VERIFIER_ADDRESS, &abi::UNPAUSE), 0));
+    let r = sim_include(
+        &mut sim,
+        &key.call(&submit(VERIFIER_ADDRESS, &abi::UNPAUSE), 0),
+    );
     assert_eq!(r.status, 1);
     assert!(!paused(&mut sim.nodes[0]));
     // A submission whose action fails reverts: an unknown mode, and a
@@ -366,7 +402,16 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
         let r = sim_include(&mut sim, &key.call(&submit(GOVERNANCE_ADDRESS, &data), 0));
         assert_eq!((r.status, r.logs.0.len()), (0, 0), "{data:?}");
     }
-    let r = sim_include(&mut sim, &key.call(&submit(VERIFIER_ADDRESS, &[abi::SET_RATE_LIMIT.as_slice(), &[1]].concat()), 0));
+    let r = sim_include(
+        &mut sim,
+        &key.call(
+            &submit(
+                VERIFIER_ADDRESS,
+                &[abi::SET_RATE_LIMIT.as_slice(), &[1]].concat(),
+            ),
+            0,
+        ),
+    );
     assert_eq!((r.status, r.logs.0.len()), (0, 0));
     assert_eq!(gov_status(&mut sim.nodes[0]).mode, mode::KEY);
 
@@ -415,24 +460,45 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
         ),
         key.wallet
             .tx(key.nonce, MODULE_ADDRESS, 0, STAGE_GAS, &install.encode()),
-        key.peek(&submit(GOVERNANCE_ADDRESS, &Call::SetMode { mode: mode::KEY }.encode()), 0),
+        key.peek(
+            &submit(
+                GOVERNANCE_ADDRESS,
+                &Call::SetMode { mode: mode::KEY }.encode(),
+            ),
+            0,
+        ),
         key.peek(&submit(GOVERNANCE_ADDRESS, &guardian_action), 0),
         val[0].peek(&submit(GOVERNANCE_ADDRESS, &switch), 0),
-        val[0].peek(&submit(GOVERNANCE_ADDRESS, &Call::SetMode { mode: mode::KEY }.encode()), 0),
+        val[0].peek(
+            &submit(
+                GOVERNANCE_ADDRESS,
+                &Call::SetMode { mode: mode::KEY }.encode(),
+            ),
+            0,
+        ),
         alice.peek(&submit(GOVERNANCE_ADDRESS, &switch), DEPOSIT),
     ] {
         assert_eq!(sim.submit(0, &raw), refused());
     }
     // The key's own call to a bridge module is nobody's now: the modules
     // take governance from the governance address.
-    let r = call(&mut sim.nodes[0], key.address(), VERIFIER_ADDRESS, &abi::PAUSE);
+    let r = call(
+        &mut sim.nodes[0],
+        key.address(),
+        VERIFIER_ADDRESS,
+        &abi::PAUSE,
+    );
     assert_eq!(
         (r.status, r.output),
         (call_status::REVERT, abi::encode(abi::NOT_GOVERNANCE, &[]))
     );
     // Validators stage code now; the key cannot.
     assert_eq!(
-        sim_include(&mut sim, &val[0].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &stage[0].encode())).status,
+        sim_include(
+            &mut sim,
+            &val[0].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &stage[0].encode())
+        )
+        .status,
         1
     );
 
@@ -452,14 +518,30 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
     ] {
         assert_eq!(sim.submit(0, &raw), refused());
     }
-    let r = sim_include(&mut sim, &alice.call(&submit(MODULE_ADDRESS, &install_data), DEPOSIT));
+    let r = sim_include(
+        &mut sim,
+        &alice.call(&submit(MODULE_ADDRESS, &install_data), DEPOSIT),
+    );
     assert_eq!(r.status, 1);
-    let p1 = expected(1, alice.address(), DEPOSIT, MODULE_ADDRESS, &install_data, r.height);
+    let p1 = expected(
+        1,
+        alice.address(),
+        DEPOSIT,
+        MODULE_ADDRESS,
+        &install_data,
+        r.height,
+    );
     assert_eq!(r.logs.0, vec![gov::submitted_log(&p1)]);
     let shown = view(&mut sim.nodes[0], 1).unwrap();
     assert_eq!(shown.proposal, p1);
-    assert_eq!((shown.yes, shown.no, shown.total, shown.votes.0.len()), (0, 0, 10, 0));
-    assert_eq!(balance(&mut sim.nodes[0], alice.address()), 100 * ETHER - DEPOSIT);
+    assert_eq!(
+        (shown.yes, shown.no, shown.total, shown.votes.0.len()),
+        (0, 0, 10, 0)
+    );
+    assert_eq!(
+        balance(&mut sim.nodes[0], alice.address()),
+        100 * ETHER - DEPOSIT
+    );
     assert_eq!(balance(&mut sim.nodes[0], GOVERNANCE_ADDRESS), DEPOSIT);
     let s = gov_status(&mut sim.nodes[0]);
     assert_eq!((s.next_id, s.proposals.0.len()), (2, 1));
@@ -475,30 +557,62 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
     }
     let r = sim_include(&mut sim, &val[0].call(&vote(1, true), 0));
     assert_eq!(r.status, 1);
-    assert_eq!(r.logs.0, vec![gov::voted_log(1, &val[0].address(), true, 5)]);
-    assert_eq!(sim_include(&mut sim, &val[1].call(&vote(1, true), 0)).status, 1);
-    assert_eq!(sim_include(&mut sim, &val[2].call(&vote(1, false), 0)).status, 1);
+    assert_eq!(
+        r.logs.0,
+        vec![gov::voted_log(1, &val[0].address(), true, 5)]
+    );
+    assert_eq!(
+        sim_include(&mut sim, &val[1].call(&vote(1, true), 0)).status,
+        1
+    );
+    assert_eq!(
+        sim_include(&mut sim, &val[2].call(&vote(1, false), 0)).status,
+        1
+    );
     let shown = view(&mut sim.nodes[0], 1).unwrap();
     assert_eq!((shown.yes, shown.no, shown.total), (8, 1, 10));
     assert_eq!(
         shown.votes.0,
         vec![
-            gov::Ballot { validator: solo_node::validator_id(&validators[0]), support: true, weight: 5 },
-            gov::Ballot { validator: solo_node::validator_id(&validators[1]), support: true, weight: 3 },
-            gov::Ballot { validator: solo_node::validator_id(&validators[2]), support: false, weight: 1 },
+            gov::Ballot {
+                validator: solo_node::validator_id(&validators[0]),
+                support: true,
+                weight: 5
+            },
+            gov::Ballot {
+                validator: solo_node::validator_id(&validators[1]),
+                support: true,
+                weight: 3
+            },
+            gov::Ballot {
+                validator: solo_node::validator_id(&validators[2]),
+                support: false,
+                weight: 1
+            },
         ]
     );
-    assert_eq!(sim_include(&mut sim, &val[2].call(&vote(1, true), 0)).status, 1);
+    assert_eq!(
+        sim_include(&mut sim, &val[2].call(&vote(1, true), 0)).status,
+        1
+    );
     let shown = view(&mut sim.nodes[0], 1).unwrap();
     assert_eq!((shown.yes, shown.no, shown.votes.0.len()), (9, 0, 3));
     // Voting ends: tallied, passed, and closed to votes and still to execution.
     sim_reach(&mut sim, p1.voting_end + 1);
     let shown = view(&mut sim.nodes[0], 1).unwrap();
     assert_eq!(
-        (shown.proposal.status, shown.proposal.yes, shown.proposal.no, shown.proposal.total),
+        (
+            shown.proposal.status,
+            shown.proposal.yes,
+            shown.proposal.no,
+            shown.proposal.total
+        ),
         (status::PASSED, 9, 0, 10)
     );
-    for raw in [val[3].peek(&vote(1, true), 0), alice.peek(&Call::Execute { id: 1 }, 0)] {
+    for raw in [
+        val[3].peek(&vote(1, true), 0),
+        alice.peek(&Call::Execute { id: 1 }, 0),
+    ] {
         assert_eq!(sim.submit(0, &raw), refused());
     }
     sim_reach(&mut sim, p1.executable_at - 1);
@@ -509,50 +623,112 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
     assert_eq!(r.logs.0[1].topics.0[0], INSTALLED_TOPIC);
     assert!(r.height >= p1.executable_at && r.height <= p1.expires_at);
     assert_eq!(
-        sim.nodes[0].query(modules::query::MODULE, &install.target.to_bytes()).unwrap().status,
+        sim.nodes[0]
+            .query(modules::query::MODULE, &install.target.to_bytes())
+            .unwrap()
+            .status,
         0
     );
     assert_eq!(view(&mut sim.nodes[0], 1), None);
     assert_eq!(balance(&mut sim.nodes[0], alice.address()), 100 * ETHER);
     assert_eq!(balance(&mut sim.nodes[0], GOVERNANCE_ADDRESS), 0);
     // Never twice.
-    assert_eq!(sim.submit(0, &alice.peek(&Call::Execute { id: 1 }, 0)), refused());
+    assert_eq!(
+        sim.submit(0, &alice.peek(&Call::Execute { id: 1 }, 0)),
+        refused()
+    );
 
     // Proposal 2 fails with quorum: the deposit comes back. Proposal 3
     // fails short of quorum: the deposit is burned.
     let limit = solo_ethlc::verifier::set_rate_limit_call(3600, 3);
-    let r = sim_include(&mut sim, &alice.call(&submit(VERIFIER_ADDRESS, &limit), DEPOSIT));
+    let r = sim_include(
+        &mut sim,
+        &alice.call(&submit(VERIFIER_ADDRESS, &limit), DEPOSIT),
+    );
     assert_eq!((r.status, view(&mut sim.nodes[0], 2).is_some()), (1, true));
     let p2_end = r.height + VOTING;
-    assert_eq!(sim_include(&mut sim, &val[0].call(&vote(2, true), 0)).status, 1);
-    assert_eq!(sim_include(&mut sim, &val[1].call(&vote(2, false), 0)).status, 1);
-    let r = sim_include(&mut sim, &alice.call(&submit(VERIFIER_ADDRESS, &limit), DEPOSIT));
+    assert_eq!(
+        sim_include(&mut sim, &val[0].call(&vote(2, true), 0)).status,
+        1
+    );
+    assert_eq!(
+        sim_include(&mut sim, &val[1].call(&vote(2, false), 0)).status,
+        1
+    );
+    let r = sim_include(
+        &mut sim,
+        &alice.call(&submit(VERIFIER_ADDRESS, &limit), DEPOSIT),
+    );
     assert_eq!(r.status, 1);
     let p3_end = r.height + VOTING;
-    assert_eq!(sim_include(&mut sim, &val[2].call(&vote(3, true), 0)).status, 1);
-    assert_eq!(sim_include(&mut sim, &val[3].call(&vote(3, true), 0)).status, 1);
-    assert_eq!(balance(&mut sim.nodes[0], alice.address()), 100 * ETHER - 2 * DEPOSIT);
+    assert_eq!(
+        sim_include(&mut sim, &val[2].call(&vote(3, true), 0)).status,
+        1
+    );
+    assert_eq!(
+        sim_include(&mut sim, &val[3].call(&vote(3, true), 0)).status,
+        1
+    );
+    assert_eq!(
+        balance(&mut sim.nodes[0], alice.address()),
+        100 * ETHER - 2 * DEPOSIT
+    );
     sim_reach(&mut sim, p3_end.max(p2_end) + 1);
-    assert_eq!((view(&mut sim.nodes[0], 2), view(&mut sim.nodes[0], 3)), (None, None));
-    assert_eq!(balance(&mut sim.nodes[0], alice.address()), 100 * ETHER - DEPOSIT);
+    assert_eq!(
+        (view(&mut sim.nodes[0], 2), view(&mut sim.nodes[0], 3)),
+        (None, None)
+    );
+    assert_eq!(
+        balance(&mut sim.nodes[0], alice.address()),
+        100 * ETHER - DEPOSIT
+    );
     assert_eq!(balance(&mut sim.nodes[0], [0; 20]), DEPOSIT);
     assert_eq!(balance(&mut sim.nodes[0], GOVERNANCE_ADDRESS), 0);
-    let r = call(&mut sim.nodes[0], alice.address(), VERIFIER_ADDRESS, &abi::RATE_LIMIT);
-    assert_eq!(r.output, [abi::word(3600), abi::word(2)].concat(), "unchanged");
+    let r = call(
+        &mut sim.nodes[0],
+        alice.address(),
+        VERIFIER_ADDRESS,
+        &abi::RATE_LIMIT,
+    );
+    assert_eq!(
+        r.output,
+        [abi::word(3600), abi::word(2)].concat(),
+        "unchanged"
+    );
 
     // Proposal 4 passes and the guardian vetoes it during the timelock.
     let name_alice = Call::SetGuardian {
         guardian: alice.address(),
     }
     .encode();
-    let r = sim_include(&mut sim, &val[0].call(&submit(GOVERNANCE_ADDRESS, &name_alice), 0));
+    let r = sim_include(
+        &mut sim,
+        &val[0].call(&submit(GOVERNANCE_ADDRESS, &name_alice), 0),
+    );
     assert_eq!(r.status, 1);
-    let p4 = expected(4, val[0].address(), 0, GOVERNANCE_ADDRESS, &name_alice, r.height);
+    let p4 = expected(
+        4,
+        val[0].address(),
+        0,
+        GOVERNANCE_ADDRESS,
+        &name_alice,
+        r.height,
+    );
     assert_eq!(view(&mut sim.nodes[0], 4).unwrap().proposal, p4);
-    assert_eq!(sim_include(&mut sim, &val[0].call(&vote(4, true), 0)).status, 1);
+    assert_eq!(
+        sim_include(&mut sim, &val[0].call(&vote(4, true), 0)).status,
+        1
+    );
     sim_reach(&mut sim, p4.voting_end + 1);
-    assert_eq!(view(&mut sim.nodes[0], 4).unwrap().proposal.status, status::PASSED);
-    for raw in [alice.peek(&Call::Veto { id: 4 }, 0), key.peek(&Call::Veto { id: 4 }, 0), guardian.peek(&Call::Veto { id: 9 }, 0)] {
+    assert_eq!(
+        view(&mut sim.nodes[0], 4).unwrap().proposal.status,
+        status::PASSED
+    );
+    for raw in [
+        alice.peek(&Call::Veto { id: 4 }, 0),
+        key.peek(&Call::Veto { id: 4 }, 0),
+        guardian.peek(&Call::Veto { id: 9 }, 0),
+    ] {
         assert_eq!(sim.submit(0, &raw), refused());
     }
     let r = sim_include(&mut sim, &guardian.call(&Call::Veto { id: 4 }, 0));
@@ -560,35 +736,73 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
     assert_eq!(view(&mut sim.nodes[0], 4), None);
     assert_eq!(gov_status(&mut sim.nodes[0]).guardian, guardian.address());
     sim_reach(&mut sim, p4.executable_at);
-    assert_eq!(sim.submit(0, &alice.peek(&Call::Execute { id: 4 }, 0)), refused());
+    assert_eq!(
+        sim.submit(0, &alice.peek(&Call::Execute { id: 4 }, 0)),
+        refused()
+    );
 
     // Proposal 5 pauses the inbox on the fast track: it executes in the
     // vote that takes yes past half of all stake, half itself not enough.
-    let r = sim_include(&mut sim, &val[1].call(&submit(VERIFIER_ADDRESS, &abi::PAUSE), 0));
+    let r = sim_include(
+        &mut sim,
+        &val[1].call(&submit(VERIFIER_ADDRESS, &abi::PAUSE), 0),
+    );
     assert_eq!(r.status, 1);
     let shown = view(&mut sim.nodes[0], 5).unwrap();
     assert_eq!(
-        (shown.proposal.fast_track, shown.proposal.executable_at, shown.proposal.expires_at),
+        (
+            shown.proposal.fast_track,
+            shown.proposal.executable_at,
+            shown.proposal.expires_at
+        ),
         (true, 0, r.height + VOTING)
     );
-    assert_eq!(sim_include(&mut sim, &val[2].call(&vote(5, true), 0)).status, 1);
-    assert_eq!(sim_include(&mut sim, &val[3].call(&vote(5, true), 0)).status, 1);
-    assert_eq!(sim_include(&mut sim, &val[1].call(&vote(5, true), 0)).status, 1);
+    assert_eq!(
+        sim_include(&mut sim, &val[2].call(&vote(5, true), 0)).status,
+        1
+    );
+    assert_eq!(
+        sim_include(&mut sim, &val[3].call(&vote(5, true), 0)).status,
+        1
+    );
+    assert_eq!(
+        sim_include(&mut sim, &val[1].call(&vote(5, true), 0)).status,
+        1
+    );
     assert_eq!(view(&mut sim.nodes[0], 5).unwrap().yes, 5);
     assert!(!paused(&mut sim.nodes[0]));
     let r = sim_include(&mut sim, &val[0].call(&vote(5, true), 0));
     assert_eq!(r.status, 1);
     assert_eq!(
         r.logs.0,
-        vec![gov::voted_log(5, &val[0].address(), true, 5), gov::executed_log(5)]
+        vec![
+            gov::voted_log(5, &val[0].address(), true, 5),
+            gov::executed_log(5)
+        ]
     );
     assert!(paused(&mut sim.nodes[0]));
     assert_eq!(view(&mut sim.nodes[0], 5), None);
     // Unpausing takes the normal track; anyone executes.
-    let r = sim_include(&mut sim, &val[0].call(&submit(VERIFIER_ADDRESS, &abi::UNPAUSE), 0));
-    let p6 = expected(6, val[0].address(), 0, VERIFIER_ADDRESS, &abi::UNPAUSE, r.height);
-    assert_eq!(sim_include(&mut sim, &val[0].call(&vote(6, true), 0)).status, 1);
-    assert_eq!(sim_include(&mut sim, &val[1].call(&vote(6, true), 0)).status, 1);
+    let r = sim_include(
+        &mut sim,
+        &val[0].call(&submit(VERIFIER_ADDRESS, &abi::UNPAUSE), 0),
+    );
+    let p6 = expected(
+        6,
+        val[0].address(),
+        0,
+        VERIFIER_ADDRESS,
+        &abi::UNPAUSE,
+        r.height,
+    );
+    assert_eq!(
+        sim_include(&mut sim, &val[0].call(&vote(6, true), 0)).status,
+        1
+    );
+    assert_eq!(
+        sim_include(&mut sim, &val[1].call(&vote(6, true), 0)).status,
+        1
+    );
     sim_reach(&mut sim, p6.executable_at - 1);
     let r = sim_include(&mut sim, &val[3].call(&Call::Execute { id: 6 }, 0));
     assert_eq!((r.status, r.logs.0), (1, vec![gov::executed_log(6)]));
@@ -623,7 +837,11 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
     assert_eq!(r.status, 1);
     assert_eq!(
         r.logs.0,
-        vec![gov::enacted_log(&guardian.address(), &VERIFIER_ADDRESS, &abi::PAUSE)]
+        vec![gov::enacted_log(
+            &guardian.address(),
+            &VERIFIER_ADDRESS,
+            &abi::PAUSE
+        )]
     );
     assert!(paused(&mut sim.nodes[0]));
 
@@ -635,9 +853,22 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
         quorum_bps: 3_000,
         deposit: 0,
     };
-    let r = sim_include(&mut sim, &val[0].call(&submit(GOVERNANCE_ADDRESS, &new_rules.encode()), 0));
-    let p7 = expected(7, val[0].address(), 0, GOVERNANCE_ADDRESS, &new_rules.encode(), r.height);
-    assert_eq!(sim_include(&mut sim, &val[0].call(&vote(7, true), 0)).status, 1);
+    let r = sim_include(
+        &mut sim,
+        &val[0].call(&submit(GOVERNANCE_ADDRESS, &new_rules.encode()), 0),
+    );
+    let p7 = expected(
+        7,
+        val[0].address(),
+        0,
+        GOVERNANCE_ADDRESS,
+        &new_rules.encode(),
+        r.height,
+    );
+    assert_eq!(
+        sim_include(&mut sim, &val[0].call(&vote(7, true), 0)).status,
+        1
+    );
     sim_reach(&mut sim, p7.executable_at - 1);
     let r = sim_include(&mut sim, &val[0].call(&Call::Execute { id: 7 }, 0));
     let in_force = GovernanceParams {
@@ -659,16 +890,25 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
         assert_eq!(sim.submit(0, &raw), refused());
     }
     // Proposal 8 passes with 30% of the stake and nobody executes it: it expires.
-    let r = sim_include(&mut sim, &val[1].call(&submit(GOVERNANCE_ADDRESS, &guardian_action), 0));
+    let r = sim_include(
+        &mut sim,
+        &val[1].call(&submit(GOVERNANCE_ADDRESS, &guardian_action), 0),
+    );
     assert_eq!(r.status, 1);
     let p8 = view(&mut sim.nodes[0], 8).unwrap().proposal;
     assert_eq!(
         (p8.voting_end, p8.executable_at, p8.expires_at),
         (r.height + 2, r.height + 3, r.height + 4)
     );
-    assert_eq!(sim_include(&mut sim, &val[1].call(&vote(8, true), 0)).status, 1);
+    assert_eq!(
+        sim_include(&mut sim, &val[1].call(&vote(8, true), 0)).status,
+        1
+    );
     sim_reach(&mut sim, p8.voting_end + 1);
-    assert_eq!(view(&mut sim.nodes[0], 8).unwrap().proposal.status, status::PASSED);
+    assert_eq!(
+        view(&mut sim.nodes[0], 8).unwrap().proposal.status,
+        status::PASSED
+    );
     sim_reach(&mut sim, p8.expires_at + 1);
     assert_eq!(view(&mut sim.nodes[0], 8), None);
     assert_eq!(gov_status(&mut sim.nodes[0]).next_id, 9);
@@ -712,26 +952,55 @@ fn a_proposal_upgrades_the_kernel_across_four_validators() {
         required_gates: 0,
     }
     .encode();
-    let r = sim_include(&mut sim, &val[0].call(&submit(GOVERNANCE_ADDRESS, &propose), 0));
+    let r = sim_include(
+        &mut sim,
+        &val[0].call(&submit(GOVERNANCE_ADDRESS, &propose), 0),
+    );
     assert_eq!(r.status, 1);
-    let p = expected(1, val[0].address(), 0, GOVERNANCE_ADDRESS, &propose, r.height);
+    let p = expected(
+        1,
+        val[0].address(),
+        0,
+        GOVERNANCE_ADDRESS,
+        &propose,
+        r.height,
+    );
     assert_eq!(view(&mut sim.nodes[0], 1).unwrap().proposal, p);
     // Validators 0 and 1 carry 80% of the stake; validator 3 says no.
-    assert_eq!(sim_include(&mut sim, &val[0].call(&vote(1, true), 0)).status, 1);
-    assert_eq!(sim_include(&mut sim, &val[1].call(&vote(1, true), 0)).status, 1);
-    assert_eq!(sim_include(&mut sim, &val[3].call(&vote(1, false), 0)).status, 1);
+    assert_eq!(
+        sim_include(&mut sim, &val[0].call(&vote(1, true), 0)).status,
+        1
+    );
+    assert_eq!(
+        sim_include(&mut sim, &val[1].call(&vote(1, true), 0)).status,
+        1
+    );
+    assert_eq!(
+        sim_include(&mut sim, &val[3].call(&vote(1, false), 0)).status,
+        1
+    );
     sim_reach(&mut sim, p.executable_at - 1);
     let shown = view(&mut sim.nodes[0], 1).unwrap().proposal;
-    assert_eq!((shown.status, shown.yes, shown.no, shown.total), (status::PASSED, 8, 1, 10));
+    assert_eq!(
+        (shown.status, shown.yes, shown.no, shown.total),
+        (status::PASSED, 8, 1, 10)
+    );
     let r = sim_include(&mut sim, &alice.call(&Call::Execute { id: 1 }, 0));
     assert_eq!(
         (r.status, r.logs.0),
-        (1, vec![gov::executed_log(1), proposed_log(&code_hash, h, 0)])
+        (
+            1,
+            vec![gov::executed_log(1), proposed_log(&code_hash, h, 0)]
+        )
     );
     assert!(r.height + 2 <= h, "the delay holds");
     for (i, node) in sim.nodes.iter_mut().enumerate() {
         let pending = node.upgrade_status().unwrap().pending.unwrap();
-        assert_eq!((pending.code_hash, pending.activation_height), (code_hash, h), "node {i}");
+        assert_eq!(
+            (pending.code_hash, pending.activation_height),
+            (code_hash, h),
+            "node {i}"
+        );
         assert_eq!(node.upgrades().prepared, Some(code_hash), "node {i}");
     }
     // Every validator switches at `h`; governance's state carries over.
@@ -761,7 +1030,10 @@ fn a_proposal_upgrades_the_kernel_across_four_validators() {
         );
         assert_eq!(node.kernel_version().unwrap(), 2);
         let s = gov_status(node);
-        assert_eq!((s.mode, s.guardian, s.next_id), (mode::STAKE, key.address(), 2));
+        assert_eq!(
+            (s.mode, s.guardian, s.next_id),
+            (mode::STAKE, key.address(), 2)
+        );
     }
     assert_agreement(&mut sim);
 }
@@ -782,44 +1054,77 @@ fn reach(node: &mut Node, height: u64) {
     run_until(node, 60, &mut |n| n.block_number().unwrap() >= height);
 }
 
-#[test]
-#[allow(clippy::too_many_lines)]
-fn one_validator_meets_the_bounds_the_gas_and_the_edge_cases() {
-    let validators = keys(1);
-    let short = GovernanceParams {
+/// Rules with a voting period of `voting_blocks` and a timelock of one block.
+fn single(voting_blocks: u64) -> GovernanceParams {
+    GovernanceParams {
         mode: mode::STAKE,
-        voting_blocks: 2,
+        voting_blocks,
         timelock_blocks: 1,
         quorum_bps: QUORUM,
         deposit: DEPOSIT,
-    };
-    let mut node = start(&genesis(&validators, &[1], short, None));
+    }
+}
+
+#[test]
+fn one_validator_meets_the_bounds_and_the_gas() {
+    let validators = keys(1);
+    let mut node = start(&genesis(&validators, &[1], single(40), None));
     let mut v0 = Sender::new(Wallet::from_key(validators[0].clone()));
-    let mut alice = Sender::new(alice());
-    let guardian_action = Call::SetGuardian { guardian: [0xAB; 20] }.encode();
+    let guardian_action = Call::SetGuardian {
+        guardian: [0xAB; 20],
+    }
+    .encode();
     // The gas of a vote is pinned: its intrinsic gas at the EIP-7623 floor
-    // plus the surcharge (spec 13 §9.9). A submission of the largest action
-    // fits a block.
-    let r = include(&mut node, &v0.call(&submit(GOVERNANCE_ADDRESS, &guardian_action), 0));
+    // plus the surcharge (spec 13 §9.9).
+    let r = include(
+        &mut node,
+        &v0.call(&submit(GOVERNANCE_ADDRESS, &guardian_action), 0),
+    );
     assert_eq!(r.status, 1);
     let r = include(&mut node, &v0.call(&vote(1, true), 0));
     assert_eq!((r.status, r.gas_used), (1, 21_860 + GOVERNANCE_GAS));
+    // The largest actions fit a block: a bridge action is checked by its
+    // selector alone until it executes, an install decodes in full.
     let mut big = abi::UNPAUSE.to_vec();
     big.resize(MAX_PROPOSAL_DATA, 0);
-    let raw = v0.tx(GOVERNANCE_ADDRESS, 0, 3_000_000, &submit(VERIFIER_ADDRESS, &big).encode());
-    assert_eq!(node.submit(&raw), refused(), "no bridge on this chain");
+    let r = include(
+        &mut node,
+        &v0.tx(
+            GOVERNANCE_ADDRESS,
+            0,
+            3_000_000,
+            &submit(VERIFIER_ADDRESS, &big).encode(),
+        ),
+    );
+    assert_eq!(r.status, 1);
+    assert_eq!(
+        view(&mut node, 2).unwrap().proposal.data.len(),
+        MAX_PROPOSAL_DATA
+    );
     let big_install = Install {
         init: vec![7; modules::MAX_INIT_LEN],
         ..Install::default()
     }
     .encode();
-    let r = include(&mut node, &v0.tx(GOVERNANCE_ADDRESS, 0, 3_000_000, &submit(MODULE_ADDRESS, &big_install).encode()));
+    let r = include(
+        &mut node,
+        &v0.tx(
+            GOVERNANCE_ADDRESS,
+            0,
+            3_000_000,
+            &submit(MODULE_ADDRESS, &big_install).encode(),
+        ),
+    );
     assert_eq!(r.status, 1);
-    assert_eq!(view(&mut node, 2).unwrap().proposal.data, big_install);
+    assert_eq!(view(&mut node, 3).unwrap().proposal.data, big_install);
     // At most 16 proposals are open at once.
-    for _ in 2..MAX_OPEN_PROPOSALS {
+    for _ in 3..MAX_OPEN_PROPOSALS {
         assert_eq!(
-            include(&mut node, &v0.call(&submit(GOVERNANCE_ADDRESS, &guardian_action), 0)).status,
+            include(
+                &mut node,
+                &v0.call(&submit(GOVERNANCE_ADDRESS, &guardian_action), 0)
+            )
+            .status,
             1
         );
     }
@@ -829,16 +1134,38 @@ fn one_validator_meets_the_bounds_the_gas_and_the_edge_cases() {
         refused()
     );
     // Unvoted, they all fail at their voting ends and the slots free up;
-    // the one with the vote passed and expires unexecuted.
-    let last = gov_status(&mut node).proposals.0.last().unwrap().proposal.voting_end;
+    // the one with the vote passed, and expires unexecuted.
+    let last = gov_status(&mut node)
+        .proposals
+        .0
+        .last()
+        .unwrap()
+        .proposal
+        .voting_end;
     reach(&mut node, last + 1);
     let s = gov_status(&mut node);
     assert_eq!(s.proposals.0.len(), 1);
-    assert_eq!((s.proposals.0[0].proposal.id, s.proposals.0[0].proposal.status), (1, status::PASSED));
-    reach(&mut node, s.proposals.0[0].proposal.expires_at + 1);
+    let passed = &s.proposals.0[0].proposal;
+    assert_eq!(
+        (passed.id, passed.status, passed.yes, passed.total),
+        (1, status::PASSED, 1, 1)
+    );
+    reach(&mut node, passed.expires_at + 1);
     assert_eq!(gov_status(&mut node).proposals.0.len(), 0);
-    assert_eq!(gov_status(&mut node).guardian, governance().address, "nothing executed");
+    assert_eq!(
+        gov_status(&mut node).guardian,
+        governance().address,
+        "nothing executed"
+    );
+    assert_eq!(gov_status(&mut node).next_id, 17);
+}
 
+#[test]
+fn one_validator_meets_the_edge_cases() {
+    let validators = keys(1);
+    let mut node = start(&genesis(&validators, &[1], single(2), None));
+    let mut v0 = Sender::new(Wallet::from_key(validators[0].clone()));
+    let mut alice = Sender::new(alice());
     // A passed proposal whose action fails is executed once all the same:
     // the receipt says so and the proposal is gone.
     let unstaged = Install {
@@ -847,17 +1174,26 @@ fn one_validator_meets_the_bounds_the_gas_and_the_edge_cases() {
         capabilities: 0,
         init: vec![],
     };
-    let r = include(&mut node, &alice.call(&submit(MODULE_ADDRESS, &unstaged.encode()), DEPOSIT));
-    let id = 17;
-    let p = expected(id, alice.address(), DEPOSIT, MODULE_ADDRESS, &unstaged.encode(), r.height);
-    assert_eq!(view(&mut node, id).unwrap().proposal.voting_end, r.height + 2);
+    let r = include(
+        &mut node,
+        &alice.call(&submit(MODULE_ADDRESS, &unstaged.encode()), DEPOSIT),
+    );
+    let id = 1;
+    let p = view(&mut node, id).unwrap().proposal;
+    assert_eq!(
+        (p.voting_end, p.executable_at, p.expires_at),
+        (r.height + 2, r.height + 4, r.height + 5)
+    );
     assert_eq!(include(&mut node, &v0.call(&vote(id, true), 0)).status, 1);
     reach(&mut node, p.voting_end + 1);
     let r = include(&mut node, &alice.call(&Call::Execute { id }, 0));
     assert_eq!((r.status, r.logs.0.len()), (0, 0));
     assert_eq!(view(&mut node, id), None);
     assert_eq!(balance(&mut node, alice.address()), 100 * ETHER);
-    assert_eq!(node.submit(&alice.peek(&Call::Execute { id }, 0)), refused());
+    assert_eq!(
+        node.submit(&alice.peek(&Call::Execute { id }, 0)),
+        refused()
+    );
     // Rules that cannot work are refused when the proposal executes.
     let bad_rules = Call::SetParams {
         voting_blocks: 0,
@@ -865,8 +1201,11 @@ fn one_validator_meets_the_bounds_the_gas_and_the_edge_cases() {
         quorum_bps: 10_001,
         deposit: 0,
     };
-    let r = include(&mut node, &v0.call(&submit(GOVERNANCE_ADDRESS, &bad_rules.encode()), 0));
-    let id = 18;
+    let r = include(
+        &mut node,
+        &v0.call(&submit(GOVERNANCE_ADDRESS, &bad_rules.encode()), 0),
+    );
+    let id = 2;
     assert_eq!(include(&mut node, &v0.call(&vote(id, true), 0)).status, 1);
     reach(&mut node, r.height + 2 + 1);
     let r = include(&mut node, &v0.call(&Call::Execute { id }, 0));
@@ -878,7 +1217,14 @@ fn one_validator_meets_the_bounds_the_gas_and_the_edge_cases() {
     let tiny = tiny_kernel(&2u32.to_le_bytes(), false, None);
     let tiny_hash = keccak256(&tiny);
     for action in stage_actions(&tiny) {
-        assert_eq!(include(&mut node, &v0.tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &action.encode())).status, 1);
+        assert_eq!(
+            include(
+                &mut node,
+                &v0.tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &action.encode())
+            )
+            .status,
+            1
+        );
     }
     let h = node.block_number().unwrap() + 40;
     let propose = Action::Propose {
@@ -887,30 +1233,52 @@ fn one_validator_meets_the_bounds_the_gas_and_the_edge_cases() {
         required_gates: 0,
     }
     .encode();
-    let r = include(&mut node, &v0.call(&submit(GOVERNANCE_ADDRESS, &propose), 0));
-    let id = 19;
+    let r = include(
+        &mut node,
+        &v0.call(&submit(GOVERNANCE_ADDRESS, &propose), 0),
+    );
+    let id = 3;
     assert_eq!(include(&mut node, &v0.call(&vote(id, true), 0)).status, 1);
     reach(&mut node, r.height + 2 + 1);
     let r = include(&mut node, &v0.call(&Call::Execute { id }, 0));
-    assert_eq!((r.status, r.logs.0), (1, vec![gov::executed_log(id), proposed_log(&tiny_hash, h, 0)]));
-    assert_eq!(node.upgrade_status().unwrap().pending.unwrap().code_hash, tiny_hash);
-    let cancel = Action::Cancel { code_hash: tiny_hash }.encode();
+    assert_eq!(
+        (r.status, r.logs.0),
+        (
+            1,
+            vec![gov::executed_log(id), proposed_log(&tiny_hash, h, 0)]
+        )
+    );
+    assert_eq!(
+        node.upgrade_status().unwrap().pending.unwrap().code_hash,
+        tiny_hash
+    );
+    let cancel = Action::Cancel {
+        code_hash: tiny_hash,
+    }
+    .encode();
     let r = include(&mut node, &v0.call(&submit(GOVERNANCE_ADDRESS, &cancel), 0));
-    let id = 20;
+    let id = 4;
     assert!(view(&mut node, id).unwrap().proposal.fast_track);
     let r2 = include(&mut node, &v0.call(&vote(id, true), 0));
     assert_eq!(
         (r2.status, r2.logs.0),
-        (1, vec![gov::voted_log(id, &v0.address(), true, 1), gov::executed_log(id), cancelled_log(&tiny_hash)])
+        (
+            1,
+            vec![
+                gov::voted_log(id, &v0.address(), true, 1),
+                gov::executed_log(id),
+                cancelled_log(&tiny_hash)
+            ]
+        )
     );
     assert!(r2.height > r.height);
     assert_eq!(node.upgrade_status().unwrap().pending, None);
     assert_eq!(view(&mut node, id), None);
     // A fast-track proposal nobody carries fails at its voting end.
     let r = include(&mut node, &v0.call(&submit(GOVERNANCE_ADDRESS, &cancel), 0));
-    assert!(view(&mut node, 21).is_some());
+    assert!(view(&mut node, 5).is_some());
     reach(&mut node, r.height + 2 + 1);
-    assert_eq!(view(&mut node, 21), None);
+    assert_eq!(view(&mut node, 5), None);
     // The governance queries refuse malformed parameters.
     assert_eq!(node.query(gov::query::PROPOSAL, &[1, 2]).unwrap().status, 2);
     assert_eq!(node.query(query::CODE, &tiny_hash).unwrap().status, 0);
@@ -937,10 +1305,19 @@ fn a_chain_without_a_key_has_no_guardian_until_a_proposal_names_one() {
     assert_eq!(include(&mut node, &v0.call(&vote(1, true), 0)).status, 1);
     reach(&mut node, p.voting_end + 1);
     // Nobody can veto yet.
-    assert_eq!(node.submit(&guardian.peek(&Call::Veto { id: 1 }, 0)), refused());
+    assert_eq!(
+        node.submit(&guardian.peek(&Call::Veto { id: 1 }, 0)),
+        refused()
+    );
     reach(&mut node, p.executable_at - 1);
     let r = include(&mut node, &v0.call(&Call::Execute { id: 1 }, 0));
-    assert_eq!((r.status, r.logs.0), (1, vec![gov::executed_log(1), gov::guardian_log(&guardian.address())]));
+    assert_eq!(
+        (r.status, r.logs.0),
+        (
+            1,
+            vec![gov::executed_log(1), gov::guardian_log(&guardian.address())]
+        )
+    );
     assert_eq!(gov_status(&mut node).guardian, guardian.address());
     // Now the guardian vetoes; and a guardian set to zero is none again.
     let r = include(&mut node, &v0.call(&submit(GOVERNANCE_ADDRESS, &name), 0));
@@ -952,11 +1329,17 @@ fn a_chain_without_a_key_has_no_guardian_until_a_proposal_names_one() {
     let p = expected(3, v0.address(), 0, GOVERNANCE_ADDRESS, &clear, r.height);
     assert_eq!(include(&mut node, &v0.call(&vote(3, true), 0)).status, 1);
     reach(&mut node, p.executable_at - 1);
-    assert_eq!(include(&mut node, &v0.call(&Call::Execute { id: 3 }, 0)).status, 1);
+    assert_eq!(
+        include(&mut node, &v0.call(&Call::Execute { id: 3 }, 0)).status,
+        1
+    );
     assert_eq!(gov_status(&mut node).guardian, [0; 20]);
     let r = include(&mut node, &v0.call(&submit(GOVERNANCE_ADDRESS, &name), 0));
     assert_eq!(r.status, 1);
-    assert_eq!(node.submit(&guardian.peek(&Call::Veto { id: 4 }, 0)), refused());
+    assert_eq!(
+        node.submit(&guardian.peek(&Call::Veto { id: 4 }, 0)),
+        refused()
+    );
 }
 
 #[test]
@@ -991,10 +1374,18 @@ fn genesis_refuses_rules_that_cannot_work() {
         ..rules(mode::STAKE)
     });
     // The key track needs no voting period: `setMode` checks it at the switch.
-    let mut node = start(&genesis(&validators, &[1], GovernanceParams::default(), None));
+    let mut node = start(&genesis(
+        &validators,
+        &[1],
+        GovernanceParams::default(),
+        None,
+    ));
     let mut key = Sender::new(governance());
     let switch = Call::SetMode { mode: mode::STAKE }.encode();
-    let r = include(&mut node, &key.call(&submit(GOVERNANCE_ADDRESS, &switch), 0));
+    let r = include(
+        &mut node,
+        &key.call(&submit(GOVERNANCE_ADDRESS, &switch), 0),
+    );
     assert_eq!((r.status, gov_status(&mut node).mode), (0, mode::KEY));
     let fix = Call::SetParams {
         voting_blocks: 1,
@@ -1003,8 +1394,14 @@ fn genesis_refuses_rules_that_cannot_work() {
         deposit: 0,
     }
     .encode();
-    assert_eq!(include(&mut node, &key.call(&submit(GOVERNANCE_ADDRESS, &fix), 0)).status, 1);
-    let r = include(&mut node, &key.call(&submit(GOVERNANCE_ADDRESS, &switch), 0));
+    assert_eq!(
+        include(&mut node, &key.call(&submit(GOVERNANCE_ADDRESS, &fix), 0)).status,
+        1
+    );
+    let r = include(
+        &mut node,
+        &key.call(&submit(GOVERNANCE_ADDRESS, &switch), 0),
+    );
     assert_eq!((r.status, gov_status(&mut node).mode), (1, mode::STAKE));
     // Under the key the module address took the key's installs; a chain
     // without a key under the key track takes nothing at all.
@@ -1030,12 +1427,18 @@ fn selectors_and_topics_are_the_solidity_ones() {
     assert_eq!(sel("pause(address)"), selector::PAUSE);
     assert_eq!(sel("setGuardian(address)"), selector::SET_GUARDIAN);
     assert_eq!(sel("setMode(uint8)"), selector::SET_MODE);
-    assert_eq!(sel("setParams(uint64,uint64,uint64,uint256)"), selector::SET_PARAMS);
+    assert_eq!(
+        sel("setParams(uint64,uint64,uint64,uint256)"),
+        selector::SET_PARAMS
+    );
     assert_eq!(
         keccak256(b"ProposalSubmitted(uint64,address,address,bytes,uint64)"),
         event::SUBMITTED
     );
-    assert_eq!(keccak256(b"Voted(uint64,address,bool,uint64)"), event::VOTED);
+    assert_eq!(
+        keccak256(b"Voted(uint64,address,bool,uint64)"),
+        event::VOTED
+    );
     assert_eq!(keccak256(b"ProposalExecuted(uint64)"), event::EXECUTED);
     assert_eq!(keccak256(b"ProposalVetoed(uint64)"), event::VETOED);
     assert_eq!(keccak256(b"Enacted(address,address,bytes)"), event::ENACTED);

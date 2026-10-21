@@ -150,7 +150,10 @@ fn proposals_are_read_from_submission_to_execution() {
         json!({"yes": "0x0", "no": "0x0", "total": "0x7"})
     );
     assert_eq!(p["votes"], json!([]));
-    assert_eq!(ok(&mut rpc, "solo_getGovernance", json!([]))["nextId"], "0x2");
+    assert_eq!(
+        ok(&mut rpc, "solo_getGovernance", json!([]))["nextId"],
+        "0x2"
+    );
 
     // The validator votes yes; the tally and the vote show at once.
     let voter = validator();
@@ -192,7 +195,10 @@ fn proposals_are_read_from_submission_to_execution() {
     }
     let p = ok(&mut rpc, "solo_getProposal", json!(["0x1"]));
     assert_eq!(p["status"], "passed");
-    assert_eq!(ok(&mut rpc, "solo_getProposals", json!([]))[0]["status"], "passed");
+    assert_eq!(
+        ok(&mut rpc, "solo_getProposals", json!([]))[0]["status"],
+        "passed"
+    );
     // Anyone executes it once the timelock is over; then nothing is open.
     while rpc.node_mut().block_number().unwrap() + 1 < submitted + 4 {
         tick(&mut rpc, 1);
@@ -219,6 +225,22 @@ fn proposals_are_read_from_submission_to_execution() {
     assert_eq!(status["proposals"], json!([]));
     // Parameter errors.
     assert_eq!(err_code(&mut rpc, "solo_getProposal", json!([])), -32602);
-    assert_eq!(err_code(&mut rpc, "solo_getProposal", json!(["zz"])), -32602);
+    assert_eq!(
+        err_code(&mut rpc, "solo_getProposal", json!(["zz"])),
+        -32602
+    );
     assert_eq!(err_code(&mut rpc, "solo_getProposal", json!([1])), -32602);
+}
+
+#[test]
+fn a_development_chain_reads_as_the_key_track() {
+    let alice = Wallet::new(1);
+    let mut rpc = Rpc::new(common::node(&alice));
+    let status = ok(&mut rpc, "solo_getGovernance", json!([]));
+    assert_eq!(status["mode"], "key");
+    assert_eq!(status["key"], data(&[0; 20]));
+    assert_eq!(status["guardian"], data(&[0; 20]));
+    assert_eq!(status["params"]["votingBlocks"], "0x0");
+    assert_eq!(status["proposals"], json!([]));
+    assert_eq!(ok(&mut rpc, "solo_getProposals", json!([])), json!([]));
 }

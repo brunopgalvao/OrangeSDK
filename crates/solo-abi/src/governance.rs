@@ -549,7 +549,8 @@ pub fn quorum(yes: u64, no: u64, total: u64, quorum_bps: u64) -> bool {
 /// thirds of the stake that voted said yes.
 #[must_use]
 pub fn passes(yes: u64, no: u64, total: u64, quorum_bps: u64) -> bool {
-    quorum(yes, no, total, quorum_bps) && u128::from(yes) * 3 > (u128::from(yes) + u128::from(no)) * 2
+    quorum(yes, no, total, quorum_bps)
+        && u128::from(yes) * 3 > (u128::from(yes) + u128::from(no)) * 2
 }
 
 /// Whether a fast-track proposal passes: more than half of all stake said yes.
@@ -705,7 +706,12 @@ mod tests {
         assert_eq!((mode::KEY, mode::STAKE), (0, 1));
         assert_eq!((status::VOTING, status::PASSED), (0, 1));
         assert_eq!(
-            (MAX_OPEN_PROPOSALS, MAX_PROPOSAL_DATA, GOVERNANCE_GAS, ACTION_GAS),
+            (
+                MAX_OPEN_PROPOSALS,
+                MAX_PROPOSAL_DATA,
+                GOVERNANCE_GAS,
+                ACTION_GAS
+            ),
             (16, 32_768, 50_000, 1 << 26)
         );
         assert_eq!(
@@ -772,7 +778,11 @@ mod tests {
             },
         ];
         for call in &calls {
-            assert_eq!(Call::decode(&call.encode()).as_ref(), Some(call), "{call:?}");
+            assert_eq!(
+                Call::decode(&call.encode()).as_ref(),
+                Some(call),
+                "{call:?}"
+            );
         }
         let submit = calls[0].encode();
         assert_eq!(submit.len(), 4 + 32 * 4);
@@ -918,7 +928,10 @@ mod tests {
         assert_eq!((l.data[31], l.data[63], l.data[95]), (64, 13, 3));
         assert_eq!(&l.data[96..99], &[3, 4, 5]);
         let l = voted_log(7, &[1; 20], true, 4);
-        assert_eq!(l.topics.0, vec![event::VOTED, word(7), address_word(&[1; 20])]);
+        assert_eq!(
+            l.topics.0,
+            vec![event::VOTED, word(7), address_word(&[1; 20])]
+        );
         assert_eq!(l.data, [word(1), word(4)].concat());
         assert_eq!(executed_log(7).topics.0, vec![event::EXECUTED, word(7)]);
         assert!(executed_log(7).data.is_empty());
@@ -926,7 +939,11 @@ mod tests {
         let l = enacted_log(&[1; 20], &[2; 20], &[9; 40]);
         assert_eq!(
             l.topics.0,
-            vec![event::ENACTED, address_word(&[1; 20]), address_word(&[2; 20])]
+            vec![
+                event::ENACTED,
+                address_word(&[1; 20]),
+                address_word(&[2; 20])
+            ]
         );
         assert_eq!(l.data.len(), 128);
         assert_eq!((l.data[31], l.data[63]), (32, 40));

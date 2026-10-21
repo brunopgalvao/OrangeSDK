@@ -426,17 +426,19 @@ fn parse_peers(args: &[String]) -> Result<Vec<std::net::SocketAddr>, String> {
 /// What the commands that run no node print: `key`, `doctor` and `gov`.
 /// `None` for any other command.
 fn tool_output(command: &str, args: &[String]) -> Option<Result<String, CliError>> {
-    Some(match command {
-        "key" => args
-            .get(2)
-            .ok_or_else(|| "key: expected 64 hex digits".to_owned())
-            .and_then(|hex| parse_key(hex))
-            .map(|key| describe_key(&key)),
-        "doctor" => doctor::run(args),
-        "gov" => gov::parse(args.get(2..).unwrap_or(&[])).map(|call| gov::describe(&call)),
-        _ => return None,
-    }
-    .map_err(CliError::from))
+    Some(
+        match command {
+            "key" => args
+                .get(2)
+                .ok_or_else(|| "key: expected 64 hex digits".to_owned())
+                .and_then(|hex| parse_key(hex))
+                .map(|key| describe_key(&key)),
+            "doctor" => doctor::run(args),
+            "gov" => gov::parse(args.get(2..).unwrap_or(&[])).map(|call| gov::describe(&call)),
+            _ => return None,
+        }
+        .map_err(CliError::from),
+    )
 }
 
 fn run_inner(

@@ -37,7 +37,9 @@ fn address(text: &str, what: &str) -> Result<[u8; 20], String> {
 }
 
 fn number(text: &str, what: &str) -> Result<u64, String> {
-    text.parse().ok().ok_or_else(|| format!("gov: {what} must be a number"))
+    text.parse()
+        .ok()
+        .ok_or_else(|| format!("gov: {what} must be a number"))
 }
 
 fn wei(text: &str, what: &str) -> Result<u128, String> {
@@ -46,7 +48,9 @@ fn wei(text: &str, what: &str) -> Result<u128, String> {
         None => (text, 10),
     };
     if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
-        return Err(format!("gov: {what} must be a decimal or 0x hex amount in wei"));
+        return Err(format!(
+            "gov: {what} must be a decimal or 0x hex amount in wei"
+        ));
     }
     u128::from_str_radix(digits, radix)
         .ok()
