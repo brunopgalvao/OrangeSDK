@@ -184,7 +184,7 @@ Each costs `200 + 2 · g` VM gas, `g` being the Ethereum (Osaka) gas of the oper
 
 ## 5. Determinism requirements on the host
 
-Every function in §4.1–§4.4 MUST return identical results on every node given identical chain state and arguments. Functions in §4.5–§4.7 have no result the program can branch on except a status that MUST be `0` whenever the arguments are well-formed; a host that cannot send a message still returns `0` and drops it. This is what allows the driver to be a pure state machine over host effects.
+Every function in §4.1–§4.4 and §4.8 MUST return identical results on every node given identical chain state and arguments. For §4.8 that means the result, and whether the operation fails, equal what revm 43's `Crypto` trait computes by default on its pure-Rust backends (arkworks for bn254, BLS12-381 and KZG, aurora-engine-modexp for modexp): a host built with another backend, such as revm-precompile's `blst` or `c-kzg` features, may disagree on an input the backends treat differently and fork. `crates/solo-host/tests/precompile_backends.rs` fails if any build of the workspace turns on a revm-precompile feature other than `std`, since Cargo's feature unification would swap the backend silently. Functions in §4.5–§4.7 have no result the program can branch on except a status that MUST be `0` whenever the arguments are well-formed; a host that cannot send a message still returns `0` and drops it. This is what allows the driver to be a pure state machine over host effects.
 
 ## 6. Status and error codes
 
