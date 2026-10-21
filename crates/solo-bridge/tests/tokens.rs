@@ -47,7 +47,7 @@ use solo_ethlc::testing::{Chain, EthState, Native};
 use solo_node::keystore::encryption_key;
 use solo_node::{NodeConfig, Sim, SubmitError, validator_id};
 use solo_trie::keccak256;
-use support::eth::{ETH_CHAIN_ID, Eth, Outcome, init_code, selector};
+use support::eth::{ETH_CHAIN_ID, Eth, Outcome, init_code, runtime_code, selector};
 use support::solo::{CHAIN_ID, ETHER, address, create_address, kernel_module, key, tx_priced};
 
 const SLOT_MS: u64 = 200;
@@ -665,6 +665,13 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
         ("FIRST_MINT_GAS", minted.gas_used, FIRST_MINT_GAS),
         ("MINT_GAS", minted_again.gas_used, MINT_GAS),
     ]);
+    // Spec 21 §5.1 and §8: creating the wrapped token costs about 720 000 gas, mostly the code
+    // deposit of its 2 779-byte runtime.
+    assert_eq!(runtime_code("BridgedToken").len(), 2_779);
+    assert_eq!(
+        (FIRST_MINT_GAS - MINT_GAS).div_ceil(10_000) * 10_000,
+        720_000
+    );
     // A replay is refused at admission.
     let replay = solo.raw(
         &relayer,
