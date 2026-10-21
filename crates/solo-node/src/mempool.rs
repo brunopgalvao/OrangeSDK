@@ -94,7 +94,9 @@ impl fmt::Display for PoolError {
             PoolError::Full => "txpool is full",
             PoolError::Oversized => "oversized data",
             PoolError::Overdraft => "insufficient funds for gas * price + value",
-            PoolError::InflightLimit => "in-flight transaction limit reached for delegated accounts",
+            PoolError::InflightLimit => {
+                "in-flight transaction limit reached for delegated accounts"
+            }
             PoolError::AuthorityReserved => "authority already reserved",
         })
     }
@@ -384,7 +386,8 @@ impl Mempool {
         // A delegated account's code can spend its balance outside its own
         // transactions, so the pool holds at most one of them at a time, as
         // geth does; a replacement of it is still allowed.
-        let delegated = queue.account.code_hash != [0; 32] || self.authorities.contains_key(&tx.sender);
+        let delegated =
+            queue.account.code_hash != [0; 32] || self.authorities.contains_key(&tx.sender);
         if delegated && !queue.txs.contains_key(&tx.nonce) {
             return Err(PoolError::InflightLimit);
         }

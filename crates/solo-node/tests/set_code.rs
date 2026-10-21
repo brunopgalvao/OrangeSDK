@@ -40,7 +40,10 @@ fn authorization(authority: &Wallet, chain_id: u64, address: [u8; 20], nonce: u6
     encode_uint(u128::from(nonce), &mut body);
     let mut message = vec![0x05];
     encode_list(&body, &mut message);
-    let (sig, rid) = authority.key.sign_prehash_recoverable(&keccak256(&message)).unwrap();
+    let (sig, rid) = authority
+        .key
+        .sign_prehash_recoverable(&keccak256(&message))
+        .unwrap();
     encode_uint(u128::from(rid.to_byte()), &mut body);
     encode_bytes(&strip(&sig.r().to_bytes()), &mut body);
     encode_bytes(&strip(&sig.s().to_bytes()), &mut body);
@@ -50,7 +53,13 @@ fn authorization(authority: &Wallet, chain_id: u64, address: [u8; 20], nonce: u6
 }
 
 /// A set-code transaction of `sender` to `to` carrying the encoded `auths`.
-fn set_code_tx(sender: &Wallet, nonce: u64, to: [u8; 20], auths: &[Vec<u8>], data: &[u8]) -> Vec<u8> {
+fn set_code_tx(
+    sender: &Wallet,
+    nonce: u64,
+    to: [u8; 20],
+    auths: &[Vec<u8>],
+    data: &[u8],
+) -> Vec<u8> {
     let mut fields = Vec::new();
     for n in [u128::from(CHAIN_ID), u128::from(nonce), 0, 0, 200_000] {
         encode_uint(n, &mut fields);
@@ -62,7 +71,10 @@ fn set_code_tx(sender: &Wallet, nonce: u64, to: [u8; 20], auths: &[Vec<u8>], dat
     encode_list(&auths.concat(), &mut fields);
     let mut unsigned = vec![0x04];
     encode_list(&fields, &mut unsigned);
-    let (sig, rid) = sender.key.sign_prehash_recoverable(&keccak256(&unsigned)).unwrap();
+    let (sig, rid) = sender
+        .key
+        .sign_prehash_recoverable(&keccak256(&unsigned))
+        .unwrap();
     encode_uint(u128::from(rid.to_byte()), &mut fields);
     encode_bytes(&strip(&sig.r().to_bytes()), &mut fields);
     encode_bytes(&strip(&sig.s().to_bytes()), &mut fields);
@@ -90,10 +102,24 @@ fn address_word(address: &[u8; 20]) -> [u8; 32] {
 fn genesis(validators: &[k256::ecdsa::SigningKey], funded: &[[u8; 20]]) -> Genesis {
     let mut allocations: Vec<Allocation> = funded
         .iter()
-        .map(|a| Allocation { address: *a, balance: 100 * ETHER, ..Allocation::default() })
+        .map(|a| Allocation {
+            address: *a,
+            balance: 100 * ETHER,
+            ..Allocation::default()
+        })
         .collect();
-    allocations.push(Allocation { address: DELEGATE, code: DELEGATE_CODE.to_vec(), nonce: 1, ..Allocation::default() });
-    let params = GenesisParams { slot_ms: SLOT_MS, max_txs: 100, allocations: Seq(allocations), ..GenesisParams::default() };
+    allocations.push(Allocation {
+        address: DELEGATE,
+        code: DELEGATE_CODE.to_vec(),
+        nonce: 1,
+        ..Allocation::default()
+    });
+    let params = GenesisParams {
+        slot_ms: SLOT_MS,
+        max_txs: 100,
+        allocations: Seq(allocations),
+        ..GenesisParams::default()
+    };
     Genesis {
         chain_id: CHAIN_ID,
         fee_schedule: vec![],
@@ -110,7 +136,10 @@ fn an_account_delegates_and_calls_itself_across_validators() {
     let carol = Wallet::new(0x73);
     let validators = keys(3);
     let genesis = genesis(&validators, &[alice.address]);
-    let template = NodeConfig { now_ms: 1_000, ..NodeConfig::default() };
+    let template = NodeConfig {
+        now_ms: 1_000,
+        ..NodeConfig::default()
+    };
     let mut sim = Sim::new(v1(), &genesis, &validators, 1, &template, 20).unwrap();
     // Alice authorizes the delegate for herself (at her nonce after this
     // transaction's), Bob for himself, and Carol for another chain; then calls
@@ -122,7 +151,13 @@ fn an_account_delegates_and_calls_itself_across_validators() {
     ];
     let first = set_code_tx(&alice, 0, alice.address, &auths, &[]);
     let hash = sim.submit(0, &first).unwrap();
-    assert!(sim.run_until(60 * SLOT_MS, |s| s.nodes.iter_mut().all(|n| n.receipt(&hash).unwrap().is_some())).unwrap());
+    assert!(
+        sim.run_until(60 * SLOT_MS, |s| s
+            .nodes
+            .iter_mut()
+            .all(|n| n.receipt(&hash).unwrap().is_some()))
+            .unwrap()
+    );
     let observer = sim.nodes.len() - 1;
     let node = &mut sim.nodes[observer];
     let receipt = node.receipt(&hash).unwrap().unwrap();
@@ -130,32 +165,60 @@ fn an_account_delegates_and_calls_itself_across_validators() {
     // The delegate's code ran in Alice's context, Alice its caller.
     assert_eq!(receipt.logs.0.len(), 1);
     assert_eq!(receipt.logs.0[0].address, alice.address);
-    assert_eq!(receipt.logs.0[0].topics.0, vec![address_word(&alice.address)]);
+    assert_eq!(
+        receipt.logs.0[0].topics.0,
+        vec![address_word(&alice.address)]
+    );
     assert_eq!(node.code(&alice.address).unwrap(), designator(DELEGATE));
     assert_eq!(node.code(&bob.address).unwrap(), designator(DELEGATE));
-    assert!(node.code(&carol.address).unwrap().is_empty(), "another chain's authorization is skipped");
+    assert!(
+        node.code(&carol.address).unwrap().is_empty(),
+        "another chain's authorization is skipped"
+    );
     assert_eq!(node.storage(&alice.address, &word(0)).unwrap(), word(1));
-    assert_eq!(node.storage(&alice.address, &word(1)).unwrap(), address_word(&alice.address));
+    assert_eq!(
+        node.storage(&alice.address, &word(1)).unwrap(),
+        address_word(&alice.address)
+    );
     // Her nonce moved for the transaction and for her authorization; Bob's for his.
     assert_eq!(node.account(&alice.address).unwrap().nonce, 2);
     assert_eq!(node.account(&bob.address).unwrap().nonce, 1);
     // Intrinsic gas: 21 000 plus 25 000 per authorization, less the refund of
     // 12 500 for each authority that existed (Alice), plus the code that ran.
-    assert!(receipt.gas_used > 21_000 + 2 * 25_000, "{}", receipt.gas_used);
+    assert!(
+        receipt.gas_used > 21_000 + 2 * 25_000,
+        "{}",
+        receipt.gas_used
+    );
     // A delegated account still sends (EIP-3607 allows a designator), and a
     // call to it runs the delegate again.
     let again = alice.tx(2, alice.address, 0, 100_000, &[]);
     let hash = sim.submit(1, &again).unwrap();
-    assert!(sim.run_until(60 * SLOT_MS, |s| s.nodes.iter_mut().all(|n| n.receipt(&hash).unwrap().is_some())).unwrap());
+    assert!(
+        sim.run_until(60 * SLOT_MS, |s| s
+            .nodes
+            .iter_mut()
+            .all(|n| n.receipt(&hash).unwrap().is_some()))
+            .unwrap()
+    );
     let node = &mut sim.nodes[observer];
     assert_eq!(node.receipt(&hash).unwrap().unwrap().status, 1);
     assert_eq!(node.storage(&alice.address, &word(0)).unwrap(), word(2));
     // Calling Bob runs the delegate in Bob's storage, Alice the caller.
     let call_bob = alice.tx(3, bob.address, 0, 100_000, &[]);
     let hash = sim.submit(2, &call_bob).unwrap();
-    assert!(sim.run_until(60 * SLOT_MS, |s| s.nodes.iter_mut().all(|n| n.receipt(&hash).unwrap().is_some())).unwrap());
+    assert!(
+        sim.run_until(60 * SLOT_MS, |s| s
+            .nodes
+            .iter_mut()
+            .all(|n| n.receipt(&hash).unwrap().is_some()))
+            .unwrap()
+    );
     let node = &mut sim.nodes[observer];
-    assert_eq!(node.storage(&bob.address, &word(1)).unwrap(), address_word(&alice.address));
+    assert_eq!(
+        node.storage(&bob.address, &word(1)).unwrap(),
+        address_word(&alice.address)
+    );
     // Every node recorded the same blocks, under the same Ethereum hashes.
     let height = node.block_number().unwrap();
     let hashes: Vec<_> = sim
@@ -167,7 +230,12 @@ fn an_account_delegates_and_calls_itself_across_validators() {
         })
         .collect();
     assert!(hashes.iter().all(|h| *h == hashes[0]));
-    let executed = sim.nodes[0].executed.iter().find(|(h, _)| *h == height).unwrap().1;
+    let executed = sim.nodes[0]
+        .executed
+        .iter()
+        .find(|(h, _)| *h == height)
+        .unwrap()
+        .1;
     assert_eq!(executed, hashes[0]);
 }
 
@@ -177,32 +245,80 @@ fn a_delegated_account_may_have_one_transaction_in_the_pool() {
     let bob = Wallet::new(0x75);
     let validators = keys(1);
     let genesis = genesis(&validators, &[alice.address, bob.address]);
-    let mut node = solo_node::Node::open(v1(), &genesis, NodeConfig { key: Some(validators[0].clone()), now_ms: 1_000, ..NodeConfig::default() }).unwrap();
+    let mut node = solo_node::Node::open(
+        v1(),
+        &genesis,
+        NodeConfig {
+            key: Some(validators[0].clone()),
+            now_ms: 1_000,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
     node.start(None).unwrap();
     // Before delegating, Alice may queue several.
-    assert!(node.submit(&alice.tx(0, bob.address, 1, 21_000, &[])).is_ok());
-    assert!(node.submit(&alice.tx(1, bob.address, 1, 21_000, &[])).is_ok());
+    assert!(
+        node.submit(&alice.tx(0, bob.address, 1, 21_000, &[]))
+            .is_ok()
+    );
+    assert!(
+        node.submit(&alice.tx(1, bob.address, 1, 21_000, &[]))
+            .is_ok()
+    );
     let receipt = include(&mut node, &alice.tx(2, bob.address, 1, 21_000, &[]));
     assert_eq!(receipt.status, 1);
     // A set-code transaction naming Bob as authority while Bob has two
     // transactions waiting is refused; with one waiting it is admitted.
-    assert!(node.submit(&bob.tx(0, alice.address, 1, 21_000, &[])).is_ok());
-    assert!(node.submit(&bob.tx(5, alice.address, 1, 21_000, &[])).is_ok());
-    let delegate_bob = set_code_tx(&alice, 3, alice.address, &[authorization(&bob, CHAIN_ID, DELEGATE, 1)], &[]);
-    assert_eq!(node.submit(&delegate_bob), Err(SubmitError::Pool(PoolError::AuthorityReserved)));
+    assert!(
+        node.submit(&bob.tx(0, alice.address, 1, 21_000, &[]))
+            .is_ok()
+    );
+    assert!(
+        node.submit(&bob.tx(5, alice.address, 1, 21_000, &[]))
+            .is_ok()
+    );
+    let delegate_bob = set_code_tx(
+        &alice,
+        3,
+        alice.address,
+        &[authorization(&bob, CHAIN_ID, DELEGATE, 1)],
+        &[],
+    );
+    assert_eq!(
+        node.submit(&delegate_bob),
+        Err(SubmitError::Pool(PoolError::AuthorityReserved))
+    );
     // Alice delegates herself.
-    let receipt = include(&mut node, &set_code_tx(&alice, 3, alice.address, &[authorization(&alice, CHAIN_ID, DELEGATE, 4)], &[]));
+    let receipt = include(
+        &mut node,
+        &set_code_tx(
+            &alice,
+            3,
+            alice.address,
+            &[authorization(&alice, CHAIN_ID, DELEGATE, 4)],
+            &[],
+        ),
+    );
     assert_eq!(receipt.status, 1);
     assert_eq!(node.code(&alice.address).unwrap(), designator(DELEGATE));
     // Now one in flight at a time; a replacement of it is still allowed.
     let one = alice.tx(5, bob.address, 1, 21_000, &[]);
     assert!(node.submit(&one).is_ok());
-    assert_eq!(node.submit(&alice.tx(6, bob.address, 1, 21_000, &[])), Err(SubmitError::Pool(PoolError::InflightLimit)));
+    assert_eq!(
+        node.submit(&alice.tx(6, bob.address, 1, 21_000, &[])),
+        Err(SubmitError::Pool(PoolError::InflightLimit))
+    );
     assert_eq!(
         PoolError::InflightLimit.to_string(),
         "in-flight transaction limit reached for delegated accounts"
     );
-    assert_eq!(PoolError::AuthorityReserved.to_string(), "authority already reserved");
+    assert_eq!(
+        PoolError::AuthorityReserved.to_string(),
+        "authority already reserved"
+    );
     // A set-code transaction that does not decode is refused for it.
-    assert_eq!(node.submit(&[0x04, 0xC0]), Err(SubmitError::Rejected(reason::MALFORMED)));
+    assert_eq!(
+        node.submit(&[0x04, 0xC0]),
+        Err(SubmitError::Rejected(reason::MALFORMED))
+    );
 }

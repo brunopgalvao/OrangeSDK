@@ -216,7 +216,9 @@ fn authorization_list(item: &Item<'_>) -> Result<Vec<Authorization>, Error> {
             chain_id: chain_id.u256().ok().ok_or(Error::Malformed)?,
             address: address.array().ok().ok_or(Error::Malformed)?,
             nonce: u64_of(nonce)?,
-            y_parity: u8::try_from(u64_of(y_parity)?).ok().ok_or(Error::Malformed)?,
+            y_parity: u8::try_from(u64_of(y_parity)?)
+                .ok()
+                .ok_or(Error::Malformed)?,
             r: r.u256().ok().ok_or(Error::Malformed)?,
             s: s.u256().ok().ok_or(Error::Malformed)?,
         });
@@ -308,8 +310,12 @@ fn typed(tx_type: u8, body: &[u8]) -> Result<Tx, Error> {
     // Every type shares a layout once the dynamic-fee types' priority fee and
     // the set-code type's authorization list are set aside.
     let (chain_id, nonce, priority_fee, gas_price, rest, unsigned) = match (tx_type, fields) {
-        (1, [chain_id, nonce, gas_price, rest @ ..]) if rest.len() == 8 => (chain_id, nonce, None, gas_price, rest, 8),
-        (2, [chain_id, nonce, priority, max_fee, rest @ ..]) if rest.len() == 8 => (chain_id, nonce, Some(priority), max_fee, rest, 9),
+        (1, [chain_id, nonce, gas_price, rest @ ..]) if rest.len() == 8 => {
+            (chain_id, nonce, None, gas_price, rest, 8)
+        }
+        (2, [chain_id, nonce, priority, max_fee, rest @ ..]) if rest.len() == 8 => {
+            (chain_id, nonce, Some(priority), max_fee, rest, 9)
+        }
         (SET_CODE_TX_TYPE, [chain_id, nonce, priority, max_fee, rest @ ..]) if rest.len() == 9 => {
             (chain_id, nonce, Some(priority), max_fee, rest, 10)
         }
@@ -317,10 +323,17 @@ fn typed(tx_type: u8, body: &[u8]) -> Result<Tx, Error> {
     };
     // The arms checked that eight fields remain, nine with an authorization list.
     let (gas_limit, to, value, input, list) = (&rest[0], &rest[1], &rest[2], &rest[3], &rest[4]);
-    let (parity, r, s) = (&rest[rest.len() - 3], &rest[rest.len() - 2], &rest[rest.len() - 1]);
+    let (parity, r, s) = (
+        &rest[rest.len() - 3],
+        &rest[rest.len() - 2],
+        &rest[rest.len() - 1],
+    );
     let (authorizations, to) = if tx_type == SET_CODE_TX_TYPE {
         // A set-code transaction cannot create a contract.
-        (authorization_list(&rest[5])?, Some(to.array().ok().ok_or(Error::Malformed)?))
+        (
+            authorization_list(&rest[5])?,
+            Some(to.array().ok().ok_or(Error::Malformed)?),
+        )
     } else {
         (Vec::new(), to_field(to)?)
     };

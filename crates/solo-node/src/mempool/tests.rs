@@ -451,7 +451,10 @@ fn delegated_senders_and_authorities_are_limited_as_geth_limits_them() {
     // another nonce does not, a replacement does.
     pool.insert(tx(1, 0, 10), delegated.clone()).unwrap();
     assert_eq!(pool.check(&tx(1, 1, 10)), Err(PoolError::InflightLimit));
-    assert_eq!(pool.insert(tx(1, 1, 10), delegated), Err(PoolError::InflightLimit));
+    assert_eq!(
+        pool.insert(tx(1, 1, 10), delegated),
+        Err(PoolError::InflightLimit)
+    );
     assert!(pool.insert(tx(1, 0, 20), rich(0)).is_ok());
     // A set-code transaction naming sender 2 as authority makes sender 2
     // delegated for the pool, until it leaves.
@@ -470,7 +473,10 @@ fn delegated_senders_and_authorities_are_limited_as_geth_limits_them() {
         authorities: vec![[2; 20], [9; 20]],
         ..tx(4, 0, 10)
     };
-    assert_eq!(add(&mut pool, &naming_two), Err(PoolError::AuthorityReserved));
+    assert_eq!(
+        add(&mut pool, &naming_two),
+        Err(PoolError::AuthorityReserved)
+    );
     // An authority with one transaction may be named; removal forgets it.
     let naming_one = PoolTx {
         authorities: vec![[1; 20], [1; 20]],

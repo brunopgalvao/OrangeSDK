@@ -8,8 +8,7 @@ use solo_eth::Tx;
 
 use crate::RpcError;
 use crate::hex::{
-    data, parse_address, parse_big, parse_hash, parse_hex, parse_quantity, parse_word,
-    quantity_be,
+    data, parse_address, parse_big, parse_hash, parse_hex, parse_quantity, parse_word, quantity_be,
 };
 
 /// The error for an `accessList` that is not a list of entries.
@@ -171,7 +170,12 @@ pub fn min_gas(request: &CallRequest) -> u64 {
                 keys: item.keys.0.clone(),
             })
             .collect(),
-        authorization_list: request.authorization_list.0.iter().map(eth_authorization).collect(),
+        authorization_list: request
+            .authorization_list
+            .0
+            .iter()
+            .map(eth_authorization)
+            .collect(),
         v: 0,
         r: [0; 32],
         s: [0; 32],

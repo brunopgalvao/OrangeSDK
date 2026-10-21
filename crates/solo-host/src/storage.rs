@@ -122,11 +122,17 @@ struct History {
 }
 
 impl History {
-    /// The value `key` held when version `at` was sealed, if anything wrote
-    /// it since; `None` when it still holds that value.
-    fn at(&self, key: &[u8], at: u64) -> Option<Option<Vec<u8>>> {
-        let later = self.versions.get(key).and_then(|v| v.range(at + 1..).next());
-        later.map(|(_, old)| old).or_else(|| self.pending.get(key)).cloned()
+    /// The value `key` held when version `at` was sealed, given `current`,
+    /// the value it holds now.
+    fn at(&self, key: &[u8], at: u64, current: Option<Vec<u8>>) -> Option<Vec<u8>> {
+        let later = self
+            .versions
+            .get(key)
+            .and_then(|v| v.range(at + 1..).next());
+        match later.map(|(_, old)| old).or_else(|| self.pending.get(key)) {
+            Some(old) => old.clone(),
+            None => current,
+        }
     }
 }
 
@@ -274,13 +280,11 @@ impl MemStorage {
 
 impl Storage for MemStorage {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        if let Some((history, at)) = self.viewed()
-            && committed(key)
-            && let Some(old) = history.at(key, at)
-        {
-            return old;
+        let current = self.map.get(key).cloned();
+        match self.viewed() {
+            Some((history, at)) if committed(key) => history.at(key, at, current),
+            _ => current,
         }
-        self.map.get(key).cloned()
     }
 
     fn set(&mut self, key: &[u8], value: &[u8]) {
@@ -324,9 +328,8 @@ impl Storage for MemStorage {
                     .take_while(|k| k.starts_with(prefix)),
             );
         for key in written {
-            if let Some(old) = history.at(key, at) {
-                merged.insert(key.clone(), old);
-            }
+            let current = merged.get(key).cloned().flatten();
+            merged.insert(key.clone(), history.at(key, at, current));
         }
         merged
             .into_iter()
@@ -759,6 +762,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::many_single_char_names)]
     fn history_reads_every_sealed_version() {
         let mut s = MemStorage::default();
         s.set(b"a", b"0");
@@ -797,7 +801,13 @@ mod tests {
         let (a, b, c, all) = read(&mut s, 0);
         assert_eq!((a, b, c), (Some(b"0".to_vec()), None, None));
         // Local keys read as they are, whatever the view.
-        assert_eq!(all, vec![(b"a".to_vec(), b"0".to_vec()), (b"local/x".to_vec(), b"1".to_vec())]);
+        assert_eq!(
+            all,
+            vec![
+                (b"a".to_vec(), b"0".to_vec()),
+                (b"local/x".to_vec(), b"1".to_vec())
+            ]
+        );
         let (a, b, c, _) = read(&mut s, 1);
         assert_eq!((a, b, c), (Some(b"1b".to_vec()), Some(b"1".to_vec()), None));
         let (a, b, c, all) = read(&mut s, 2);

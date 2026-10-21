@@ -61,7 +61,7 @@ pub fn response(
     account: Option<&solo_abi::chain::Account>,
     state_root: &[u8; 32],
     account_proof: &Proof,
-    storage: Vec<Value>,
+    storage: &[Value],
 ) -> Value {
     let default = solo_abi::chain::Account::default();
     let a = account.unwrap_or(&default);

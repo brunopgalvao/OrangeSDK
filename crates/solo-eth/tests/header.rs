@@ -2,12 +2,17 @@
 //! implementations: alloy's header encoding and hash, alloy's receipt
 //! envelopes and `alloy-trie`'s ordered roots, and a mainnet block.
 
-use alloy_consensus::{Eip658Value, Header as AlloyHeader, Receipt as AlloyReceipt, ReceiptEnvelope, ReceiptWithBloom};
+use alloy_consensus::{
+    Eip658Value, Header as AlloyHeader, Receipt as AlloyReceipt, ReceiptEnvelope, ReceiptWithBloom,
+};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, B64, B256, Bloom, Bytes, Log as AlloyLog, LogData, U256};
 use solo_abi::chain::{BlockHeader, Log, Receipt};
 use solo_abi::codec::Seq;
-use solo_eth::header::{EMPTY_OMMERS_HASH, EMPTY_REQUESTS_HASH, Header, accrue, block_hash, receipt_bloom, receipt_envelope};
+use solo_eth::header::{
+    EMPTY_OMMERS_HASH, EMPTY_REQUESTS_HASH, Header, accrue, block_hash, receipt_bloom,
+    receipt_envelope,
+};
 use solo_eth::mpt::{EMPTY_ROOT, ordered_root};
 use tiny_keccak::{Hasher, Keccak};
 
@@ -47,7 +52,6 @@ fn alloy_header(header: &Header) -> AlloyHeader {
         excess_blob_gas: Some(header.excess_blob_gas),
         parent_beacon_block_root: Some(B256::from(header.parent_beacon_block_root)),
         requests_hash: Some(B256::from(header.requests_hash)),
-        ..AlloyHeader::default()
     }
 }
 
@@ -83,13 +87,19 @@ fn solo_header_matches_alloy() {
     alloy_rlp::Encodable::encode(&theirs, &mut encoded);
     assert_eq!(header.rlp(), encoded);
     // A record whose bloom is not 256 bytes (a template) has an empty bloom.
-    let template = BlockHeader { logs_bloom: Vec::new(), ..block };
+    let template = BlockHeader {
+        logs_bloom: Vec::new(),
+        ..block
+    };
     assert_eq!(Header::of(&template).logs_bloom, [0; 256]);
 }
 
 fn hex(s: &str) -> Vec<u8> {
     let s = s.trim_start_matches("0x");
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
 }
 
 fn quantity(v: &serde_json::Value) -> u64 {
@@ -106,7 +116,8 @@ fn fixed<const N: usize>(v: &serde_json::Value) -> [u8; N] {
 /// transactions and receipts roots are the tries built here.
 #[test]
 fn mainnet_block_hashes_and_roots() {
-    let vector: serde_json::Value = serde_json::from_str(include_str!("vectors/mainnet-23000003.json")).unwrap();
+    let vector: serde_json::Value =
+        serde_json::from_str(include_str!("vectors/mainnet-23000003.json")).unwrap();
     let j = &vector["header"];
     let header = Header {
         parent_hash: fixed(&j["parentHash"]),
@@ -135,7 +146,12 @@ fn mainnet_block_hashes_and_roots() {
     assert_eq!(header.hash(keccak), fixed::<32>(&j["hash"]));
     assert_eq!(header.ommers_hash, EMPTY_OMMERS_HASH);
     assert_eq!(header.requests_hash, EMPTY_REQUESTS_HASH);
-    let raws: Vec<Vec<u8>> = vector["transactions"].as_array().unwrap().iter().map(|t| hex(t.as_str().unwrap())).collect();
+    let raws: Vec<Vec<u8>> = vector["transactions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| hex(t.as_str().unwrap()))
+        .collect();
     assert_eq!(raws.len(), 89);
     assert_eq!(ordered_root(&raws, keccak), header.transactions_root);
     // Every transaction but the blob ones decodes, set-code ones included.
@@ -161,7 +177,11 @@ fn mainnet_block_hashes_and_roots() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|l| Log { address: fixed(&l["address"]), topics: Seq(l["topics"].as_array().unwrap().iter().map(fixed).collect()), data: hex(l["data"].as_str().unwrap()) })
+                .map(|l| Log {
+                    address: fixed(&l["address"]),
+                    topics: Seq(l["topics"].as_array().unwrap().iter().map(fixed).collect()),
+                    data: hex(l["data"].as_str().unwrap()),
+                })
                 .collect();
             let receipt = Receipt {
                 tx_type: u8::try_from(quantity(&r["type"])).unwrap(),
@@ -180,7 +200,11 @@ fn mainnet_block_hashes_and_roots() {
 }
 
 fn log(address: u8, topics: &[u8], data: &[u8]) -> Log {
-    Log { address: [address; 20], topics: Seq(topics.iter().map(|t| [*t; 32]).collect()), data: data.to_vec() }
+    Log {
+        address: [address; 20],
+        topics: Seq(topics.iter().map(|t| [*t; 32]).collect()),
+        data: data.to_vec(),
+    }
 }
 
 fn alloy_receipt(receipt: &Receipt) -> ReceiptEnvelope {
@@ -190,10 +214,17 @@ fn alloy_receipt(receipt: &Receipt) -> ReceiptEnvelope {
         .iter()
         .map(|l| AlloyLog {
             address: Address::from(l.address),
-            data: LogData::new_unchecked(l.topics.0.iter().map(|t| B256::from(*t)).collect(), Bytes::from(l.data.clone())),
+            data: LogData::new_unchecked(
+                l.topics.0.iter().map(|t| B256::from(*t)).collect(),
+                Bytes::from(l.data.clone()),
+            ),
         })
         .collect();
-    let inner = AlloyReceipt { status: Eip658Value::Eip658(receipt.status == 1), cumulative_gas_used: receipt.cumulative_gas_used, logs };
+    let inner = AlloyReceipt {
+        status: Eip658Value::Eip658(receipt.status == 1),
+        cumulative_gas_used: receipt.cumulative_gas_used,
+        logs,
+    };
     let with_bloom = ReceiptWithBloom::from(inner);
     match receipt.tx_type {
         0 => ReceiptEnvelope::Legacy(with_bloom),
@@ -205,10 +236,26 @@ fn alloy_receipt(receipt: &Receipt) -> ReceiptEnvelope {
 
 #[test]
 fn receipts_and_their_root_match_alloy() {
-    let receipts: Vec<Receipt> = [(0u8, 1u8, 21_000u64, vec![]), (2, 0, 50_000, vec![log(1, &[2], &[3; 40])]), (4, 1, 90_000, vec![log(4, &[], &[]), log(5, &[6, 7, 8], &[9])]), (1, 1, 120_000, vec![])]
-        .into_iter()
-        .map(|(tx_type, status, cumulative_gas_used, logs)| Receipt { tx_type, status, cumulative_gas_used, logs: Seq(logs), ..Receipt::default() })
-        .collect();
+    let receipts: Vec<Receipt> = [
+        (0u8, 1u8, 21_000u64, vec![]),
+        (2, 0, 50_000, vec![log(1, &[2], &[3; 40])]),
+        (
+            4,
+            1,
+            90_000,
+            vec![log(4, &[], &[]), log(5, &[6, 7, 8], &[9])],
+        ),
+        (1, 1, 120_000, vec![]),
+    ]
+    .into_iter()
+    .map(|(tx_type, status, cumulative_gas_used, logs)| Receipt {
+        tx_type,
+        status,
+        cumulative_gas_used,
+        logs: Seq(logs),
+        ..Receipt::default()
+    })
+    .collect();
     let mut block_bloom = [0u8; 256];
     let mut ours = Vec::new();
     let mut theirs = Vec::new();
@@ -222,7 +269,10 @@ fn receipts_and_their_root_match_alloy() {
         ours.push(encoded);
         theirs.push(envelope);
     }
-    assert_eq!(ordered_root(&ours, keccak), alloy_trie::root::ordered_trie_root_with_encoder(&theirs, |r, buf| r.encode_2718(buf)).0);
+    assert_eq!(
+        ordered_root(&ours, keccak),
+        alloy_trie::root::ordered_trie_root_with_encoder(&theirs, |r, buf| r.encode_2718(buf)).0
+    );
     let bits: u32 = block_bloom.iter().map(|b| b.count_ones()).sum();
     assert!(bits > 0);
 }
@@ -232,7 +282,9 @@ fn ordered_roots_match_alloy_trie_at_every_size() {
     // Sizes that cross the single-byte keys (0x01..0x7f), the 0x80 key of
     // index 128 and the two-byte keys after it.
     for n in [0usize, 1, 2, 3, 16, 17, 127, 128, 129, 300] {
-        let values: Vec<Vec<u8>> = (0..n).map(|i| vec![(i % 251) as u8; 1 + i % 40]).collect();
+        let values: Vec<Vec<u8>> = (0..n)
+            .map(|i| vec![u8::try_from(i % 251).unwrap(); 1 + i % 40])
+            .collect();
         let expected = alloy_trie::root::ordered_trie_root_encoded(&values);
         assert_eq!(ordered_root(&values, keccak), expected.0, "{n} items");
     }

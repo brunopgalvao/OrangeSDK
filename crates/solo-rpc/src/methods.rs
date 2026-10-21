@@ -11,11 +11,11 @@ use solo_node::{Node, NodeError, SubmitError};
 
 use crate::call::{call_error, call_request, min_gas};
 use crate::filter::{Blocks, Filter};
-use crate::proof;
 pub use crate::hex::{
     data, parse_address, parse_big, parse_hash, parse_hex, parse_quantity, parse_word, quantity,
     quantity_be,
 };
+use crate::proof;
 use crate::views::{self, Destination, Position, created_address, decode_or_blank};
 
 /// Default widest block range one `eth_getLogs` request may search
@@ -359,7 +359,11 @@ impl Rpc {
         let oldest = self.node.oldest_state();
         if height < oldest {
             let (header, _) = self.header_at(height)?.unwrap_or_default();
-            return Err(RpcError::server(missing_state(&header.state_root, height, oldest)));
+            return Err(RpcError::server(missing_state(
+                &header.state_root,
+                height,
+                oldest,
+            )));
         }
         Ok(Some(height))
     }
@@ -569,7 +573,10 @@ impl Rpc {
         let oldest = self.node.oldest_state();
         let unavailable = || RpcError::server(missing_state(&header.state_root, height, oldest));
         let key = proof::account_key(&address);
-        let account_proof = self.node.state_proof_at(height, &key).ok_or_else(unavailable)?;
+        let account_proof = self
+            .node
+            .state_proof_at(height, &key)
+            .ok_or_else(unavailable)?;
         let at = (height < self.block_number()?).then_some(height);
         let account = self.node.account_at(&address, at)?;
         let present = matches!(account_proof.terminal,
@@ -588,7 +595,7 @@ impl Rpc {
             present.then_some(&account),
             &header.state_root,
             &account_proof,
-            storage,
+            &storage,
         ))
     }
 

@@ -719,10 +719,11 @@ impl Node {
     ) -> Result<QueryResult, NodeError> {
         let base = self.exec.state_mut().base_mut();
         let view = at.filter(|h| base.versions().is_none_or(|(_, latest)| *h != latest));
-        base.set_view(view).map_err(|_| NodeError::StateUnavailable {
-            height: at.unwrap_or_default(),
-            oldest: self.oldest_state(),
-        })?;
+        base.set_view(view)
+            .map_err(|_| NodeError::StateUnavailable {
+                height: at.unwrap_or_default(),
+                oldest: self.oldest_state(),
+            })?;
         let args = QueryArgs {
             method: method.as_bytes().to_vec(),
             params: params.to_vec(),
@@ -755,7 +756,11 @@ impl Node {
     /// and proofs reach back to it, and no further.
     #[must_use]
     pub fn oldest_state(&self) -> u64 {
-        self.exec.state().base().versions().map_or(0, |(oldest, _)| oldest)
+        self.exec
+            .state()
+            .base()
+            .versions()
+            .map_or(0, |(oldest, _)| oldest)
     }
 
     fn query_decoded<T: Decode>(

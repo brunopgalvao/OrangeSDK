@@ -95,7 +95,10 @@ fn node(items: &[(Vec<u8>, &[u8])], depth: usize, keccak: fn(&[u8]) -> [u8; 32])
                 .take_while(|(a, b)| a == b)
                 .count();
             if shared > 0 {
-                encode_bytes(&hex_prefix(&first[depth..depth + shared], false), &mut payload);
+                encode_bytes(
+                    &hex_prefix(&first[depth..depth + shared], false),
+                    &mut payload,
+                );
                 reference(&node(items, depth + shared, keccak), &mut payload, keccak);
             } else {
                 // Sorted paths: one that ends here comes first.
@@ -107,7 +110,11 @@ fn node(items: &[(Vec<u8>, &[u8])], depth: usize, keccak: fn(&[u8]) -> [u8; 32])
                 for nibble in 0..16 {
                     let start = rest.partition_point(|(p, _)| p[depth] < nibble);
                     let end = rest.partition_point(|(p, _)| p[depth] <= nibble);
-                    reference(&node(&rest[start..end], depth + 1, keccak), &mut payload, keccak);
+                    reference(
+                        &node(&rest[start..end], depth + 1, keccak),
+                        &mut payload,
+                        keccak,
+                    );
                 }
                 encode_bytes(value, &mut payload);
             }
@@ -165,24 +172,49 @@ mod tests {
         );
         // Extension, branch with a value, inline and hashed children.
         assert_eq!(
-            trie(&[("doe", "reindeer"), ("dog", "puppy"), ("dogglesworth", "cat")]).to_vec(),
+            trie(&[
+                ("doe", "reindeer"),
+                ("dog", "puppy"),
+                ("dogglesworth", "cat")
+            ])
+            .to_vec(),
             h("8aad789dff2f538bca5d8ea56e8abe10f4c7ba3a5dea95fea4cd6e7c3a1168d3")
         );
         assert_eq!(
-            trie(&[("do", "verb"), ("dog", "puppy"), ("doge", "coin"), ("horse", "stallion")])
-                .to_vec(),
+            trie(&[
+                ("do", "verb"),
+                ("dog", "puppy"),
+                ("doge", "coin"),
+                ("horse", "stallion")
+            ])
+            .to_vec(),
             h("5991bb8c6514148a29db676a14ac506cd2cd5775ace63c30a4fe457715e9ac84")
         );
         // An odd-length leaf path after a branch, and a key that ends at the root branch.
-        assert_eq!(trie(&[("a", "A"), ("b", "B")]), trie(&[("b", "B"), ("a", "A")]));
-        assert_eq!(trie(&[("", "root"), ("a", "A")]), trie(&[("a", "A"), ("", "root")]));
+        assert_eq!(
+            trie(&[("a", "A"), ("b", "B")]),
+            trie(&[("b", "B"), ("a", "A")])
+        );
+        assert_eq!(
+            trie(&[("", "root"), ("a", "A")]),
+            trie(&[("a", "A"), ("", "root")])
+        );
     }
 
     #[test]
     fn hex_prefix_encodes_every_parity_and_kind() {
         assert_eq!(hex_prefix(&[1, 2, 3, 4, 5], false), vec![0x11, 0x23, 0x45]);
-        assert_eq!(hex_prefix(&[0, 1, 2, 3, 4, 5], false), vec![0x00, 0x01, 0x23, 0x45]);
-        assert_eq!(hex_prefix(&[0x0f, 1, 0x0c, 0x0b, 8], true), vec![0x3f, 0x1c, 0xb8]);
-        assert_eq!(hex_prefix(&[0, 0x0f, 1, 0x0c, 0x0b, 8], true), vec![0x20, 0x0f, 0x1c, 0xb8]);
+        assert_eq!(
+            hex_prefix(&[0, 1, 2, 3, 4, 5], false),
+            vec![0x00, 0x01, 0x23, 0x45]
+        );
+        assert_eq!(
+            hex_prefix(&[0x0f, 1, 0x0c, 0x0b, 8], true),
+            vec![0x3f, 0x1c, 0xb8]
+        );
+        assert_eq!(
+            hex_prefix(&[0, 0x0f, 1, 0x0c, 0x0b, 8], true),
+            vec![0x20, 0x0f, 0x1c, 0xb8]
+        );
     }
 }

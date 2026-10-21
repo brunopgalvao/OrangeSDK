@@ -47,7 +47,12 @@ fn recover(hash: &[u8; 32], sig: &[u8; 65]) -> [u8; 20] {
     address_of(&key)
 }
 
-fn signed_authorization(key: &SigningKey, chain_id: u64, address: [u8; 20], nonce: u64) -> SignedAuthorization {
+fn signed_authorization(
+    key: &SigningKey,
+    chain_id: u64,
+    address: [u8; 20],
+    nonce: u64,
+) -> SignedAuthorization {
     let auth = AlloyAuthorization {
         chain_id: U256::from(chain_id),
         address: Address::from(address),
@@ -86,29 +91,51 @@ fn decodes_alloys_encoding() {
     let decoded = decode(&raw).unwrap();
     assert_eq!(decoded.tx_type, 4);
     assert_eq!(decoded.chain_id, Some(1337));
-    assert_eq!((decoded.nonce, decoded.gas_limit, decoded.value), (3, 100_000, 9));
+    assert_eq!(
+        (decoded.nonce, decoded.gas_limit, decoded.value),
+        (3, 100_000, 9)
+    );
     assert_eq!((decoded.gas_price, decoded.priority_fee), (30, Some(2)));
     assert_eq!(decoded.to, Some([0x44; 20]));
     assert_eq!(decoded.input, vec![0, 1, 2, 3]);
     assert_eq!(decoded.access_list.len(), 1);
     assert_eq!(decoded.authorization_list.len(), 2);
-    assert_eq!(recover(&keccak(&decoded.signing_payload), &decoded.signature()), address_of(sender.verifying_key()));
+    assert_eq!(
+        recover(&keccak(&decoded.signing_payload), &decoded.signature()),
+        address_of(sender.verifying_key())
+    );
     for (ours, theirs) in decoded.authorization_list.iter().zip(&auths) {
         assert_eq!(ours.address, theirs.address.0.0);
         assert_eq!(ours.nonce, theirs.nonce);
         assert_eq!(ours.chain_id, theirs.chain_id.to_be_bytes::<32>());
         assert_eq!(keccak(&ours.signing_payload()), theirs.signature_hash().0);
         let sig = ours.signature().unwrap();
-        assert_eq!(recover(&keccak(&ours.signing_payload()), &sig), address_of(authority.verifying_key()));
-        assert_eq!(theirs.recover_authority().unwrap().0.0, address_of(authority.verifying_key()));
+        assert_eq!(
+            recover(&keccak(&ours.signing_payload()), &sig),
+            address_of(authority.verifying_key())
+        );
+        assert_eq!(
+            theirs.recover_authority().unwrap().0.0,
+            address_of(authority.verifying_key())
+        );
     }
     // Intrinsic gas: the base, calldata, access list and 25 000 per authorization.
-    assert_eq!(decoded.intrinsic_gas(), 21_000 + 4 + 16 * 3 + 2_400 + 1_900 + 2 * AUTHORIZATION_GAS);
+    assert_eq!(
+        decoded.intrinsic_gas(),
+        21_000 + 4 + 16 * 3 + 2_400 + 1_900 + 2 * AUTHORIZATION_GAS
+    );
     assert_eq!(decoded.max_cost(), Some(100_000 * 30 + 9));
 }
 
 fn authorization(y_parity: u8, r: [u8; 32], s: [u8; 32]) -> Authorization {
-    Authorization { chain_id: [0; 32], address: [1; 20], nonce: 0, y_parity, r, s }
+    Authorization {
+        chain_id: [0; 32],
+        address: [1; 20],
+        nonce: 0,
+        y_parity,
+        r,
+        s,
+    }
 }
 
 #[test]
@@ -124,7 +151,10 @@ fn signatures_that_name_no_authority() {
     // A chain id is written without leading zeros, and a zero nonce as the empty string.
     let mut chain = [0; 32];
     chain[31] = 1;
-    let auth = Authorization { chain_id: chain, ..authorization(0, [1; 32], [1; 32]) };
+    let auth = Authorization {
+        chain_id: chain,
+        ..authorization(0, [1; 32], [1; 32])
+    };
     let mut body = Vec::new();
     encode_uint(1, &mut body);
     encode_bytes(&[1; 20], &mut body);
@@ -178,26 +208,50 @@ fn malformations() {
     let mut to = Vec::new();
     encode_bytes(&[2; 20], &mut to);
     let good = entry(&[1], &[3; 20], &[], &[1]);
-    let tx = decode(&set_code(&to, &list(&[good.clone()]), 0)).unwrap();
+    let tx = decode(&set_code(&to, &list(std::slice::from_ref(&good)), 0)).unwrap();
     assert_eq!(tx.authorization_list[0].y_parity, 1);
     assert_eq!(tx.authorization_list[0].chain_id[31], 1);
     // A parity byte above one decodes; it only names no authority.
     let odd = entry(&[], &[3; 20], &[], &[0x7F]);
-    assert_eq!(decode(&set_code(&to, &list(&[odd]), 0)).unwrap().authorization_list[0].signature(), None);
+    assert_eq!(
+        decode(&set_code(&to, &list(&[odd]), 0))
+            .unwrap()
+            .authorization_list[0]
+            .signature(),
+        None
+    );
     let cases = [
         // No recipient: a set-code transaction cannot create.
-        (set_code(&[0x80], &list(&[good.clone()]), 0), Error::Malformed),
+        (
+            set_code(&[0x80], &list(std::slice::from_ref(&good)), 0),
+            Error::Malformed,
+        ),
         // An empty authorization list.
         (set_code(&to, &list(&[]), 0), Error::Malformed),
         // Not a list, an entry that is not a list, an entry of five fields.
         (set_code(&to, &[0x80], 0), Error::Malformed),
         (set_code(&to, &list(&[vec![0x80]]), 0), Error::Malformed),
-        (set_code(&to, &list(&[list(&vec![vec![0x80]; 5])]), 0), Error::Malformed),
+        (
+            set_code(&to, &list(&[list(&vec![vec![0x80]; 5])]), 0),
+            Error::Malformed,
+        ),
         // A chain id over 32 bytes, a short address, a nonce over 64 bits, a parity over 8 bits.
-        (set_code(&to, &list(&[entry(&[1; 33], &[3; 20], &[], &[])]), 0), Error::Malformed),
-        (set_code(&to, &list(&[entry(&[1], &[3; 19], &[], &[])]), 0), Error::Malformed),
-        (set_code(&to, &list(&[entry(&[1], &[3; 20], &[1; 9], &[])]), 0), Error::Malformed),
-        (set_code(&to, &list(&[entry(&[1], &[3; 20], &[], &[1, 0])]), 0), Error::Malformed),
+        (
+            set_code(&to, &list(&[entry(&[1; 33], &[3; 20], &[], &[])]), 0),
+            Error::Malformed,
+        ),
+        (
+            set_code(&to, &list(&[entry(&[1], &[3; 19], &[], &[])]), 0),
+            Error::Malformed,
+        ),
+        (
+            set_code(&to, &list(&[entry(&[1], &[3; 20], &[1; 9], &[])]), 0),
+            Error::Malformed,
+        ),
+        (
+            set_code(&to, &list(&[entry(&[1], &[3; 20], &[], &[1, 0])]), 0),
+            Error::Malformed,
+        ),
         // The transaction's own parity is checked as for every typed transaction.
         (set_code(&to, &list(&[good]), 2), Error::BadSignature),
     ];

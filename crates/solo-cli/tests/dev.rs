@@ -235,6 +235,7 @@ fn genesis_accounts() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn argument_and_file_errors() {
     assert_eq!(run(&args(&[])).unwrap_err(), USAGE);
     assert_eq!(run(&args(&["start"])).unwrap_err(), USAGE);
