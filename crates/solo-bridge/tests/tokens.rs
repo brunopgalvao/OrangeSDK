@@ -78,19 +78,19 @@ const DEPOSIT_ETH_GAS: u64 = 118_426;
 /// Of the first `deposit` of an ERC-20 there.
 const DEPOSIT_TOKEN_GAS: u64 = 159_315;
 /// Of the delivery on Solo whose mint creates wrapped ETH (the inbox's proofs included).
-const FIRST_MINT_GAS: u64 = 822_633;
+const FIRST_MINT_GAS: u64 = 822_627;
 /// Of a delivery on Solo whose wrapped token exists.
-const MINT_GAS: u64 = 103_358;
+const MINT_GAS: u64 = 103_352;
 /// Of a withdrawal on Solo: the burn and the send through the outbox.
 const BURN_GAS: u64 = 97_525;
 /// Of a deposit of Solo's currency on Solo.
 const LOCK_NATIVE_GAS: u64 = 117_482;
 /// Of `SoloInbox.execute` releasing ETH through the gateway on Ethereum.
-const RELEASE_GAS: u64 = 77_858;
+const RELEASE_GAS: u64 = 77_846;
 /// Of a withdrawal on Ethereum: the burn and the send through `EthereumOutbox`.
 const ETH_BURN_GAS: u64 = 86_385;
 /// Of the delivery on Solo that releases Solo's currency.
-const NATIVE_RELEASE_GAS: u64 = 96_490;
+const NATIVE_RELEASE_GAS: u64 = 96_478;
 
 /// The Solo side: the simulated chain and its wallets' nonces.
 struct Solo {

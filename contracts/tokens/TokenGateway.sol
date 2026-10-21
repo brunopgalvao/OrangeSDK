@@ -221,7 +221,8 @@ abstract contract TokenGateway {
     /// @dev Acts on a message the subcontract authenticated as the paired gateway's. Reverting
     /// leaves the message undelivered, to be delivered again.
     function _receive(uint64 nonce, bytes calldata payload) internal whenNotPaused nonReentrant {
-        uint8 kind = uint8(uint256(bytes32(payload[:32])));
+        // The whole first word names the kind, so a word that only ends in a kind is unknown.
+        uint256 kind = uint256(bytes32(payload[:32]));
         if (kind == MINT) {
             (, address origin, address from, address to, uint256 amount, string memory name, string memory symbol, uint8 decimals)
             = abi.decode(payload, (uint8, address, address, address, uint256, string, string, uint8));

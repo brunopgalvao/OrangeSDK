@@ -613,6 +613,13 @@ fn deliveries_count_only_from_the_paired_gateway_and_failed_releases_are_owed() 
     unknown.payload[31] = 9;
     let data = w.delivery(&unknown);
     reverted_with(&w.eth.call(RELAYER, w.messenger, &data), "UnknownMessage()");
+    // The whole first word names the kind: one that only ends in a kind's byte is unknown too.
+    for byte in [30, 0] {
+        let mut unknown = message.clone();
+        unknown.payload[byte] = if byte == 0 { 0x80 } else { 1 };
+        let data = w.delivery(&unknown);
+        reverted_with(&w.eth.call(RELAYER, w.messenger, &data), "UnknownMessage()");
+    }
     // Over the mint cap the delivery fails and waits; the owner raises the cap and it goes through.
     ok(&w
         .eth

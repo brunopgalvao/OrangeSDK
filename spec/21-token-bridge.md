@@ -163,13 +163,13 @@ Measured by `crates/solo-bridge/tests/tokens.rs`, which pins each number: on Eth
 |---|---|---|
 | `deposit` of ETH, the gateway's first (two new outbox slots, `locked` from zero) | Ethereum | 118 426 |
 | `deposit` of an ERC-20, its first | Ethereum | 159 315 |
-| `EthereumInbox.deliver` of the `MINT` that creates wrapped ETH, proofs of a 13-account state | Solo | 822 633 |
-| `EthereumInbox.deliver` of a `MINT` of an existing wrapped token | Solo | 103 358 |
+| `EthereumInbox.deliver` of the `MINT` that creates wrapped ETH, proofs of a 13-account state | Solo | 822 627 |
+| `EthereumInbox.deliver` of a `MINT` of an existing wrapped token | Solo | 103 352 |
 | `deposit` of a wrapped token (burn and outbox send) | Solo | 97 525 |
 | `deposit` of Solo's currency | Solo | 117 482 |
-| `SoloInbox.execute` of a `RELEASE` of ETH | Ethereum | 77 858 |
+| `SoloInbox.execute` of a `RELEASE` of ETH | Ethereum | 77 846 |
 | `deposit` of a wrapped token (burn and `EthereumOutbox` send) | Ethereum | 86 385 |
-| `EthereumInbox.deliver` of a `RELEASE` of Solo's currency | Solo | 96 490 |
+| `EthereumInbox.deliver` of a `RELEASE` of Solo's currency | Solo | 96 478 |
 
 Creating a wrapped token costs about 720 000 gas, mostly the code deposit of its 2 779-byte runtime at 200 gas a byte and the initialization's storage writes; the deliveries include the inbox's proof verification (spec 18 §8), which grows with the depth of the Ethereum state. The `MINT` payload is 384 bytes for a name and symbol of up to 32 bytes each, and `send_gas` (spec 17 §2.4) charges for it on Solo.
 
