@@ -455,9 +455,12 @@ pub fn finality_proof(node: &mut Node, height: u64) -> Result<Option<FinalityPro
         .flatten())
 }
 
-/// The submission with the highest anchor among the finalized heights of
-/// `node` whose anchor is at least `height` and that `node` can still prove
-/// state against (the last [`Node::state_history`] heights); `None` if none is.
+/// The submission with the highest anchor among the last
+/// [`Node::state_history`] finalized heights of `node` whose anchor is at
+/// least `height`; `None` if none is. The node proves state against the
+/// anchor while the anchor is at or after [`Node::oldest_state`]: within
+/// `state_history` blocks of the head, and nearer when the blocks of the
+/// window wrote more keys than history keeps (spec 20 §5.1).
 ///
 /// # Errors
 /// [`Error::Node`] if a query fails.
@@ -498,8 +501,10 @@ fn covering(
 }
 
 /// The proof of message `nonce`'s outbox slot against the state root of
-/// `height`; `None` if `node` does not hold that height's state (older than
-/// [`Node::state_history`] blocks, or not executed yet).
+/// `height`; `None` if `node` does not hold that height's state: before
+/// [`Node::oldest_state`], which is within [`Node::state_history`] blocks
+/// of the head and nearer when the window's blocks wrote more keys than
+/// history keeps (spec 20 §5.1), or not executed yet.
 ///
 /// # Errors
 /// [`Error::NotCommitted`] if the message is not in that state,
