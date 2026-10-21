@@ -107,7 +107,7 @@ The gas check keeps a relayer, who chooses the gas of a `SoloInbox` execution, f
 | guardian | `pause()` | unpause, change any parameter, move value |
 | owner | `pause()`, `unpause()`, `setLockCap(token, cap)`, `setMintCap(origin, cap)`, `setGuardian` (never zero), `transferOwnership` (never zero); on Ethereum also `setInbox` and `setMessageGas` | mint, release, burn, take locked or owed value, change the paired gateway, the outbox or the creation code |
 
-Others get `NotGuardian()` and `NotOwner()`. Pausing stops deposits, deliveries and claims; deliveries refused while paused wait in their channel. On Solo the owner should be the chain's governance account (spec 13 §1.1). On Ethereum the owner, like `SoloInbox`'s, should be a timelock: `setInbox` is the one power that reaches value, since an inbox the owner chose could deliver anything, and the timelock gives holders time to see a change coming.
+Others get `NotGuardian()` and `NotOwner()`. Pausing stops deposits, deliveries and claims; deliveries refused while paused wait in their channel. On Solo the owner should be the chain's governance key under the key track of spec 13 §9, and under the stake track an account the chain can operate, such as a timelock or multisig contract: the governance address of a stake-governed chain signs nothing, and its proposals reach only the system addresses of 13 §9.2, not an ordinary contract's owner functions. On Ethereum the owner, like `SoloInbox`'s, should be a timelock: `setInbox` is the one power that reaches value, since an inbox the owner chose could deliver anything, and the timelock gives holders time to see a change coming.
 
 ### 5.7 Deployment
 

@@ -15,7 +15,9 @@
 //! `validators` the dev node is the only validator, signing with
 //! [`DEV_KEY_SEED`]. Governed upgrades and feature gates (spec 13) are off
 //! unless the file names a `"governance"` address (with an optional
-//! `"upgradeDelay"` in blocks) or a non-zero `"epochBlocks"`. Kernel modules
+//! `"upgradeDelay"` in blocks) or a non-zero `"epochBlocks"`. Governance runs
+//! under the key track unless `"governanceMode"` says `"stake"`; see [`gov`],
+//! which also has `solo gov`, the encoder of governance calls. Kernel modules
 //! installed at genesis (spec 16) are listed under `"modules"`; see [`modules`].
 //! The Ethereum-to-Solo bridge (spec 18) is configured under `"bridgeIn"`;
 //! see [`bridge`].
@@ -24,6 +26,7 @@
 
 pub mod bridge;
 pub mod doctor;
+pub mod gov;
 pub mod modules;
 
 use std::cell::Cell;
@@ -80,6 +83,7 @@ pub const USAGE: &str = "usage:
   solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
   solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex>] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
   solo key  <64 hex>
+  solo gov  submit <target> <0x calldata> | vote <id> yes|no | execute <id> | veto <id> | pause <target> | set-guardian <address> | set-mode stake | set-params <voting> <timelock> <quorumBps> <deposit>
   solo doctor [--rpc 127.0.0.1:8545] [--max-head-age <s>] [--max-finality-lag <blocks>] [--min-peers <n>] [--max-mempool <txs>] [--max-call-ms <ms>]";
 
 /// Where `solo node` listens for peers unless `--listen` says otherwise.
@@ -120,6 +124,7 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
         allocations: Seq(allocations),
         upgrades: parse_upgrades(&v)?,
         bridge_in: bridge::parse_bridge(&v)?,
+        governance: gov::parse_governance(&v)?,
         ..GenesisParams::default()
     };
     let mut validators = Vec::new();
@@ -418,18 +423,31 @@ fn parse_peers(args: &[String]) -> Result<Vec<std::net::SocketAddr>, String> {
         .collect()
 }
 
+/// What the commands that run no node print: `key`, `doctor` and `gov`.
+/// `None` for any other command.
+fn tool_output(command: &str, args: &[String]) -> Option<Result<String, CliError>> {
+    Some(
+        match command {
+            "key" => args
+                .get(2)
+                .ok_or_else(|| "key: expected 64 hex digits".to_owned())
+                .and_then(|hex| parse_key(hex))
+                .map(|key| describe_key(&key)),
+            "doctor" => doctor::run(args),
+            "gov" => gov::parse(args.get(2..).unwrap_or(&[])).map(|call| gov::describe(&call)),
+            _ => return None,
+        }
+        .map_err(CliError::from),
+    )
+}
+
 fn run_inner(
     args: &[String],
     keep_going: &mut dyn FnMut(&solo_rpc::Rpc) -> bool,
 ) -> Result<(), CliError> {
     let command = args.get(1).map_or("", String::as_str);
-    if command == "key" {
-        let key = parse_key(args.get(2).ok_or("key: expected 64 hex digits")?)?;
-        println!("{}", describe_key(&key));
-        return Ok(());
-    }
-    if command == "doctor" {
-        println!("{}", doctor::run(args)?);
+    if let Some(output) = tool_output(command, args) {
+        println!("{}", output?);
         return Ok(());
     }
     if command != "dev" && command != "node" {

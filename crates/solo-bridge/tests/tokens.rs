@@ -269,6 +269,7 @@ fn genesis(
         },
         staking,
         bridge_in: bridge,
+        ..GenesisParams::default()
     };
     Genesis {
         chain_id: CHAIN_ID,

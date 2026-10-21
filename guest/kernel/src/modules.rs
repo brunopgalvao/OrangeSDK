@@ -5,16 +5,15 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use solo_abi::chain::{GenesisParams, Log, call_status, reason};
+use solo_abi::chain::{GenesisParams, Log};
 use solo_abi::codec::Seq;
 use solo_abi::modules::{self, Install, ModuleCall, ModuleOutput, ModuleQuery, ModuleRecord, Write, capability, keys, status};
 use solo_abi::types::{Address, Genesis, Hash, QueryResult};
 use solo_abi::{Decode, Encode};
 use solo_guest::host;
 
-use crate::evm::{self, BlockFields, Message, Outcome};
+use crate::evm;
 use crate::state;
-use crate::tx::Signed;
 
 /// What an invoke of a module produced.
 pub struct Invoked {
@@ -177,39 +176,6 @@ pub fn end_block(height: u64, timestamp_ms: u64) {
     hooks(&ModuleCall::EndBlock { height, timestamp_ms });
 }
 
-/// The install a transaction to the module address carries, if it can run:
-/// signed for this chain, no value, an `install` the governance account sent.
-fn install_of(s: &Signed) -> Option<Install> {
-    if s.tx.chain_id != Some(state::chain_id()) || s.tx.value != 0 {
-        return None;
-    }
-    let governance = state::params().upgrades.governance;
-    let install = Install::decode(&s.tx.input)?;
-    (governance != [0; 20] && s.from == governance).then_some(install)
-}
-
-/// Admission: a transaction to the module address must be able to run.
-pub fn admit(s: &Signed) -> Result<(), u32> {
-    if s.tx.to == Some(modules::MODULE_ADDRESS) && install_of(s).is_none() { Err(reason::SYSTEM_ACTION) } else { Ok(()) }
-}
-
-/// Executes a transaction to the module address: a plain call through the
-/// EVM for gas, fees and nonce, then the install, which reverts the
-/// transaction if its checks fail (spec 16 §4.2).
-pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Outcome {
-    let Some(install) = install_of(s) else {
-        return Outcome { status: call_status::INVALID, gas_used: 0, output: Vec::new(), logs: Vec::new(), contract: None };
-    };
-    let mut outcome = crate::native::run(message, block, true);
-    if outcome.status == call_status::SUCCESS {
-        match governance_install(&install, height) {
-            Some(log) => outcome.logs.push(log),
-            None => outcome.status = call_status::REVERT,
-        }
-    }
-    outcome
-}
-
 /// The staged code of `code_hash` (spec 13 §3): chunks from 0 up to the
 /// first missing one, concatenated.
 fn staged(code_hash: &Hash) -> Vec<u8> {
@@ -222,7 +188,10 @@ fn staged(code_hash: &Hash) -> Vec<u8> {
     code
 }
 
-fn governance_install(action: &Install, height: u64) -> Option<Log> {
+/// A governance install (spec 16 §4.2), authorized by `governance.rs`: the
+/// `ModuleInstalled` log if it went through, `None` with nothing changed if
+/// any of its checks failed.
+pub fn install_action(action: &Install, height: u64) -> Option<Log> {
     let target = &action.target;
     let account = state::account(target);
     if action.capabilities & !capability::HOOKS != 0 || system_address(target) || account.code_hash != [0; 32] || account.nonce != 0 || record(target).is_some() {

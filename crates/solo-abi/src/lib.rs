@@ -12,6 +12,7 @@ pub mod bridge_in;
 pub mod chain;
 pub mod codec;
 pub mod conformance;
+pub mod governance;
 pub mod modules;
 pub mod rotation;
 pub mod staking;

@@ -86,6 +86,9 @@ pub mod keys {
     pub const CHUNK: &[u8] = b"gov/chunk/";
     /// `gov/kernel/` + code hash → `EnactedUpgrade`, for every kernel switched to.
     pub const KERNEL: &[u8] = b"gov/kernel/";
+    /// `gov/staker/` + code hash → `[20]`, the account that staged the first
+    /// chunk under the code hash and alone stages the rest (spec 13 §3).
+    pub const STAKER: &[u8] = b"gov/staker/";
     /// `gate/book` → `GateBook`.
     pub const BOOK: &[u8] = b"gate/book";
     /// `gate/signal/` + validator id → `Signal`, the validator's latest.
@@ -104,6 +107,14 @@ pub mod keys {
     #[must_use]
     pub fn kernel(code_hash: &Hash) -> Vec<u8> {
         let mut k = KERNEL.to_vec();
+        k.extend_from_slice(code_hash);
+        k
+    }
+
+    /// The key of the staker of `code_hash`.
+    #[must_use]
+    pub fn staker(code_hash: &Hash) -> Vec<u8> {
+        let mut k = STAKER.to_vec();
         k.extend_from_slice(code_hash);
         k
     }
@@ -139,6 +150,8 @@ mod tests {
     fn constants_and_keys() {
         assert_eq!(UPGRADE_ADDRESS[18..], [0x50, 0x10]);
         assert!(UPGRADE_ADDRESS[..18].iter().all(|b| *b == 0));
+        // The governance address of spec 13 §9 is this address.
+        assert_eq!(UPGRADE_ADDRESS, solo_abi::governance::GOVERNANCE_ADDRESS);
         // A chunk transaction still fits a 64 KiB storage value with room for its envelope.
         const { assert!(CHUNK_SIZE + 1024 < 65_536) };
         assert_eq!(MAX_CHUNKS as usize * CHUNK_SIZE, 15 << 19);
@@ -154,6 +167,11 @@ mod tests {
         assert_eq!(
             (k.len(), &k[..11], &k[11..]),
             (43, keys::KERNEL, &[5u8; 32][..])
+        );
+        let k = keys::staker(&[6; 32]);
+        assert_eq!(
+            (k.len(), &k[..11], &k[11..]),
+            (43, keys::STAKER, &[6u8; 32][..])
         );
         assert_eq!(
             (keys::PENDING, keys::ENACTED, keys::BOOK),

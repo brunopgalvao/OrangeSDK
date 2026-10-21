@@ -1,20 +1,24 @@
 //! The Ethereum-to-Solo bridge (spec 18): at genesis, the light-client and
 //! message-verifier modules behind their addresses, the checked checkpoint,
 //! and the inbox contract at the inbox address; afterwards, the admission
-//! checks of transactions to the three. Everything else is the modules'
-//! (spec 16 native contracts) and the inbox contract's.
+//! checks of transactions to the three, and the governed calls governance
+//! makes to the two modules on the chain's behalf (spec 13 §9.5).
+//! Everything else is the modules' (spec 16 native contracts) and the inbox
+//! contract's.
 
 use alloc::vec::Vec;
 
-use solo_abi::Decode;
 use solo_abi::bridge_in::{INBOX_ADDRESS, LIGHT_CLIENT_ADDRESS, VERIFIER_ADDRESS};
 use solo_abi::chain::{Account, GenesisParams};
-use solo_abi::modules;
-use solo_abi::types::{Genesis, Hash};
+use solo_abi::codec::Seq;
+use solo_abi::modules::{self, CallContext, ModuleCall, status};
+use solo_abi::types::{Address, Genesis, Hash};
+use solo_abi::{Decode, Encode};
 use solo_ethlc::client::{self, Storage};
 use solo_ethlc::{Crypto, verifier};
 use solo_guest::host;
 
+use crate::evm::BlockFields;
 use crate::state;
 use crate::tx::Signed;
 
@@ -105,11 +109,59 @@ pub fn init(genesis: &Genesis) {
         place(&address, &modules::designator(&code_hash));
     }
     place(&INBOX_ADDRESS, &unhex(INBOX_CODE));
-    let governance = params.upgrades.governance;
+    // The modules take their governance from the governance track in force
+    // (spec 13 §9.5): the key, or the governance address.
+    let governance = crate::governance::authority();
     if client::genesis(&HostCrypto, &mut Namespace(LIGHT_CLIENT_ADDRESS), &bridge, governance).is_err() {
         solo_guest::trap();
     }
     verifier::genesis(&mut Namespace(VERIFIER_ADDRESS), &bridge, genesis.chain_id, governance);
+}
+
+/// Whether `address` is a governed native contract of the bridge: one of
+/// its two addresses, holding a module designator (the bridge is on).
+pub fn governed(address: &Address) -> bool {
+    (*address == LIGHT_CLIENT_ADDRESS || *address == VERIFIER_ADDRESS) && modules::designated(&crate::evm::code(address)).is_some()
+}
+
+/// Names `governance` as the account both modules take governed calls
+/// from, when the chain switches governance tracks (spec 13 §9.6). Nothing
+/// happens on a chain without the bridge.
+pub fn set_governance(governance: &Address) {
+    let mut light = Namespace(LIGHT_CLIENT_ADDRESS);
+    if let Some(cfg) = light.get(client::keys::CONFIG).and_then(|b| client::Config::from_bytes(&b).ok()) {
+        light.set(client::keys::CONFIG, Some(&client::Config { governance: *governance, ..cfg }.to_bytes()));
+    }
+    let mut messages = Namespace(VERIFIER_ADDRESS);
+    if let Some(cfg) = messages.get(verifier::keys::CONFIG).and_then(|b| verifier::Config::from_bytes(&b).ok()) {
+        messages.set(verifier::keys::CONFIG, Some(&verifier::Config { governance: *governance, ..cfg }.to_bytes()));
+    }
+}
+
+/// A governed call to the module at `target` (spec 18 §5.1–§5.2) made by
+/// governance in `block` (spec 13 §9.5): the module runs sandboxed with
+/// `gas` VM gas, as the governance account, with no value, and its writes
+/// are applied if it returns. `None`, with nothing changed, if the address
+/// is not a governed native contract, the module fails or reverts.
+pub fn govern(target: &Address, data: &[u8], block: BlockFields, gas: u64) -> Option<()> {
+    if !governed(target) {
+        return None;
+    }
+    let code_hash = modules::designated(&crate::evm::code(target))?;
+    let namespace = modules::namespace(target);
+    let call = ModuleCall::Call {
+        context: CallContext { address: *target, caller: crate::governance::authority(), value: 0, height: block.number, timestamp: block.timestamp, is_static: false },
+        data: data.to_vec(),
+        pending: Seq(Vec::new()),
+    };
+    let invoked = crate::modules::invoke(&code_hash, &namespace, &call.to_bytes(), gas, false);
+    match invoked.output {
+        Some(out) if out.status == status::RETURN => {
+            crate::modules::apply(Some(&namespace), &out.writes.0);
+            Some(())
+        }
+        _ => None,
+    }
 }
 
 /// Admission (spec 18 §7): a transaction to the light-client or inbox
