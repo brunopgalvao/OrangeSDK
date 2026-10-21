@@ -5,8 +5,9 @@
 //! receipts with logs, blocks, `eth_call` and gas estimation, code and
 //! storage, log filters, fee history and the `txpool` namespace, the
 //! bridge relayer's `solo_getFinalityProof`, `solo_getOutboxProof` and
-//! `solo_getRotation`, and governance's `solo_getGovernance`,
-//! `solo_getProposals` and `solo_getProposal`.
+//! `solo_getRotation`, governance's `solo_getGovernance`,
+//! `solo_getProposals` and `solo_getProposal`, and the operator's
+//! `solo_upgradeStatus`.
 //! Responses take geth's shapes and error codes. Quantities are `0x` hex
 //! without leading zeros, data is `0x` hex, addresses are lowercase.
 
