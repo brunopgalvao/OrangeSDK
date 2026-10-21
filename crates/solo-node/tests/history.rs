@@ -110,21 +110,44 @@ fn queries_answer_from_every_kept_height_and_refuse_pruned_ones() {
 }
 
 #[test]
-fn an_archive_node_keeps_the_genesis_state() {
-    let mut node = node(ARCHIVE);
+fn an_archive_node_keeps_what_a_windowed_node_prunes() {
+    let mut archive = node(ARCHIVE);
+    let mut windowed = node(2);
     let bob = Wallet::new(0x43);
+    let mut paid_at = Vec::new();
     for nonce in 0..3u64 {
-        include(
-            &mut node,
-            &alice().tx(nonce, bob.address, ETHER, 21_000, &[]),
+        let transfer = alice().tx(nonce, bob.address, ETHER, 21_000, &[]);
+        paid_at.push(include(&mut archive, &transfer).height);
+        include(&mut windowed, &transfer);
+    }
+    // The same blocks; the node with a window of two kept the last two.
+    let head = archive.block_number().unwrap();
+    assert_eq!(windowed.block_number().unwrap(), head);
+    assert_eq!(windowed.oldest_state(), head - 1);
+    for height in 0..head - 1 {
+        assert!(windowed.account_at(&bob.address, Some(height)).is_err());
+        assert!(windowed.state_proof_at(height, b"meta/chain_id").is_none());
+    }
+    // The archive node keeps every height's state and trie, the genesis
+    // included.
+    assert_eq!(archive.oldest_state(), 0);
+    for height in 0..=head {
+        assert!(archive.state_proof_at(height, b"meta/chain_id").is_some());
+        let transfers = paid_at.iter().filter(|h| **h <= height).count();
+        assert_eq!(
+            archive
+                .account_at(&bob.address, Some(height))
+                .unwrap()
+                .balance,
+            u128::try_from(transfers).unwrap() * ETHER,
+            "{height}"
         );
     }
-    assert_eq!(node.oldest_state(), 0);
     assert_eq!(
-        node.account_at(&alice().address, Some(0)).unwrap().balance,
+        archive
+            .account_at(&alice().address, Some(0))
+            .unwrap()
+            .balance,
         100 * ETHER
     );
-    assert_eq!(node.account_at(&bob.address, Some(0)).unwrap().balance, 0);
-    // Its tries reach back to the first block.
-    assert!(node.state_proof_at(1, b"meta/chain_id").is_some());
 }

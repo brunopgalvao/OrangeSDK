@@ -354,9 +354,21 @@ fn in_process_node_stops_on_blocks_and_on_request() {
         &["--blocks", "1", "--query-gas", "100000000"],
     ))
     .unwrap();
-    // With a state history of its own, and as an archive node.
-    run(&dev_args(&good, &["--blocks", "1", "--state-history", "8"])).unwrap();
-    run(&dev_args(&good, &["--blocks", "1", "--archive"])).unwrap();
+    // The node keeps the state history the flags ask for: its own window,
+    // every block as an archive node, or the default.
+    for (flags, expected) in [
+        (&["--state-history", "8"][..], 8),
+        (&["--archive"][..], solo_node::ARCHIVE),
+        (&[][..], solo_node::STATE_HISTORY),
+    ] {
+        let mut kept = None;
+        run_until(&dev_args(&good, flags), |rpc| {
+            kept = Some(rpc.node().state_history);
+            false
+        })
+        .unwrap();
+        assert_eq!(kept, Some(expected), "{flags:?}");
+    }
     // A starved kernel fails every slot; the caller's condition ends the loop after enough ticks.
     let mut iterations = 0;
     run_until(
