@@ -1,6 +1,6 @@
 [package]
 name = "solo-bridge"
-description = "Relayer library of the Solo-to-Ethereum bridge (spec 17): light-client submissions from threshold certificates, outbox proofs and inbox calldata"
+description = "Relayer library of the Solo-to-Ethereum bridge (spec 17): light-client submissions from threshold certificates, outbox proofs and inbox calldata; and the token bridge's messages and calldata (spec 21)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,6 +16,7 @@ solo-trie = { path = "../solo-trie" }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 revm = { version = "43.0.3", default-features = false, features = ["std"] }
 sha2 = { version = "0.10", default-features = false }
+solo-ethlc = { path = "../solo-ethlc", features = ["testing"] }
 solo-recompile = { path = "../solo-recompile" }
 solo-rlp = { path = "../solo-rlp" }
 

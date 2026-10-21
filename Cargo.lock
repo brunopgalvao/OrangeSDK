@@ -2784,6 +2784,7 @@ dependencies = [
  "sha2 0.10.9",
  "solo-abi",
  "solo-bls",
+ "solo-ethlc",
  "solo-node",
  "solo-recompile",
  "solo-rlp",

@@ -229,6 +229,79 @@ impl Eth {
         Self::outcome(self.evm.transact_commit(tx).unwrap()).0
     }
 
+    /// Sends a transaction from `from` to `to` carrying `value` wei with `data`, committing its
+    /// effects.
+    pub fn call_value(
+        &mut self,
+        from: [u8; 20],
+        to: [u8; 20],
+        value: u128,
+        data: &[u8],
+    ) -> Outcome {
+        let mut tx = self.tx(from, TxKind::Call(Address::from(to)), data.to_vec());
+        tx.value = U256::from(value);
+        Self::outcome(self.evm.transact_commit(tx).unwrap()).0
+    }
+
+    /// Sends a transaction from `from` to `to` with `data` and a gas limit of `gas`.
+    pub fn call_gas(&mut self, from: [u8; 20], to: [u8; 20], data: &[u8], gas: u64) -> Outcome {
+        let mut tx = self.tx(from, TxKind::Call(Address::from(to)), data.to_vec());
+        tx.gas_limit = gas;
+        Self::outcome(self.evm.transact_commit(tx).unwrap()).0
+    }
+
+    /// Sets the balance of `account` to `wei`.
+    pub fn fund(&mut self, account: [u8; 20], wei: u128) {
+        let db = &mut self.evm.ctx.journaled_state.database;
+        let address = Address::from(account);
+        let mut info = db
+            .cache
+            .accounts
+            .get(&address)
+            .map(|a| a.info.clone())
+            .unwrap_or_default();
+        info.balance = U256::from(wei);
+        db.insert_account_info(address, info);
+    }
+
+    /// The balance of `account` in wei.
+    pub fn balance(&self, account: [u8; 20]) -> u128 {
+        self.evm
+            .ctx
+            .journaled_state
+            .database
+            .cache
+            .accounts
+            .get(&Address::from(account))
+            .map_or(0, |a| a.info.balance.to::<u128>())
+    }
+
+    /// The state as Ethereum commits to it, with the proofs `eth_getProof` returns.
+    pub fn state(&self) -> solo_ethlc::testing::EthState {
+        let mut out = solo_ethlc::testing::EthState::default();
+        for (address, a) in &self.evm.ctx.journaled_state.database.cache.accounts {
+            let storage = a
+                .storage
+                .iter()
+                .filter(|(_, v)| !v.is_zero())
+                .map(|(k, v)| (k.to_be_bytes::<32>(), v.to_be_bytes::<32>()))
+                .collect();
+            let account = solo_ethlc::testing::Account {
+                nonce: a.info.nonce,
+                balance: a.info.balance.to::<u128>(),
+                code_hash: a.info.code_hash.0,
+                storage,
+            };
+            if account.nonce != 0
+                || account.balance != 0
+                || account.code_hash != revm::primitives::KECCAK_EMPTY.0
+            {
+                out.accounts.insert(address.0.0, account);
+            }
+        }
+        out
+    }
+
     /// Runs a call from `from` to `to` without keeping its effects.
     pub fn view(&mut self, from: [u8; 20], to: [u8; 20], data: &[u8]) -> Outcome {
         let caller = Address::from(from);
