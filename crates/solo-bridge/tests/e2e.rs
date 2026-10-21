@@ -35,7 +35,7 @@ use solo_bridge::{
     submission_covering_key, verifier_v2_args,
 };
 use solo_node::keystore::Keystore;
-use solo_node::{Node, NodeConfig, Sim, validator_id};
+use solo_node::{HISTORY_KEYS_PER_BLOCK, Node, NodeConfig, Sim, validator_id};
 use solo_trie::keccak256;
 use support::eth::{ETH_CHAIN_ID, Eth, init_code, word_u64};
 use support::solo::{CHAIN_ID, address, create_address, genesis, kernel_module, key, tx};
@@ -88,6 +88,16 @@ fn relay(
 /// Four validators with stake whose epoch-0 DKG has adopted a key set, and
 /// `alice`, funded.
 fn certifying_chain(epoch_blocks: u64, alice: &SigningKey) -> (Sim, Vec<SigningKey>) {
+    certifying_chain_with(epoch_blocks, alice, &NodeConfig::default())
+}
+
+/// [`certifying_chain`] with every node configured as `template`, its clock
+/// aside.
+fn certifying_chain_with(
+    epoch_blocks: u64,
+    alice: &SigningKey,
+    template: &NodeConfig,
+) -> (Sim, Vec<SigningKey>) {
     let validators: Vec<SigningKey> = (1..=4).map(|i| key(0x30 + i)).collect();
     let staking = StakingParams {
         epoch_blocks,
@@ -101,7 +111,7 @@ fn certifying_chain(epoch_blocks: u64, alice: &SigningKey) -> (Sim, Vec<SigningK
     let genesis = genesis(&validators, &[address(alice)], SLOT_MS, Some(staking));
     let config = NodeConfig {
         now_ms: 10_000,
-        ..NodeConfig::default()
+        ..template.clone()
     };
     let mut sim = Sim::new(kernel_module(), &genesis, &validators, 0, &config, 20).unwrap();
     assert!(
@@ -329,6 +339,93 @@ fn messages_cross_from_solo_to_ethereum() {
     assert_eq!(word_u64(&get(&mut eth, "received()")), 2);
     assert_eq!(&get(&mut eth, "lastPayload()")[64..64 + 9], b"and again");
     assert_eq!(word_u64(&get(&mut eth, "lastValue()")), 1_000);
+}
+
+#[test]
+fn the_relayer_is_offered_anchors_the_node_still_proves_against() {
+    // Every node keeps the state of its last three blocks (spec 20 §5.1).
+    let alice = key(0x11);
+    let template = NodeConfig {
+        state_history: 3,
+        ..NodeConfig::default()
+    };
+    let (mut sim, _) = certifying_chain_with(200, &alice, &template);
+    let deployed = included(
+        &mut sim,
+        &tx(&alice, 0, None, 0, &init_code("OutboxCaller"), 1_000_000),
+    );
+    let caller = deployed.contract.unwrap();
+    let sent = included(&mut sim, &relay(&alice, 1, caller, [0xAB; 20], b"kept"));
+    let (message, _) = sent_messages(CHAIN_ID, &sent.logs.0).remove(0);
+    let sent_at = sent.height;
+    let covering = |sim: &mut Sim| submission_covering(&mut sim.nodes[0], sent_at).unwrap();
+    // Whatever the relayer is offered anchors a state the node keeps, so the node proves
+    // the message's slot against the anchored root.
+    let provable = |sim: &mut Sim, s: &Submission| {
+        let node = &mut sim.nodes[0];
+        assert!(s.anchor_height >= node.oldest_state());
+        let proof = slot_proof(node, message.nonce, s.anchor_height)
+            .unwrap()
+            .expect("the anchored state is kept");
+        let header = node.block_by_number(s.anchor_height).unwrap().unwrap();
+        assert_eq!(proof.root(), header.state_root);
+        assert_eq!(s.anchor_root, header.state_root);
+    };
+
+    // Within the window by blocks, the newest certificates anchor heights the node keeps.
+    assert!(
+        sim.run_until(40 * SLOT_MS, |s| covering(s).is_some())
+            .unwrap()
+    );
+    let within = covering(&mut sim).unwrap();
+    provable(&mut sim, &within);
+
+    // Node 0 now keeps one key write of history per block of its window, three in all:
+    // every block writes more, so the node keeps the head's state only, fewer blocks than
+    // `state_history` (spec 20 §5.1). Every certificate anchors below the head, a state
+    // the node has pruned, so the relayer is offered none rather than one that the node
+    // cannot prove against.
+    sim.nodes[0].history_keys_per_block = 1;
+    let shrunk = sim
+        .run_until(40 * SLOT_MS, |s| {
+            let node = &mut s.nodes[0];
+            let head = node.block_number().unwrap();
+            node.oldest_state() == head && node.finalized_height().unwrap() == head
+        })
+        .unwrap();
+    assert!(shrunk);
+    let node = &mut sim.nodes[0];
+    let top = node.finalized_height().unwrap();
+    let oldest = node.oldest_state();
+    assert_eq!((oldest, node.state_history), (top, 3));
+    let mut certified = 0;
+    for h in sent_at + 1..=top {
+        if let Some(s) = finality_proof(node, h)
+            .unwrap()
+            .and_then(|p| Submission::new(&p).ok())
+        {
+            assert!(s.anchor_height < oldest, "{h}");
+            assert!(
+                slot_proof(node, message.nonce, s.anchor_height)
+                    .unwrap()
+                    .is_none()
+            );
+            certified += 1;
+        }
+    }
+    assert!(certified > 0);
+    assert_eq!(covering(&mut sim), None);
+
+    // With the default budget again the window grows back from the head, and the next
+    // certificates anchor heights in it.
+    sim.nodes[0].history_keys_per_block = HISTORY_KEYS_PER_BLOCK;
+    assert!(
+        sim.run_until(40 * SLOT_MS, |s| covering(s).is_some())
+            .unwrap()
+    );
+    let again = covering(&mut sim).unwrap();
+    assert!(again.anchor_height >= oldest);
+    provable(&mut sim, &again);
 }
 
 #[test]

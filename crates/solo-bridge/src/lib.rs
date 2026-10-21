@@ -460,12 +460,15 @@ pub fn finality_proof(node: &mut Node, height: u64) -> Result<Option<FinalityPro
         .flatten())
 }
 
-/// The submission with the highest anchor among the last
-/// [`Node::state_history`] finalized heights of `node` whose anchor is at
-/// least `height`; `None` if none is. The node proves state against the
-/// anchor while the anchor is at or after [`Node::oldest_state`]: within
-/// `state_history` blocks of the head, and nearer when the blocks of the
-/// window wrote more keys than history keeps (spec 20 §5.1).
+/// The submission with the highest anchor at or after `height` among the
+/// certified proposals of `node` whose anchor the node still proves state
+/// against: an anchor at or after [`Node::oldest_state`], which is within
+/// [`Node::state_history`] blocks of the head and nearer when the blocks of
+/// the window wrote more keys than history keeps (spec 20 §5.1). `None` if
+/// there is none, as when every certificate anchors a height the node has
+/// pruned: the next certificates anchor later heights, so a relayer asks
+/// again. [`slot_proof`] against the anchor returned is `None` only while
+/// the node has not executed the anchored block.
 ///
 /// # Errors
 /// [`Error::Node`] if a query fails.
@@ -492,12 +495,16 @@ fn covering(
     key_id: Option<u64>,
 ) -> Result<Option<Submission>, Error> {
     let top = node.finalized_height().map_err(Error::Node)?;
+    // An anchor below the oldest state the node keeps cannot be proven
+    // against, and a proposal anchors a height below its own (spec 17 §4),
+    // so the proposals at or below that floor anchor nothing of use.
+    let oldest = height.max(node.oldest_state());
     let mut best: Option<Submission> = None;
-    for h in (height + 1..=top).rev().take(node.state_history) {
+    for h in (oldest + 1..=top).rev() {
         let candidate = finality_proof(node, h)?
             .and_then(|p| Submission::new(&p).ok())
             .filter(|s| key_id.is_none() || s.key_id == key_id);
-        let floor = height.max(best.as_ref().map_or(0, |b| b.anchor_height + 1));
+        let floor = oldest.max(best.as_ref().map_or(0, |b| b.anchor_height + 1));
         if let Some(s) = candidate.filter(|s| s.anchor_height >= floor) {
             best = Some(s);
         }
