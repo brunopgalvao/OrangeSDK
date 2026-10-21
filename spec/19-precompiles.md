@@ -33,7 +33,7 @@ The **bound** is 256 VM gas per EVM gas: about twice the costliest ordinary opco
 | MODEXP, 64 B, exponent 2^256 − 1 | 32 756 | 1 673 145 | 51.0 | 86 617 | 2.6 |
 | MODEXP, 1 KiB, exponent 255 | 229 492 | 17 451 968 | 76.0 | 495 407 | 2.1 |
 | bn254 add | 266 | 27 388 | 102.9 | 17 375 | 65.3 |
-| bn254 mul, scalar 2^256 − 1 — *above* | 6 116 | 2 725 526 | 445.6 | 28 967 | 4.7 |
+| bn254 mul, scalar 2^256 − 1 — *above* | 6 116 | 2 725 527 | 445.6 | 28 967 | 4.7 |
 | bn254 pairing, 1 pair — *above* | 79 116 | 30 705 551 | 388.1 | 177 807 | 2.2 |
 | bn254 pairing, 2 pairs — *above* | 113 116 | 44 154 530 | 390.3 | 251 973 | 2.2 |
 | bn254 pairing, 8 pairs — *above* | 317 116 | 123 607 487 | 389.7 | 694 739 | 2.1 |
@@ -41,18 +41,18 @@ The **bound** is 256 VM gas per EVM gas: about twice the costliest ordinary opco
 | BLAKE2F, 63 rounds | 179 | 24 315 | 135.8 | 24 315 | 135.8 |
 | BLAKE2F, 64 rounds | 180 | 24 532 | 136.2 | 22 925 | 127.3 |
 | BLAKE2F, 10 000 rounds | 10 116 | 2 162 758 | 213.7 | 42 797 | 4.2 |
-| point evaluation (valid proof) — *above* | 50 116 | 84 687 122 | 1 689.8 | 115 873 | 2.3 |
+| point evaluation (valid proof) — *above* | 50 116 | 84 687 123 | 1 689.8 | 115 873 | 2.3 |
 | BLS12-381 G1 add | 491 | 45 980 | 93.6 | 19 935 | 40.6 |
 | BLS12-381 G1 MSM, 1 pair — *above* | 12 116 | 7 327 286 | 604.7 | 44 962 | 3.7 |
 | BLS12-381 G1 MSM, 16 pairs — *above* | 130 100 | 52 049 864 | 400.0 | 332 203 | 2.5 |
-| BLS12-381 G2 add — *above* | 716 | 392 016 | 547.5 | 24 409 | 34.0 |
+| BLS12-381 G2 add — *above* | 716 | 392 017 | 547.5 | 24 409 | 34.0 |
 | BLS12-381 G2 MSM, 1 pair — *above* | 22 616 | 21 010 638 | 929.0 | 70 065 | 3.0 |
 | BLS12-381 G2 MSM, 16 pairs — *above* | 258 236 | 122 388 687 | 473.9 | 626 739 | 2.4 |
 | BLS12-381 pairing, 1 pair — *above* | 70 416 | 47 025 807 | 667.8 | 159 746 | 2.2 |
 | BLS12-381 pairing, 2 pairs — *above* | 103 016 | 64 335 647 | 624.5 | 229 268 | 2.2 |
 | BLS12-381 pairing, 8 pairs — *above* | 298 616 | 170 390 475 | 570.6 | 646 714 | 2.1 |
-| BLS12-381 map to G1 — *above* | 5 616 | 3 468 565 | 617.6 | 27 948 | 4.9 |
-| BLS12-381 map to G2 — *above* | 23 916 | 10 714 861 | 448.0 | 67 282 | 2.8 |
+| BLS12-381 map to G1 — *above* | 5 616 | 3 468 566 | 617.6 | 27 948 | 4.9 |
+| BLS12-381 map to G2 — *above* | 23 916 | 10 714 862 | 448.0 | 67 282 | 2.8 |
 | P256VERIFY (host from genesis) | 7 016 | 15 765 | 2.2 | 15 765 | 2.2 |
 
 MODEXP's worst case is a modulus of at most 32 bytes, which EIP-7883 prices at a flat 16 per iteration whatever the size, with an exponent of all ones; BLAKE2F's is a large round count, Ethereum charging 1 gas per round. Each call costs the kernel about 12 000 VM gas before the precompile's own work, revm's call frame in the guest, which is why the cheapest precompiles stay above 60 per EVM gas on either path. The host path adds the module call of §3.2, about 5 000 VM gas more; BLAKE2F below 64 rounds is cheaper in the guest and stays there (§3.3).
@@ -74,15 +74,15 @@ MODEXP's worst case is a modulus of at most 32 bytes, which EIP-7883 prices at a
 | `SLOAD`, warm | 13 000 | 345 200 | 26.5 |
 | `SSTORE`, warm | 13 000 | 490 749 | 37.7 |
 | `TSTORE`, `TLOAD` | 23 400 | 543 284 | 23.2 |
-| `BALANCE`, cold | 263 000 | 1 159 269 | 4.4 |
-| `EXTCODEHASH`, cold | 263 000 | 1 240 469 | 4.7 |
+| `BALANCE`, cold | 263 000 | 1 154 070 | 4.3 |
+| `EXTCODEHASH`, cold | 263 000 | 1 235 270 | 4.6 |
 | `BLOCKHASH`, block with 1 000 transactions | 5 000 | 673 700 | 134.7 |
 | `SELFBALANCE` | 3 300 | 278 600 | 84.4 |
 | `STATICCALL` of an empty account | 14 100 | 1 001 000 | 70.9 |
 | `STATICCALL` of the identity precompile | 15 600 | 982 000 | 62.9 |
 | `STATICCALL` of itself | 423 700 | 36 181 300 | 85.3 |
-| `LOG0`, empty | 40 500 | 282 054 | 6.9 |
-| `CREATE`, empty | 3 203 400 | 2 777 280 | 0.8 |
+| `LOG0`, empty | 40 500 | 277 954 | 6.8 |
+| `CREATE`, empty | 3 203 400 | 2 779 938 | 0.8 |
 
 Before this change `KECCAK256` cost 945 (32 B) and 1 974 (1 KiB) VM gas per EVM gas, the guest hashing in software, and `BLOCKHASH` 274 for an empty block and 17 469 for one of 1 000 transactions, the kernel decoding, re-encoding and hashing the stored header on every call (§4).
 
