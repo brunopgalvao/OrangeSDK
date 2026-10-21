@@ -485,14 +485,20 @@ fn delegated_senders_and_authorities_are_limited_as_geth_limits_them() {
         add(&mut pool, &naming_two),
         Err(PoolError::AuthorityReserved)
     );
-    // An authority with one transaction may be named; removal forgets it.
+    // An authority with one transaction may be named, which limits it to
+    // that one. Sender 5 has no code, so only the naming holds it: removing
+    // the set-code transaction (which names it twice) frees it.
+    add(&mut pool, &tx(5, 0, 10)).unwrap();
     let naming_one = PoolTx {
-        authorities: vec![[1; 20], [1; 20]],
+        authorities: vec![[5; 20], [5; 20]],
         ..tx(4, 0, 10)
     };
     add(&mut pool, &naming_one).unwrap();
+    assert_eq!(add(&mut pool, &tx(5, 1, 10)), Err(PoolError::InflightLimit));
     assert!(pool.remove(&naming_one.hash).is_some());
-    add(&mut pool, &tx(1, 1, 20)).unwrap_err();
+    add(&mut pool, &tx(5, 1, 10)).unwrap();
+    // The delegated sender stays limited by its code.
+    assert_eq!(add(&mut pool, &tx(1, 1, 20)), Err(PoolError::InflightLimit));
 }
 
 #[test]
