@@ -587,3 +587,35 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn authorities_come_from_the_authorization_signatures() {
+    use k256::ecdsa::SigningKey;
+    let key = SigningKey::from_slice(&[1; 32]).unwrap();
+    let point = key.verifying_key().to_encoded_point(false);
+    let address: Address = keccak256(&point.as_bytes()[1..])[12..].try_into().unwrap();
+    let mut auth = solo_eth::Authorization {
+        chain_id: [0; 32],
+        address: [9; 20],
+        nonce: 3,
+        y_parity: 0,
+        r: [0; 32],
+        s: [0; 32],
+    };
+    let (sig, id) = key
+        .sign_prehash_recoverable(&keccak256(&auth.signing_payload()))
+        .unwrap();
+    // EIP-7702 takes the low-s form; normalizing s flips the parity.
+    let normalized = sig.normalize_s();
+    auth.y_parity = id.to_byte() ^ u8::from(normalized.is_some());
+    let sig = normalized.unwrap_or(sig);
+    auth.r = sig.r().to_bytes().into();
+    auth.s = sig.s().to_bytes().into();
+    assert_eq!(authority(&auth), Some(address));
+    // A parity other than 0 or 1 names no one, and the pool ignores it.
+    let unsigned = solo_eth::Authorization {
+        y_parity: 2,
+        ..auth
+    };
+    assert_eq!(authority(&unsigned), None);
+}

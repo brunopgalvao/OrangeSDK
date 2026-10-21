@@ -142,11 +142,7 @@ impl PoolTx {
     pub fn parse(raw: &[u8]) -> Option<PoolTx> {
         let tx = solo_eth::decode(raw).ok()?;
         let sender = recover(&tx.signing_payload, &tx.signature())?;
-        let authorities = tx
-            .authorization_list
-            .iter()
-            .filter_map(|auth| recover(&auth.signing_payload(), &auth.signature()?))
-            .collect();
+        let authorities = tx.authorization_list.iter().filter_map(authority).collect();
         Some(PoolTx {
             hash: keccak256(raw),
             raw: raw.to_vec(),
@@ -172,6 +168,12 @@ impl PoolTx {
         let threshold = |fee: u128| fee.saturating_add(bump(fee));
         self.fee_cap >= threshold(old.fee_cap) && self.tip_cap >= threshold(old.tip_cap)
     }
+}
+
+/// The authority an EIP-7702 authorization names: the signer of its
+/// payload, `None` when its signature names none (spec 20 §2.2).
+fn authority(auth: &solo_eth::Authorization) -> Option<Address> {
+    recover(&auth.signing_payload(), &auth.signature()?)
 }
 
 /// The address whose key signed `keccak256(payload)` with `sig`
@@ -476,16 +478,15 @@ impl Mempool {
 
     /// Forgets that a transaction leaving the pool named `authorities`.
     fn unname(&mut self, authorities: &[Address]) {
-        for authority in authorities {
-            // Every authority of a pool transaction is counted.
-            let emptied = self.authorities.get_mut(authority).is_some_and(|count| {
-                *count -= 1;
-                *count == 0
-            });
-            if emptied {
-                self.authorities.remove(authority);
-            }
+        if authorities.is_empty() {
+            return;
         }
+        // Every authority of a pool transaction is counted.
+        for authority in authorities {
+            let count = self.authorities.entry(*authority).or_default();
+            *count = count.saturating_sub(1);
+        }
+        self.authorities.retain(|_, count| *count > 0);
     }
 
     /// Removes the transaction of `sender` with `nonce`, and the sender's
