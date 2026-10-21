@@ -12,6 +12,10 @@ use crate::types::{Address, Hash};
 /// The export of the conformance guest that runs one case.
 pub const EXPORT: &str = "conformance_run";
 
+/// The export that runs one case with feature gate 2 active: the
+/// precompiles on the host (spec 19).
+pub const EXPORT_GATED: &str = "conformance_run_gated";
+
 macro_rules! record {
     ($(#[$meta:meta])* $name:ident { $($(#[$fmeta:meta])* $field:ident : $ty:ty),* $(,)? }) => {
         $(#[$meta])*
@@ -125,5 +129,6 @@ mod tests {
         };
         assert_eq!(Outcome::from_bytes(&outcome.to_bytes()), Ok(outcome));
         assert_eq!(EXPORT, "conformance_run");
+        assert_eq!(EXPORT_GATED, "conformance_run_gated");
     }
 }

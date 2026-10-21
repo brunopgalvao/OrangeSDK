@@ -2848,6 +2848,7 @@ dependencies = [
  "k256",
  "p256",
  "proptest",
+ "revm-precompile",
  "sha2 0.10.9",
  "solo-bls",
  "solo-jit",

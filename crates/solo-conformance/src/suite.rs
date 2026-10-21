@@ -183,9 +183,9 @@ fn verdict(case: &TestCase, runners: &mut [Runner]) -> Result<(), String> {
     for other in others {
         if other.run(&input) != result {
             return Err(format!(
-                "the {:?} backend disagrees with the {:?} backend",
-                other.backend(),
-                first.backend()
+                "the {} disagrees with the {}",
+                other.label(),
+                first.label()
             ));
         }
     }

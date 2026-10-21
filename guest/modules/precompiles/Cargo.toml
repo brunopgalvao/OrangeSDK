@@ -1,0 +1,15 @@
+[package]
+name = "precompiles"
+description = "The precompile module: hands the kernel's EVM precompile arithmetic to the host functions behind gate 2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "precompiles"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+solo-guest = { path = "../../solo-guest" }

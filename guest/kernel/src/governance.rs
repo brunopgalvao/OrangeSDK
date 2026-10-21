@@ -58,6 +58,11 @@ fn book() -> GateBook {
     state::get(keys::BOOK).unwrap_or_default()
 }
 
+/// Whether feature gate `gate` is active for the block at `height` (spec 13 §8.4).
+pub fn gate_active(gate: u8, height: u64) -> bool {
+    book().active_at(height) >> gate & 1 == 1
+}
+
 /// The action a transaction to the upgrade address carries, if it can run:
 /// signed for this chain (EIP-155 or a typed transaction, so it cannot be
 /// replayed from another chain), no value, calldata that is an action, and a

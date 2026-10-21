@@ -2,7 +2,7 @@
 # host workspace because everything here targets riscv64imac-unknown-none-elf.
 [workspace]
 resolver = "2"
-members = ["solo-guest", "solo-module", "hello", "kernel", "modules/counter", "modules/eth-light-client", "modules/eth-message-verifier", "evm-conformance"]
+members = ["solo-guest", "solo-module", "hello", "kernel", "modules/counter", "modules/eth-light-client", "modules/eth-message-verifier", "modules/precompiles", "evm-conformance"]
 
 [workspace.package]
 version = "0.0.1"

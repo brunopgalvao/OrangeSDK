@@ -49,3 +49,14 @@ opt-level = 3
 
 [profile.dev.package.ark-ff]
 opt-level = 3
+
+# The precompile host functions (spec 05 §4.8) run revm's backends; the bn254
+# and modular-exponentiation arithmetic is as slow unoptimized as pairings.
+[profile.dev.package.ark-bn254]
+opt-level = 3
+
+[profile.dev.package.aurora-engine-modexp]
+opt-level = 3
+
+[profile.dev.package.revm-precompile]
+opt-level = 3

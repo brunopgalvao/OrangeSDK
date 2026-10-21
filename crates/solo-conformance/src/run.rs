@@ -2,7 +2,7 @@
 //! read back from the storage the kernel's state code wrote.
 
 use solo_abi::chain::{Account as Stored, keys};
-use solo_abi::conformance::{Case, EXPORT, Outcome};
+use solo_abi::conformance::{Case, EXPORT, EXPORT_GATED, Outcome};
 use solo_abi::{Decode, Encode};
 use solo_host::{Backend, Executor, Flags, MemStorage, ModuleCache, Overlay};
 use solo_vm::host::Capability;
@@ -34,6 +34,8 @@ pub struct Runner {
     exec: Executor<MemStorage>,
     guest: [u8; 32],
     backend: Backend,
+    gas_used: u64,
+    export: &'static str,
 }
 
 impl Runner {
@@ -75,13 +77,54 @@ impl Runner {
             exec,
             guest,
             backend,
+            gas_used: 0,
+            export: EXPORT,
         })
+    }
+
+    /// [`Runner::new`] with feature gate 2 active: the host serves the
+    /// precompile functions (spec 05 §4.8) and the guest runs each case
+    /// through them, as the kernel does once the gate is active (spec 19).
+    ///
+    /// # Errors
+    /// As [`Runner::new`].
+    ///
+    /// # Panics
+    /// As [`Runner::new`].
+    pub fn gated(elf: &[u8], backend: Backend) -> Result<Runner, String> {
+        let mut runner = Runner::new(elf, backend)?;
+        runner
+            .exec
+            .set_extension(Box::new(solo_host::precompiles::Gate2));
+        runner.export = EXPORT_GATED;
+        Ok(runner)
+    }
+
+    /// Whether the runner runs cases with gate 2 active.
+    #[must_use]
+    pub fn is_gated(&self) -> bool {
+        self.export == EXPORT_GATED
+    }
+
+    /// The runner in reports: its backend, and the gate when active.
+    #[must_use]
+    pub fn label(&self) -> String {
+        let gate = if self.is_gated() { " with gate 2" } else { "" };
+        format!("{:?} backend{gate}", self.backend)
     }
 
     /// The backend this runner uses.
     #[must_use]
     pub fn backend(&self) -> Backend {
         self.backend
+    }
+
+    /// VM gas the guest used in the last call, whatever its outcome: the
+    /// kernel gas a case costs, which the precompile measurements of spec
+    /// 19 compare with the EVM gas it charged.
+    #[must_use]
+    pub fn gas_used(&self) -> u64 {
+        self.gas_used
     }
 
     /// Whether the guest runs as native code: `None` before the first case
@@ -115,7 +158,7 @@ impl Runner {
     /// # Panics
     /// As [`Runner::run`].
     pub fn run_on(&mut self, case: &Case, storage: MemStorage) -> Result<Executed, Termination> {
-        let output = self.call(EXPORT, &case.to_bytes(), storage)?;
+        let output = self.call(self.export, &case.to_bytes(), storage)?;
         let outcome = Outcome::from_bytes(&output).expect("the guest encodes an Outcome");
         let (post, orphans) = self.post_state();
         Ok(Executed {
@@ -146,6 +189,7 @@ impl Runner {
             Capability::Privileged,
             Flags::default(),
         );
+        self.gas_used = result.gas_used;
         if result.status != Termination::Halt {
             return Err(result.status);
         }

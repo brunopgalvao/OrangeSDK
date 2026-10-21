@@ -15,6 +15,7 @@ mod modules;
 mod native;
 mod outbox;
 mod persist;
+mod precompiles;
 mod rotation;
 mod staking;
 mod state;

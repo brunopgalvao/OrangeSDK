@@ -16,6 +16,7 @@ use crate::storage::MemStorage;
 mod bls;
 mod code;
 mod gated;
+mod precompiles;
 
 /// Writable scratch in the default layout's stack region.
 const BUF: i64 = 0xFFFC_0000;

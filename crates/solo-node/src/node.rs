@@ -16,7 +16,7 @@ use solo_abi::types::{
 use solo_abi::{Decode, Encode};
 use solo_host::hash::keccak256;
 use solo_host::{
-    CallResult, Executor, Flags, LoadError, MemStorage, ModuleCache, Overlay, Storage,
+    Backend, CallResult, Executor, Flags, LoadError, MemStorage, ModuleCache, Overlay, Storage,
 };
 use solo_vm::host::Capability;
 use solo_vm::status::Termination;
@@ -55,6 +55,13 @@ impl Default for NodeConfig {
 /// Gas allowed to each kernel entrypoint call. Kernel work is bounded by the
 /// block limits it enforces, so this is a safety net, not a budget.
 pub const KERNEL_GAS: i64 = 1 << 40;
+
+/// The kernel gas a block of the reference kernel can take at most (spec 19
+/// §5): the precompile budget, 2^34, plus 256 kernel gas per EVM gas of the
+/// block gas limit, plus room for what every block and transaction costs
+/// besides. A node whose kernel gas is below it can fail to execute a valid
+/// block and stall; [`KERNEL_GAS`] is far above.
+pub const BLOCK_KERNEL_GAS: i64 = 1 << 35;
 
 /// How many of the most recently executed blocks a node keeps the state trie
 /// of, to prove entries against their header roots
@@ -224,6 +231,13 @@ impl Node {
         node.call_unit(exports::INIT, &genesis.to_bytes())?;
         node.kernel_gas = config.kernel_gas;
         Ok(node)
+    }
+
+    /// Runs the kernel, and every module it invokes, on `backend` from the
+    /// next call on; the interpreter by default. Both backends produce the
+    /// same results and gas (spec 07 §4.1); the native one runs faster.
+    pub fn set_backend(&mut self, backend: Backend) {
+        self.exec.set_backend(backend);
     }
 
     fn call_raw(&mut self, export: &'static str, input: &[u8]) -> Result<CallResult, NodeError> {
@@ -661,7 +675,14 @@ impl Node {
             at: None,
         };
         let gas = self.query_gas.min(self.kernel_gas);
-        let r = self.call_with(exports::QUERY, &args.to_bytes(), gas)?;
+        // A query changes nothing (spec 06 §6): whatever the kernel writes,
+        // such as the precompile module of spec 19 §3.2, goes into a layer
+        // dropped afterwards, so chain state and the kernel gas of the next
+        // block never depend on which queries this node served.
+        self.exec.state_mut().push();
+        let r = self.call_with(exports::QUERY, &args.to_bytes(), gas);
+        self.exec.state_mut().discard();
+        let r = r?;
         QueryResult::from_bytes(&r.output)
             .ok()
             .ok_or(NodeError::Decode(exports::QUERY))

@@ -93,6 +93,7 @@ pub fn last_hash() -> Hash {
 /// Stores a block and its index entries.
 pub fn put_block(header: &BlockHeader, hash: &Hash) {
     set(&block_key(header.height), header);
+    set_raw(&concat(keys::BLOCK_NUMBER, &header.height.to_be_bytes()), hash);
     set(&concat(keys::BLOCK_HASH, hash), &header.height);
     set(keys::HEIGHT, &header.height);
     set(keys::LAST_HASH, hash);
@@ -101,6 +102,13 @@ pub fn put_block(header: &BlockHeader, hash: &Hash) {
 /// Block header by height.
 pub fn block_by_number(height: u64) -> Option<BlockHeader> {
     get(&block_key(height))
+}
+
+/// The hash of the block at `height`, stored beside its header so that
+/// `BLOCKHASH` costs one read of 32 bytes however large the header is
+/// (spec 19 §4).
+pub fn block_hash(height: u64) -> Option<Hash> {
+    get_raw(&concat(keys::BLOCK_NUMBER, &height.to_be_bytes())).and_then(|v| Hash::try_from(v.as_slice()).ok())
 }
 
 /// Block header by hash.

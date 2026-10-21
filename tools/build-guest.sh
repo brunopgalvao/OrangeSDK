@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Builds every guest program for the Solo target (hello, the kernel, the
-# example module, the two bridge modules and the conformance guest),
-# refreshes the test fixtures and prints the ELF paths. The kernel is built
-# twice: as is, and with the
-# `upgrade-test` feature, the next kernel version the upgrade tests switch to.
+# example module, the two bridge modules, the precompile module and the
+# conformance guest), refreshes the test fixtures and prints the ELF paths.
+# The precompile module (spec 19) is built first and recompiled with the
+# host's solo-recompile into guest/kernel/precompiles.solo, which the kernel
+# and the conformance guest embed. The kernel is built twice: as is, and with
+# the `upgrade-test` feature, the next kernel version the upgrade tests switch to.
 # The example module `counter` (spec 16) becomes the module tests' fixture,
 # and the bridge's two modules (spec 18) the bridge tests'. The kernel embeds
 # contracts/build/EthereumInbox.bin-runtime: run tools/build-contracts.sh first
@@ -41,10 +43,13 @@ OBJCOPY=$(dirname "$(rustup which rustc)")/../lib/rustlib/$(rustc -vV | sed -n "
 REMAP="target.riscv64imac-unknown-none-elf.rustflags=[\"--remap-path-prefix=$HOME=/home\"]"
 OUT=target/riscv64imac-unknown-none-elf/release
 FIX=$ROOT/crates
+cargo build --config "$REMAP" --release -p precompiles "$@"
+(cd "$BUILD" && cargo run --release -q -p solo-recompile -- "guest/$OUT/precompiles" guest/kernel/precompiles.solo)
+cp kernel/precompiles.solo "$ROOT/guest/kernel/precompiles.solo"
 cargo build --config "$REMAP" --release -p kernel --features upgrade-test "$@"
 "$OBJCOPY" --strip-debug "$OUT/kernel" "$FIX/solo-node/tests/fixtures/kernel_v2.elf"
 cargo build --config "$REMAP" --release "$@"
-ls -1 "$OUT/hello" "$OUT/kernel" "$OUT/counter" "$OUT/eth-light-client" "$OUT/eth-message-verifier" "$OUT/evm-conformance"
+ls -1 "$OUT/hello" "$OUT/kernel" "$OUT/counter" "$OUT/eth-light-client" "$OUT/eth-message-verifier" "$OUT/precompiles" "$OUT/evm-conformance"
 cp "$OUT/hello" "$FIX/solo-recompile/tests/fixtures/hello.elf"
 "$OBJCOPY" --strip-debug "$OUT/kernel" "$FIX/solo-node/tests/fixtures/kernel.elf"
 "$OBJCOPY" --strip-debug "$OUT/counter" "$FIX/solo-node/tests/fixtures/counter.elf"

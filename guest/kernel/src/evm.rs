@@ -9,6 +9,7 @@ use revm::context::transaction::{AccessList, AccessListItem};
 use revm::context::{BlockEnv, Context, TxEnv};
 use revm::handler::{EthPrecompiles, MainnetContext, PrecompileProvider};
 use revm::interpreter::InterpreterResult;
+use revm::precompile::bls12_381::{G1Point, G1PointScalar, G2Point, G2PointScalar};
 use revm::precompile::{Crypto, PrecompileHalt};
 use revm::primitives::hardfork::SpecId;
 use revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE;
@@ -52,7 +53,7 @@ impl Database for StateDb {
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Infallible> {
-        Ok(state::block_by_number(number).map_or(B256::ZERO, |h| B256::from(state::keccak256(&solo_abi::Encode::to_bytes(&h)))))
+        Ok(state::block_hash(number).map_or(B256::ZERO, B256::from))
     }
 }
 
@@ -338,7 +339,10 @@ const SECP256K1_ORDER: [u8; 32] = [
     0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
 ];
 
-/// The host's native implementations of the precompiles it accelerates.
+/// The host's native implementations of the precompiles it accelerates:
+/// SHA-256, ECRECOVER and P-256 from genesis, the others of spec 19 once
+/// gate 2 is active. `KECCAK256` reaches the host through `alloy-primitives`'
+/// `native-keccak` hook (`precompiles::native_keccak256`).
 #[derive(Debug)]
 struct HostCrypto;
 
@@ -372,6 +376,60 @@ impl Crypto for HostCrypto {
     fn secp256r1_verify_signature(&self, msg: &[u8; 32], sig: &[u8; 64], pk: &[u8; 64]) -> bool {
         // SAFETY: valid pointers into our own buffers of the sizes the host function reads.
         unsafe { host::__solo_import_p256_verify(msg.as_ptr(), sig.as_ptr(), pk.as_ptr()) == 0 }
+    }
+
+    // The rest run on the host once gate 2 is active (spec 19, `precompiles.rs`).
+
+    fn modexp(&self, base: &[u8], exp: &[u8], modulus: &[u8]) -> Result<Vec<u8>, PrecompileHalt> {
+        crate::precompiles::modexp(base, exp, modulus)
+    }
+
+    fn bn254_g1_add(&self, p1: &[u8], p2: &[u8]) -> Result<[u8; 64], PrecompileHalt> {
+        crate::precompiles::bn254_add(p1, p2)
+    }
+
+    fn bn254_g1_mul(&self, point: &[u8], scalar: &[u8]) -> Result<[u8; 64], PrecompileHalt> {
+        crate::precompiles::bn254_mul(point, scalar)
+    }
+
+    fn bn254_pairing_check(&self, pairs: &[(&[u8], &[u8])]) -> Result<bool, PrecompileHalt> {
+        crate::precompiles::bn254_pairing(pairs)
+    }
+
+    fn blake2_compress(&self, rounds: u32, h: &mut [u64; 8], m: &[u64; 16], t: &[u64; 2], f: bool) {
+        crate::precompiles::blake2f(rounds, h, m, t, f);
+    }
+
+    fn verify_kzg_proof(&self, z: &[u8; 32], y: &[u8; 32], commitment: &[u8; 48], proof: &[u8; 48]) -> Result<(), PrecompileHalt> {
+        crate::precompiles::kzg(z, y, commitment, proof)
+    }
+
+    fn bls12_381_g1_add(&self, a: G1Point, b: G1Point) -> Result<[u8; 96], PrecompileHalt> {
+        crate::precompiles::g1_add(a, b)
+    }
+
+    fn bls12_381_g1_msm(&self, pairs: &mut dyn Iterator<Item = Result<G1PointScalar, PrecompileHalt>>) -> Result<[u8; 96], PrecompileHalt> {
+        crate::precompiles::g1_msm(pairs)
+    }
+
+    fn bls12_381_g2_add(&self, a: G2Point, b: G2Point) -> Result<[u8; 192], PrecompileHalt> {
+        crate::precompiles::g2_add(a, b)
+    }
+
+    fn bls12_381_g2_msm(&self, pairs: &mut dyn Iterator<Item = Result<G2PointScalar, PrecompileHalt>>) -> Result<[u8; 192], PrecompileHalt> {
+        crate::precompiles::g2_msm(pairs)
+    }
+
+    fn bls12_381_pairing_check(&self, pairs: &[(G1Point, G2Point)]) -> Result<bool, PrecompileHalt> {
+        crate::precompiles::pairing(pairs)
+    }
+
+    fn bls12_381_fp_to_g1(&self, fp: &[u8; 48]) -> Result<[u8; 96], PrecompileHalt> {
+        crate::precompiles::map_fp(fp)
+    }
+
+    fn bls12_381_fp2_to_g2(&self, fp2: ([u8; 48], [u8; 48])) -> Result<[u8; 192], PrecompileHalt> {
+        crate::precompiles::map_fp2(fp2)
     }
 }
 

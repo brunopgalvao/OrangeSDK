@@ -23,6 +23,11 @@ pub fn strip(bytes: &[u8]) -> &[u8] {
 
 /// A pre-EIP-155 legacy call from the key `[1; 32]` and that key's address.
 pub fn signed_call(to: [u8; 20], gas: u64) -> (Vec<u8>, [u8; 20]) {
+    signed_call_with(to, gas, &[])
+}
+
+/// [`signed_call`] with calldata.
+pub fn signed_call_with(to: [u8; 20], gas: u64, data: &[u8]) -> (Vec<u8>, [u8; 20]) {
     let key = SigningKey::from_slice(&[1; 32]).unwrap();
     let point = key.verifying_key().to_encoded_point(false);
     let from: [u8; 20] = keccak256(&point.as_bytes()[1..])[12..].try_into().unwrap();
@@ -32,7 +37,7 @@ pub fn signed_call(to: [u8; 20], gas: u64) -> (Vec<u8>, [u8; 20]) {
     encode_uint(u128::from(gas), &mut fields);
     encode_bytes(&to, &mut fields);
     encode_uint(0, &mut fields);
-    encode_bytes(&[], &mut fields);
+    encode_bytes(data, &mut fields);
     let mut payload = Vec::new();
     encode_list(&fields, &mut payload);
     let (sig, rid) = key.sign_prehash_recoverable(&keccak256(&payload)).unwrap();

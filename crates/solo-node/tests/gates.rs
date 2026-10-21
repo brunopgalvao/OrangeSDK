@@ -14,7 +14,8 @@ use solo_abi::types::Genesis;
 use solo_host::hash::keccak256;
 use solo_host::{Executor, Flags, MemStorage, ModuleCache};
 use solo_node::upgrade::{
-    BLS12381_FAST_AGGREGATE_VERIFY, GATED, SECP256K1_VERIFY, SUPPORTED, gated, signal_tx,
+    BLS12381_FAST_AGGREGATE_VERIFY, GATED, PRECOMPILE_HANDLE, SECP256K1_VERIFY, SUPPORTED, gated,
+    precompile, signal_tx,
 };
 use solo_node::{GatedExtension, Node, NodeConfig, NodeExtension, NodeServices};
 use solo_upgrade::{Action, gate};
@@ -108,11 +109,24 @@ fn negate(s: &[u8]) -> Vec<u8> {
 
 #[test]
 fn the_gated_function_resolves_only_while_its_gate_is_active() {
-    assert_eq!(GATED.len(), 2);
+    assert_eq!(GATED.len(), 15);
     for f in GATED {
         assert_eq!(SUPPORTED >> f.gate & 1, 1, "{f:?}");
     }
-    assert_eq!(SUPPORTED, 0b11);
+    assert_eq!(SUPPORTED, 0b111);
+    // Gate 2 guards the thirteen precompile functions, in their order (spec 05 §4.8).
+    for (i, f) in GATED[2..].iter().enumerate() {
+        let (name, _) = solo_host::precompiles::FUNCTIONS[i];
+        let handle = PRECOMPILE_HANDLE + u32::try_from(i).unwrap();
+        assert_eq!(
+            (f.name, f.gate, f.handle, f.sandboxed),
+            (name, 2, handle, true)
+        );
+        assert_eq!(gated(name, Capability::Sandboxed, 0b011), None);
+        assert_eq!(gated(name, Capability::Sandboxed, 0b100), Some(handle));
+    }
+    assert_eq!(PRECOMPILE_HANDLE, 202);
+    assert_eq!(precompile(12), GATED[14]);
     assert_eq!(
         (GATED[0].name, GATED[0].handle, SECP256K1_VERIFY),
         ("secp256k1_verify", 200, 200)
@@ -198,6 +212,51 @@ fn the_node_serves_bls12381_fast_aggregate_verify_behind_gate_1() {
     );
     assert_eq!(
         run(&mut exec, &module(&[0xFF; 96]), Capability::Sandboxed),
+        (Termination::Halt, 1)
+    );
+}
+
+#[test]
+fn the_node_serves_the_precompile_functions_behind_gate_2() {
+    // bn254 G1 generator doubled, then a point off the curve.
+    let mut g1 = [0u8; 64];
+    g1[31] = 1;
+    g1[63] = 2;
+    let mut off = g1;
+    off[63] = 3;
+    let base = 0x1_0000;
+    let module = |p: &[u8; 64]| {
+        let rodata = [&g1[..], p].concat();
+        let mut b = ModuleBuilder::new().rodata(&rodata);
+        b.import("output_write");
+        b.import("evm_bn254_add");
+        b.block(&[
+            li(Reg::A0, base),
+            li(Reg::A1, BUF + 8),
+            Instruction::Ecall { import: 1 },
+            li(Reg::A7, BUF),
+            Instruction::Store {
+                width: StoreWidth::D,
+                rs1: Reg::A7,
+                rs2: Reg::A0,
+                off: 0,
+            },
+            li(Reg::A0, BUF),
+            li(Reg::A1, 8),
+            Instruction::Ecall { import: 0 },
+            Instruction::Halt,
+        ]);
+        b.export("main", 0).build()
+    };
+    let (mut exec, gates) = executor(2);
+    assert!(exec.load(&module(&g1), Capability::Sandboxed).is_err());
+    gates.set(0b100);
+    assert_eq!(
+        run(&mut exec, &module(&g1), Capability::Sandboxed),
+        (Termination::Halt, 0)
+    );
+    assert_eq!(
+        run(&mut exec, &module(&off), Capability::Sandboxed),
         (Termination::Halt, 1)
     );
 }
@@ -356,7 +415,7 @@ fn a_validator_signals_and_its_gate_activates_an_epoch_after_locking_in() {
     assert_eq!(node.upgrades().missing_gates(), SUPPORTED);
     // The operator hears of it through /metrics and /status (spec 13 §7.2).
     let text = node.metrics_text();
-    assert!(text.contains("\nsolo_upgrade_missing_gates 2\n"), "{text}");
+    assert!(text.contains("\nsolo_upgrade_missing_gates 3\n"), "{text}");
     assert!(text.contains("\nsolo_upgrade_blocked 0\n"), "{text}");
     assert_eq!(node.status().unwrap().missing_gates, SUPPORTED);
     // Locked in stays locked in.
