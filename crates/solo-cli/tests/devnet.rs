@@ -1,9 +1,10 @@
 //! `solo devnet` and `solo upgrade` on real processes: a devnet is
-//! initialized, run, watched, stopped and restarted; a kernel upgrade is
-//! staged and proposed over JSON-RPC and every mistake is named; and the
-//! rehearsal script runs end to end against four validators. The compose
-//! stack's rehearsal runs only with `SOLO_DOCKER` set
-//! (`tools/compose-rehearsal.sh` says so otherwise).
+//! initialized, run, watched, stopped and restarted with its driver state;
+//! a kernel upgrade is staged and proposed over JSON-RPC and every mistake
+//! is named; `up` leaves nothing of its own behind and `stop` reaches a
+//! node that does not answer; and the rehearsal script runs end to end
+//! against four validators. The compose stack's rehearsal runs only with
+//! `SOLO_DOCKER` set (`tools/compose-rehearsal.sh` says so otherwise).
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -155,6 +156,15 @@ fn init_writes_a_reproducible_devnet_and_names_mistakes() {
         data(&solo_node::validator_id(&key0)),
         devnet.nodes[0].validator
     );
+    // Key files are the owner's alone.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [devnet.governance_key(), devnet.node_dir(0).join("key")] {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
+    }
     // The same seed gives the same validators; without one each devnet differs.
     let twin = scratch("init-twin");
     init(&twin, "2", &["--seed", SEED]);
@@ -166,11 +176,24 @@ fn init_writes_a_reproducible_devnet_and_names_mistakes() {
         Devnet::load(&other).unwrap().nodes[0].validator,
         devnet.nodes[0].validator
     );
-    // A second init leaves an initialized directory alone, unless forced.
+    // A second init leaves an initialized directory alone, unless forced;
+    // forced, it starts the node directories over (an old chain's driver
+    // state must not resume on a new chain) and keys stay the owner's alone.
     assert!(init(&dir, "3", &[]).contains("already initialized"));
     assert_eq!(Devnet::load(&dir).unwrap().nodes.len(), 2);
+    std::fs::write(devnet.node_dir(0).join("driver.state"), "old").unwrap();
     init(&dir, "3", &["--force"]);
     assert_eq!(Devnet::load(&dir).unwrap().nodes.len(), 3);
+    assert!(!devnet.node_dir(0).join("driver.state").exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(devnet.governance_key())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
     // Fixed ports count up from the bases (nothing is bound yet); no epochs
     // means no staking.
     let plain = scratch("init-plain");
@@ -296,6 +319,22 @@ fn init_writes_a_reproducible_devnet_and_names_mistakes() {
                 "x",
             ],
             "--epoch-blocks must be a number",
+        ),
+        // What the kernel would trap on at `kernel_init` is refused by name.
+        (
+            vec![
+                "devnet",
+                "init",
+                "--dir",
+                fresh,
+                "--kernel",
+                KERNEL,
+                "--epoch-blocks",
+                "10",
+                "--dkg-phase-blocks",
+                "5",
+            ],
+            "four DKG phases must fit an epoch",
         ),
         (
             vec![
@@ -664,6 +703,112 @@ fn manifest_and_argument_errors() {
     assert_eq!(unmet.len(), 2, "{unmet:?}");
     assert!(unmet[0].contains("finalized 4 behind 100"), "{unmet:?}");
     assert!(all.unmet("127.0.0.1:1", 0)[0].contains("unreachable"));
+    // `--no-equivocations` reads the driver's counter from the metrics: a
+    // node that recorded some, then one whose metrics do not parse.
+    let equivocated = fake_node(
+        vec![
+            http(
+                "solo_emitted_counter_total{origin=\"driver\",name=\"equivocations\"} 2\nsolo_emitted_counter_total{origin=\"driver\",name=\"blocks\"} 9\n",
+            ),
+            http("solo_emitted_counter_total{ 1\n"),
+        ],
+        Some(status),
+    );
+    let none =
+        Conditions::parse(&["solo", "devnet", "wait", "--no-equivocations"].map(str::to_owned))
+            .unwrap();
+    assert_eq!(none.to_string(), "no equivocations");
+    assert_eq!(
+        none.unmet(&equivocated, 0),
+        vec!["2 equivocations recorded".to_owned()]
+    );
+    let unmet = none.unmet(&equivocated, 0);
+    assert!(unmet[0].contains("/metrics: line 1"), "{unmet:?}");
+    // `--caught-up` measures against the furthest of every node, not of
+    // the selected ones: node 0 alone is still 100 blocks behind node 1.
+    let behind = fake_node(vec![], Some(status));
+    let ahead = fake_node(
+        vec![],
+        Some(http(
+            r#"{"version":"0","chainId":7,"head":100,"headAgeSeconds":0.1,"finalized":100,"p2p":true,"peers":1,"mempool":0,"uptimeSeconds":1,"validator":null,"upgradeAlert":null,"missingGates":[],"kernelVersion":1,"kernelHash":"0x0000000000000000000000000000000000000000000000000000000000000000","activeGates":[],"pendingUpgrade":null}"#,
+        )),
+    );
+    let rpcs = format!("{behind},{ahead}");
+    let text = err(&[
+        "devnet",
+        "wait",
+        "--rpc",
+        &rpcs,
+        "--nodes",
+        "0",
+        "--caught-up",
+        "--timeout",
+        "0",
+    ]);
+    assert!(text.contains("node 0: finalized 4 behind 100"), "{text}");
+    let text = ok(&[
+        "devnet",
+        "wait",
+        "--rpc",
+        &rpcs,
+        "--nodes",
+        "1",
+        "--caught-up",
+        "--timeout",
+        "0",
+    ]);
+    assert!(
+        text.contains("ok after") && text.contains("caught up"),
+        "{text}"
+    );
+}
+
+#[test]
+fn up_stops_only_what_it_started_and_stop_falls_back_on_the_pid_file() {
+    let dir = scratch("orphans");
+    init(&dir, "2", &[]);
+    let d = str_of(&dir);
+    let devnet = Devnet::load(&dir).unwrap();
+    // Node 1 runs already: `up` refuses, kills the node 0 it had started
+    // and leaves node 1, which is not its own, running.
+    assert!(ok(&["devnet", "start", "--dir", d, "--node", "1"]).contains("node 1 started"));
+    let text = err(&["devnet", "up", "--dir", d]);
+    assert!(text.contains("node 1 is already running"), "{text}");
+    assert!(!dir.join("node-0/pid").exists());
+    let status = ok(&["devnet", "status", "--dir", d]);
+    assert!(
+        status.contains("node 0  down") && status.contains("node 1  up"),
+        "{status}"
+    );
+    // A pid file naming a process that is not this devnet's node is left
+    // alone, as is garbage, or the pid of a process that is gone.
+    let mut sleeper = Command::new("sleep").arg("600").spawn().unwrap();
+    let pid = dir.join("node-0/pid");
+    std::fs::write(&pid, sleeper.id().to_string()).unwrap();
+    assert!(ok(&["devnet", "stop", "--dir", d, "--node", "0"]).contains("node 0 is not running"));
+    assert!(sleeper.try_wait().unwrap().is_none());
+    sleeper.kill().unwrap();
+    sleeper.wait().unwrap();
+    std::fs::write(&pid, "x").unwrap();
+    assert!(ok(&["devnet", "stop", "--dir", d, "--node", "0"]).contains("node 0 is not running"));
+    std::fs::write(&pid, sleeper.id().to_string()).unwrap();
+    assert!(ok(&["devnet", "stop", "--dir", d, "--node", "0"]).contains("node 0 is not running"));
+    // A node whose RPC does not answer is stopped through its pid: node 1,
+    // reached through a copy of the manifest that points its RPC nowhere.
+    let wedged = scratch("orphans-wedged");
+    std::fs::create_dir_all(wedged.join("node-1")).unwrap();
+    let manifest = std::fs::read_to_string(dir.join(MANIFEST))
+        .unwrap()
+        .replace(&devnet.nodes[1].rpc, "127.0.0.1:1");
+    std::fs::write(wedged.join(MANIFEST), manifest).unwrap();
+    std::fs::copy(dir.join("node-1/pid"), wedged.join("node-1/pid")).unwrap();
+    let text = ok(&["devnet", "stop", "--dir", str_of(&wedged), "--node", "1"]);
+    assert!(
+        text.contains("node 1 stopped (pid") && text.contains("signalled)"),
+        "{text}"
+    );
+    assert!(!wedged.join("node-1/pid").exists());
+    assert!(ok(&["devnet", "status", "--dir", d]).contains("node 1  down"));
 }
 
 /// A running `solo devnet up`, taken down when dropped.
@@ -719,10 +864,15 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
     assert!(text.contains("every node stopped"), "{text}");
     let log = std::fs::read_to_string(devnet.node_dir(0).join("log")).unwrap();
     assert!(log.contains("block 2 0x"), "{log}");
+    assert!(log.contains("new, from view 1"), "{log}");
     assert!(ok(&["devnet", "status", "--dir", d]).contains("node 0  down"));
-    // Started again, alone and from nothing, it runs; a second start is refused.
+    assert!(devnet.node_dir(0).join("driver.state").exists());
+    // Started again, it resumes the view its driver state records and runs
+    // on; a second start is refused.
     assert!(ok(&["devnet", "start", "--dir", d, "--node", "0"]).contains("node 0 started"));
     assert!(err(&["devnet", "start", "--dir", d, "--node", "0"]).contains("already running"));
+    let log = std::fs::read_to_string(devnet.node_dir(0).join("log")).unwrap();
+    assert!(log.contains("resumed in view "), "{log}");
     // Conditions not met yet: no peers, no gate, no certificate, not that high.
     let text = err(&[
         "devnet",
@@ -762,6 +912,7 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
         "3",
         "--finalized",
         "1",
+        "--no-equivocations",
         "--timeout",
         "120",
     ]);
@@ -957,7 +1108,7 @@ fn the_rehearsal_passes_on_a_four_validator_devnet() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stdout}\n{stderr}");
     assert!(
-        stdout.contains("rehearsal: 9 passed, 0 failed"),
+        stdout.contains("rehearsal: 10 passed, 0 failed"),
         "{stdout}\n{stderr}"
     );
     for phase in [
@@ -970,14 +1121,21 @@ fn the_rehearsal_passes_on_a_four_validator_devnet() {
         "PASS catch-up: node 3",
         "PASS threshold share",
         "PASS catch-up: node 2",
+        "PASS no equivocation",
     ] {
         assert!(stdout.contains(phase), "{phase}: {stdout}");
     }
     assert!(up.finish());
-    // Every node's log shows the switch and no error.
+    // Every node's log shows the kernel switch and no error; the two that
+    // restarted resumed the driver state they had left on disk.
     for i in 0..4 {
         let log = std::fs::read_to_string(dir.join(format!("node-{i}/log"))).unwrap();
         assert!(!log.contains("node error"), "node {i}: {log}");
+        assert!(
+            log.contains("kernel switch after block ") && log.contains(": version 1 to 2 (0x"),
+            "node {i}: {log}"
+        );
+        assert_eq!(log.contains("resumed in view "), i >= 2, "node {i}: {log}");
     }
 }
 

@@ -2916,6 +2916,7 @@ dependencies = [
 name = "solo-cli"
 version = "0.0.1"
 dependencies = [
+ "getrandom 0.3.4",
  "k256",
  "serde_json",
  "solo-abi",

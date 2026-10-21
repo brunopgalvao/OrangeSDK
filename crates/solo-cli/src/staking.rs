@@ -14,13 +14,17 @@
 //! genesis validator set fixed. `dkgPhaseBlocks` (default 0) turns the
 //! threshold key on; four phases must fit an epoch. With a threshold key,
 //! `maxKeyAge` defaults to 2 and `unbondingEpochs` to `maxKeyAge + 2`, the
-//! least spec 15 §6.7 allows; without one both default to 0. `minStake` is
+//! least spec 15 §6.7 allows; without one both default to 0. What the
+//! kernel's `kernel_init` refuses (spec 15 §2: phases that do not fit, a
+//! key age of zero, an unbonding period that does not outlast the key age
+//! and the handoff) is refused here, by name. `minStake` is
 //! in wei, as a balance is written in `alloc`. `keys` lists the DKG
 //! encryption key of each genesis validator that takes part in the DKG, as
 //! `solo key` prints it; a validator without one holds no share.
 
 use serde_json::{Map, Value};
 use solo_abi::codec::Seq;
+use solo_abi::rotation::HANDOFF_EPOCHS;
 use solo_abi::staking::{StakingParams, ValidatorKey};
 
 fn number(fields: &Map<String, Value>, name: &str, default: u64) -> Result<u64, String> {
@@ -60,6 +64,27 @@ pub fn parse_staking(v: &Value) -> Result<StakingParams, String> {
     let max_key_age = number(fields, "maxKeyAge", if threshold { 2 } else { 0 })?;
     let unbonding_default = if threshold { max_key_age + 2 } else { 0 };
     let unbonding_epochs = number(fields, "unbondingEpochs", unbonding_default)?;
+    // The reference kernel's genesis checks (guest `staking::init`), so that
+    // a genesis the kernel would trap on is refused before a node starts.
+    if epoch_blocks != 0 && dkg_phase_blocks.saturating_mul(4) > epoch_blocks {
+        return Err(
+            "genesis: four DKG phases must fit an epoch: 4 × staking.dkgPhaseBlocks ≤ staking.epochBlocks"
+                .to_owned(),
+        );
+    }
+    if epoch_blocks != 0 && threshold && max_key_age == 0 {
+        return Err(
+            "genesis: staking.maxKeyAge must be at least 1 with a threshold key".to_owned(),
+        );
+    }
+    if epoch_blocks != 0
+        && threshold
+        && unbonding_epochs <= max_key_age.saturating_add(HANDOFF_EPOCHS)
+    {
+        return Err(format!(
+            "genesis: staking.unbondingEpochs must exceed staking.maxKeyAge + {HANDOFF_EPOCHS} (spec 15 §6.7)"
+        ));
+    }
     let min_stake = fields.get("minStake").map_or(Ok(0), crate::parse_balance)?;
     let max_validators = u32::try_from(number(fields, "maxValidators", 0)?)
         .ok()
@@ -173,6 +198,18 @@ mod tests {
             (
                 serde_json::json!({"staking": {"epochBlocks": 8, "keys": {format!("0x{}", "11".repeat(32)): "0x02"}}}),
                 "staking.keys encryption key must be 0x hex of 48 bytes",
+            ),
+            (
+                serde_json::json!({"staking": {"epochBlocks": 8, "dkgPhaseBlocks": 3}}),
+                "four DKG phases must fit an epoch",
+            ),
+            (
+                serde_json::json!({"staking": {"epochBlocks": 8, "dkgPhaseBlocks": 2, "maxKeyAge": 0}}),
+                "staking.maxKeyAge must be at least 1",
+            ),
+            (
+                serde_json::json!({"staking": {"epochBlocks": 8, "dkgPhaseBlocks": 2, "unbondingEpochs": 3}}),
+                "staking.unbondingEpochs must exceed staking.maxKeyAge + 1",
             ),
         ];
         for (v, message) in cases {

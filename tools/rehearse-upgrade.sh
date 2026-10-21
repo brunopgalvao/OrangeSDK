@@ -3,9 +3,11 @@
 # a kernel upgrade through governance that every node switches to at the
 # activation height (spec 06 §7, spec 13), a feature gate that every validator
 # signals and that locks in and activates on every node (spec 13 §8), a
-# validator that stops while the others keep finalizing, and that comes back,
-# catches up and signs with its threshold share again (spec 15 §6). Prints a
-# PASS or FAIL line per phase and exits non-zero on the first failure.
+# validator that stops while the others keep finalizing, and that comes back
+# with its driver state, catches up and signs with its threshold share again
+# (spec 08 §7, spec 15 §6), and no validator having voted twice in a view
+# across its restart (spec 08 §9). Prints a PASS or FAIL line per phase and
+# exits non-zero on the first failure.
 #
 # usage: tools/rehearse-upgrade.sh <devnet dir> [kernel_v2.elf|kernel_v2.solo]
 #
@@ -126,12 +128,12 @@ others() {
 echo "rehearsal on $N nodes ($RPCS), driver $DRIVER, kernel $KERNEL_V2"
 
 # --- 1. the network is up ----------------------------------------------------
-phase 1/6 "every node is up, connected and producing blocks"
+phase 1/7 "every node is up, connected and producing blocks"
 wait_nodes "network up" --peers 1 --head 2
 pass "network up: $N nodes, every node connected, head past 2"
 
 # --- 2. the kernel upgrade ---------------------------------------------------
-phase 2/6 "governance proposes kernel_v2; every node switches at the activation height"
+phase 2/7 "governance proposes kernel_v2; every node switches at the activation height"
 REPORT=$(submit_upgrade) || fail "upgrade submission"
 echo "$REPORT"
 CODE_HASH=$(echo "$REPORT" | sed -n 's/^code hash *//p')
@@ -141,7 +143,7 @@ wait_nodes "kernel switch" --kernel-version 2 --kernel-hash "$CODE_HASH" --final
 pass "kernel switch: every node runs version 2 ($CODE_HASH) and finalized past block $ACTIVATION"
 
 # --- 3. the feature gates ----------------------------------------------------
-phase 3/6 "every validator signals the gates $GATES; they lock in and activate everywhere"
+phase 3/7 "every validator signals the gates $GATES; they lock in and activate everywhere"
 wait_nodes "gate signalling" --signalled "$GATES"
 pass "gate signalling: every validator's latest signal names gates $GATES"
 wait_nodes "gate lock-in" --locked-in "$GATES"
@@ -150,20 +152,20 @@ wait_nodes "gate activation" --active-gates "$GATES"
 pass "gate activation: gates $GATES active on every node"
 
 # --- 4. a validator stops ----------------------------------------------------
-phase 4/6 "validator $STOP_NODE stops; the others keep finalizing"
+phase 4/7 "validator $STOP_NODE stops; the others keep finalizing"
 stop_node "$STOP_NODE" || fail "stopping node $STOP_NODE"
 FINALIZED=$(field 0 finalized)
 wait_nodes "liveness without node $STOP_NODE" --nodes "$(others "$STOP_NODE")" --finalized $((FINALIZED + 3))
 pass "liveness: the other nodes finalized 3 blocks past $FINALIZED without node $STOP_NODE"
 
 # --- 5. it comes back --------------------------------------------------------
-phase 5/6 "validator $STOP_NODE restarts from nothing and catches up"
+phase 5/7 "validator $STOP_NODE restarts with its driver state and catches up"
 start_node "$STOP_NODE" || fail "starting node $STOP_NODE"
 wait_nodes "catch-up of node $STOP_NODE" --nodes "$STOP_NODE" --peers 1 --kernel-version 2 --active-gates "$GATES" --caught-up
 pass "catch-up: node $STOP_NODE runs version 2 with the gates active and is within 2 blocks of the head"
 
 # --- 6. its threshold share still signs --------------------------------------
-phase 6/6 "validator $SIGNER_NODE stops: every threshold certificate now needs node $STOP_NODE's share"
+phase 6/7 "validator $SIGNER_NODE stops: every threshold certificate now needs node $STOP_NODE's share"
 stop_node "$SIGNER_NODE" || fail "stopping node $SIGNER_NODE"
 # Node $SIGNER_NODE may have signed finalize votes for a couple of blocks past
 # the finalized height before it left; the ones four blocks on were proposed
@@ -171,8 +173,16 @@ stop_node "$SIGNER_NODE" || fail "stopping node $SIGNER_NODE"
 ABOVE=$(($(field 0 finalized) + 4))
 wait_nodes "threshold certificates with node $STOP_NODE's share" --nodes 0 --certified 3 --above "$ABOVE"
 pass "threshold share: 3 blocks above $ABOVE carry threshold certificates signed without node $SIGNER_NODE"
+FINALIZED=$(field 0 finalized)
 start_node "$SIGNER_NODE" || fail "starting node $SIGNER_NODE"
-wait_nodes "catch-up of node $SIGNER_NODE" --nodes "$SIGNER_NODE" --caught-up
-pass "catch-up: node $SIGNER_NODE is back within 2 blocks of the head"
+wait_nodes "catch-up of node $SIGNER_NODE" --nodes "$SIGNER_NODE" --caught-up --finalized "$FINALIZED"
+pass "catch-up: node $SIGNER_NODE is back within 2 blocks of the head, past $FINALIZED"
+
+# --- 7. nobody voted twice ---------------------------------------------------
+phase 7/7 "no validator voted twice in a view across its restart"
+# A validator that came back without the votes it had cast could vote again
+# in the view it left; every node records such an equivocation (spec 08 §9).
+wait_nodes "equivocation check" --no-equivocations
+pass "no equivocation: no node recorded an equivocation across the restarts"
 
 summary

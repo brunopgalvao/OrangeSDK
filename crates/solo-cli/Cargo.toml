@@ -21,6 +21,7 @@ solo-rlp = { path = "../solo-rlp" }
 solo-upgrade = { path = "../solo-upgrade" }
 serde_json = "1"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+getrandom = "0.3"
 
 [dev-dependencies]
 solo-rpc = { path = "../solo-rpc" }

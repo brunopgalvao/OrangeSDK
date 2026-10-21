@@ -30,11 +30,15 @@
 //! `up` starts every node as a `solo devnet node` process, its output in
 //! `<dir>/node-<i>/log` and its pid in `<dir>/node-<i>/pid`, and waits for
 //! them; with `--blocks` it stops them once every node has executed that
-//! many blocks. `down` stops every node, `stop` and `start` one, through
-//! `solo_stop` and a fresh process; a restarted node has no state on disk
-//! and syncs from its peers (spec 08 §7a). `status` prints one line per
-//! node from `GET /status`. `wait` polls until every selected node meets
-//! every condition given, or the timeout passes (default 600 s):
+//! many blocks. `down` stops every node, `stop` and `start` one: through
+//! `solo_stop`, or by signalling the pid in `node-<i>/pid` when the node
+//! does not answer, and a fresh process. A node keeps its driver state in
+//! `node-<i>` (`driver.state` and `persist.log`, [`solo_node::DriverStore`]),
+//! so a restarted node resumes the view it left and never votes twice in
+//! it (spec 08 §3 and §7); its chain state it syncs again from its peers
+//! (spec 08 §7a). `status` prints one line per node from `GET /status`.
+//! `wait` polls until every selected node meets every condition given, or
+//! the timeout passes (default 600 s):
 //!
 //! - `--head <n>`, `--finalized <n>`, `--peers <n>`: at least that;
 //! - `--kernel-version <v>`: at least that; `--kernel-hash <0x…>`: exactly that;
@@ -43,13 +47,17 @@
 //! - `--locked-in <g,…>`: those gates locked in (spec 13 §8.4);
 //! - `--certified <n> --above <h>`: at least `n` finalized heights above `h`,
 //!   among the latest 64, carry a threshold certificate (spec 12 §7);
-//! - `--caught-up`: finalized within two blocks of the furthest node.
+//! - `--caught-up`: finalized within two blocks of the furthest node, of
+//!   all of them, whichever `--nodes` selects;
+//! - `--no-equivocations`: the node has recorded no equivocation (the
+//!   driver's `equivocations` counter in its metrics, spec 08 §9).
 //!
 //! `status` and `wait` take `--rpc <addr,...>` instead of `--dir` for nodes
 //! that run elsewhere, such as the compose stack in `ops/`.
 
 use std::fmt::Write as _;
 use std::fs::{self, File};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -106,6 +114,21 @@ fn io(path: &Path, e: &std::io::Error) -> String {
 
 fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     fs::write(path, bytes).map_err(|e| io(path, &e))
+}
+
+/// Writes a key file that its owner alone can read.
+fn write_secret(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    // The mode applies to a file being created: an old one goes first.
+    let _ = fs::remove_file(path);
+    let mut options = File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|e| io(path, &e))?;
+    file.write_all(bytes).map_err(|e| io(path, &e))
 }
 
 fn text_of(v: &Value, key: &str) -> Result<String, String> {
@@ -238,12 +261,6 @@ fn ports(host: &str, base: u64, n: usize) -> Result<Vec<u16>, String> {
         .collect())
 }
 
-fn unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-}
-
 /// `solo devnet init`.
 #[allow(clippy::too_many_lines)]
 fn init(args: &[String]) -> Result<String, String> {
@@ -265,9 +282,14 @@ fn init(args: &[String]) -> Result<String, String> {
     let dkg_phase_blocks = number(args, "--dkg-phase-blocks", 5)?;
     let upgrade_delay = number(args, "--upgrade-delay", 2)?;
     let host = arg(args, "--host").unwrap_or_else(|| "127.0.0.1".to_owned());
-    let seed: [u8; 32] = match arg(args, "--seed") {
-        Some(hex) => parse_key(&hex)?.to_bytes().into(),
-        None => keccak256(&[dir.as_os_str().as_encoded_bytes(), &unix_ms().to_be_bytes()].concat()),
+    let seed: [u8; 32] = if let Some(hex) = arg(args, "--seed") {
+        parse_key(&hex)?.to_bytes().into()
+    } else {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed)
+            .ok()
+            .ok_or("init: the operating system gave no randomness")?;
+        seed
     };
     let keys: Vec<SigningKey> = (0..validators as u64)
         .map(|i| derive(&seed, b"solo devnet validator", i))
@@ -312,8 +334,12 @@ fn init(args: &[String]) -> Result<String, String> {
         });
     }
     let genesis_text = serde_json::to_string_pretty(&genesis).expect("json");
-    // What the node will read; a combination the kernel refuses fails here.
-    parse_genesis(&genesis_text)?;
+    // What the node will read, parsed as a node parses it and run through
+    // `kernel_init` once, so that a genesis the kernel refuses fails here
+    // with the reason, not in every node's log.
+    let parsed = parse_genesis(&genesis_text)?;
+    solo_node::Node::open(&kernel, &parsed, solo_node::NodeConfig::default())
+        .map_err(|e| format!("the kernel refuses this genesis: {e}"))?;
     fs::create_dir_all(&dir).map_err(|e| io(&dir, &e))?;
     let devnet = Devnet {
         dir: dir.clone(),
@@ -330,7 +356,7 @@ fn init(args: &[String]) -> Result<String, String> {
     write(&devnet.kernel(), &kernel)?;
     write(&devnet.genesis(), genesis_text.as_bytes())?;
     let hex = |k: &SigningKey| data(&k.to_bytes())[2..].to_owned();
-    write(&devnet.governance_key(), hex(&governance).as_bytes())?;
+    write_secret(&devnet.governance_key(), hex(&governance).as_bytes())?;
     let mut report = format!(
         "devnet initialized in {}\n  chain id {chain_id}, {validators} validators, slot {slot_ms} ms, epochs of {epoch_blocks} blocks, DKG phases of {dkg_phase_blocks} blocks, upgrade delay {upgrade_delay} blocks\n  governance {} (key in governance.key)",
         dir.display(),
@@ -339,8 +365,13 @@ fn init(args: &[String]) -> Result<String, String> {
     let mut nodes = Vec::new();
     for (i, node) in devnet.nodes.iter().enumerate() {
         let node_dir = devnet.node_dir(i);
+        // A node directory of an earlier devnet holds that chain's driver
+        // state, log and pid: `--force` starts over from nothing.
+        if node_dir.exists() {
+            fs::remove_dir_all(&node_dir).map_err(|e| io(&node_dir, &e))?;
+        }
         fs::create_dir_all(&node_dir).map_err(|e| io(&node_dir, &e))?;
-        write(&node_dir.join("key"), hex(&keys[i]).as_bytes())?;
+        write_secret(&node_dir.join("key"), hex(&keys[i]).as_bytes())?;
         let _ = write!(
             report,
             "\n  node {i}  p2p {}  rpc {}  validator {}",
@@ -398,16 +429,53 @@ fn spawn(devnet: &Devnet, index: usize) -> Result<Child, String> {
     Ok(child)
 }
 
-/// Stops node `index` through `solo_stop` and waits for it to go.
+/// Stops node `index` through `solo_stop`, or by signalling the pid in
+/// `node-<i>/pid` when its RPC does not answer (a node still starting, or
+/// wedged), and waits for it to go.
 fn stop_node(devnet: &Devnet, index: usize) -> Result<String, String> {
     let node = devnet.node(index)?;
-    if client::call(&node.rpc, "solo_stop", &json!([])).is_err() {
-        return Ok(format!("node {index} is not running"));
-    }
-    let what = format!("node {index} did not stop");
     let rpc = &node.rpc;
-    poll_until(NODE_TIMEOUT, &what, &mut || client::status(rpc).is_err())?;
-    Ok(format!("node {index} stopped"))
+    let pid_file = devnet.node_dir(index).join("pid");
+    let what = format!("node {index} did not stop");
+    if client::call(rpc, "solo_stop", &json!([])).is_ok() {
+        poll_until(NODE_TIMEOUT, &what, &mut || client::status(rpc).is_err())?;
+        let _ = fs::remove_file(&pid_file);
+        return Ok(format!("node {index} stopped"));
+    }
+    let Some(pid) = recorded_pid(&pid_file, index) else {
+        return Ok(format!("node {index} is not running"));
+    };
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
+    poll_until(NODE_TIMEOUT, &what, &mut || !alive(pid))?;
+    let _ = fs::remove_file(&pid_file);
+    Ok(format!("node {index} stopped (pid {pid} signalled)"))
+}
+
+/// The pid in `pid_file` when it names a live `solo devnet node` of index
+/// `index`: a pid file left by a node that exited may name any process by
+/// now, so the command line is checked first.
+fn recorded_pid(pid_file: &Path, index: usize) -> Option<u32> {
+    let pid: u32 = fs::read_to_string(pid_file).ok()?.trim().parse().ok()?;
+    let out = Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let line = String::from_utf8_lossy(&out.stdout);
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let index = index.to_string();
+    let ours = words.windows(2).any(|w| w == ["devnet", "node"])
+        && words.windows(2).any(|w| w == ["--index", index.as_str()]);
+    ours.then_some(pid)
+}
+
+/// Whether process `pid` exists.
+fn alive(pid: u32) -> bool {
+    Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Stops every node; one line per node.
@@ -437,8 +505,14 @@ fn up(args: &[String]) -> Result<String, String> {
         match spawn(&devnet, i) {
             Ok(child) => children.push((i, child, None)),
             Err(e) => {
-                // Leave nothing behind: the nodes started so far go down.
-                let _ = stop_all(&devnet);
+                // Leave nothing of this command's behind: the nodes it
+                // started go down; one that was already running is not its
+                // to stop.
+                for (j, mut child, _) in children {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = fs::remove_file(devnet.node_dir(j).join("pid"));
+                }
                 return Err(e);
             }
         }
@@ -485,9 +559,12 @@ fn up(args: &[String]) -> Result<String, String> {
     }
 }
 
-/// The nodes a command addresses, as `(label, rpc)`: `--rpc <a,b,...>`, or
-/// the manifest's, narrowed by `--nodes <i,...>`.
-fn targets(args: &[String]) -> Result<Vec<(String, String)>, String> {
+/// The nodes, as `(label, rpc)`: every node (`--rpc <a,b,...>`, or the
+/// manifest's), and the ones a command addresses, which `--nodes <i,...>`
+/// narrows.
+type Targets = (Vec<(String, String)>, Vec<(String, String)>);
+
+fn targets(args: &[String]) -> Result<Targets, String> {
     let all: Vec<(String, String)> = match arg(args, "--rpc") {
         Some(list) => list
             .split(',')
@@ -503,9 +580,9 @@ fn targets(args: &[String]) -> Result<Vec<(String, String)>, String> {
             .collect(),
     };
     let Some(selected) = arg(args, "--nodes") else {
-        return Ok(all);
+        return Ok((all.clone(), all));
     };
-    selected
+    let selected = selected
         .split(',')
         .map(|i| {
             all.iter()
@@ -513,7 +590,8 @@ fn targets(args: &[String]) -> Result<Vec<(String, String)>, String> {
                 .cloned()
                 .ok_or_else(|| format!("--nodes: no node {i}"))
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok((all, selected))
 }
 
 /// One node's row of `solo devnet status`.
@@ -538,6 +616,7 @@ fn row(label: &str, rpc: &str) -> Value {
 
 fn status(args: &[String]) -> Result<String, String> {
     let rows: Vec<Value> = targets(args)?
+        .1
         .iter()
         .map(|(label, rpc)| row(label, rpc))
         .collect();
@@ -595,6 +674,8 @@ pub struct Conditions {
     pub certified: Option<(u64, u64)>,
     /// `--caught-up`.
     pub caught_up: bool,
+    /// `--no-equivocations`.
+    pub no_equivocations: bool,
 }
 
 impl std::fmt::Display for Conditions {
@@ -637,6 +718,9 @@ impl std::fmt::Display for Conditions {
         if self.caught_up {
             parts.push("caught up".to_owned());
         }
+        if self.no_equivocations {
+            parts.push("no equivocations".to_owned());
+        }
         f.write_str(&parts.join(", "))
     }
 }
@@ -670,6 +754,7 @@ impl Conditions {
                 (Some(count), above) => Some((count, above.unwrap_or(0))),
             },
             caught_up: flag(args, "--caught-up"),
+            no_equivocations: flag(args, "--no-equivocations"),
         };
         if c == Conditions::default() {
             return Err("wait: give at least one condition".to_owned());
@@ -689,8 +774,9 @@ impl Conditions {
     }
 
     /// Every condition node `rpc` does not meet; `top` is the furthest
-    /// finalized height among the nodes, for `--caught-up`.
+    /// finalized height among all the nodes, for `--caught-up`.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn unmet(&self, rpc: &str, top: u64) -> Vec<String> {
         let mut unmet = Vec::new();
         let s: Status = match client::status(rpc) {
@@ -733,6 +819,13 @@ impl Conditions {
         if self.caught_up && s.finalized + 2 < top {
             unmet.push(format!("finalized {} behind {top}", s.finalized));
         }
+        if self.no_equivocations {
+            match equivocations(rpc) {
+                Ok(n) if n > 0.0 => unmet.push(format!("{n} equivocations recorded")),
+                Ok(_) => {}
+                Err(e) => unmet.push(e),
+            }
+        }
         if self.signalled.is_some() || self.locked_in.is_some() {
             match client::call(rpc, "solo_upgradeStatus", &json!([])) {
                 Ok(u) => {
@@ -774,21 +867,39 @@ impl Conditions {
     }
 }
 
+/// The equivocations node `rpc` has recorded: the driver's `equivocations`
+/// counter (spec 08 §9) in its metrics, `0` before the first.
+fn equivocations(rpc: &str) -> Result<f64, String> {
+    let text = crate::doctor::get(client::host_port(rpc), "/metrics")?;
+    let samples = solo_metrics::parse(&text).map_err(|e| format!("{rpc}/metrics: {e}"))?;
+    Ok(samples
+        .iter()
+        .filter(|s| {
+            s.name == "solo_emitted_counter_total"
+                && s.label("origin") == Some("driver")
+                && s.label("name") == Some("equivocations")
+        })
+        .map(|s| s.value)
+        .sum())
+}
+
 /// `solo devnet wait`.
 fn wait(args: &[String]) -> Result<String, String> {
     let conditions = Conditions::parse(args)?;
-    let targets = targets(args)?;
+    let (all, selected) = targets(args)?;
     let timeout = Duration::from_secs(number(args, "--timeout", 600)?);
     let started = Instant::now();
     let mut last = String::new();
     let mut check = || {
-        let top = targets
+        // The furthest of every node, not of the selected ones: a node
+        // selected alone is always caught up with itself.
+        let top = all
             .iter()
             .filter_map(|(_, rpc)| client::status(rpc).ok())
             .map(|s| s.finalized)
             .max()
             .unwrap_or(0);
-        let unmet: Vec<String> = targets
+        let unmet: Vec<String> = selected
             .iter()
             .filter_map(|(label, rpc)| {
                 let reasons = conditions.unmet(rpc, top);
@@ -808,7 +919,8 @@ fn wait(args: &[String]) -> Result<String, String> {
 
 /// `solo devnet node --dir <dir> --index <i> [options]`: runs node `i` of the
 /// manifest in this process, as `solo node` would with the manifest's
-/// addresses, the key file and the peers, plus any other `solo node` option.
+/// addresses, the key file, the peers and `node-<i>` as its data directory,
+/// plus any other `solo node` option.
 fn node(args: &[String], keep_going: &mut dyn FnMut(&solo_rpc::Rpc) -> bool) -> Result<(), String> {
     let devnet = Devnet::load(&dir_argument(args)?)?;
     let index = crate::parse_number(args, "--index")?
@@ -836,6 +948,8 @@ fn node(args: &[String], keep_going: &mut dyn FnMut(&solo_rpc::Rpc) -> bool) -> 
             &path(devnet.genesis()),
             "--key-file",
             &path(devnet.node_dir(index).join("key")),
+            "--data-dir",
+            &path(devnet.node_dir(index)),
             "--listen",
             &spec.listen,
             "--rpc",
