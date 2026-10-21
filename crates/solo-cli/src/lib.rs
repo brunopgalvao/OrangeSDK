@@ -2,10 +2,16 @@
 //!
 //! `solo dev --kernel <kernel.elf|kernel.solo> --genesis <genesis.json>
 //! [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>]
-//! [--state-history <blocks> | --archive]`
+//! [--state-history <blocks> | --archive] [--data-dir <dir>]`
 //! runs a single-node development chain with Ethereum JSON-RPC. The node keeps
 //! the state of its latest 1 024 blocks for historical queries and proofs, or
 //! `--state-history` of them, or every block's with `--archive` (spec 20 §5).
+//! `--data-dir` keeps the driver's node-local data on disk
+//! ([`solo_node::DriverStore`]): a node started again over the same
+//! directory resumes the view it left with the votes it cast there, so it
+//! never votes twice in one view (spec 08 §3 and §7); `solo node` requires
+//! it for a validator. Chain state is not kept: a restarted node replays
+//! the chain from its peers.
 //! The genesis file is
 //! JSON: `{"chainId": 1337, "slotMs": 400, "maxTxs": 64,
 //! "alloc": {"0x<address>": "<wei>"}, "validators": ["0x<32-byte id>"]}`.
@@ -86,8 +92,8 @@ pub const DEFAULT_RPC: &str = "127.0.0.1:8545";
 
 /// Usage line printed on a command-line mistake.
 pub const USAGE: &str = "usage:
-  solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
-  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
+  solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive] [--data-dir <dir>]
+  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
   solo key  <64 hex>
   solo doctor [--rpc 127.0.0.1:8545] [--max-head-age <s>] [--max-finality-lag <blocks>] [--min-peers <n>] [--max-mempool <txs>] [--max-call-ms <ms>]
   solo upgrade --kernel <kernel.elf|kernel.solo> (--key <64 hex> | --key-file <path>) [--rpc 127.0.0.1:8545] [--delay <blocks>] [--required-gates <g,g,...>] [--timeout <s>]
@@ -96,7 +102,7 @@ pub const USAGE: &str = "usage:
   solo devnet down --dir <dir>
   solo devnet stop|start --dir <dir> --node <i>
   solo devnet status (--dir <dir> | --rpc <addr,...>) [--json]
-  solo devnet wait (--dir <dir> | --rpc <addr,...>) [--nodes <i,...>] [--timeout <s>] [--head <n>] [--finalized <n>] [--peers <n>] [--kernel-version <v>] [--kernel-hash <0x...>] [--active-gates <g,...>] [--signalled <g,...>] [--locked-in <g,...>] [--certified <n> --above <height>] [--caught-up]
+  solo devnet wait (--dir <dir> | --rpc <addr,...>) [--nodes <i,...>] [--timeout <s>] [--head <n>] [--finalized <n>] [--peers <n>] [--kernel-version <v>] [--kernel-hash <0x...>] [--active-gates <g,...>] [--signalled <g,...>] [--locked-in <g,...>] [--certified <n> --above <height>] [--caught-up] [--no-equivocations]
   solo devnet node --dir <dir> --index <i> [solo node options]";
 
 /// Where `solo node` listens for peers unless `--listen` says otherwise.
@@ -477,6 +483,80 @@ fn bind_transport(
     Ok(t)
 }
 
+/// A driver store, if any, with the tables and the state it holds from a
+/// previous run.
+type Opened = (
+    Option<solo_node::DriverStore>,
+    solo_node::store::Tables,
+    Option<Vec<u8>>,
+);
+
+/// The driver store `--data-dir` names and what it holds; none without the
+/// option, which a validator's `solo node` may not leave out.
+fn open_store(args: &[String], validator: bool) -> Result<Opened, CliError> {
+    let Some(dir) = arg(args, "--data-dir") else {
+        if validator {
+            return Err(
+                "--data-dir is required for a validator: its driver state must outlive a restart (spec 08 §7)"
+                    .into(),
+            );
+        }
+        return Ok((None, solo_node::store::Tables::new(), None));
+    };
+    let mut store = solo_node::DriverStore::open(std::path::Path::new(&dir))
+        .map_err(|e| format!("{dir}: {e}"))?;
+    let (persisted, resumed) = store.take_loaded();
+    Ok((Some(store), persisted, resumed))
+}
+
+/// Says where the driver's state lives and which view it started in.
+fn report_driver_state(node: &solo_node::Node, resuming: bool) {
+    if let Some(store) = node.store() {
+        let view = node.simplex_state().map_or(0, |s| s.view);
+        let how = if resuming { "resumed in" } else { "new, from" };
+        eprintln!(
+            "driver state in {}: {how} view {view}",
+            store.dir().display()
+        );
+    }
+}
+
+/// Binds the JSON-RPC listener and announces the node.
+fn bind_rpc(
+    rpc_addr: &str,
+    command: &str,
+    chain_id: u64,
+    key: Option<&k256::ecdsa::SigningKey>,
+) -> Result<std::net::TcpListener, CliError> {
+    let listener = match solo_rpc::http::bind(rpc_addr) {
+        Ok(listener) => listener,
+        Err(e) => return Err(format!("{rpc_addr}: {e}").into()),
+    };
+    let bound = listener.local_addr().ok();
+    let bound = bound.map_or(rpc_addr.to_owned(), |a| a.to_string());
+    let validator = key.map_or("none (observer)".to_owned(), |k| {
+        solo_rpc::methods::data(&solo_node::validator_id(k))
+    });
+    eprintln!(
+        "solo {command} node: chain id {chain_id}, validator {validator}, JSON-RPC on http://{bound}"
+    );
+    Ok(listener)
+}
+
+/// Prints every kernel switch (spec 06 §7.3) the node performed since `seen`.
+fn report_switches(node: &solo_node::Node, seen: &mut usize) {
+    for s in &node.upgrades().switches[*seen..] {
+        eprintln!(
+            "kernel switch after block {}: version {} to {} ({})",
+            s.height,
+            s.from_version,
+            s.to_version,
+            solo_rpc::methods::data(&s.code_hash)
+        );
+    }
+    *seen = node.upgrades().switches.len();
+}
+
 pub(crate) fn run_inner(
     args: &[String],
     keep_going: &mut dyn FnMut(&solo_rpc::Rpc) -> bool,
@@ -520,6 +600,7 @@ pub(crate) fn run_inner(
         key_argument(args)?
     };
     let peers = parse_peers(args)?;
+    let (store, persisted, resumed) = open_store(args, command == "node" && key.is_some())?;
     let start = Instant::now();
     let epoch = unix_ms();
     let mut node = solo_node::Node::open(
@@ -528,6 +609,7 @@ pub(crate) fn run_inner(
         solo_node::NodeConfig {
             now_ms: epoch,
             key: key.clone(),
+            persisted,
             kernel_gas,
             query_gas,
             state_history,
@@ -535,26 +617,21 @@ pub(crate) fn run_inner(
         },
     )?;
     let chain_id = node.chain_id().unwrap_or(0);
-    node.start(None)?;
+    if let Some(store) = store {
+        node.attach_store(store);
+    }
+    let resuming = resumed.is_some();
+    node.start(resumed)?;
+    report_driver_state(&node, resuming);
     let mut transport = if command == "node" {
         Some(bind_transport(args, &node, chain_id, peers)?)
     } else {
         None
     };
     let mut rpc = solo_rpc::Rpc::new(node);
-    let listener = match solo_rpc::http::bind(rpc_addr) {
-        Ok(listener) => listener,
-        Err(e) => return Err(format!("{rpc_addr}: {e}").into()),
-    };
-    let bound = listener.local_addr().ok();
-    let bound = bound.map_or(rpc_addr.to_owned(), |a| a.to_string());
-    let validator = key.as_ref().map_or("none (observer)".to_owned(), |k| {
-        solo_rpc::methods::data(&solo_node::validator_id(k))
-    });
-    eprintln!(
-        "solo {command} node: chain id {chain_id}, validator {validator}, JSON-RPC on http://{bound}"
-    );
+    let listener = bind_rpc(rpc_addr, command, chain_id, key.as_ref())?;
     let mut last_tick = Instant::now();
+    let mut switches_seen = 0usize;
     let blocks_seen = Rc::new(Cell::new(0u64));
     let seen = Rc::clone(&blocks_seen);
     // The network and the clock, between connections and between the steps
@@ -569,6 +646,10 @@ pub(crate) fn run_inner(
         }
         last_tick = Instant::now();
         report(node.tick(now));
+        // What a timer step did reaches the disk now; a transport does the
+        // same before it sends (spec 08 §7).
+        report(node.sync_store());
+        report_switches(node, &mut switches_seen);
         let executed = node.executed.len();
         if executed as u64 > seen.get() {
             seen.set(executed as u64);

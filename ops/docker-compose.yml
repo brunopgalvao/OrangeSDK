@@ -5,14 +5,18 @@
 #   docker compose -f ops/docker-compose.yml up --build -d
 #   docker compose -f ops/docker-compose.yml down -v
 #
-# JSON-RPC: 127.0.0.1:8545 to 8548 (node 0 to 3). Prometheus: 9090. Grafana:
-# 3000, anonymous admin, the Solo dashboard provisioned.
+# Published on this machine's loopback only, since the RPC carries the
+# unauthenticated `solo_stop` and Grafana runs as an anonymous admin:
+# JSON-RPC 127.0.0.1:8545 to 8548 (node 0 to 3), Prometheus 127.0.0.1:9090,
+# Grafana 127.0.0.1:3000 with the Solo dashboard provisioned.
 #
 # `init` runs once and writes the genesis, the kernel module and the keys to
 # the `devnet` volume; it leaves them alone on later runs, so a restart keeps
-# the chain's identities. The nodes reach each other by fixed addresses on
-# the `solo` network, every node dialling the ones before it, as
-# `solo devnet` does on one machine.
+# the chain's identities. Each node keeps its driver state in its directory
+# on that volume (`--data-dir`), so a restarted container resumes the view
+# it left (spec 08 §7). The nodes reach each other by fixed addresses on the
+# `solo` network, every node dialling the ones before it, as `solo devnet`
+# does on one machine.
 name: solo-devnet
 
 x-node: &node
@@ -58,6 +62,8 @@ services:
       - /devnet/genesis.json
       - --key-file
       - /devnet/node-0/key
+      - --data-dir
+      - /devnet/node-0
       - --listen
       - 0.0.0.0:30333
       - --rpc
@@ -66,7 +72,7 @@ services:
       solo:
         ipv4_address: 172.28.0.10
     ports:
-      - "8545:8545"
+      - "127.0.0.1:8545:8545"
 
   solo-1:
     <<: *node
@@ -78,6 +84,8 @@ services:
       - /devnet/genesis.json
       - --key-file
       - /devnet/node-1/key
+      - --data-dir
+      - /devnet/node-1
       - --listen
       - 0.0.0.0:30333
       - --rpc
@@ -88,7 +96,7 @@ services:
       solo:
         ipv4_address: 172.28.0.11
     ports:
-      - "8546:8545"
+      - "127.0.0.1:8546:8545"
 
   solo-2:
     <<: *node
@@ -100,6 +108,8 @@ services:
       - /devnet/genesis.json
       - --key-file
       - /devnet/node-2/key
+      - --data-dir
+      - /devnet/node-2
       - --listen
       - 0.0.0.0:30333
       - --rpc
@@ -112,7 +122,7 @@ services:
       solo:
         ipv4_address: 172.28.0.12
     ports:
-      - "8547:8545"
+      - "127.0.0.1:8547:8545"
 
   solo-3:
     <<: *node
@@ -124,6 +134,8 @@ services:
       - /devnet/genesis.json
       - --key-file
       - /devnet/node-3/key
+      - --data-dir
+      - /devnet/node-3
       - --listen
       - 0.0.0.0:30333
       - --rpc
@@ -138,7 +150,7 @@ services:
       solo:
         ipv4_address: 172.28.0.13
     ports:
-      - "8548:8545"
+      - "127.0.0.1:8548:8545"
 
   prometheus:
     image: prom/prometheus:v3.5.0
@@ -150,7 +162,7 @@ services:
     networks:
       - solo
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
 
   grafana:
     image: grafana/grafana:11.6.0
@@ -166,7 +178,7 @@ services:
     networks:
       - solo
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
 
 volumes:
   devnet: {}

@@ -18,7 +18,7 @@ open http://127.0.0.1:3000   # Grafana, anonymous admin; Prometheus is on :9090
 docker compose -f ops/docker-compose.yml down -v
 ```
 
-The nodes' JSON-RPC is published on `127.0.0.1:8545` to `8548`. The genesis has epochs of 20 blocks, DKG phases of 5 and a known governance key (`SOLO_GOVERNANCE_KEY`, default `0x60…60`; `SOLO_EPOCH_BLOCKS` and `SOLO_DKG_PHASE_BLOCKS` change the epochs). The `devnet` volume keeps the chain's identities across `up` and `down`; `down -v` starts over.
+The nodes' JSON-RPC is published on `127.0.0.1:8545` to `8548`, Prometheus on `127.0.0.1:9090` and Grafana on `127.0.0.1:3000`: loopback only, since the RPC carries the unauthenticated `solo_stop` and Grafana runs as an anonymous admin. The genesis has epochs of 20 blocks, DKG phases of 5 and a known governance key (`SOLO_GOVERNANCE_KEY`, default `0x60…60`; `SOLO_EPOCH_BLOCKS` and `SOLO_DKG_PHASE_BLOCKS` change the epochs). The `devnet` volume keeps the chain's identities and each node's driver state (`node-<i>/driver.state` and `persist.log`) across `up` and `down`; `down -v` starts over.
 
 To rehearse a kernel upgrade on the stack, as `tools/rehearse-upgrade.sh` does on a local devnet:
 
@@ -30,7 +30,7 @@ DEVNET_DRIVER=compose RPCS=127.0.0.1:8545,127.0.0.1:8546,127.0.0.1:8547,127.0.0.
   tools/rehearse-upgrade.sh compose crates/solo-node/tests/fixtures/kernel_v2.elf
 ```
 
-The compose driver stops and starts validators with `docker compose stop` and `start`; a restarted container has no chain state and syncs from its peers, as a restarted process does. `cargo test -p solo-cli --test devnet` runs the compose rehearsal only when `SOLO_DOCKER` is set.
+The compose driver stops and starts validators with `docker compose stop` and `start`; a restarted container resumes the view its driver state on the volume records, so it never votes twice in one view (spec 08 §7), and syncs its chain state from its peers, as a restarted process does. `cargo test -p solo-cli --test devnet` runs the compose rehearsal only when `SOLO_DOCKER` is set.
 
 ## Prometheus and Grafana by hand
 

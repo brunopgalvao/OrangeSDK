@@ -597,7 +597,9 @@ fn node_command_runs_a_multi_validator_chain() {
             "127.0.0.1:0".into(),
         ];
         if i < 4 {
-            list.extend(["--key".into(), seeds[i].clone()]);
+            let data = scratch(&format!("multi-data-{i}"));
+            let _ = std::fs::remove_dir_all(&data);
+            list.extend(["--key".into(), seeds[i].clone(), "--data-dir".into(), data]);
             for port in &ports[..i] {
                 list.extend(["--peer".into(), port.clone()]);
             }
@@ -657,11 +659,29 @@ fn node_command_errors() {
             .unwrap_err()
             .starts_with("nope: ")
     );
-    // An observer with the default listen address stops on request like any node.
+    // A validator keeps its driver state on disk, or does not run; a data
+    // directory that cannot be made is named.
+    assert!(
+        with(&["--key", &"51".repeat(32)])
+            .unwrap_err()
+            .contains("--data-dir is required for a validator")
+    );
+    let file = genesis_file("not-a-directory", "x");
+    assert!(
+        with(&["--data-dir", &file])
+            .unwrap_err()
+            .starts_with(&format!("{file}: "))
+    );
+    // An observer with the default listen address stops on request like any
+    // node; with a data directory it keeps its driver state there.
     let mut iterations = 0;
-    run_until(&args(&base), |_| {
+    let data = scratch("observer-data");
+    let mut list = base.to_vec();
+    list.extend(["--data-dir", &data]);
+    run_until(&args(&list), |_| {
         iterations += 1;
         iterations < 5
     })
     .unwrap();
+    assert!(std::path::Path::new(&data).join("driver.state").exists());
 }
