@@ -208,7 +208,7 @@ const ZERO: Hash = [0; 32];
 /// index names, with nothing recorded for that sender and phase; a
 /// confirmation is from a member of the epoch's set that has not
 /// confirmed, while no key set of the epoch is adopted; a handoff is from
-/// the active key set to a newer adopted one; evidence is of an offence not
+/// the active key set to the target, the newest adopted one; evidence is of an offence not
 /// on record. The signatures of handoffs and evidence are checked once, when
 /// they arrive ([`pool_add`]).
 fn wanted(env: &DkgEnvelope, signer: &Hash, executed: u64) -> bool {
@@ -225,7 +225,7 @@ fn wanted(env: &DkgEnvelope, signer: &Hash, executed: u64) -> bool {
     let Some(run) = staking::dkg_run(epoch) else { return false };
     if env.kind == envelope::HANDOFF {
         return RotationCertificate::from_bytes(&env.body).is_ok_and(|c| {
-            staking::active().is_some_and(|a| a.id == c.from) && c.to > c.from && staking::key_set(c.to).is_some()
+            staking::active().is_some_and(|a| a.id == c.from) && rotation::pending().is_some_and(|t| t.id == c.to)
         });
     }
     if env.kind == envelope::EVIDENCE {
@@ -443,7 +443,9 @@ pub fn rotation_step(chain_id: u64, me: &Hash) -> Vec<Vec<u8>> {
     };
     let index = index_of(&active.shareholders.0, me);
     if index != 0 {
-        let out_key = [RSHARE_KEY, &target.id.to_be_bytes()].concat();
+        // Keyed by both ends: a share is the active key set's partial over
+        // the rotation to the target, and is never reused for another pair.
+        let out_key = [RSHARE_KEY, &active.id.to_be_bytes(), &target.id.to_be_bytes()].concat();
         let share = persist::get::<RotationShare>(&out_key).or_else(|| {
             let key = target.group_key()?.to_vec();
             let request = KeystoreRequest::Sign { key_set: active.id, message: rotation_message(chain_id, target.id, &key) };

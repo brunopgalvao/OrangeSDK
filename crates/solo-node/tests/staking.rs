@@ -12,20 +12,21 @@ use solo_abi::chain::consensus::{
     KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE, TOPIC, leader, signing_preimage,
 };
 use solo_abi::chain::{
-    Allocation, Certificate, ConsensusMessage, GenesisParams, Proposal, Signature, SyncResponse,
-    Validator, ValidatorSet, reason,
+    Allocation, BlockHeader, Certificate, ConsensusMessage, GenesisParams, Proposal, Signature,
+    SyncResponse, Validator, ValidatorSet, reason,
 };
 use solo_abi::codec::Seq;
 use solo_abi::rotation::{
-    self, Handoff, ThresholdEvidence, certificate_bytes as certificate_bytes_v2,
-    certificate_message as certificate_message_v2, offence, rotation_message,
+    self, Handoff, RotationCertificate, ThresholdEvidence,
+    certificate_bytes as certificate_bytes_v2, certificate_message as certificate_message_v2,
+    offence, rotation_message,
 };
 use solo_abi::staking::{
     DkgEnvelope, DkgRequest, DkgRun, GWEI, KIND_DKG, KeySetRecord, KeystoreRequest, PartialShare,
     STAKING_ADDRESS, StakingAction, StakingParams, StakingStatus, ValidatorKey, envelope, event,
     first_view, keys as skeys, query, selector, view_epoch,
 };
-use solo_abi::types::{Genesis, Input};
+use solo_abi::types::{Block, Effect, Genesis, Input};
 use solo_abi::{Decode, Encode};
 use solo_host::hash::keccak256;
 use solo_node::keystore::{Keystore, encryption_key};
@@ -134,10 +135,22 @@ fn staking(epoch_blocks: u64, dkg_phase_blocks: u64) -> StakingParams {
 
 /// A legacy EIP-155 transaction from `key` to `to`.
 fn tx(key: &SigningKey, nonce: u64, to: [u8; 20], value: u128, data: &[u8]) -> Vec<u8> {
+    tx_with_gas(key, nonce, to, value, data, 200_000)
+}
+
+/// [`tx`] with gas limit `gas`.
+fn tx_with_gas(
+    key: &SigningKey,
+    nonce: u64,
+    to: [u8; 20],
+    value: u128,
+    data: &[u8],
+    gas: u64,
+) -> Vec<u8> {
     let fields = |out: &mut Vec<u8>| {
         encode_uint(u128::from(nonce), out);
         encode_uint(1_000_000_000, out);
-        encode_uint(200_000, out);
+        encode_uint(u128::from(gas), out);
         encode_bytes(&to, out);
         encode_uint(value, out);
         encode_bytes(data, out);
@@ -844,6 +857,48 @@ fn threshold_keys_rotate_across_epochs() {
     }
     assert!(named.contains(&0) && named.contains(&1), "{named:?}");
     assert_agreement(&sim);
+    // Honest rotation produced no evidence and slashed no one.
+    assert_eq!(evidence_count(&mut sim.nodes[0]), 0);
+    assert!(!record_of(&mut sim.nodes[0], &keys[1]).jailed);
+    // A valid partial of key 0 over a proposal anchored below the handoff is honest, so
+    // it is no evidence of a stale key: key 0 was still in force at that anchor.
+    let early = Proposal {
+        height: h.height + 1,
+        anchor_height: h.height - 1,
+        anchor_root: sim.nodes[0]
+            .block_by_number(h.height - 1)
+            .unwrap()
+            .unwrap()
+            .state_root,
+        ..Proposal::default()
+    };
+    let subject = early.to_bytes();
+    let message = certificate_message_v2(CHAIN_ID, 0, early.height, &keccak256(&subject));
+    let p = partial_of(&sim.nodes[0], &keys[1], 0, &message);
+    assert!(share_verifies(
+        &first.public_shares.0[p.index as usize - 1],
+        &message,
+        &p.signature
+    ));
+    let honest = ThresholdEvidence {
+        kind: offence::STALE_KEY,
+        key_set: 0,
+        index: p.index,
+        signature: p.signature,
+        subject,
+    };
+    let refused = action(
+        &keys[2],
+        0,
+        0,
+        &StakingAction::Report {
+            evidence: honest.to_bytes(),
+        },
+    );
+    assert_eq!(
+        sim.submit(2, &refused),
+        Err(SubmitError::Rejected(reason::STAKING_ACTION))
+    );
     // A partial of key 0 over a proposal anchored at or after the handoff is slashable:
     // its shareholders had all moved to key set 1 by then (spec 15 §5.1).
     let fake = Proposal {
@@ -882,7 +937,19 @@ fn threshold_keys_rotate_across_epochs() {
             .is_some())
             .unwrap()
     );
+    let receipt = sim.nodes[0].receipt(&hash).unwrap().unwrap();
+    assert_eq!(receipt.status, 1);
+    let log = &receipt.logs.0[0];
+    assert_eq!(
+        (log.topics.0[0], &log.topics.0[1][12..]),
+        (event::REPORTED, &address(&keys[1])[..])
+    );
+    // `Reported(offender, kind, key_set)`: kind 2, key set 0.
+    let mut kind = [0u8; 32];
+    kind[31] = offence::STALE_KEY;
+    assert_eq!(log.data, [kind, [0u8; 32]].concat());
     assert!(record_of(&mut sim.nodes[0], &keys[1]).jailed);
+    assert_eq!(evidence_count(&mut sim.nodes[0]), 1);
 }
 
 #[test]
@@ -1391,6 +1458,14 @@ fn envelope_of(key: &SigningKey, epoch: u64, kind: u8, body: Vec<u8>) -> Consens
     }
 }
 
+/// Whether `signature` (48 bytes) verifies over `message` under the public
+/// share `share` (96 bytes), as the kernel checks a partial.
+fn share_verifies(share: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    let key = solo_bls::PublicKey::from_bytes(share.try_into().unwrap()).unwrap();
+    let signature = solo_bls::Signature::from_bytes(signature.try_into().unwrap()).unwrap();
+    key.verify(message, &signature)
+}
+
 fn evidence_count(node: &mut Node) -> usize {
     let r = node
         .query(rotation::query::THRESHOLD_EVIDENCE, &0u64.to_bytes())
@@ -1443,11 +1518,22 @@ fn threshold_misbehaviour_is_slashed_once() {
             },
         )
     };
-    // Evidence that shows nothing (the right root) cannot run.
-    let mut honest = evidence.clone();
+    // Evidence that shows nothing cannot run: validator 3's partial, valid under its
+    // share, over the same proposal with the root the chain executed.
     let mut proposal = fake.clone();
     proposal.anchor_root = sim.nodes[0].block_by_number(2).unwrap().unwrap().state_root;
-    honest.subject = proposal.to_bytes();
+    let subject = proposal.to_bytes();
+    let message = certificate_message_v2(CHAIN_ID, 0, proposal.height, &keccak256(&subject));
+    let valid = partial_of(&sim.nodes[0], &keys[3], 0, &message);
+    let share = &key_set(&sim.nodes[0], 0).unwrap().public_shares.0[valid.index as usize - 1];
+    assert!(share_verifies(share, &message, &valid.signature));
+    let honest = ThresholdEvidence {
+        kind: offence::ANCHOR,
+        key_set: 0,
+        index: valid.index,
+        signature: valid.signature,
+        subject,
+    };
     assert_eq!(
         sim.submit(0, &report(0, &honest)),
         Err(SubmitError::Rejected(reason::STAKING_ACTION))
@@ -1538,5 +1624,202 @@ fn threshold_misbehaviour_is_slashed_once() {
     );
     assert_eq!(evidence_count(&mut sim.nodes[0]), 2);
     assert_eq!(record_of(&mut sim.nodes[0], &keys[3]).stake, after.stake);
+    assert_agreement(&sim);
+}
+
+#[test]
+fn checks_that_need_a_pairing_spend_a_block_budget() {
+    // A leader puts staking transactions that fail a pairing check into its proposal:
+    // they use no gas, but each costs every node a pairing, so they draw on a budget of
+    // the block gas limit (spec 15 §3.3). Here the check is register's key check.
+    let keys = keys(2);
+    let genesis = genesis(&keys, &[0], &[STAKE], &staking(16, 0));
+    let mut node = Node::open(kernel_module(), &genesis, at(10_000)).unwrap();
+    let bad = |variant: u8| {
+        let register = StakingAction::Register {
+            dkg_key: vec![0x80 | variant; 48],
+        };
+        tx_with_gas(
+            &keys[1],
+            0,
+            STAKING_ADDRESS,
+            0,
+            &register.encode(),
+            15_000_000,
+        )
+    };
+    let rekey = |nonce: u64, to: &SigningKey| {
+        let register = StakingAction::Register {
+            dkg_key: encryption_key(to).to_vec(),
+        };
+        action(&keys[0], nonce, 0, &register)
+    };
+    let execute = |node: &mut Node, height: u64, txs: Vec<Vec<u8>>| {
+        let header = BlockHeader {
+            height,
+            timestamp_ms: 10_000 + height * SLOT_MS,
+            ..BlockHeader::default()
+        };
+        node.apply_effect(Effect::ExecuteBlock {
+            block: Block {
+                header: header.to_bytes(),
+                txs: Seq(txs),
+                participation: Vec::new(),
+            },
+        })
+        .unwrap();
+        // The running sum never reaches committed state.
+        assert!(node.state_get(b"stake/pairing_gas").is_none());
+    };
+    let receipt = |node: &mut Node, raw: &[u8]| node.receipt(&keccak256(raw)).unwrap().unwrap();
+    // Half the budget spent on a failing check leaves room for a valid one.
+    let first = rekey(0, &keys[1]);
+    execute(&mut node, 1, vec![bad(1), first.clone()]);
+    assert_eq!(receipt(&mut node, &bad(1)).gas_used, 0);
+    assert_eq!(receipt(&mut node, &first).status, 1);
+    assert_eq!(
+        record_of(&mut node, &keys[0]).dkg_key,
+        encryption_key(&keys[1]).to_vec()
+    );
+    // The whole budget spent: the valid one after it cannot run, and nothing changes.
+    let second = rekey(1, &keys[0]);
+    execute(&mut node, 2, vec![bad(2), bad(3), second.clone()]);
+    let r = receipt(&mut node, &second);
+    assert_eq!((r.status, r.gas_used), (0, 0));
+    assert_eq!(
+        record_of(&mut node, &keys[0]).dkg_key,
+        encryption_key(&keys[1]).to_vec()
+    );
+    // The budget is per block: alone in the next block it runs.
+    execute(&mut node, 3, vec![second.clone()]);
+    assert_eq!(receipt(&mut node, &second).status, 1);
+    assert_eq!(
+        record_of(&mut node, &keys[0]).dkg_key,
+        encryption_key(&keys[0]).to_vec()
+    );
+}
+
+/// The newest adopted key set's id in `node`'s chain state.
+fn newest_adopted(node: &Node) -> u64 {
+    u64::from_bytes(&node.state_get(rotation::keys::ADOPTED).unwrap()).unwrap()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_key_hands_off_only_once_its_shareholders_sign_and_only_to_the_newest_key() {
+    // Four genesis validators hold key 0. Two of them unbond and two newcomers take their
+    // seats in epoch 1, then the two leavers stop their nodes.
+    let keys = keys(6);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, &[0, 1, 2, 3], &[STAKE; 4], &staking(24, 4));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    let done = sim
+        .run_until(80 * SLOT_MS, |s| adopted(s, &[0, 1, 2, 3, 4, 5], 0))
+        .unwrap();
+    assert!(done, "{:?}", sim.finalized_heights().unwrap());
+    for i in [4, 5] {
+        let register = StakingAction::Register {
+            dkg_key: encryption_key(&keys[i]).to_vec(),
+        };
+        sim.submit(i, &action(&keys[i], 0, u128::from(STAKE) * GWEI, &register))
+            .unwrap();
+    }
+    for i in [2, 3] {
+        let unbond = StakingAction::Unbond {
+            amount: u128::from(STAKE) * GWEI,
+        };
+        sim.submit(i, &action(&keys[i], 0, 0, &unbond)).unwrap();
+    }
+    let next = sim
+        .run_until(160 * SLOT_MS, |s| {
+            s.nodes[0].finalized_height().unwrap() >= 25
+        })
+        .unwrap();
+    assert!(next, "{:?}", sim.finalized_heights().unwrap());
+    let mut set = set_of(&mut sim.nodes[0], 1).unwrap();
+    set.sort_unstable();
+    let mut newcomers = ids_of(&[
+        keys[0].clone(),
+        keys[1].clone(),
+        keys[4].clone(),
+        keys[5].clone(),
+    ]);
+    newcomers.sort_unstable();
+    assert_eq!(set, newcomers);
+    sim.crash(2);
+    sim.crash(3);
+    // Epochs 1 and 2 each adopt a fresh key among the new set, but only two of key 0's
+    // four shareholders are left to sign a handoff, below its threshold of three: key 0
+    // stays active, whichever newer key is the target.
+    let stalled = sim
+        .run_until(400 * SLOT_MS, |s| key_set(&s.nodes[0], 2).is_some())
+        .unwrap();
+    assert!(stalled, "{:?}", sim.finalized_heights().unwrap());
+    let height = sim.nodes[0].finalized_height().unwrap();
+    assert!(
+        sim.run_until(40 * SLOT_MS, |s| s.nodes[0].finalized_height().unwrap()
+            >= height + 4)
+            .unwrap()
+    );
+    assert!(key_set(&sim.nodes[0], 1).is_some());
+    assert_eq!(status(&mut sim.nodes[0]).active.unwrap().id, 0);
+    assert!(handoff(&mut sim.nodes[0], 0).is_none());
+    assert!(newest_adopted(&sim.nodes[0]) >= 2);
+    // A handoff from key 0 to key set 1, validly signed by three of its shareholders, is
+    // never recorded: key set 1 was superseded before its handoff, and the active key
+    // only ever moves to the newest adopted key (spec 15 §6.6).
+    let older = key_set(&sim.nodes[0], 1).unwrap();
+    let message = rotation_message(CHAIN_ID, 1, &older.key_set[..96]);
+    let partials = (0..3)
+        .map(|i| partial_of(&sim.nodes[0], &keys[i], 0, &message))
+        .collect();
+    let combine = KeystoreRequest::Combine {
+        key_set: key_set(&sim.nodes[0], 0).unwrap().key_set,
+        message: message.clone(),
+        partials: Seq(partials),
+    };
+    let signature = Keystore::default()
+        .handle(None, &combine.to_bytes())
+        .unwrap();
+    let first = key_set(&sim.nodes[0], 0).unwrap();
+    let point = solo_bls::Signature::from_bytes(&signature.clone().try_into().unwrap()).unwrap();
+    assert!(public_key(&first).verify(&message, &point));
+    let certificate = RotationCertificate {
+        from: 0,
+        to: 1,
+        signature,
+    };
+    let epoch = status(&mut sim.nodes[0]).epoch;
+    let m = envelope_of(&keys[0], epoch, envelope::HANDOFF, certificate.to_bytes());
+    for i in [0, 1, 4, 5] {
+        sim.nodes[i]
+            .deliver(validator_id(&keys[0]), TOPIC, m.to_bytes())
+            .unwrap();
+    }
+    let height = sim.nodes[0].finalized_height().unwrap();
+    assert!(
+        sim.run_until(40 * SLOT_MS, |s| s.nodes[0].finalized_height().unwrap()
+            >= height + 4)
+            .unwrap()
+    );
+    assert!(handoff(&mut sim.nodes[0], 0).is_none());
+    assert_eq!(status(&mut sim.nodes[0]).active.unwrap().id, 0);
+    assert!(height_of(&sim.nodes[0], rotation::keys::ACTIVATED, 1).is_none());
+    // The leavers come back and sign: key 0 hands off to the newest adopted key, and key
+    // set 1 is never activated.
+    sim.revive(2, kernel, &genesis).unwrap();
+    sim.revive(3, kernel, &genesis).unwrap();
+    let handed = sim
+        .run_until(400 * SLOT_MS, |s| handoff(&mut s.nodes[0], 0).is_some())
+        .unwrap();
+    assert!(handed, "{:?}", sim.finalized_heights().unwrap());
+    let h = handoff(&mut sim.nodes[0], 0).unwrap();
+    assert!(h.to >= 2, "{h:?}");
+    assert_eq!(
+        height_of(&sim.nodes[0], rotation::keys::ACTIVATED, h.to),
+        Some(h.height)
+    );
+    assert!(height_of(&sim.nodes[0], rotation::keys::ACTIVATED, 1).is_none());
+    assert_eq!(status(&mut sim.nodes[0]).active.unwrap().id, h.to);
     assert_agreement(&sim);
 }

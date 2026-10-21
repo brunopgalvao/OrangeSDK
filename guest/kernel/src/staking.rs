@@ -8,7 +8,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use solo_abi::chain::consensus::signing_preimage;
-use solo_abi::chain::{Account, Evidence, Log, Validator, ValidatorSet, call_status, reason};
+use solo_abi::chain::{Account, BLOCK_GAS_LIMIT, Evidence, Log, Validator, ValidatorSet, call_status, reason};
 use solo_abi::codec::Seq;
 use solo_abi::rotation::{HANDOFF_EPOCHS, REPORT_GAS, ThresholdEvidence};
 use solo_abi::staking::{
@@ -228,9 +228,36 @@ pub fn init(genesis: &Genesis) {
     }
 }
 
+/// Gas limits of the staking transactions whose admission check in the
+/// block being executed needed a pairing (spec 15 §3.3). Written during the
+/// block and deleted at its end, so it is never part of a committed state.
+const PAIRING_GAS: &[u8] = b"stake/pairing_gas";
+
+/// Charges `s`'s gas limit to the block's pairing budget before an
+/// admission check that needs a pairing; false, charging nothing, once the
+/// budget would pass the block gas limit. Only execution charges (`charge`),
+/// never admission or selection: a block built by the rules keeps the sum of
+/// its gas limits within the block gas limit and never runs out, while a
+/// leader who fills a proposal with transactions that fail such a check pays
+/// for at most a block's worth of pairings.
+fn spend(s: &Signed, charge: bool) -> bool {
+    if !charge {
+        return true;
+    }
+    let used: u64 = state::get(PAIRING_GAS).unwrap_or(0);
+    let total = used.saturating_add(s.tx.gas_limit);
+    if total > BLOCK_GAS_LIMIT {
+        return false;
+    }
+    state::set(PAIRING_GAS, &total);
+    true
+}
+
 /// The action a transaction to the staking address carries, with the
-/// validator it acts for, if it can run in the block at `height`.
-fn action_of(s: &Signed, height: u64) -> Option<(StakingAction, Hash)> {
+/// validator it acts for, if it can run in the block at `height`; `charge`
+/// when executing, so a check that needs a pairing spends from the block's
+/// pairing budget ([`spend`]).
+fn action_of(s: &Signed, height: u64, charge: bool) -> Option<(StakingAction, Hash)> {
     let p = params();
     if p.epoch_blocks == 0 || s.tx.chain_id != Some(state::chain_id()) {
         return None;
@@ -240,7 +267,7 @@ fn action_of(s: &Signed, height: u64) -> Option<(StakingAction, Hash)> {
     let value = s.tx.value;
     let id = match &action {
         StakingAction::Register { dkg_key } => {
-            if !valid_key(dkg_key) {
+            if !spend(s, charge) || !valid_key(dkg_key) {
                 return None;
             }
             match registered {
@@ -273,7 +300,7 @@ fn action_of(s: &Signed, height: u64) -> Option<(StakingAction, Hash)> {
                 return None;
             }
             let evidence = ThresholdEvidence::from_bytes(evidence).ok()?;
-            if rotation::on_record(&evidence) {
+            if rotation::on_record(&evidence) || !spend(s, charge) {
                 return None;
             }
             rotation::offender(&evidence, height)?
@@ -285,7 +312,7 @@ fn action_of(s: &Signed, height: u64) -> Option<(StakingAction, Hash)> {
 /// Admission: a transaction to the staking address must be able to run.
 pub fn admit(s: &Signed) -> Result<(), u32> {
     let next = state::height().unwrap_or(0) + 1;
-    if s.tx.to == Some(STAKING_ADDRESS) && action_of(s, next).is_none() { Err(reason::STAKING_ACTION) } else { Ok(()) }
+    if s.tx.to == Some(STAKING_ADDRESS) && action_of(s, next, false).is_none() { Err(reason::STAKING_ACTION) } else { Ok(()) }
 }
 
 /// Whether `s` goes to the staking address.
@@ -298,7 +325,7 @@ pub fn is_staking(s: &Signed) -> bool {
 /// fees, nonce, and for `bond` the value moving to the staking address),
 /// then applies its action.
 pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Outcome {
-    let Some((action, id)) = action_of(s, height) else {
+    let Some((action, id)) = action_of(s, height, true) else {
         return Outcome { status: call_status::INVALID, gas_used: 0, output: Vec::new(), logs: Vec::new(), contract: None };
     };
     let report = matches!(action, StakingAction::Report { .. });
@@ -500,6 +527,7 @@ fn prune(next: &ValidatorSet) {
 /// Bookkeeping at the end of the block at `height`: at the end of epoch `e`
 /// it decides the set of `e + 1` and schedules its DKG run.
 pub fn end_block(height: u64) {
+    state::delete(PAIRING_GAS);
     let p = params();
     if p.epoch_blocks == 0 || !height.is_multiple_of(p.epoch_blocks) {
         return;

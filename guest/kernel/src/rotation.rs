@@ -41,7 +41,6 @@ pub fn replaced(id: u64) -> Option<u64> {
     state::get(&id_key(keys::REPLACED, id))
 }
 
-
 /// Makes key set `record` the active one from the block at `height` on.
 pub fn activate(record: &KeySetRecord, height: u64) {
     state::set(skeys::ACTIVE, &record.id);
@@ -66,14 +65,17 @@ pub fn pending() -> Option<KeySetRecord> {
     (newest > active).then(|| staking::key_set(newest)).flatten()
 }
 
-/// Whether `certificate` hands the active key off to an adopted, newer key
-/// set with a valid group signature of the active key; the target's record.
+/// Whether `certificate` hands the active key off to the pending target,
+/// the newest adopted key set, with a valid group signature of the active
+/// key; the target's record. A handoff to an older adopted key set that a
+/// newer one superseded before it was recorded is never recorded (spec 15
+/// §6.6), so the active key only ever moves to the newest key.
 pub fn handoff_target(certificate: &RotationCertificate) -> Option<KeySetRecord> {
     let active = staking::active()?;
-    if certificate.from != active.id || certificate.to <= active.id {
+    if certificate.from != active.id {
         return None;
     }
-    let target = staking::key_set(certificate.to)?;
+    let target = pending().filter(|t| t.id == certificate.to)?;
     let message = rotation_message(state::chain_id(), target.id, target.group_key()?);
     verify(&message, &certificate.signature, active.group_key()?).then_some(target)
 }

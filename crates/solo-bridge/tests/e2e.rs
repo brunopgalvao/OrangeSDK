@@ -486,13 +486,20 @@ fn partial_of(node: &Node, key: &SigningKey, id: u64, message: &[u8]) -> Partial
 
 /// The group signature, in EIP-2537 encoding, that the shareholders of key set
 /// `id` among `signers` make over `message` by combining their partials.
-fn forged_signature(node: &Node, signers: &[SigningKey], id: u64, message: &[u8]) -> Vec<u8> {
-    let record = KeySetRecord::from_bytes(
+/// Key set `id` as `node`'s chain adopted it.
+fn key_set_record(node: &Node, id: u64) -> KeySetRecord {
+    KeySetRecord::from_bytes(
         &node
             .state_get(&[skeys::KEY_SET, &id.to_be_bytes()].concat())
             .unwrap(),
     )
-    .unwrap();
+    .unwrap()
+}
+
+/// The threshold signature of `signers` with their shares of key set `id`
+/// over `message`.
+fn forged(node: &Node, signers: &[SigningKey], id: u64, message: &[u8]) -> solo_bls::Signature {
+    let record = key_set_record(node, id);
     let partials = signers
         .iter()
         .map(|k| partial_of(node, k, id, message))
@@ -505,8 +512,24 @@ fn forged_signature(node: &Node, signers: &[SigningKey], id: u64, message: &[u8]
     let signature = Keystore::default()
         .handle(None, &combine.to_bytes())
         .unwrap();
-    let point = solo_bls::Signature::from_bytes(&signature.try_into().unwrap()).unwrap();
-    solo_bls::evm::encode_g1(point.point()).to_vec()
+    solo_bls::Signature::from_bytes(&signature.try_into().unwrap()).unwrap()
+}
+
+/// Whether `signature` verifies over `message` under the group key of key
+/// set `id`, checked off chain: the forgery is a real one.
+fn verifies_under(node: &Node, id: u64, message: &[u8], signature: &solo_bls::Signature) -> bool {
+    let record = key_set_record(node, id);
+    solo_bls::PublicKey::from_bytes(record.key_set[..96].try_into().unwrap())
+        .unwrap()
+        .verify(message, signature)
+}
+
+/// [`forged`] in the EIP-2537 encoding the contracts take, after checking
+/// that it verifies under key set `id`.
+fn forged_signature(node: &Node, signers: &[SigningKey], id: u64, message: &[u8]) -> Vec<u8> {
+    let signature = forged(node, signers, id, message);
+    assert!(verifies_under(node, id, message, &signature));
+    solo_bls::evm::encode_g1(signature.point()).to_vec()
 }
 
 fn submit_call(proposal: &[u8], signature: &[u8]) -> Vec<u8> {
@@ -575,9 +598,10 @@ fn a_light_client_follows_the_group_key_across_epochs() {
         );
         current = r.to;
     }
-    let get = |eth: &mut Eth, signature: &str| {
-        eth.view(RELAYER, client, &abi::call(signature, &[])).output
+    let get_from = |eth: &mut Eth, at: [u8; 20], signature: &str| {
+        eth.view(RELAYER, at, &abi::call(signature, &[])).output
     };
+    let get = |eth: &mut Eth, signature: &str| get_from(eth, client, signature);
     assert_eq!(word_u64(&get(&mut eth, "keyId()")), current);
     let target = sim.nodes[0].finalized_height().unwrap() + 4;
     assert!(
@@ -620,7 +644,11 @@ fn a_light_client_follows_the_group_key_across_epochs() {
             certificate_message(CHAIN_ID, claimed, submission.anchor_height + 3, &fake_hash);
         let signature = forged_signature(node, &validators[..3], 0, &message);
         let refused = eth.call(RELAYER, client, &submit_call(&fake, &signature));
-        assert!(!refused.success, "claimed key set {claimed}");
+        assert_eq!(
+            refused.output,
+            support::eth::selector("InvalidCertificate()"),
+            "claimed key set {claimed}"
+        );
     }
     // Nor can they hand the client off to a key of their own.
     let theirs = solo_bls::SecretKey::generate(&[0x77; 32], b"")
@@ -636,10 +664,29 @@ fn a_light_client_follows_the_group_key_across_epochs() {
             Value::Bytes(signature.clone()),
         ],
     );
-    assert!(!eth.call(RELAYER, client, &rotate).success);
-    // A client still holding key set 0 refuses a certificate of it anchored three epochs
-    // on, past the key's age, however well signed, and a handoff that far ahead.
+    assert_eq!(
+        eth.call(RELAYER, client, &rotate).output,
+        support::eth::selector("InvalidCertificate()")
+    );
+    // A client still holding key set 0 accepts the same shareholders' false root while
+    // the key is within its age: the forgery is real, and only the client having moved
+    // on, or the key's age, stops it.
     let stale = deploy_client(&mut eth);
+    let young = Proposal {
+        height: 21,
+        anchor_height: 20,
+        anchor_root: [0x67; 32],
+        ..Proposal::default()
+    }
+    .to_bytes();
+    let message = certificate_message(CHAIN_ID, 0, 21, &keccak256(&young));
+    let signature = forged_signature(node, &validators[..3], 0, &message);
+    assert!(
+        eth.call(RELAYER, stale, &submit_call(&young, &signature))
+            .success
+    );
+    // It refuses a certificate of key set 0 anchored three epochs on, past the key's age,
+    // however well signed, and a handoff that far ahead.
     let old = Proposal {
         height: 51,
         anchor_height: 50,
@@ -666,4 +713,18 @@ fn a_light_client_follows_the_group_key_across_epochs() {
         eth.call(RELAYER, stale, &data).output,
         support::eth::selector("KeyExpired()")
     );
+    // Within the age, the same shareholders can hand that client off to a key of their
+    // own, which is why a client must be kept current (spec 17 §10).
+    let message = rotation_message(CHAIN_ID, MAX_KEY_AGE, &theirs.to_bytes());
+    let signature = forged_signature(node, &validators[..3], 0, &message);
+    let data = abi::call(
+        "rotate(uint64,bytes,bytes)",
+        &[
+            Value::uint(u128::from(MAX_KEY_AGE)),
+            Value::Bytes(solo_bls::evm::encode_g2(theirs.point()).to_vec()),
+            Value::Bytes(signature),
+        ],
+    );
+    assert!(eth.call(RELAYER, stale, &data).success);
+    assert_eq!(word_u64(&get_from(&mut eth, stale, "keyId()")), MAX_KEY_AGE);
 }
