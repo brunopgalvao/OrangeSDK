@@ -34,6 +34,18 @@ fn strip(b: &[u8]) -> Vec<u8> {
 /// A signed authorization of `authority` for `address` at `nonce`, as an RLP
 /// list item.
 fn authorization(authority: &Wallet, chain_id: u64, address: [u8; 20], nonce: u64) -> Vec<u8> {
+    signed_authorization(authority, chain_id, address, nonce, None)
+}
+
+/// As [`authorization`], its y parity replaced by `parity` when given: a
+/// parity other than 0 and 1 names no authority.
+fn signed_authorization(
+    authority: &Wallet,
+    chain_id: u64,
+    address: [u8; 20],
+    nonce: u64,
+    parity: Option<u8>,
+) -> Vec<u8> {
     let mut body = Vec::new();
     encode_uint(u128::from(chain_id), &mut body);
     encode_bytes(&address, &mut body);
@@ -44,7 +56,7 @@ fn authorization(authority: &Wallet, chain_id: u64, address: [u8; 20], nonce: u6
         .key
         .sign_prehash_recoverable(&keccak256(&message))
         .unwrap();
-    encode_uint(u128::from(rid.to_byte()), &mut body);
+    encode_uint(u128::from(parity.unwrap_or(rid.to_byte())), &mut body);
     encode_bytes(&strip(&sig.r().to_bytes()), &mut body);
     encode_bytes(&strip(&sig.s().to_bytes()), &mut body);
     let mut out = Vec::new();
@@ -142,12 +154,14 @@ fn an_account_delegates_and_calls_itself_across_validators() {
     };
     let mut sim = Sim::new(v1(), &genesis, &validators, 1, &template, 20).unwrap();
     // Alice authorizes the delegate for herself (at her nonce after this
-    // transaction's), Bob for himself, and Carol for another chain; then calls
-    // herself.
+    // transaction's), Bob for himself, Carol for another chain, and Dave
+    // with a parity that names no authority; then calls herself.
+    let dave = Wallet::new(0x76);
     let auths = [
         authorization(&alice, CHAIN_ID, DELEGATE, 1),
         authorization(&bob, 0, DELEGATE, 0),
         authorization(&carol, CHAIN_ID + 1, DELEGATE, 0),
+        signed_authorization(&dave, CHAIN_ID, DELEGATE, 0, Some(2)),
     ];
     let first = set_code_tx(&alice, 0, alice.address, &auths, &[]);
     let hash = sim.submit(0, &first).unwrap();
@@ -175,6 +189,11 @@ fn an_account_delegates_and_calls_itself_across_validators() {
         node.code(&carol.address).unwrap().is_empty(),
         "another chain's authorization is skipped"
     );
+    assert!(
+        node.code(&dave.address).unwrap().is_empty(),
+        "an authorization that names no authority is skipped"
+    );
+    assert_eq!(node.account(&dave.address).unwrap().nonce, 0);
     assert_eq!(node.storage(&alice.address, &word(0)).unwrap(), word(1));
     assert_eq!(
         node.storage(&alice.address, &word(1)).unwrap(),
@@ -183,13 +202,14 @@ fn an_account_delegates_and_calls_itself_across_validators() {
     // Her nonce moved for the transaction and for her authorization; Bob's for his.
     assert_eq!(node.account(&alice.address).unwrap().nonce, 2);
     assert_eq!(node.account(&bob.address).unwrap().nonce, 1);
-    // Intrinsic gas: 21 000 plus 25 000 per authorization, less the refund of
-    // 12 500 for each authority that existed (Alice), plus the code that ran.
-    assert!(
-        receipt.gas_used > 21_000 + 2 * 25_000,
-        "{}",
-        receipt.gas_used
-    );
+    // Intrinsic gas: 21 000 plus 25 000 for each of the four authorizations,
+    // skipped ones included. The delegate's code: a cold SLOAD (2 100), an
+    // SSTORE from zero to the slot it warmed (20 000), one to a cold slot
+    // (22 100), LOG1 with no data (750) and 21 for its pushes, ADD, CALLER
+    // and ADDRESS. Less a refund of 12 500 for each authority that existed:
+    // Alice; Bob had no account, Carol and Dave were skipped.
+    let code = 2_100 + 20_000 + 22_100 + 750 + 21;
+    assert_eq!(receipt.gas_used, 21_000 + 4 * 25_000 + code - 12_500);
     // A delegated account still sends (EIP-3607 allows a designator), and a
     // call to it runs the delegate again.
     let again = alice.tx(2, alice.address, 0, 100_000, &[]);

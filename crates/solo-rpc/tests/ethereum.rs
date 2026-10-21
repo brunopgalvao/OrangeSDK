@@ -354,10 +354,44 @@ fn calls_and_estimates_take_an_authorization_list() {
     let call = json!({ "from": data(&bob.address), "to": data(&bob.address), "input": increment, "authorizationList": [auth] });
     // Bob's slot 0 starts at zero: the counter returns the delta.
     assert_eq!(ok(&mut rpc, "eth_call", json!([call])), data(&word(3)));
-    let with = number(&ok(&mut rpc, "eth_estimateGas", json!([call])));
     let plain = json!({ "from": data(&bob.address), "to": data(&counter), "input": increment });
+    // Without refunds an estimate is exactly the gas used. An authorization
+    // that is skipped (another chain's) still costs its 25 000 of
+    // intrinsic gas, and nothing else.
     let without = number(&ok(&mut rpc, "eth_estimateGas", json!([plain])));
-    assert!(with > without + 12_500, "{with} {without}");
+    let mut elsewhere = auth.clone();
+    elsewhere["chainId"] = json!("0x3e7");
+    let mut skipped = plain.clone();
+    skipped["authorizationList"] = json!([elsewhere]);
+    assert_eq!(
+        number(&ok(&mut rpc, "eth_estimateGas", json!([skipped]))),
+        without + 25_000
+    );
+    // Bob's own authorization costs the same 25 000, and the counter's
+    // SSTORE sets his slot 0 from zero (22 100, cold) where the plain call
+    // reset the counter's (5 000). Bob's account exists, so 12 500 comes
+    // back as a refund, which a gas limit must still cover: the call
+    // succeeds with exactly that much gas and fails with one less, and the
+    // estimate lands within its 1.5% above.
+    let needed = without + 25_000 + 22_100 - 5_000;
+    let limited = |gas: u64| {
+        let mut call = call.clone();
+        call["gas"] = json!(format!("{gas:#x}"));
+        json!([call])
+    };
+    assert_eq!(ok(&mut rpc, "eth_call", limited(needed)), data(&word(3)));
+    assert_eq!(
+        err(&mut rpc, "eth_call", limited(needed - 1)),
+        (
+            -32000,
+            "execution halted: out of gas or an exceptional halt".to_owned()
+        )
+    );
+    let with = number(&ok(&mut rpc, "eth_estimateGas", json!([call])));
+    assert!(
+        (needed..=needed + needed * 15 / 1000).contains(&with),
+        "{with} {needed}"
+    );
     // `v` stands for `yParity`; a missing field or a bad list is refused.
     let mut with_v = auth.clone();
     with_v["v"] = with_v["yParity"].take();
