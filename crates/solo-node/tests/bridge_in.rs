@@ -16,6 +16,7 @@ use solo_abi::bridge_in::{
 };
 use solo_abi::chain::{Allocation, CallRequest, CallResult, GenesisParams, Receipt, reason};
 use solo_abi::codec::Seq;
+use solo_abi::governance::{Call, GOVERNANCE_ADDRESS};
 use solo_abi::types::Genesis;
 use solo_ethlc::abi::{self, Delivery, word};
 use solo_ethlc::beacon::Update;
@@ -529,6 +530,54 @@ fn messages_from_ethereum_reach_their_recipient_once() {
         1
     );
     assert_eq!(count(&mut sim.nodes[0]), 3);
+
+    // The light client's own governance actions (spec 18 §5.1) go through
+    // the governance address as actions (spec 13 §9.2), which the kernel
+    // runs as the governance authority within `ACTION_GAS`: a new delay,
+    // then a later checkpoint of the synthetic chain, which becomes the
+    // finalized header and revokes every root stored before it. A
+    // checkpoint that is no bootstrap fails the action.
+    let action = |data: &[u8]| {
+        Call::Submit {
+            target: LIGHT_CLIENT_ADDRESS,
+            data: data.to_vec(),
+        }
+        .encode()
+    };
+    let set_delay = abi::encode(abi::SET_DELAY, &[word(7)]);
+    let r = send(
+        &mut sim,
+        &gov.tx(GOVERNANCE_ADDRESS, 200_000, &action(&set_delay)),
+    );
+    assert_eq!((r.status, r.logs.0.len()), (1, 1));
+    assert_eq!(
+        call(&mut sim.nodes[0], LIGHT_CLIENT_ADDRESS, &abi::DELAY).output,
+        word(7)
+    );
+    let later = chain.bootstrap(72, [4; 32]);
+    let checkpoint = abi::encode_bytes_call(abi::SET_CHECKPOINT, &later.encode());
+    let r = send(
+        &mut sim,
+        &gov.tx(GOVERNANCE_ADDRESS, 300_000, &action(&checkpoint)),
+    );
+    assert_eq!((r.status, r.logs.0.len()), (1, 1));
+    let view = call(&mut sim.nodes[0], LIGHT_CLIENT_ADDRESS, &abi::FINALIZED).output;
+    assert_eq!(view[..32], word(72));
+    let root = call(
+        &mut sim.nodes[0],
+        LIGHT_CLIENT_ADDRESS,
+        &client::u64_call(abi::EXECUTION_ROOT, 16),
+    )
+    .output;
+    assert_eq!(root[..32], [0; 32], "revoked by the new checkpoint");
+    let junk = abi::encode_bytes_call(abi::SET_CHECKPOINT, &[1]);
+    let r = send(
+        &mut sim,
+        &gov.tx(GOVERNANCE_ADDRESS, 200_000, &action(&junk)),
+    );
+    assert_eq!((r.status, r.logs.0.len()), (0, 0));
+    let view = call(&mut sim.nodes[0], LIGHT_CLIENT_ADDRESS, &abi::FINALIZED).output;
+    assert_eq!(view[..32], word(72));
 
     // Value is refused at admission; the observer agrees on the state.
     let raw = relayer

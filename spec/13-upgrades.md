@@ -28,7 +28,7 @@ struct UpgradeParams { governance: [20], min_delay: u64, epoch_blocks: u64 }
 struct GovernanceParams { mode: u8, voting_blocks: u64, timelock_blocks: u64, quorum_bps: u64, deposit: u128 }
 ```
 
-The `solo` command reads them from the genesis JSON as `governance` (0x address), `upgradeDelay`, `epochBlocks`, `governanceMode` (`key`, the default, or `stake`), `votingBlocks`, `timelockBlocks`, `quorumBps` and `proposalDeposit` (wei); each number defaults to zero.
+The `solo` command reads them from the genesis JSON as `governance` (0x address), `upgradeDelay`, `epochBlocks`, `governanceMode` (`key`, the default, or `stake`), `votingBlocks`, `timelockBlocks`, `quorumBps` and `proposalDeposit` (wei); each number defaults to zero. The stake track needs `votingBlocks` and `quorumBps` above zero (§9.1): `solo` refuses a genesis that starts under it without them, before a node's `kernel_init` traps on it.
 
 ## 2. The upgrade address
 
@@ -71,20 +71,20 @@ A *validator's account* is the last 20 bytes of a validator id in the current va
 
 ### 2.3 Admission and execution
 
-A transaction to the upgrade address *can run* if it is signed for this chain (a typed transaction, or a legacy one with an EIP-155 chain id; a pre-EIP-155 legacy transaction carries no chain id and could be replayed from any chain sharing the key), its calldata is an action (§2.1) carrying no value, or a governance call that can run (§9.4), and its sender is authorized for that action (§2.2) or call. Admission (`kernel_stf_validate_tx`, and selection in `kernel_stf_build_block`) rejects one that cannot run with reason 12 (`SYSTEM_ACTION`). That check comes after decoding, the chain-id check, signature recovery and the well-formedness checks every transaction gets, and before the checks against the sender's account (nonce, then funds): a transaction that cannot run gets reason 12 whatever its nonce and the sender's balance. Transactions to the module address of spec 16 §4.2 are checked at the same point under the same rules.
+A transaction to the upgrade address *can run* if it is signed for this chain (a typed transaction, or a legacy one with an EIP-155 chain id; a pre-EIP-155 legacy transaction carries no chain id and could be replayed from any chain sharing the key), its calldata is an action (§2.1) carrying no value, or a governance call that can run (§9.4), and its sender is authorized for that action (§2.2) or call. Admission (`kernel_stf_validate_tx`, and selection in `kernel_stf_build_block`) rejects one that cannot run with reason 12 (`SYSTEM_ACTION`), except that a governance call whose gas limit is below its intrinsic gas plus the surcharge of §9.9 is rejected first with reason 6 (`GAS_TOO_LOW`), the shortfall named as one. That check comes after decoding, the chain-id check, signature recovery and the well-formedness checks every transaction gets, and before the checks against the sender's account (nonce, then funds): a transaction that cannot run gets reason 12 whatever its nonce and the sender's balance. Transactions to the module address of spec 16 §4.2 are checked at the same point under the same rules.
 
 In `kernel_stf_execute_block`, a transaction to the upgrade address that cannot run changes nothing and gets a failed receipt, as any transaction that should not have been included. One that can run executes in two steps:
 
 1. It runs through the EVM as a call to the upgrade address, which has no code: intrinsic gas (including the calldata floor) is charged, fees are paid, the nonce is used, and a deposit's value moves to the address.
 2. If that succeeded, the action or call is applied against the state at that point in the block. If the action's state checks (§3) fail, the receipt has status 0, as for a revert: gas and nonce stay spent, the action changes nothing. Otherwise the receipt has status 1 and carries the action's logs (§3). A governance call adds its surcharge (§9.9) to the gas used, and §9.5 says what a failing one leaves behind.
 
-Actions cost no gas beyond the intrinsic cost; only the authorized accounts can send them. `eth_call` and `eth_estimateGas` see the plain call of step 1, not the action.
+Actions cost no gas beyond the intrinsic cost; only the authorized accounts can send them. `eth_call` and `eth_estimateGas` see the plain call of step 1, not the action; for a governance call they report the plain call's gas plus the surcharge of §9.9, so that an estimate is a gas limit admission takes.
 
 ## 3. Actions
 
 Heights below are those of the block executing the action; under the stake track, `propose` and `cancel` execute when the proposal that carries them does (§9.5), and the height is that block's.
 
-- **`stage(codeHash, index, chunk)`** stores `chunk` as chunk `index` of `codeHash`, replacing any chunk already there. Fails if `codeHash` is the pending upgrade's or that of a kernel the chain has switched to (§5): their code is frozen. Emits nothing.
+- **`stage(codeHash, index, chunk)`** stores `chunk` as chunk `index` of `codeHash`, replacing any chunk already there. The first `stage` under a code hash makes its sender the code hash's *staker*, recorded under `gov/staker/` ‖ `codeHash` (§5), and only the staker stages further chunks under it, so that nobody spoils another account's upload by writing a chunk of its own under the hash: an account that wants the same code under a hash another holds proposes over that code once it is complete, or stages a build of its own under a hash of its own. Fails if the sender is not the staker, or if `codeHash` is *frozen*: the pending upgrade's, that of a kernel the chain has switched to (§5), or one an open proposal names in its `propose` or `install` (§9.3). Emits nothing.
 - **`propose(codeHash, activationHeight, requiredGates)`** at height `B` makes the code the *pending upgrade*. Fails if an upgrade is pending, if `activationHeight < B + max(N, 1)`, if `activationHeight` is `2^64 − 1` (block `H + 1` must have a height), if the chain has already switched to `codeHash` (a kernel never comes back: versions only increase, 06 §7.1), if chunk 0 of `codeHash` is not staged, or if the chunks staged from index 0 up to the first missing index, concatenated, do not hash to `codeHash` under `keccak256`. Records `PendingUpgrade { code_hash, activation_height, required_gates, size, chunks, proposed_at: B }` and emits `UpgradeProposed(codeHash, activationHeight, requiredGates)`.
 - **`cancel(codeHash)`** removes the pending upgrade. Fails unless an upgrade is pending and its code hash is `codeHash`. Emits `UpgradeCancelled(codeHash)`. Staged chunks stay; the same code may be proposed again without uploading it again.
 - **`signal(features)`** records `Signal { epoch: epoch(B), features }` as the sender's latest signal (§8.2). Emits nothing.
@@ -109,6 +109,7 @@ Under the reference kernel's state layout (all covered by the state commitment):
 | `gov/enacted` | `EnactedUpgrade`, the latest switch |
 | `gov/kernel/` ‖ code hash | `EnactedUpgrade`, for every kernel the chain switched to |
 | `gov/chunk/` ‖ code hash ‖ index (big-endian `u32`) | chunk bytes |
+| `gov/staker/` ‖ code hash | `[20]`, the staker of the code hash (§3), for good |
 | `gate/book` | `GateBook` (§8.3) |
 | `gate/signal/` ‖ validator id | `Signal`, the validator's latest |
 
@@ -202,12 +203,12 @@ Every privileged action of the reference kernel is a *governance action*: propos
 
 ### 9.1 Tracks and rules
 
-`GovernanceParams::mode` is 0, the **key track**, or 1, the **stake track**; `kernel_init` traps on any other value, on `quorum_bps > 10 000`, and on the stake track with `voting_blocks = 0`.
+`GovernanceParams::mode` is 0, the **key track**, or 1, the **stake track**; `kernel_init` traps on any other value, on `quorum_bps > 10 000`, and on the stake track with rules that cannot work: `voting_blocks = 0`, or `quorum_bps = 0`, under which one vote decides whatever nobody else votes on and no deposit is ever forfeited (§9.3).
 
 - **Key track.** The governance key of §1.1 executes any governance action at once by submitting it (§9.2); nobody else acts, and no proposal, vote, veto or guardian exists. A chain without a key has no governance. This is the track of development chains (`solo dev`), where one operator holds the key, and of a chain's first days before it switches.
-- **Stake track.** Anyone *bonded* proposes a governance action: a validator's account (§2.2), or any account that locks `deposit` wei with its proposal (`deposit = 0`: validators only). Validators vote, each with the weight it has in the current validator set. A proposal is tallied at the end of its voting period of `voting_blocks` blocks, waits `timelock_blocks` blocks once passed, and is then executed by anyone within a window as long as the voting period. The **guardian**, the governance key unless a proposal named another account (zero: none), may veto any open proposal and may pause the inbox's message verifier at once, and nothing else.
+- **Stake track.** Anyone *bonded* proposes a governance action: a validator's account (§2.2), or any account that locks `deposit` wei with its proposal (`deposit = 0`: validators only). Validators vote, each with the weight it has in the current validator set. A proposal is tallied at the end of its voting period of `voting_blocks` blocks, waits `timelock_blocks` blocks once passed, and is then executed by anyone within a window as long as the voting period. The **guardian**, the governance key unless a proposal named another account (zero: none), may veto any open normal-track proposal other than one that names a guardian (§9.3), may pause the inbox's message verifier at once, and nothing else: validators can always replace it, and it cannot protect what a majority of stake stops on the fast track.
 
-The rules in force are `GovernanceParams` as genesis set them, until a `setParams` action replaces them (§9.2).
+The rules in force are `GovernanceParams` as genesis set them, until a `setParams` action replaces them (§9.2); their `mode` is the track in force.
 
 ### 9.2 Calls and actions
 
@@ -266,13 +267,15 @@ struct Proposal { id: u64, proposer: [20], deposit: u128, target: [20], data: by
 
 `voting_end = B + voting_blocks`; on the normal track `executable_at = voting_end + timelock_blocks + 1` and `expires_at = executable_at + voting_blocks − 1`, on the fast track `executable_at = 0` and `expires_at = voting_end`; `status` 0 is *voting*, 1 *passed*; `deposit` is the value the transaction carried (zero for a validator). It emits `ProposalSubmitted(id, proposer, target, data, votingEnd)`. At most `MAX_OPEN_PROPOSALS = 16` proposals are open at once.
 
+A `submit` whose action runs staged code, `propose` or `install`, opens the proposal only if that code is there: the chunks staged under its code hash (§3) hash to it, or, for an install, the module is already in state under its hash. Otherwise the submission reverts (§9.5). The code hash an open proposal names is frozen until the proposal leaves state (§3), so validators vote on the code that will run, and what passes is what executes.
+
 **Voting.** A validator's account votes with `vote(id, support)` in any block up to and including `voting_end` while the proposal is voting; voting again replaces the vote. It emits `Voted(id, voter, support, weight)` with the voter's weight at the time. A vote weighs what its validator weighs in the validator set at the moment of a tally, and nothing once it has left the set.
 
 **Tally.** A *tally* over the current validator set gives `yes` and `no`, the stake voting each way, and `total`, the set's whole stake. The *quorum* holds when `(yes + no) · 10 000 ≥ total · quorum_bps` (never with no stake). A normal-track proposal *passes* when the quorum holds and `yes · 3 > (yes + no) · 2`, more than two thirds of the stake that voted; a fast-track one when `yes · 2 > total`.
 
 - At the end of block `voting_end`, before the state commitment (after the module hooks of 16 §7, before the gate tallies of §8.3 and the epoch transition of 15 §4), a voting proposal is tallied. On the normal track, passed, it becomes *passed* with the tally recorded; otherwise, and always on the fast track, it fails and is pruned (below).
 - A fast-track proposal is also tallied after each vote it receives; the vote that makes it pass executes it (§9.5) in the same transaction.
-- A passed proposal is executed by anyone with `execute(id)` in any block from `executable_at` to `expires_at`. The guardian vetoes any open proposal with `veto(id)`, voting or passed, which emits `ProposalVetoed(id)`.
+- A passed proposal is executed by anyone with `execute(id)` in any block from `executable_at` to `expires_at`. The guardian vetoes an open normal-track proposal with `veto(id)`, voting or passed, unless its action is `setGuardian`; a fast-track proposal is never vetoed. A veto emits `ProposalVetoed(id)`.
 - At the end of block `expires_at`, a passed proposal still open has *expired* and is pruned.
 
 **Pruning.** A proposal that is executed, vetoed, failed or expired leaves state: its record, its votes and its place among the open proposals. Its deposit, held by the governance address since the submission, goes back to the proposer, except that a proposal that failed without reaching quorum, which nobody cared to vote on, forfeits it to the zero address, where fees go and nobody spends them.
@@ -286,18 +289,18 @@ A governance call *can run* in the block at height `h` (for admission, the execu
 | `submit(target, data)` | the sender is the governance key, no value, and `(target, data)` is an action of §9.2 (`setMode` included) | the sender is a validator's account sending no value, or any account sending exactly `deposit` wei while `deposit` is non-zero; `(target, data)` is an action of §9.2 other than `setMode`; fewer than 16 proposals are open |
 | `vote(id, support)` | never | the sender is a validator's account, no value; proposal `id` is open, voting, and `h ≤ voting_end` |
 | `execute(id)` | never | no value; proposal `id` is open, passed, and `executable_at ≤ h ≤ expires_at` |
-| `veto(id)` | never | the sender is the guardian, no value; proposal `id` is open |
+| `veto(id)` | never | the sender is the guardian, no value; proposal `id` is open, on the normal track, and its action is not `setGuardian` |
 | `pause(target)` | never | the sender is the guardian, no value; `target` is the verifier address and the bridge is on (its address holds a module designator) |
 | `setGuardian`, `setMode`, `setParams` sent directly | never | never |
 
-A transaction to the module address (16 §4.2) can run only under the key track, from the governance key, with no value and an `install` as calldata. One that cannot run, to either address, is refused at admission with reason 12 (§2.3).
+A transaction to the module address (16 §4.2) can run only under the key track, from the governance key, with no value and an `install` as calldata. A governance call whose gas limit is below its intrinsic gas plus `GOVERNANCE_GAS` is refused at admission with reason 6 (`GAS_TOO_LOW`), before any other check; one that cannot run, to either address, with reason 12 (§2.3).
 
 ### 9.5 Execution
 
 A governance call that can run executes as §2.3 says: the plain call, then the call itself, which adds `GOVERNANCE_GAS` to the gas used and charges it at the transaction's gas price to the zero address, like every fee.
 
 - **`submit` under the key track** executes the action at once, as a proposal that passes under the key. The receipt carries `Enacted(key, target, data)` followed by the action's own logs; if the action's checks fail, the transaction reverts (status 0, nothing changed).
-- **`submit` under the stake track** opens the proposal (§9.3).
+- **`submit` under the stake track** opens the proposal (§9.3), unless its action names staged code that is not complete: then the transaction reverts, nothing opens, and the deposit it carried goes back to the sender. Every governance call that reverts returns the value it carried.
 - **`vote`** records the vote; on the fast track, when the vote makes the proposal pass, the receipt carries `ProposalExecuted(id)` and the action's logs after `Voted`, and the proposal is pruned.
 - **`execute`** prunes the proposal (its deposit returned) and applies the action: the receipt carries `ProposalExecuted(id)` and the action's logs. If the action's checks fail, the receipt has status 0 and the proposal is pruned all the same: a passed proposal is executed exactly once, whatever comes of it, so that nobody can make every node redo an expensive action by executing it again.
 - **`veto`** prunes the proposal (its deposit returned) and emits `ProposalVetoed(id)`.
@@ -308,11 +311,11 @@ An action executes against the state at that point in the block, at that block's
 - `propose` and `cancel` as §3 says;
 - `install` as 16 §4.2 says, the `ModuleInstalled` log included;
 - a bridge action as a call to the native contract at `target` (16 §5) made by the *governance authority*: the governance key under the key track, the governance address itself under the stake track, which is the account the two modules' configuration names as their governance (18 §4.1, §9.6). The module runs sandboxed with `ACTION_GAS = 2^26` VM gas of the kernel's own, with no value, and its writes are applied if it returns; a module that reverts, fails or is not there (the bridge is off, or the light client's gate is not yet active) fails the action. Nothing is charged to anyone beyond the surcharge: the actions are bounded by the voting and by the proposal bound.
-- `setGuardian(guardian)` records the guardian (zero: none) and emits `GuardianSet`; `setParams(voting, timelock, quorum, deposit)` fails unless `voting ≥ 1` and `quorum ≤ 10 000`, else records the rules and emits `ParamsSet`; `setMode` is §9.6's.
+- `setGuardian(guardian)` records the guardian (zero: none) and emits `GuardianSet`; `setParams(voting, timelock, quorum, deposit)` fails unless `voting ≥ 1` and `1 ≤ quorum ≤ 10 000`, else records the rules under the mode in force and emits `ParamsSet`; `setMode` is §9.6's.
 
 ### 9.6 The switch
 
-Under the key track, the key submits `setMode(1)`; the action fails unless the rules in force have `voting_blocks ≥ 1` and `quorum_bps ≤ 10 000`. It records the stake track, makes the key the guardian unless a `setGuardian` already named one, renames the governance in both bridge modules' configuration (18 §4.2) to the governance address, so that from then on only the kernel, executing a proposal or the guardian's pause, reaches their governed functions, and emits `ModeSet(1)`. `setMode(0)`, or any `setMode` under the stake track, is no action that can run: the switch is irreversible, and only a kernel upgrade, which can rewrite `gov/mode`, takes a chain back. A chain may also start under the stake track at genesis, with the key as its guardian and the modules configured accordingly from the first block.
+Under the key track, the key submits `setMode(1)`; the action fails unless the rules in force have `voting_blocks ≥ 1` and `1 ≤ quorum_bps ≤ 10 000`. It records the stake track, rewrites the rules a `setParams` recorded (§9.7) under the new mode, makes the key the guardian unless a `setGuardian` already named one, renames the governance in both bridge modules' configuration (18 §4.2) to the governance address, so that from then on only the kernel, executing a proposal or the guardian's pause, reaches their governed functions, and emits `ModeSet(1)`. `setMode(0)`, or any `setMode` under the stake track, is no action that can run: the switch is irreversible, and only a kernel upgrade, which can rewrite `gov/mode`, takes a chain back. A chain may also start under the stake track at genesis, with the key as its guardian and the modules configured accordingly from the first block.
 
 ### 9.7 State
 
@@ -320,7 +323,7 @@ Under the key track, the key submits `setMode(1)`; the action fails unless the r
 |---|---|
 | `gov/mode` | `u8`, once the mode left its genesis value |
 | `gov/guardian` | `[20]`, once a guardian was named |
-| `gov/params` | `GovernanceParams`, once `setParams` ran |
+| `gov/params` | `GovernanceParams`, once `setParams` ran; its `mode` is the track in force |
 | `gov/next` | `u64`, the id of the next proposal |
 | `gov/open` | `vec<OpenProposal { id: u64, due: u64 }>`, the open proposals in id order, `due` the next height the end of a block must look at each (its voting end, then its expiry) |
 | `gov/proposal/` ‖ id (big-endian u64) | `Proposal` |
@@ -342,7 +345,7 @@ struct ProposalView     { proposal: Proposal, yes: u64, no: u64, total: u64, vot
 struct GovernanceStatus { mode: u8, key: [20], guardian: [20], params: GovernanceParams, next_id: u64, proposals: vec<ProposalView> }
 ```
 
-A view's `yes`, `no` and `total` are the live tally over the current validator set and `votes` every vote of a validator still in it, in set order; `proposal.yes`, `no` and `total` are the tally recorded when a proposal passed. The reference node serves them as `solo_getGovernance`, `solo_getProposals` and `solo_getProposal(id)` (`null` once a proposal is pruned), and the `solo gov` command prints the calldata of every call above.
+A view's `yes`, `no` and `total` are the live tally over the current validator set and `votes` every vote of a validator still in it, in set order; `proposal.yes`, `no` and `total` are the tally recorded when a proposal passed; `params` are the rules in force, their `mode` the status's `mode`. The reference node serves them as `solo_getGovernance`, `solo_getProposals` and `solo_getProposal(id)` (`null` once a proposal is pruned), and the `solo gov` command prints the calldata of every call above with the gas limit it needs (§9.9).
 
 ### 9.9 Gas and bounds
 
@@ -353,12 +356,13 @@ A view's `yes`, `no` and `total` are the live tally over the current validator s
 | `MAX_OPEN_PROPOSALS` | 16 |
 | `MAX_PROPOSAL_DATA` | 32 768 bytes |
 
-A `vote(id, true)` transaction with no other calldata uses 71 860 gas: its intrinsic gas at the EIP-7623 floor, 21 860, plus the surcharge (`crates/solo-node/tests/governance.rs`, 2026-10-21). A `submit` pays for its calldata like any transaction, so the largest action costs about 525 000 gas of calldata before the surcharge. With the base fee of the reference kernel at zero the surcharge counts against the block gas limit, which bounds governance calls to 600 a block, and the deposit is what a proposal costs a sender that is not a validator.
+A `vote(id, true)` transaction with no other calldata uses 71 860 gas: its intrinsic gas at the EIP-7623 floor, 21 860, plus the surcharge (`crates/solo-node/tests/governance.rs`, 2026-10-21). A `submit` pays for its calldata like any transaction, and an action with few zero bytes pays the floor: the largest action with none uses 1 382 960 gas, the floor of its 32 868 bytes of calldata, 1 332 960, plus the surcharge (the same test, 2026-10-22). The kernel's `call` query, so `eth_call` and `eth_estimateGas`, reports a governance call's gas with the surcharge, and admission refuses a gas limit below the intrinsic gas plus the surcharge as a gas shortfall (§9.4): an estimate is a limit the chain takes, and `solo gov` prints it. With the base fee of the reference kernel at zero the surcharge counts against the block gas limit, which bounds governance calls to 600 a block, and the deposit is what a proposal costs a sender that is not a validator.
 
 ### 9.10 Limits of this version
 
 - Votes weigh the validator set at the tally, not at the vote: a validator that leaves the set loses its vote, one that joins can vote. Delegated or token-holder voting (15 §9) does not exist; only validators vote.
 - A proposal carries one action. Several actions take several proposals, which may run at the same time within the bound.
-- The guardian's powers, veto and pause, cover proposals and the inbox; they do not cancel a pending upgrade (that is the validators' fast track) or pause the token gateways of spec 21, which have guardians of their own.
+- The guardian's powers, veto and pause, cover normal-track proposals other than a change of guardian, and the inbox; they do not cancel a pending upgrade or stop a fast-track proposal (both are the validators' majority), nor pause the token gateways of spec 21, which have guardians of their own. A guardian that vetoes what it should not is replaced by a proposal it cannot veto, and delays until then.
 - The deposit is returned or burned, never paid to voters or to anyone who executes; nothing pays for governance beyond the proposer's interest.
+- Staged code is bounded by the block gas limit alone: under the stake track any validator stages any number of code hashes, each up to 7.5 MiB, at the calldata's gas, which at the reference kernel's zero base fee costs nothing, as every byte of state costs nothing then (contract creation included); the staker rule of §3 stops interference, not volume, and nothing deletes a chunk. A bound per account is a later change.
 - The only way back from the stake track is a kernel upgrade, which the stake track itself must pass.

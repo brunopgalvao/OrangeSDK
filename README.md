@@ -56,7 +56,7 @@ A `modules` array installs kernel modules at genesis (spec 16 §4.1): `{"address
 
 The reference kernel's base fee is zero and its block beneficiary is the zero address, so every fee, `gas used × price paid`, is credited to `0x0000…0000`, where no one can spend it. The genesis block has no header and its hash is zero: block 1's parent hash, `BLOCKHASH(0)` and the RPC's block 0 all say so.
 
-`solo dev` runs under the key track of governance: a `"governance"` address in the genesis file acts alone, at once, by sending `submit(target, data)` to `0x…5010` (spec 13 §9), and `solo gov` prints the calldata of every governance call. A chain meant for others sets `"governanceMode": "stake"`, or switches to it later with `solo gov set-mode stake`, and from then on its validators decide.
+`solo dev` runs under the key track of governance: a `"governance"` address in the genesis file acts alone, at once, by sending `submit(target, data)` to `0x…5010` (spec 13 §9), and `solo gov` prints the calldata of every governance call with the gas limit it needs. A chain meant for others sets `"governanceMode": "stake"`, or switches to it later with `solo gov set-mode stake`, and from then on its validators decide.
 
 Run a chain of several validators, each with its own key. `solo key` prints the validator id to list in the genesis file:
 

@@ -79,6 +79,19 @@ fn governance_parameters() {
             r#"{"chainId": 1, "proposalDeposit": []}"#,
             "proposalDeposit must be a string or number",
         ),
+        // The stake track cannot start without a voting period and a quorum (spec 13 §9.1).
+        (
+            r#"{"chainId": 1, "governanceMode": "stake", "votingBlocks": 10}"#,
+            "governanceMode stake needs votingBlocks and quorumBps above zero",
+        ),
+        (
+            r#"{"chainId": 1, "governanceMode": "stake", "quorumBps": 5000}"#,
+            "governanceMode stake needs votingBlocks and quorumBps above zero",
+        ),
+        (
+            r#"{"chainId": 1, "quorumBps": 10001}"#,
+            "quorumBps must be at most 10000",
+        ),
     ];
     for (text, expected) in cases {
         let message = parse_genesis(text).unwrap_err();
@@ -146,11 +159,31 @@ fn gov_encodes_every_call() {
         assert!(
             text.starts_with("to       0x0000000000000000000000000000000000005010\ncalldata 0x")
         );
-        assert!(text.ends_with(&solo_rpc::methods::data(&call.encode())));
+        let calldata = format!(
+            "\ncalldata {}\ngas      ",
+            solo_rpc::methods::data(&call.encode())
+        );
+        assert!(text.contains(&calldata), "{text}");
+        assert_eq!(
+            text.contains("\nvalue    0 from the key or a validator"),
+            matches!(call, Call::Submit { .. }),
+            "{text}"
+        );
         let mut full = vec!["solo".to_owned(), "gov".to_owned()];
         full.extend(words(&args));
         run(&full).unwrap();
     }
+    // The gas line is the calldata's EIP-7623 floor plus the 50 000 gas
+    // surcharge: what a vote uses (spec 13 §9.9), and what `execute` needs.
+    let gas_of = |args: &[&str]| -> String {
+        let text = describe(&parse(&words(args)).unwrap());
+        text.lines()
+            .find_map(|l| l.strip_prefix("gas      "))
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(gas_of(&["vote", "3", "yes"]), "71860");
+    assert_eq!(gas_of(&["execute", "5"]), "71510");
 }
 
 #[test]

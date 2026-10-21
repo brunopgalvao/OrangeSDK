@@ -434,8 +434,12 @@ fn claimed(code_hash: &Hash) -> bool {
 pub fn admit(s: &Signed) -> Result<(), u32> {
     let system = s.tx.to == Some(GOVERNANCE_ADDRESS) || s.tx.to == Some(MODULE_ADDRESS);
     let next = state::height().unwrap_or(0) + 1;
-    if system && s.tx.gas_limit < s.tx.min_gas_limit().saturating_add(gov::surcharge(s.tx.to.as_ref(), &s.tx.input)) {
-        return Err(reason::GAS_TOO_LOW);
+    if system {
+        // Anything without a surcharge has its intrinsic gas already (`well_formed`).
+        let surcharge = gov::surcharge(s.tx.to.as_ref(), &s.tx.input);
+        if surcharge != 0 && s.tx.gas_limit < s.tx.min_gas_limit().saturating_add(surcharge) {
+            return Err(reason::GAS_TOO_LOW);
+        }
     }
     if system && request_of(s, next).is_none() { Err(reason::SYSTEM_ACTION) } else { Ok(()) }
 }

@@ -4,12 +4,14 @@
 
 mod common;
 
-use common::{CHAIN_ID, ETHER, Fields, SLOT_MS, Wallet, err_code, kernel_module, node_key, ok};
+use common::{
+    CHAIN_ID, ETHER, Fields, GAS_PRICE, SLOT_MS, Wallet, err, err_code, kernel_module, node_key, ok,
+};
 use serde_json::{Value, json};
 use solo_abi::Encode;
 use solo_abi::chain::{Allocation, GenesisParams, UpgradeParams, Validator, ValidatorSet};
 use solo_abi::codec::Seq;
-use solo_abi::governance::{Call, GOVERNANCE_ADDRESS, GovernanceParams, mode};
+use solo_abi::governance::{Call, GOVERNANCE_ADDRESS, GOVERNANCE_GAS, GovernanceParams, mode};
 use solo_abi::types::Genesis;
 use solo_host::hash::keccak256;
 use solo_node::{Node, NodeConfig, validator_id};
@@ -65,6 +67,15 @@ fn stake_node(alice: &Wallet) -> Node {
     let mut node = Node::open(&kernel_module(), &genesis, config).unwrap();
     node.start(None).unwrap();
     node
+}
+
+/// A hex quantity.
+fn number(v: &Value) -> u128 {
+    u128::from_str_radix(&v.as_str().unwrap()[2..], 16).unwrap()
+}
+
+fn balance(rpc: &mut Rpc, address: &[u8; 20]) -> u128 {
+    number(&ok(rpc, "eth_getBalance", json!([data(address), "latest"])))
 }
 
 /// The validator's account: its consensus key's address, which signs with
@@ -131,6 +142,16 @@ fn proposals_are_read_from_submission_to_execution() {
     assert_eq!(receipt["status"], "0x1");
     let height = receipt["blockNumber"].as_str().unwrap();
     let submitted = u64::from_str_radix(&height[2..], 16).unwrap();
+    // The deposit is held by the governance address, and the surcharge is
+    // paid like every fee: at the gas price, to the zero address.
+    let submit_fee = number(&receipt["gasUsed"]) * GAS_PRICE;
+    assert!(number(&receipt["gasUsed"]) > u128::from(GOVERNANCE_GAS));
+    assert_eq!(
+        balance(&mut rpc, &alice.address),
+        100 * ETHER - ETHER - submit_fee
+    );
+    assert_eq!(balance(&mut rpc, &GOVERNANCE_ADDRESS), ETHER);
+    assert_eq!(balance(&mut rpc, &[0; 20]), submit_fee);
     let proposals = ok(&mut rpc, "solo_getProposals", json!([]));
     let p = &proposals[0];
     assert_eq!(proposals.as_array().unwrap().len(), 1);
@@ -155,26 +176,56 @@ fn proposals_are_read_from_submission_to_execution() {
         "0x2"
     );
 
-    // The validator votes yes; the tally and the vote show at once.
+    // The validator votes yes with the gas `eth_estimateGas` gives, which
+    // carries the surcharge (spec 13 §9.9): one gas less is refused as the
+    // shortfall it is. The tally and the vote show at once.
     let voter = validator();
     let vote = Call::Vote {
         id: 1,
         support: true,
     }
     .encode();
-    let raw = voter.legacy_on(
-        &Fields {
-            nonce: 0,
-            to: Some(GOVERNANCE_ADDRESS),
-            value: 0,
-            gas_limit: GAS,
-            data: &vote,
-        },
-        0,
-        CHAIN_ID,
+    let estimate = ok(
+        &mut rpc,
+        "eth_estimateGas",
+        json!([{"from": data(&voter.address), "to": data(&GOVERNANCE_ADDRESS), "data": data(&vote)}]),
     );
-    ok(&mut rpc, "eth_sendRawTransaction", json!([data(&raw)]));
+    assert_eq!(number(&estimate), 21_860 + u128::from(GOVERNANCE_GAS));
+    let with_gas = |gas_limit: u64| {
+        voter.legacy_on(
+            &Fields {
+                nonce: 0,
+                to: Some(GOVERNANCE_ADDRESS),
+                value: 0,
+                gas_limit,
+                data: &vote,
+            },
+            0,
+            CHAIN_ID,
+        )
+    };
+    assert_eq!(
+        err(
+            &mut rpc,
+            "eth_sendRawTransaction",
+            json!([data(&with_gas(71_859))])
+        ),
+        (
+            -32000,
+            "intrinsic gas too low: gas 71859, minimum needed 71860".into()
+        )
+    );
+    let hash = ok(
+        &mut rpc,
+        "eth_sendRawTransaction",
+        json!([data(&with_gas(71_860))]),
+    );
     tick(&mut rpc, 1);
+    let receipt = ok(&mut rpc, "eth_getTransactionReceipt", json!([hash]));
+    assert_eq!(
+        (&receipt["status"], &receipt["gasUsed"]),
+        (&json!("0x1"), &estimate)
+    );
     let p = ok(&mut rpc, "solo_getProposal", json!(["0x1"]));
     assert_eq!(
         p["tally"],
@@ -223,6 +274,15 @@ fn proposals_are_read_from_submission_to_execution() {
     let status = ok(&mut rpc, "solo_getGovernance", json!([]));
     assert_eq!(status["guardian"], data(&[0xAB; 20]));
     assert_eq!(status["proposals"], json!([]));
+    // The deposit came back; the two calls' fees, surcharges included, went
+    // to the zero address.
+    let execute_fee = number(&receipt["gasUsed"]) * GAS_PRICE;
+    assert_eq!(
+        balance(&mut rpc, &alice.address),
+        100 * ETHER - submit_fee - execute_fee
+    );
+    assert_eq!(balance(&mut rpc, &GOVERNANCE_ADDRESS), 0);
+    assert_eq!(balance(&mut rpc, &[0; 20]), submit_fee + execute_fee);
     // Parameter errors.
     assert_eq!(err_code(&mut rpc, "solo_getProposal", json!([])), -32602);
     assert_eq!(

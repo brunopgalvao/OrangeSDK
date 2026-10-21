@@ -316,8 +316,9 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
     .encode();
 
     // Under the key: nothing is open, nobody is guardian, and the calls of
-    // the stake track, a submission by anyone but the key, an action no
-    // proposal may carry and a gas limit below the surcharge are refused.
+    // the stake track, a submission by anyone but the key and an action no
+    // proposal may carry are refused; a gas limit below the surcharge is
+    // refused as the gas shortfall it is.
     let s = gov_status(&mut sim.nodes[0]);
     assert_eq!(
         (s.mode, s.key, s.guardian, s.next_id, s.proposals.0.len()),
@@ -330,6 +331,10 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
         0,
         60_000,
         &submit(GOVERNANCE_ADDRESS, &guardian_action).encode(),
+    );
+    assert_eq!(
+        sim.submit(0, &too_little),
+        Err(SubmitError::Rejected(reason::GAS_TOO_LOW))
     );
     for raw in [
         val[0].peek(&vote(1, true), 0),
@@ -349,7 +354,6 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
             0,
         ),
         key.peek(&submit(GOVERNANCE_ADDRESS, &guardian_action), 1),
-        too_little,
     ] {
         assert_eq!(sim.submit(0, &raw), refused());
     }
@@ -394,7 +398,8 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
     assert_eq!(r.status, 1);
     assert!(!paused(&mut sim.nodes[0]));
     // A submission whose action fails reverts: an unknown mode, and a
-    // module action the verifier rejects.
+    // module action the verifier rejects. (The light client's actions run
+    // in `bridge_in.rs`, on a chain whose feature gate 1 is active.)
     for data in [
         Call::SetMode { mode: 2 }.encode(),
         Call::SetMode { mode: mode::KEY }.encode(),
@@ -428,6 +433,11 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
     );
     let s = gov_status(&mut sim.nodes[0]);
     assert_eq!((s.mode, s.guardian), (mode::STAKE, guardian.address()));
+    assert_eq!(
+        s.params,
+        rules(mode::STAKE),
+        "the rules read under the new mode"
+    );
     // Irreversible, and the key's direct powers are gone: it neither
     // stages, proposes, cancels nor installs, and its submissions need the
     // deposit like anyone's; nobody proposes a mode.
@@ -696,24 +706,12 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
         "unchanged"
     );
 
-    // Proposal 4 passes and the guardian vetoes it during the timelock.
-    let name_alice = Call::SetGuardian {
-        guardian: alice.address(),
-    }
-    .encode();
-    let r = sim_include(
-        &mut sim,
-        &val[0].call(&submit(GOVERNANCE_ADDRESS, &name_alice), 0),
-    );
+    // Proposal 4, the rate limit again, passes and the guardian vetoes it
+    // during the timelock. (A proposal that names a guardian it could not:
+    // `the_validators_replace_a_guardian_that_vetoes`.)
+    let r = sim_include(&mut sim, &val[0].call(&submit(VERIFIER_ADDRESS, &limit), 0));
     assert_eq!(r.status, 1);
-    let p4 = expected(
-        4,
-        val[0].address(),
-        0,
-        GOVERNANCE_ADDRESS,
-        &name_alice,
-        r.height,
-    );
+    let p4 = expected(4, val[0].address(), 0, VERIFIER_ADDRESS, &limit, r.height);
     assert_eq!(view(&mut sim.nodes[0], 4).unwrap().proposal, p4);
     assert_eq!(
         sim_include(&mut sim, &val[0].call(&vote(4, true), 0)).status,
@@ -912,6 +910,25 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
     sim_reach(&mut sim, p8.expires_at + 1);
     assert_eq!(view(&mut sim.nodes[0], 8), None);
     assert_eq!(gov_status(&mut sim.nodes[0]).next_id, 9);
+    // Proposal 9 sets the light client's delay. Its module needs feature
+    // gate 1, which this chain never activates: the action fails when the
+    // proposal executes, as a bridge call to a module that is not there
+    // does (spec 13 §9.5), and the proposal is pruned all the same.
+    let set_delay = abi::encode(abi::SET_DELAY, &[abi::word(11)]);
+    let r = sim_include(
+        &mut sim,
+        &val[0].call(&submit(LIGHT_CLIENT_ADDRESS, &set_delay), 0),
+    );
+    assert_eq!(r.status, 1);
+    assert_eq!(
+        sim_include(&mut sim, &val[0].call(&vote(9, true), 0)).status,
+        1
+    );
+    let p9 = view(&mut sim.nodes[0], 9).unwrap().proposal;
+    sim_reach(&mut sim, p9.executable_at - 1);
+    let r = sim_include(&mut sim, &alice.call(&Call::Execute { id: 9 }, 0));
+    assert_eq!((r.status, r.logs.0.len()), (0, 0));
+    assert_eq!(view(&mut sim.nodes[0], 9), None);
     assert_agreement(&mut sim);
 }
 
@@ -943,6 +960,48 @@ fn a_proposal_upgrades_the_kernel_across_four_validators() {
         let raw = val[0].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &action.encode());
         assert_eq!(sim_include(&mut sim, &raw).status, 1);
     }
+    // The code hash is validator 0's: a byte another validator appends
+    // after the last chunk, or writes over the first, changes nothing, so
+    // nobody spoils what a proposal will hash. Its staker may still replace
+    // a chunk of its own.
+    let spoil = |index: u32| Action::Stage {
+        code_hash,
+        index,
+        chunk: vec![0xFF],
+    };
+    for action in [spoil(stages.len() as u32), spoil(0)] {
+        let raw = val[3].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &action.encode());
+        assert_eq!(sim_include(&mut sim, &raw).status, 0);
+    }
+    let staged = sim.nodes[0].query(query::CODE, &code_hash).unwrap();
+    assert_eq!(Vec::<u8>::from_bytes(&staged.body).unwrap(), code);
+    let last = stages.len() - 1;
+    let raw = val[0].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &stages[last].encode());
+    assert_eq!(sim_include(&mut sim, &raw).status, 1);
+    // A proposal over code that does not hash to its hash never opens: the
+    // submission reverts and the deposit comes back.
+    let wrong = Action::Stage {
+        code_hash: [7; 32],
+        index: 0,
+        chunk: vec![1, 2, 3],
+    };
+    let raw = val[1].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &wrong.encode());
+    assert_eq!(sim_include(&mut sim, &raw).status, 1);
+    let far = sim.nodes[0].block_number().unwrap() + 100;
+    let hopeless = Action::Propose {
+        code_hash: [7; 32],
+        activation_height: far,
+        required_gates: 0,
+    }
+    .encode();
+    let r = sim_include(
+        &mut sim,
+        &alice.call(&submit(GOVERNANCE_ADDRESS, &hopeless), DEPOSIT),
+    );
+    assert_eq!((r.status, r.logs.0.len()), (0, 0));
+    assert_eq!(gov_status(&mut sim.nodes[0]).next_id, 1);
+    assert_eq!(balance(&mut sim.nodes[0], alice.address()), 100 * ETHER);
+    assert_eq!(balance(&mut sim.nodes[0], GOVERNANCE_ADDRESS), 0);
     // The proposal names an activation height that leaves room for the
     // vote, the timelock and the execution, plus the upgrade delay.
     let h = sim.nodes[0].block_number().unwrap() + VOTING + TIMELOCK + 1 + 2 + 12;
@@ -966,6 +1025,9 @@ fn a_proposal_upgrades_the_kernel_across_four_validators() {
         r.height,
     );
     assert_eq!(view(&mut sim.nodes[0], 1).unwrap().proposal, p);
+    // Code an open proposal names is frozen, for its staker too.
+    let raw = val[0].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &stages[last].encode());
+    assert_eq!(sim_include(&mut sim, &raw).status, 0);
     // Validators 0 and 1 carry 80% of the stake; validator 3 says no.
     assert_eq!(
         sim_include(&mut sim, &val[0].call(&vote(1, true), 0)).status,
@@ -1038,6 +1100,152 @@ fn a_proposal_upgrades_the_kernel_across_four_validators() {
     assert_agreement(&mut sim);
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn the_validators_replace_a_guardian_that_vetoes() {
+    let validators = keys(4);
+    // Under the stake track from genesis, with the bridge: the key is the guardian.
+    let genesis = genesis(&validators, &WEIGHTS, rules(mode::STAKE), Some(bridge()));
+    let template = NodeConfig {
+        now_ms: 10_000,
+        ..NodeConfig::default()
+    };
+    let mut sim = Sim::new(v1(), &genesis, &validators, 0, &template, 30).unwrap();
+    let mut key = Sender::new(governance());
+    let mut alice = Sender::new(alice());
+    let mut val: Vec<Sender> = validators
+        .iter()
+        .map(|k| Sender::new(Wallet::from_key(k.clone())))
+        .collect();
+    assert_eq!(gov_status(&mut sim.nodes[0]).guardian, key.address());
+    // Proposal 1 names Alice guardian, proposal 2 pauses the inbox on the
+    // fast track, proposal 3 changes the rules. The guardian vetoes neither
+    // of the first two, and the third at once.
+    let name_alice = Call::SetGuardian {
+        guardian: alice.address(),
+    }
+    .encode();
+    let r = sim_include(
+        &mut sim,
+        &val[0].call(&submit(GOVERNANCE_ADDRESS, &name_alice), 0),
+    );
+    assert_eq!(r.status, 1);
+    let p1 = expected(
+        1,
+        val[0].address(),
+        0,
+        GOVERNANCE_ADDRESS,
+        &name_alice,
+        r.height,
+    );
+    let r = sim_include(
+        &mut sim,
+        &val[1].call(&submit(VERIFIER_ADDRESS, &abi::PAUSE), 0),
+    );
+    assert_eq!(r.status, 1);
+    let p2_end = r.height + VOTING;
+    let new_rules = Call::SetParams {
+        voting_blocks: 3,
+        timelock_blocks: 1,
+        quorum_bps: QUORUM,
+        deposit: DEPOSIT,
+    }
+    .encode();
+    assert_eq!(
+        sim_include(
+            &mut sim,
+            &val[0].call(&submit(GOVERNANCE_ADDRESS, &new_rules), 0)
+        )
+        .status,
+        1
+    );
+    for id in [1, 2] {
+        assert_eq!(sim.submit(0, &key.peek(&Call::Veto { id }, 0)), refused());
+    }
+    let r = sim_include(&mut sim, &key.call(&Call::Veto { id: 3 }, 0));
+    assert_eq!((r.status, r.logs.0), (1, vec![gov::vetoed_log(3)]));
+    // 80% of the stake names Alice; the guardian cannot stop it while it
+    // votes, nor once it has passed.
+    assert_eq!(
+        sim_include(&mut sim, &val[0].call(&vote(1, true), 0)).status,
+        1
+    );
+    assert_eq!(
+        sim_include(&mut sim, &val[1].call(&vote(1, true), 0)).status,
+        1
+    );
+    sim_reach(&mut sim, p1.voting_end + 1);
+    assert_eq!(
+        view(&mut sim.nodes[0], 1).unwrap().proposal.status,
+        status::PASSED
+    );
+    assert_eq!(
+        sim.submit(0, &key.peek(&Call::Veto { id: 1 }, 0)),
+        refused()
+    );
+    sim_reach(&mut sim, p1.executable_at - 1);
+    let r = sim_include(&mut sim, &alice.call(&Call::Execute { id: 1 }, 0));
+    assert_eq!(
+        (r.status, r.logs.0),
+        (
+            1,
+            vec![gov::executed_log(1), gov::guardian_log(&alice.address())]
+        )
+    );
+    assert_eq!(gov_status(&mut sim.nodes[0]).guardian, alice.address());
+    // The pause nobody voted for failed at its voting end.
+    sim_reach(&mut sim, p2_end + 1);
+    assert_eq!(view(&mut sim.nodes[0], 2), None);
+    assert!(!paused(&mut sim.nodes[0]));
+    // The old guardian is nobody; the new one vetoes, and governance goes
+    // on: the rules change the old guardian vetoed passes.
+    let r = sim_include(
+        &mut sim,
+        &val[0].call(&submit(GOVERNANCE_ADDRESS, &new_rules), 0),
+    );
+    assert_eq!(r.status, 1);
+    assert_eq!(
+        sim.submit(0, &key.peek(&Call::Veto { id: 4 }, 0)),
+        refused()
+    );
+    let r = sim_include(&mut sim, &alice.call(&Call::Veto { id: 4 }, 0));
+    assert_eq!((r.status, r.logs.0), (1, vec![gov::vetoed_log(4)]));
+    let r = sim_include(
+        &mut sim,
+        &val[0].call(&submit(GOVERNANCE_ADDRESS, &new_rules), 0),
+    );
+    let p5 = expected(
+        5,
+        val[0].address(),
+        0,
+        GOVERNANCE_ADDRESS,
+        &new_rules,
+        r.height,
+    );
+    assert_eq!(
+        sim_include(&mut sim, &val[0].call(&vote(5, true), 0)).status,
+        1
+    );
+    assert_eq!(
+        sim_include(&mut sim, &val[1].call(&vote(5, true), 0)).status,
+        1
+    );
+    sim_reach(&mut sim, p5.executable_at - 1);
+    let r = sim_include(&mut sim, &val[2].call(&Call::Execute { id: 5 }, 0));
+    assert_eq!(r.status, 1);
+    assert_eq!(
+        gov_status(&mut sim.nodes[0]).params,
+        GovernanceParams {
+            mode: mode::STAKE,
+            voting_blocks: 3,
+            timelock_blocks: 1,
+            quorum_bps: QUORUM,
+            deposit: DEPOSIT,
+        }
+    );
+    assert_agreement(&mut sim);
+}
+
 fn start(genesis: &Genesis) -> Node {
     let config = NodeConfig {
         now_ms: 1_000,
@@ -1084,24 +1292,42 @@ fn one_validator_meets_the_bounds_and_the_gas() {
     let r = include(&mut node, &v0.call(&vote(1, true), 0));
     assert_eq!((r.status, r.gas_used), (1, 21_860 + GOVERNANCE_GAS));
     // The largest actions fit a block: a bridge action is checked by its
-    // selector alone until it executes, an install decodes in full.
+    // selector alone until it executes, an install decodes in full. The
+    // largest submission with no zero byte in its action pays the EIP-7623
+    // floor of its calldata and the surcharge (spec 13 §9.9).
     let mut big = abi::UNPAUSE.to_vec();
-    big.resize(MAX_PROPOSAL_DATA, 0);
+    big.resize(MAX_PROPOSAL_DATA, 0xFF);
+    let calldata = submit(VERIFIER_ADDRESS, &big).encode();
     let r = include(
         &mut node,
-        &v0.tx(
-            GOVERNANCE_ADDRESS,
-            0,
-            3_000_000,
-            &submit(VERIFIER_ADDRESS, &big).encode(),
-        ),
+        &v0.tx(GOVERNANCE_ADDRESS, 0, 3_000_000, &calldata),
     );
     assert_eq!(r.status, 1);
+    let zeros = calldata.iter().filter(|b| **b == 0).count() as u64;
+    let floor = 21_000 + 10 * (zeros + 4 * (calldata.len() as u64 - zeros));
+    assert_eq!(r.gas_used, floor + GOVERNANCE_GAS);
+    assert_eq!(r.gas_used, 1_382_960);
     assert_eq!(
         view(&mut node, 2).unwrap().proposal.data.len(),
         MAX_PROPOSAL_DATA
     );
+    // An install proposal needs its code staged, so a few bytes are.
+    let blob = vec![0xAB; 3];
+    let staged = Action::Stage {
+        code_hash: keccak256(&blob),
+        index: 0,
+        chunk: blob.clone(),
+    };
+    assert_eq!(
+        include(
+            &mut node,
+            &v0.tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &staged.encode())
+        )
+        .status,
+        1
+    );
     let big_install = Install {
+        code_hash: keccak256(&blob),
         init: vec![7; modules::MAX_INIT_LEN],
         ..Install::default()
     }
@@ -1167,8 +1393,8 @@ fn one_validator_meets_the_edge_cases() {
     let mut node = start(&genesis(&validators, &[1], single(2), None));
     let mut v0 = Sender::new(Wallet::from_key(validators[0].clone()));
     let mut alice = Sender::new(alice());
-    // A passed proposal whose action fails is executed once all the same:
-    // the receipt says so and the proposal is gone.
+    // A submission naming code that is not staged opens nothing: it
+    // reverts, and the deposit it carried comes back.
     let unstaged = Install {
         target: [0x48; 20],
         code_hash: [9; 32],
@@ -1178,6 +1404,36 @@ fn one_validator_meets_the_edge_cases() {
     let r = include(
         &mut node,
         &alice.call(&submit(MODULE_ADDRESS, &unstaged.encode()), DEPOSIT),
+    );
+    assert_eq!((r.status, r.logs.0.len()), (0, 0));
+    assert_eq!(gov_status(&mut node).next_id, 1);
+    assert_eq!(balance(&mut node, alice.address()), 100 * ETHER);
+    // A passed proposal whose action fails (an install into the system
+    // range) is executed once all the same: the receipt says so and the
+    // proposal is gone.
+    let tiny = tiny_kernel(&2u32.to_le_bytes(), false, None);
+    let tiny_hash = keccak256(&tiny);
+    for action in stage_actions(&tiny) {
+        assert_eq!(
+            include(
+                &mut node,
+                &v0.tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &action.encode())
+            )
+            .status,
+            1
+        );
+    }
+    let mut system = [0u8; 20];
+    system[19] = 0x42;
+    let doomed = Install {
+        target: system,
+        code_hash: tiny_hash,
+        capabilities: 0,
+        init: vec![],
+    };
+    let r = include(
+        &mut node,
+        &alice.call(&submit(MODULE_ADDRESS, &doomed.encode()), DEPOSIT),
     );
     let id = 1;
     let p = view(&mut node, id).unwrap().proposal;
@@ -1195,38 +1451,41 @@ fn one_validator_meets_the_edge_cases() {
         node.submit(&alice.peek(&Call::Execute { id }, 0)),
         refused()
     );
-    // Rules that cannot work are refused when the proposal executes.
-    let bad_rules = Call::SetParams {
-        voting_blocks: 0,
-        timelock_blocks: 0,
-        quorum_bps: 10_001,
-        deposit: 0,
-    };
-    let r = include(
-        &mut node,
-        &v0.call(&submit(GOVERNANCE_ADDRESS, &bad_rules.encode()), 0),
-    );
-    let id = 2;
-    assert_eq!(include(&mut node, &v0.call(&vote(id, true), 0)).status, 1);
-    reach(&mut node, r.height + 2 + 1);
-    let r = include(&mut node, &v0.call(&Call::Execute { id }, 0));
-    assert_eq!(r.status, 0);
-    assert_eq!(gov_status(&mut node).params.voting_blocks, 2);
+    // Rules that cannot work, no voting period or no quorum, are refused
+    // when the proposal executes.
+    for (id, bad_rules) in [
+        (
+            2,
+            Call::SetParams {
+                voting_blocks: 0,
+                timelock_blocks: 0,
+                quorum_bps: 10_001,
+                deposit: 0,
+            },
+        ),
+        (
+            3,
+            Call::SetParams {
+                voting_blocks: 2,
+                timelock_blocks: 0,
+                quorum_bps: 0,
+                deposit: 0,
+            },
+        ),
+    ] {
+        let r = include(
+            &mut node,
+            &v0.call(&submit(GOVERNANCE_ADDRESS, &bad_rules.encode()), 0),
+        );
+        assert_eq!(include(&mut node, &v0.call(&vote(id, true), 0)).status, 1);
+        reach(&mut node, r.height + 2 + 1);
+        let r = include(&mut node, &v0.call(&Call::Execute { id }, 0));
+        assert_eq!(r.status, 0, "{bad_rules:?}");
+        assert_eq!(gov_status(&mut node).params, single(2));
+    }
 
     // A pending upgrade proposed by proposal, then cancelled on the fast
     // track by the vote that reaches a majority.
-    let tiny = tiny_kernel(&2u32.to_le_bytes(), false, None);
-    let tiny_hash = keccak256(&tiny);
-    for action in stage_actions(&tiny) {
-        assert_eq!(
-            include(
-                &mut node,
-                &v0.tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &action.encode())
-            )
-            .status,
-            1
-        );
-    }
     let h = node.block_number().unwrap() + 40;
     let propose = Action::Propose {
         code_hash: tiny_hash,
@@ -1238,7 +1497,7 @@ fn one_validator_meets_the_edge_cases() {
         &mut node,
         &v0.call(&submit(GOVERNANCE_ADDRESS, &propose), 0),
     );
-    let id = 3;
+    let id = 4;
     assert_eq!(include(&mut node, &v0.call(&vote(id, true), 0)).status, 1);
     reach(&mut node, r.height + 2 + 1);
     let r = include(&mut node, &v0.call(&Call::Execute { id }, 0));
@@ -1258,7 +1517,7 @@ fn one_validator_meets_the_edge_cases() {
     }
     .encode();
     let r = include(&mut node, &v0.call(&submit(GOVERNANCE_ADDRESS, &cancel), 0));
-    let id = 4;
+    let id = 5;
     assert!(view(&mut node, id).unwrap().proposal.fast_track);
     let r2 = include(&mut node, &v0.call(&vote(id, true), 0));
     assert_eq!(
@@ -1277,9 +1536,9 @@ fn one_validator_meets_the_edge_cases() {
     assert_eq!(view(&mut node, id), None);
     // A fast-track proposal nobody carries fails at its voting end.
     let r = include(&mut node, &v0.call(&submit(GOVERNANCE_ADDRESS, &cancel), 0));
-    assert!(view(&mut node, 5).is_some());
+    assert!(view(&mut node, 6).is_some());
     reach(&mut node, r.height + 2 + 1);
-    assert_eq!(view(&mut node, 5), None);
+    assert_eq!(view(&mut node, 6), None);
     // The governance queries refuse malformed parameters.
     assert_eq!(node.query(gov::query::PROPOSAL, &[1, 2]).unwrap().status, 2);
     assert_eq!(node.query(query::CODE, &tiny_hash).unwrap().status, 0);
@@ -1320,8 +1579,16 @@ fn a_chain_without_a_key_has_no_guardian_until_a_proposal_names_one() {
         )
     );
     assert_eq!(gov_status(&mut node).guardian, guardian.address());
-    // Now the guardian vetoes; and a guardian set to zero is none again.
-    let r = include(&mut node, &v0.call(&submit(GOVERNANCE_ADDRESS, &name), 0));
+    // Now the guardian vetoes a change of rules; and a guardian set to zero
+    // is none again.
+    let tweak = Call::SetParams {
+        voting_blocks: VOTING,
+        timelock_blocks: 1,
+        quorum_bps: QUORUM,
+        deposit: 0,
+    }
+    .encode();
+    let r = include(&mut node, &v0.call(&submit(GOVERNANCE_ADDRESS, &tweak), 0));
     assert_eq!(r.status, 1);
     let r = include(&mut node, &guardian.call(&Call::Veto { id: 2 }, 0));
     assert_eq!((r.status, r.logs.0), (1, vec![gov::vetoed_log(2)]));
@@ -1374,7 +1641,12 @@ fn genesis_refuses_rules_that_cannot_work() {
         voting_blocks: 0,
         ..rules(mode::STAKE)
     });
-    // The key track needs no voting period: `setMode` checks it at the switch.
+    trap(GovernanceParams {
+        quorum_bps: 0,
+        ..rules(mode::STAKE)
+    });
+    // The key track needs neither a voting period nor a quorum: `setMode`
+    // checks both at the switch, and `setParams` takes no rules without them.
     let mut node = start(&genesis(
         &validators,
         &[1],
@@ -1388,7 +1660,7 @@ fn genesis_refuses_rules_that_cannot_work() {
         &key.call(&submit(GOVERNANCE_ADDRESS, &switch), 0),
     );
     assert_eq!((r.status, gov_status(&mut node).mode), (0, mode::KEY));
-    let fix = Call::SetParams {
+    let no_quorum = Call::SetParams {
         voting_blocks: 1,
         timelock_blocks: 0,
         quorum_bps: 0,
@@ -1396,14 +1668,41 @@ fn genesis_refuses_rules_that_cannot_work() {
     }
     .encode();
     assert_eq!(
+        include(
+            &mut node,
+            &key.call(&submit(GOVERNANCE_ADDRESS, &no_quorum), 0)
+        )
+        .status,
+        0
+    );
+    let fix = Call::SetParams {
+        voting_blocks: 1,
+        timelock_blocks: 0,
+        quorum_bps: 1,
+        deposit: 0,
+    }
+    .encode();
+    assert_eq!(
         include(&mut node, &key.call(&submit(GOVERNANCE_ADDRESS, &fix), 0)).status,
         1
     );
+    assert_eq!(gov_status(&mut node).params.mode, mode::KEY);
     let r = include(
         &mut node,
         &key.call(&submit(GOVERNANCE_ADDRESS, &switch), 0),
     );
     assert_eq!((r.status, gov_status(&mut node).mode), (1, mode::STAKE));
+    // The rules `setParams` recorded now read as the stake track's.
+    assert_eq!(
+        gov_status(&mut node).params,
+        GovernanceParams {
+            mode: mode::STAKE,
+            voting_blocks: 1,
+            timelock_blocks: 0,
+            quorum_bps: 1,
+            deposit: 0,
+        }
+    );
     // Under the key the module address took the key's installs; a chain
     // without a key under the key track takes nothing at all.
     let mut genesis = genesis(&validators, &[1], GovernanceParams::default(), None);
