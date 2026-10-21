@@ -180,7 +180,7 @@ With the bound of §2 and the budget, a block of the reference kernel takes at m
 
 ## 6. Conformance
 
-The committed subset (07 §4.2) passes with gate 2 active as without it, 490 passed, 31 expected failures, 0 failures, on both backends (`committed_subset_passes_with_gate_2_on_both_backends`), each case also run without the gate and required to agree. The `solo-conformance` command takes `--gated` for the same run over any fixtures. The full pinned set does not regress either way (§6.1).
+The committed subset (07 §4.2) passes with gate 2 active as without it, 534 passed, 22 expected failures, 0 failures, on both backends (`committed_subset_passes_with_gate_2_on_both_backends`), each case also run without the gate and required to agree. The `solo-conformance` command takes `--gated` for the same run over any fixtures. The full pinned set does not regress either way (§6.1).
 
 ### 6.1 Full pinned set
 
