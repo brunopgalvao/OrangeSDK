@@ -100,14 +100,8 @@ fn deploy_code_storage_and_calls() {
     assert_eq!(ok(&mut rpc, "eth_getCode", json!([c, "latest"])), runtime);
     assert_eq!(ok(&mut rpc, "eth_getCode", json!([c])), runtime);
     assert_eq!(ok(&mut rpc, "eth_getCode", json!([c, null])), runtime);
-    assert_eq!(
-        err(&mut rpc, "eth_getCode", json!([c, "earliest"])),
-        (
-            -32000,
-            "historical state not available: block 0, the node keeps the state of block 1 only"
-                .into()
-        )
-    );
+    // The genesis state, before the deployment (spec 20 §5).
+    assert_eq!(ok(&mut rpc, "eth_getCode", json!([c, "earliest"])), "0x");
     assert_eq!(ok(&mut rpc, "eth_getCode", json!([c, "0x1"])), runtime);
     assert_eq!(ok(&mut rpc, "eth_getCode", json!([c, "safe"])), runtime);
     assert_eq!(
@@ -331,7 +325,7 @@ fn deploy_code_storage_and_calls() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn state_at_the_head_only() {
+fn state_at_every_block_parameter() {
     let alice = Wallet::new(1);
     let mut rpc = Rpc::new(node_funding(&[&alice]));
     let counter = deploy(&mut rpc, &alice, 0, 5);
@@ -342,8 +336,9 @@ fn state_at_the_head_only() {
     let a = data(&alice.address);
     let c = data(&counter);
     let count = to(&counter, &calldata("count()", &[]));
-    // Every state method answers for every name of the head, and refuses
-    // older blocks instead of answering from the head's state.
+    // Every state method answers for every name of the head and, block 2
+    // being empty, the same for block 1, read from block 1's state (spec 20
+    // §5.2); the genesis has neither the deployment nor its nonce.
     let methods = [
         ("eth_getBalance", json!([a])),
         ("eth_getTransactionCount", json!([a])),
@@ -362,21 +357,11 @@ fn state_at_the_head_only() {
         json!({ "blockHash": head_hash }),
         json!({ "blockNumber": "0x2" }),
         json!({}),
-    ];
-    let older = [
         json!("0x1"),
         first.clone(),
         json!({ "blockHash": first }),
         json!({ "blockNumber": "0x1" }),
     ];
-    let historical = |height: u64| {
-        (
-            -32000,
-            format!(
-                "historical state not available: block {height}, the node keeps the state of block 2 only"
-            ),
-        )
-    };
     for (method, params) in methods {
         let at = |block: &Value| {
             let mut list = params.as_array().unwrap().clone();
@@ -387,24 +372,29 @@ fn state_at_the_head_only() {
         for block in &heads {
             assert_eq!(ok(&mut rpc, method, at(block)), answer, "{method} {block}");
         }
-        for block in &older {
-            assert_eq!(
-                err(&mut rpc, method, at(block)),
-                historical(1),
-                "{method} {block}"
-            );
+        let genesis = ok(&mut rpc, method, at(&json!("earliest")));
+        assert_eq!(ok(&mut rpc, method, at(&json!("0x0"))), genesis, "{method}");
+        match method {
+            "eth_getTransactionCount" => assert_eq!(genesis, "0x0"),
+            "eth_getCode" | "eth_call" => assert_eq!(genesis, "0x"),
+            "eth_getStorageAt" => assert_eq!(genesis, data(&word(0))),
+            // No code to run: the EIP-7623 floor of four nonzero bytes.
+            "eth_estimateGas" => assert_eq!(genesis, quantity(21_000 + 10 * 16)),
+            _ => {}
         }
-        assert_eq!(err(&mut rpc, method, at(&json!("earliest"))), historical(0));
         assert_eq!(
             err(&mut rpc, method, at(&json!("0x3"))),
             (-32000, "header not found".into())
         );
     }
-    // A call runs in the head block, as geth's `latest`: NUMBER and
-    // TIMESTAMP (each followed by PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN)
-    // describe the same block.
+    // A call runs in the block it names, as geth's: NUMBER and TIMESTAMP
+    // (each followed by PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN) describe it.
     let number = json!({ "input": "0x4360005260206000f3" });
     assert_eq!(ok(&mut rpc, "eth_call", json!([number])), data(&word(2)));
+    assert_eq!(
+        ok(&mut rpc, "eth_call", json!([number, "0x1"])),
+        data(&word(1))
+    );
     let timestamp = json!({ "input": "0x4260005260206000f3" });
     assert_eq!(
         ok(&mut rpc, "eth_call", json!([timestamp])),

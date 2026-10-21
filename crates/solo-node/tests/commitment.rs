@@ -214,8 +214,15 @@ fn proofs_verify_against_block_headers() {
             Some(keccak256(&stored))
         );
     }
-    // Heights the node never executed have no trie.
-    assert!(node.state_proof_at(0, &bob_key).is_none());
+    // The genesis state is height 0's (spec 20 §4.3): Bob is not in it.
+    let genesis = node.genesis_state_root();
+    assert_eq!(
+        node.state_proof_at(0, &bob_key)
+            .unwrap()
+            .verify(keccak256, &genesis, &bob_key),
+        Ok(None)
+    );
+    // A height the node never executed has no trie.
     assert!(node.state_proof_at(6, &bob_key).is_none());
 }
 

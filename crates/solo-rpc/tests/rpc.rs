@@ -285,7 +285,10 @@ fn transactions_blocks_and_receipts() {
         genesis["sha3Uncles"],
         "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"
     );
-    assert_eq!(genesis["transactionsRoot"], data(&keccak256(&[])));
+    // Empty Merkle-Patricia tries (spec 20 §3.1).
+    let empty_trie = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421";
+    assert_eq!(genesis["transactionsRoot"], empty_trie);
+    assert_eq!(genesis["receiptsRoot"], empty_trie);
     assert_eq!(
         ok(&mut rpc, "eth_getBlockByNumber", json!(["latest"])),
         genesis
