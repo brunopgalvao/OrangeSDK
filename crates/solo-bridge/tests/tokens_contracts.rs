@@ -774,6 +774,7 @@ fn deliveries_count_only_from_the_paired_gateway_and_failed_releases_are_owed() 
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn the_owner_governs_and_the_constructors_check_their_arguments() {
     let mut w = World::new();
     let on_eth = w.on_eth;
