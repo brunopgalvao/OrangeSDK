@@ -1161,6 +1161,7 @@ fn one_validator_meets_the_bounds_and_the_gas() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn one_validator_meets_the_edge_cases() {
     let validators = keys(1);
     let mut node = start(&genesis(&validators, &[1], single(2), None));
