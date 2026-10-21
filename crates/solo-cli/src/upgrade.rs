@@ -9,14 +9,20 @@
 //! recompiles the kernel if it is an ELF, uploads the module in `stage`
 //! transactions of one chunk each, waits for every receipt, and sends
 //! `propose` with an activation height `delay` blocks after the head it
-//! then sees, plus two blocks of slack for the proposal's own inclusion;
-//! `delay` defaults to the chain's `upgradeDelay`. It refuses to start
-//! while another upgrade is pending or when the key is not the governance
-//! account, and fails if any transaction reverts or the receipts do not
-//! arrive within the timeout (default 600 s). It prints the code hash, the
-//! blocks the chunks landed in, the block of the proposal and the
-//! activation height. Watch the switch with `solo devnet wait
-//! --kernel-version` or `GET /status`.
+//! then sees, plus [`SLACK`] blocks for the proposal's own inclusion;
+//! `delay` defaults to the chain's `upgradeDelay`. The kernel takes a
+//! proposal only from a block at least `upgradeDelay` (one at the least)
+//! before its activation height (spec 13 §3), so a proposal that lands
+//! later than the slack allowed reverts; the command then proposes again
+//! from the head it sees, with twice the slack, up to [`RESENDS`] times,
+//! and a loaded network delays the activation instead of failing the
+//! command. It refuses to start while another upgrade is pending or when
+//! the key is not the governance account, and fails if any transaction
+//! reverts for another reason or the receipts do not arrive within the
+//! timeout (default 600 s). It prints the code hash, the blocks the chunks
+//! landed in, how many proposals landed too late, the block of the
+//! proposal and the activation height. Watch the switch with `solo devnet
+//! wait --kernel-version` or `GET /status`.
 
 use std::time::{Duration, Instant};
 
@@ -37,8 +43,13 @@ pub const STAGE_GAS: u64 = 3_000_000;
 pub const PROPOSE_GAS: u64 = 200_000;
 
 /// Blocks of slack between the head seen when proposing and the earliest
-/// activation height, for the proposal's own inclusion.
+/// activation height, for the proposal's own inclusion; doubled every time
+/// a proposal lands too late for its activation height.
 pub const SLACK: u64 = 2;
+
+/// How many times a proposal that landed too late for its activation
+/// height is sent again, from the head seen then and with twice the slack.
+pub const RESENDS: u32 = 3;
 
 /// Parses a list of gates (`0,1,2`) into a bit set.
 ///
@@ -142,19 +153,51 @@ pub fn submit(
         let receipt = wait_receipt(rpc, hash, &what, deadline)?;
         blocks.push(landed(&receipt, &what)?);
     }
-    let head = quantity(&call(rpc, "eth_blockNumber", &json!([]))?)?;
-    let activation_height = head + delay.unwrap_or(min_delay).max(1) + SLACK;
-    let propose = Action::Propose {
-        code_hash,
-        activation_height,
-        required_gates,
+    let delay = delay.unwrap_or(min_delay).max(1);
+    let mut slack = SLACK;
+    let mut resent = 0;
+    let (proposed_at, activation_height) = loop {
+        let head = quantity(&call(rpc, "eth_blockNumber", &json!([]))?)?;
+        let activation_height = head + delay + slack;
+        let propose = Action::Propose {
+            code_hash,
+            activation_height,
+            required_gates,
+        };
+        let raw = action_tx(key, chain_id, nonce, PROPOSE_GAS, &propose);
+        nonce += 1;
+        let hash = call(rpc, "eth_sendRawTransaction", &json!([data(&raw)]))?;
+        let receipt = wait_receipt(rpc, hash.as_str().unwrap_or_default(), "proposal", deadline)?;
+        let reverted = match landed(&receipt, "proposal") {
+            Ok(block) => break (block, activation_height),
+            Err(reverted) => reverted,
+        };
+        // The kernel takes a proposal only from a block at least `min_delay`
+        // (one at the least) before its activation height (spec 13 §3).
+        // One that landed too late for that is sent again from the head
+        // seen now, with twice the slack; any other revert is final.
+        let block = quantity(&receipt["blockNumber"])?;
+        if activation_height >= block + min_delay.max(1) {
+            return Err(reverted);
+        }
+        if resent == RESENDS {
+            return Err(format!(
+                "{} proposals landed too late for their activation height; the last: {receipt}",
+                RESENDS + 1
+            ));
+        }
+        resent += 1;
+        slack *= 2;
     };
-    let raw = action_tx(key, chain_id, nonce, PROPOSE_GAS, &propose);
-    let hash = call(rpc, "eth_sendRawTransaction", &json!([data(&raw)]))?;
-    let receipt = wait_receipt(rpc, hash.as_str().unwrap_or_default(), "proposal", deadline)?;
-    let proposed_at = landed(&receipt, "proposal")?;
+    let resent = match resent {
+        0 => String::new(),
+        1 => "\nresent     1 time: a proposal landed too late for its activation height".to_owned(),
+        n => {
+            format!("\nresent     {n} times: a proposal landed too late for its activation height")
+        }
+    };
     Ok(format!(
-        "code hash  {}\nstaged     {} chunks ({} bytes) in blocks {}..{}\nproposed   block {proposed_at}\nactivation {activation_height}",
+        "code hash  {}\nstaged     {} chunks ({} bytes) in blocks {}..{}{resent}\nproposed   block {proposed_at}\nactivation {activation_height}",
         data(&code_hash),
         chunks.len(),
         code.len(),

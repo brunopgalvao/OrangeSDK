@@ -1,7 +1,8 @@
 //! `solo devnet` and `solo upgrade` on real processes: a devnet is
 //! initialized, run, watched, stopped and restarted with its driver state;
-//! a kernel upgrade is staged and proposed over JSON-RPC and every mistake
-//! is named; `up` leaves nothing of its own behind and `stop` reaches a
+//! a kernel upgrade is staged and proposed over JSON-RPC, a proposal that
+//! lands too late for its activation height is sent again, and every
+//! mistake is named; `up` leaves nothing of its own behind and `stop` reaches a
 //! node that does not answer; and the rehearsal script runs end to end
 //! against four validators. The compose stack's rehearsal runs only with
 //! `SOLO_DOCKER` set (`tools/compose-rehearsal.sh` says so otherwise).
@@ -10,6 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::time::Duration;
 
 use solo_abi::Decode;
 use solo_abi::chain::GenesisParams;
@@ -491,6 +493,101 @@ fn the_client_names_every_bad_answer() {
             .contains("expected a quantity")
     );
     assert!(client::status("127.0.0.1:1").is_err());
+}
+
+#[test]
+fn a_proposal_that_lands_too_late_is_sent_again_with_more_slack() {
+    let key = parse_key(STRANGER).unwrap();
+    let result = |v: String| http(&format!(r#"{{"jsonrpc":"2.0","id":1,"result":{v}}}"#));
+    let quantity = |n: u64| result(format!(r#""{n:#x}""#));
+    let receipt = |ok: bool, block: u64| {
+        result(format!(
+            r#"{{"status":"{:#x}","blockNumber":"{block:#x}"}}"#,
+            u8::from(ok)
+        ))
+    };
+    let hash = result(r#""0xabc""#.to_owned());
+    // What the node answers before the first proposal's receipt: the status
+    // naming this key as governance with an upgradeDelay of 2, the chain id,
+    // the nonce, the one chunk's hash and its receipt in block 5, the head
+    // (5) and the proposal's hash; that proposal names activation height
+    // 5 + 2 + 2 = 9.
+    let status = result(format!(
+        r#"{{"pending":null,"params":{{"governance":"{}","minDelay":2}}}}"#,
+        data(&client::address(&key))
+    ));
+    let preamble = [
+        status,
+        quantity(1337),
+        quantity(0),
+        hash,
+        receipt(true, 5),
+        quantity(5),
+        hash,
+    ];
+    let submit = |rest: &[&'static str]| {
+        let node = fake_node([&preamble[..], rest].concat(), None);
+        solo_cli::upgrade::submit(&node, &key, b"a kernel", None, 0, Duration::from_secs(30))
+    };
+    // Landing in block 9, the proposal reverts: the kernel wants at least
+    // two blocks between it and its activation height. The next one, from
+    // head 9 with twice the slack, names 9 + 2 + 4 = 15 and lands in block 10.
+    let report = submit(&[receipt(false, 9), quantity(9), hash, receipt(true, 10)]).unwrap();
+    assert!(report.starts_with("code hash  0x"), "{report}");
+    assert!(
+        report.ends_with(
+            "staged     1 chunks (8 bytes) in blocks 5..5\n\
+             resent     1 time: a proposal landed too late for its activation height\n\
+             proposed   block 10\n\
+             activation 15"
+        ),
+        "{report}"
+    );
+    // Twice late: 15 from head 9 lands in block 14, then 14 + 2 + 8 = 24
+    // from head 14 lands in block 15.
+    let report = submit(&[
+        receipt(false, 9),
+        quantity(9),
+        hash,
+        receipt(false, 14),
+        quantity(14),
+        hash,
+        receipt(true, 15),
+    ])
+    .unwrap();
+    assert!(
+        report.ends_with(
+            "resent     2 times: a proposal landed too late for its activation height\n\
+             proposed   block 15\n\
+             activation 24"
+        ),
+        "{report}"
+    );
+    // A proposal that reverts in time (block 6, three blocks before 9)
+    // reverted for another reason: the command stops there.
+    let message = submit(&[receipt(false, 6)]).unwrap_err();
+    assert!(message.starts_with("proposal reverted: "), "{message}");
+    assert!(message.contains(r#""blockNumber":"0x6""#), "{message}");
+    // Four proposals in a row landing too late (9, 15, 24 and 41 landing in
+    // blocks 9, 14, 23 and 40) exhaust the resends.
+    let message = submit(&[
+        receipt(false, 9),
+        quantity(9),
+        hash,
+        receipt(false, 14),
+        quantity(14),
+        hash,
+        receipt(false, 23),
+        quantity(23),
+        hash,
+        receipt(false, 40),
+    ])
+    .unwrap_err();
+    assert!(
+        message.starts_with("4 proposals landed too late for their activation height; the last: "),
+        "{message}"
+    );
+    assert!(message.contains(r#""blockNumber":"0x28""#), "{message}");
 }
 
 #[test]

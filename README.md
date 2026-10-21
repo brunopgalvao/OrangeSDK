@@ -87,11 +87,12 @@ solo devnet up --dir devnet &                 # JSON-RPC on 127.0.0.1:8545 to 85
 solo devnet wait --dir devnet --peers 3 --head 10
 solo devnet status --dir devnet
 solo devnet stop --dir devnet --node 3        # the others keep finalizing
+solo devnet node --dir devnet --index 3       # or run it in this shell's foreground, with any solo node option after it
 solo devnet start --dir devnet --node 3       # back in the view it left, it syncs and signs again
 solo devnet down --dir devnet
 ```
 
-The genesis funds the README's account above (`solo key` prints a validator's id, address and the DKG encryption key a `staking.keys` entry needs). `solo upgrade` proposes a kernel upgrade with the governance key `init` wrote: it stages the module in chunks, waits for the receipts and proposes an activation height; every node then switches at that block (spec 06 §7):
+The genesis funds the README's account above (`solo key` prints a validator's id, address and the DKG encryption key a `staking.keys` entry needs). `solo upgrade` proposes a kernel upgrade with the governance key `init` wrote: it stages the module in chunks, waits for the receipts and proposes an activation height a few blocks past the head it sees (a proposal that lands too late for its height reverts, and the command proposes again from the new head with more slack); every node then switches at that block (spec 06 §7):
 
 ```sh
 solo upgrade --rpc 127.0.0.1:8545 --key-file devnet/governance.key --kernel crates/solo-node/tests/fixtures/kernel_v2.elf
@@ -134,7 +135,7 @@ cargo test --release -p solo-jit --test bench --test guests -- --ignored --nocap
 - `crates/solo-bls` — threshold BLS over BLS12-381: the DKG and resharing, finality certificates and their Ethereum verification inputs (spec 12), `no_std`.
 - `crates/solo-upgrade` — kernel upgrades and feature gates (spec 13): the upgrade-address actions, their records, the gate state machine.
 - `crates/solo-node` — the node host: privileged functions (including `sign`), the driver loop, the mempool of spec 14 (per-sender nonce queues, replacement, limits), queries, the kernel switchover and gated host functions of spec 13, telemetry, the threshold keystore behind `sign` key role 2 (spec 15 §6.4), the TCP transport, and `Sim`, an in-process network of nodes with a virtual clock.
-- `crates/solo-rpc` — Ethereum JSON-RPC over a node, including `txpool_status` and `txpool_content` and the bridge relayer's `solo_getFinalityProof` and `solo_getOutboxProof`, with a minimal HTTP server.
+- `crates/solo-rpc` — Ethereum JSON-RPC over a node, including `txpool_status` and `txpool_content`, the bridge relayer's `solo_getFinalityProof`, `solo_getOutboxProof` and `solo_getRotation`, governance's `solo_getGovernance`, `solo_getProposals` and `solo_getProposal`, and `solo_upgradeStatus`, with a minimal HTTP server.
 - `crates/solo-bridge` — the relayer library of the bridge to Ethereum (spec 17): light-client submissions from threshold certificates, outbox proofs, and the calldata of every call to the contracts; and the token bridge's messages, wrapped-token addresses, calls and constructor arguments (spec 21, `solo_bridge::tokens`).
 - `crates/solo-cli` — the `solo` command (`solo dev`, `solo node`, `solo key`, `solo gov`, `solo doctor`, `solo upgrade`, `solo devnet`).
 - `crates/solo-metrics` — telemetry: a metrics registry with Prometheus text exposition, the node's metric schema, and the health rules `solo doctor` applies.
