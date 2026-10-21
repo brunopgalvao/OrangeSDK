@@ -1,8 +1,12 @@
 //! The `solo` command.
 //!
 //! `solo dev --kernel <kernel.elf|kernel.solo> --genesis <genesis.json>
-//! [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>]`
-//! runs a single-node development chain with Ethereum JSON-RPC. The genesis file is
+//! [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>]
+//! [--state-history <blocks> | --archive]`
+//! runs a single-node development chain with Ethereum JSON-RPC. The node keeps
+//! the state of its latest 1 024 blocks for historical queries and proofs, or
+//! `--state-history` of them, or every block's with `--archive` (spec 20 §5).
+//! The genesis file is
 //! JSON: `{"chainId": 1337, "slotMs": 400, "maxTxs": 64,
 //! "alloc": {"0x<address>": "<wei>"}, "validators": ["0x<32-byte id>"]}`.
 //! An `alloc` entry is a balance, or a geth-style account that predeploys a
@@ -73,8 +77,8 @@ pub const DEFAULT_RPC: &str = "127.0.0.1:8545";
 
 /// Usage line printed on a command-line mistake.
 pub const USAGE: &str = "usage:
-  solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>]
-  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex>] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>]
+  solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
+  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex>] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
   solo key  <64 hex>
   solo doctor [--rpc 127.0.0.1:8545] [--max-head-age <s>] [--max-finality-lag <blocks>] [--min-peers <n>] [--max-mempool <txs>] [--max-call-ms <ms>]";
 
@@ -353,6 +357,19 @@ fn parse_gas(args: &[String], name: &str, default: i64) -> Result<i64, String> {
     Ok(parse_number(args, name)?.map_or(default, |gas| i64::try_from(gas).unwrap_or(i64::MAX)))
 }
 
+/// How many blocks' states the node keeps: `--archive` for all,
+/// `--state-history` blocks, or [`solo_node::STATE_HISTORY`].
+fn state_history(args: &[String]) -> Result<usize, String> {
+    let archive = args.iter().any(|a| a == "--archive");
+    match (archive, parse_number(args, "--state-history")?) {
+        (true, Some(_)) => Err("--archive and --state-history exclude each other".into()),
+        (true, None) => Ok(solo_node::ARCHIVE),
+        (false, Some(0)) => Err("--state-history must be at least 1".into()),
+        (false, Some(n)) => Ok(usize::try_from(n).unwrap_or(solo_node::ARCHIVE)),
+        (false, None) => Ok(solo_node::STATE_HISTORY),
+    }
+}
+
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -430,6 +447,7 @@ fn run_inner(
     let max_blocks = parse_number(args, "--blocks")?;
     let kernel_gas = parse_gas(args, "--kernel-gas", solo_node::node::KERNEL_GAS)?;
     let query_gas = parse_gas(args, "--query-gas", solo_node::node::QUERY_GAS)?;
+    let state_history = state_history(args)?;
     let key = if command == "dev" {
         Some(dev_key())
     } else {
@@ -446,6 +464,7 @@ fn run_inner(
             key: key.clone(),
             kernel_gas,
             query_gas,
+            state_history,
             ..solo_node::NodeConfig::default()
         },
     )?;

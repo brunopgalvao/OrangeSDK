@@ -14,11 +14,18 @@ solo-host = { path = "../solo-host" }
 solo-metrics = { path = "../solo-metrics" }
 solo-node = { path = "../solo-node" }
 solo-rlp = { path = "../solo-rlp" }
+solo-trie = { path = "../solo-trie" }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 serde_json = "1"
 
 [dev-dependencies]
+alloy-consensus = { version = "1.8.3", default-features = false, features = ["k256"] }
+alloy-eips = { version = "1.8.3", default-features = false }
+alloy-primitives = "1.7.3"
+alloy-rlp = "0.3"
+alloy-trie = { version = "0.9", default-features = false, features = ["ethereum"] }
 solo-recompile = { path = "../solo-recompile" }
+tiny-keccak = { version = "2", features = ["keccak"] }
 
 [lints]
 workspace = true

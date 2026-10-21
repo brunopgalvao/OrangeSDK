@@ -223,8 +223,8 @@ fn proofs_verify_against_block_headers() {
 fn the_node_keeps_the_tries_of_its_latest_blocks() {
     let alice = SigningKey::from_slice(&[1; 32]).unwrap();
     let (mut node, bob) = chain(&alice, 1);
-    assert_eq!(node.proof_history, solo_node::PROOF_HISTORY);
-    node.proof_history = 2;
+    assert_eq!(node.state_history, solo_node::STATE_HISTORY);
+    node.state_history = 2;
     let after_one = node.state_root();
     for height in 2..=4 {
         node.tick(1_000 + height * SLOT_MS).unwrap();

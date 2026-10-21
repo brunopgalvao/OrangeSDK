@@ -179,6 +179,7 @@ impl Sim {
             persisted,
             kernel_gas: old.kernel_gas,
             query_gas: old.query_gas,
+            state_history: old.state_history,
         };
         self.nodes[index] = Self::open_started(kernel, genesis, config, resumed)?;
         self.ids[index] = key;

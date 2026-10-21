@@ -169,6 +169,7 @@ fn contracts_through_the_node() {
         data: selector("count()"),
         gas: 0,
         access_list: Seq(vec![]),
+        authorization_list: Seq(Vec::new()),
     };
     let read = node.call(&request).unwrap();
     assert_eq!(read.status, call_status::SUCCESS);
@@ -220,6 +221,7 @@ fn contracts_through_the_node() {
             data: initcode,
             gas: 1_000_000,
             access_list: Seq(vec![]),
+            authorization_list: Seq(Vec::new()),
         })
         .unwrap();
     assert_eq!(created.status, call_status::SUCCESS);
@@ -262,6 +264,7 @@ fn access_lists_and_the_query_budget() {
         data: selector("count()"),
         gas: 0,
         access_list: Seq(vec![]),
+        authorization_list: Seq(Vec::new()),
     };
     let read = node.call(&count).unwrap();
     assert_eq!(read.output, word(5));

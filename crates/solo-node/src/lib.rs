@@ -17,6 +17,8 @@ pub mod upgrade;
 pub use extension::{NodeExtension, NodeServices, Outbound, sign_recoverable, validator_id};
 pub use mempool::{MAX_TX_BYTES, Mempool, PoolError, PoolLimits, PoolTx};
 pub use net::Transport;
-pub use node::{BLOCK_KERNEL_GAS, Node, NodeConfig, NodeError, PROOF_HISTORY, SubmitError};
+pub use node::{
+    ARCHIVE, BLOCK_KERNEL_GAS, Node, NodeConfig, NodeError, STATE_HISTORY, SubmitError,
+};
 pub use sim::Sim;
 pub use upgrade::{GatedExtension, Switch, Upgrades};

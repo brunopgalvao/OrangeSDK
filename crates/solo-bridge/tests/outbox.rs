@@ -231,6 +231,7 @@ fn accounts_and_contracts_send_messages_that_state_proofs_reach() {
         data: data.clone(),
         gas: 0,
         access_list: Seq(vec![]),
+        authorization_list: Seq(Vec::new()),
     };
     let result = chain.node.call(&request).unwrap();
     assert_eq!(result.output[31], 3);

@@ -8,7 +8,7 @@ use solo_abi::chain::{Account, BLOCK_GAS_LIMIT, BlockHeader, CallRequest, CallRe
 use solo_abi::codec::Seq;
 use solo_abi::types::{Address, Ahead, Block, BuildArgs, ExecuteArgs, ExecuteResult, ExecuteSummary, FinalizeArgs, Hash, QueryArgs, QueryResult, ValidateArgs, ValidateResult};
 use solo_abi::{Decode, Encode};
-use solo_eth::MAX_TX_GAS;
+use solo_eth::{MAX_TX_GAS, header, mpt};
 
 use crate::evm::{self, BASE_FEE, BlockFields, Message};
 use crate::state;
@@ -173,6 +173,7 @@ fn run_tx(raw: &[u8], chain_id: u64, block: BlockFields, index: u32, cumulative:
         priority_fee: s.tx.priority_fee,
         nonce: Some(s.tx.nonce),
         access_list: s.tx.access_list.clone(),
+        authorization_list: s.tx.authorization_list.iter().cloned().zip(s.authorities.iter().copied()).collect(),
     };
     let outcome = if crate::staking::is_staking(&s) {
         crate::staking::run(&s, block.number, message, block)
@@ -219,7 +220,9 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let mut receipts = Vec::new();
     let mut tx_hashes = Vec::new();
     let mut cumulative = 0u64;
-    let mut receipt_hashes = Vec::new();
+    let mut listed = Vec::new();
+    let mut envelopes = Vec::new();
+    let mut logs_bloom = [0u8; 256];
     for raw in &args.block.txs.0 {
         let index = receipts.len() as u32;
         let hash = state::keccak256(raw);
@@ -230,12 +233,16 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
         };
         cumulative = receipt.cumulative_gas_used;
         state::put_receipt(&hash, &receipt, raw);
-        let encoded = receipt.to_bytes();
-        receipt_hashes.extend_from_slice(&state::keccak256(&encoded));
-        receipts.push(encoded);
+        let bloom = header::receipt_bloom(&receipt, state::keccak256);
+        header::accrue(&mut logs_bloom, &bloom);
+        envelopes.push(header::receipt_envelope(&receipt, &bloom));
+        listed.push(raw.clone());
+        receipts.push(receipt.to_bytes());
         tx_hashes.push(hash);
     }
-    let receipts_root = state::keccak256(&receipt_hashes);
+    // Ethereum's tries over what the block records (spec 20 §3.2).
+    let receipts_root = mpt::ordered_root(&envelopes, state::keccak256);
+    let transactions_root = mpt::ordered_root(&listed, state::keccak256);
     crate::modules::end_block(height, template.timestamp_ms);
     crate::governance::end_block(height);
     crate::staking::end_block(height);
@@ -248,12 +255,17 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
         receipts_root,
         tx_hashes: Seq(tx_hashes),
         gas_used: cumulative,
+        transactions_root,
+        logs_bloom: logs_bloom.to_vec(),
+        gas_limit: BLOCK_GAS_LIMIT,
+        base_fee: BASE_FEE,
+        beneficiary: [0; 20],
     };
-    let block_hash = state::keccak256(&header.to_bytes());
+    let block_hash = header::block_hash(&header, state::keccak256);
     state::put_block(&header, &block_hash);
     ExecuteResult {
         state_root,
-        summary: ExecuteSummary { gas_used: cumulative, tx_count: receipts.len() as u32, receipts_root, logs_bloom: Vec::new() },
+        summary: ExecuteSummary { gas_used: cumulative, tx_count: receipts.len() as u32, receipts_root, logs_bloom: logs_bloom.to_vec() },
         receipts: Seq(receipts),
     }
 }
@@ -277,14 +289,26 @@ fn bad_params() -> QueryResult {
 /// Runs a call against the head state without keeping its effects. The EVM
 /// sees the head block (its number and timestamp), as `eth_call` at `latest`
 /// does. A message with an access list runs as an EIP-2930 transaction, the
-/// only way the EVM charges and warms one.
+/// only way the EVM charges and warms one, and one with an authorization list
+/// as an EIP-7702 transaction, each authority recovered as for a transaction.
 fn call(request: CallRequest) -> CallResult {
     let height = state::height().unwrap_or(0);
     let timestamp = state::block_by_number(height).map_or(0, |h| h.timestamp_ms / 1000);
     let gas = if request.gas == 0 { MAX_TX_GAS } else { request.gas.min(MAX_TX_GAS) };
     let access_list: Vec<solo_eth::AccessItem> = request.access_list.0.into_iter().map(|item| solo_eth::AccessItem { address: item.address, keys: item.keys.0 }).collect();
+    let authorization_list: Vec<_> = request
+        .authorization_list
+        .0
+        .into_iter()
+        .map(|a| solo_eth::Authorization { chain_id: a.chain_id, address: a.address, nonce: a.nonce, y_parity: a.y_parity, r: a.r, s: a.s })
+        .map(|a| {
+            let authority = tx::authority(&a);
+            (a, authority)
+        })
+        .collect();
+    let tx_type = if authorization_list.is_empty() { u8::from(!access_list.is_empty()) } else { solo_eth::SET_CODE_TX_TYPE };
     let message = Message {
-        tx_type: u8::from(!access_list.is_empty()),
+        tx_type,
         caller: request.from,
         to: request.to,
         value: request.value,
@@ -294,6 +318,7 @@ fn call(request: CallRequest) -> CallResult {
         priority_fee: None,
         nonce: None,
         access_list,
+        authorization_list,
     };
     // The host serves the gates active for the next block (spec 13 §7.1).
     crate::precompiles::begin(crate::governance::gate_active(solo_upgrade::gate::PRECOMPILES, height + 1));

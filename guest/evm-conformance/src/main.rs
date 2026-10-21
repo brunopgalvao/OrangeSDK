@@ -61,6 +61,7 @@ fn run(case: Case, accelerated: bool) -> Outcome {
         return Outcome { status: call_status::INVALID, gas_used: 0, logs: Seq(Vec::new()) };
     };
     let tx = signed.tx;
+    let authorization_list = tx.authorization_list.into_iter().zip(signed.authorities).collect();
     let message = Message {
         tx_type: tx.tx_type,
         caller: signed.from,
@@ -72,6 +73,7 @@ fn run(case: Case, accelerated: bool) -> Outcome {
         priority_fee: tx.priority_fee,
         nonce: Some(tx.nonce),
         access_list: tx.access_list,
+        authorization_list,
     };
     let env = Env {
         chain_id: env.chain_id,

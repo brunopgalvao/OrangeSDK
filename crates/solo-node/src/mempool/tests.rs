@@ -23,6 +23,7 @@ fn sized(sender: u8, nonce: u64, fee: u128, size: usize) -> PoolTx {
         tip_cap: fee,
         gas: GAS,
         cost: u128::from(GAS).saturating_mul(fee),
+        authorities: Vec::new(),
         priority: u64::try_from(fee).unwrap_or(u64::MAX),
         arrival: 0,
         announced: false,
@@ -429,13 +430,55 @@ fn reset_follows_the_account() {
     assert_eq!(pool.status(), (1, 1));
     assert_eq!(pool.pending_nonce(&[1; 20]), Some(3));
     assert_eq!(pool.account(&[1; 20]), Some(&funded(2, cost + cost / 2)));
-    // Code appearing at the sender drops all it has.
-    let coded = Account {
+    // A delegation appearing at the sender keeps what it has: a delegated
+    // account still sends.
+    let delegated = Account {
         code_hash: [7; 32],
         ..funded(2, u128::MAX)
     };
-    assert_eq!(pool.reset(&[1; 20], coded), vec![txs[2].hash, far.hash]);
-    assert!(pool.is_empty());
+    assert!(pool.reset(&[1; 20], delegated).is_empty());
+    assert_eq!(pool.status(), (1, 1));
+}
+
+#[test]
+fn delegated_senders_and_authorities_are_limited_as_geth_limits_them() {
+    let mut pool = Mempool::default();
+    let delegated = Account {
+        code_hash: [7; 32],
+        ..rich(0)
+    };
+    // A delegated sender: the first transaction enters, a second with
+    // another nonce does not, a replacement does.
+    pool.insert(tx(1, 0, 10), delegated.clone()).unwrap();
+    assert_eq!(pool.check(&tx(1, 1, 10)), Err(PoolError::InflightLimit));
+    assert_eq!(pool.insert(tx(1, 1, 10), delegated), Err(PoolError::InflightLimit));
+    assert!(pool.insert(tx(1, 0, 20), rich(0)).is_ok());
+    // A set-code transaction naming sender 2 as authority makes sender 2
+    // delegated for the pool, until it leaves.
+    let set_code = PoolTx {
+        authorities: vec![[2; 20]],
+        ..tx(3, 0, 10)
+    };
+    add(&mut pool, &set_code).unwrap();
+    add(&mut pool, &tx(2, 0, 10)).unwrap();
+    assert_eq!(add(&mut pool, &tx(2, 1, 10)), Err(PoolError::InflightLimit));
+    // Replacing the set-code transaction with one naming nobody frees sender 2.
+    add(&mut pool, &tx(3, 0, 20)).unwrap();
+    add(&mut pool, &tx(2, 1, 10)).unwrap();
+    // Sender 2 now holds two: a set-code transaction naming it is refused.
+    let naming_two = PoolTx {
+        authorities: vec![[2; 20], [9; 20]],
+        ..tx(4, 0, 10)
+    };
+    assert_eq!(add(&mut pool, &naming_two), Err(PoolError::AuthorityReserved));
+    // An authority with one transaction may be named; removal forgets it.
+    let naming_one = PoolTx {
+        authorities: vec![[1; 20], [1; 20]],
+        ..tx(4, 0, 10)
+    };
+    add(&mut pool, &naming_one).unwrap();
+    assert!(pool.remove(&naming_one.hash).is_some());
+    add(&mut pool, &tx(1, 1, 20)).unwrap_err();
 }
 
 #[test]

@@ -1,5 +1,7 @@
 //! Transactions: decoding through `solo-eth` and sender recovery through the host.
 
+use alloc::vec::Vec;
+
 use solo_abi::chain::reason;
 use solo_abi::types::{Address, Hash};
 use solo_eth::Tx;
@@ -14,6 +16,16 @@ pub struct Signed {
     pub tx: Tx,
     /// Recovered sender.
     pub from: Address,
+    /// The authority each authorization of a set-code transaction names, in
+    /// order; `None` for one whose signature names none, which the EVM
+    /// skips (EIP-7702). Empty for every other type.
+    pub authorities: Vec<Option<Address>>,
+}
+
+/// The authority that signed an authorization, through the host's
+/// `secp256k1_recover` (spec 20 §2.2).
+pub fn authority(auth: &solo_eth::Authorization) -> Option<Address> {
+    recover_address(&keccak256(&auth.signing_payload()), &auth.signature()?)
 }
 
 /// The uncompressed public key (64 bytes) that signed `msg`, via the host.
@@ -45,5 +57,6 @@ pub fn decode_signed(raw: &[u8], chain_id: u64) -> Result<Signed, u32> {
         return Err(reason::WRONG_CHAIN);
     }
     let from = recover_address(&keccak256(&tx.signing_payload), &tx.signature()).ok_or(reason::BAD_SIGNATURE)?;
-    Ok(Signed { tx, from })
+    let authorities = tx.authorization_list.iter().map(authority).collect();
+    Ok(Signed { tx, from, authorities })
 }

@@ -15,7 +15,7 @@ use solo_abi::codec::Seq;
 use solo_abi::staking::{StakingParams, ValidatorKey};
 use solo_abi::types::Genesis;
 use solo_node::keystore::encryption_key;
-use solo_node::{Node, NodeConfig, PROOF_HISTORY, validator_id};
+use solo_node::{Node, NodeConfig, validator_id};
 use solo_rpc::Rpc;
 use solo_rpc::methods::{data, parse_hex, parse_quantity};
 
@@ -177,8 +177,9 @@ fn a_relayer_gets_certificates_and_outbox_proofs() {
         ok(&mut rpc, "solo_getRotation", json!(["0x0"])),
         Value::Null
     );
-    // Nor has a height the node no longer keeps, once PROOF_HISTORY blocks have passed it.
-    tick(&mut rpc, PROOF_HISTORY as u64 + 1);
+    // Nor has a height the node no longer keeps, once its state history has passed it.
+    rpc.node_mut().state_history = 4;
+    tick(&mut rpc, 5);
     assert_eq!(
         ok(
             &mut rpc,

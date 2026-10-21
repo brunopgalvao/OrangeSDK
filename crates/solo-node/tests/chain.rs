@@ -226,7 +226,9 @@ fn transfers_make_blocks() {
     assert_eq!(header.gas_used, 21_000);
     assert_ne!(header.state_root, [0; 32]);
     let block_hash = node.executed[0].1;
-    assert_eq!(block_hash, keccak256(&header.to_bytes()));
+    // The block hash is that of the block's Ethereum header (spec 20 §3.1).
+    assert_eq!(block_hash, solo_eth::header::block_hash(&header, keccak256));
+    assert_ne!(block_hash, keccak256(&header.to_bytes()));
     assert_eq!(node.block_by_hash(&block_hash).unwrap(), Some(header));
     let receipt = node.receipt(&hash).unwrap().expect("receipt");
     assert_eq!(receipt.status, 1);

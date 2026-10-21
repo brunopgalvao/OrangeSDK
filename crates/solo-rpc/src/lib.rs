@@ -17,6 +17,7 @@ pub mod filter;
 pub mod hex;
 pub mod http;
 pub mod methods;
+pub mod proof;
 pub mod txpool;
 pub mod views;
 

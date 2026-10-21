@@ -38,6 +38,10 @@ pub struct NodeConfig {
     pub kernel_gas: i64,
     /// Gas budget per `kernel_query` call; see [`QUERY_GAS`].
     pub query_gas: i64,
+    /// How many of the latest executed blocks' states the node keeps to
+    /// serve historical queries and proofs; see [`STATE_HISTORY`] and
+    /// [`ARCHIVE`].
+    pub state_history: usize,
 }
 
 impl Default for NodeConfig {
@@ -48,6 +52,7 @@ impl Default for NodeConfig {
             persisted: BTreeMap::new(),
             kernel_gas: KERNEL_GAS,
             query_gas: QUERY_GAS,
+            state_history: STATE_HISTORY,
         }
     }
 }
@@ -63,11 +68,16 @@ pub const KERNEL_GAS: i64 = 1 << 40;
 /// block and stall; [`KERNEL_GAS`] is far above.
 pub const BLOCK_KERNEL_GAS: i64 = 1 << 35;
 
-/// How many of the most recently executed blocks a node keeps the state trie
-/// of, to prove entries against their header roots
-/// ([`Node::state_proof_at`]). The tries share every unchanged node, so each
-/// costs only the nodes its block changed.
-pub const PROOF_HISTORY: usize = 256;
+/// How many of the most recently executed blocks a node keeps the state of
+/// by default (spec 20 §5): the values every key held after each, to serve
+/// queries at those heights ([`Node::query_at`]), and the state trie behind
+/// each header's root, to prove entries against it
+/// ([`Node::state_proof_at`]). Both keep only what each block changed: the
+/// old values of the keys it wrote, and the trie nodes on their paths.
+pub const STATE_HISTORY: usize = 1024;
+
+/// A [`NodeConfig::state_history`] that keeps the state of every block.
+pub const ARCHIVE: usize = usize::MAX;
 
 /// Gas allowed to each `kernel_query` call (spec 06 §6), unless
 /// [`Node::kernel_gas`] is lower. Queries run on the thread that drives
@@ -99,6 +109,9 @@ pub enum NodeError {
     Decode(&'static str),
     /// A kernel switch could not complete (spec 06 §7); the node has halted.
     Upgrade(String),
+    /// A query named a height whose state the node does not keep: pruned,
+    /// below `oldest`, or not executed yet (spec 20 §5).
+    StateUnavailable { height: u64, oldest: u64 },
 }
 
 impl fmt::Display for NodeError {
@@ -108,6 +121,10 @@ impl fmt::Display for NodeError {
             NodeError::Kernel { export, status } => write!(f, "{export} ended with {status:?}"),
             NodeError::Decode(export) => write!(f, "{export} returned an undecodable result"),
             NodeError::Upgrade(why) => write!(f, "kernel upgrade halted the node: {why}"),
+            NodeError::StateUnavailable { height, oldest } => write!(
+                f,
+                "state of block {height} is not available: the node keeps the state from block {oldest}"
+            ),
         }
     }
 }
@@ -161,10 +178,13 @@ pub struct Node {
     /// for the transport to forward to peers.
     tx_gossip: Vec<Vec<u8>>,
     /// The state trie behind the root each recent executed block returned,
-    /// by height; at most [`Node::proof_history`] of them.
+    /// by height; at most [`Node::state_history`] of them.
     committed: BTreeMap<u64, solo_trie::Trie>,
-    /// How many executed blocks' tries to keep; see [`PROOF_HISTORY`].
-    pub proof_history: usize,
+    /// How many executed blocks' states to keep; see [`STATE_HISTORY`]. A
+    /// change applies from the next executed block.
+    pub state_history: usize,
+    /// The state commitment of the genesis state, as `kernel_init` left it.
+    genesis_root: [u8; 32],
     /// Telemetry (spec 11); consensus-ignored.
     pub(crate) telemetry: solo_metrics::NodeMetrics,
     /// Kernel switchover and feature-gate state (`crate::upgrade`).
@@ -224,12 +244,18 @@ impl Node {
             query_gas: config.query_gas,
             tx_gossip: Vec::new(),
             committed: BTreeMap::new(),
-            proof_history: PROOF_HISTORY,
+            state_history: config.state_history.max(1),
+            genesis_root: [0; 32],
             telemetry: solo_metrics::NodeMetrics::new(),
             upgrades: Upgrades::new(active_gates),
         };
         node.call_unit(exports::INIT, &genesis.to_bytes())?;
         node.kernel_gas = config.kernel_gas;
+        // The genesis state is version 0; each executed block seals its height.
+        node.exec.state_mut().base_mut().keep_history(0);
+        let genesis = node.exec.state().base().state_trie();
+        node.genesis_root = genesis.root();
+        node.committed.insert(0, genesis);
         Ok(node)
     }
 
@@ -544,13 +570,19 @@ impl Node {
             .rev()
             .find(|trie| trie.root() == result.state_root);
         self.committed.extend(kept.map(|trie| (height, trie)));
-        while self.committed.len() > self.proof_history {
+        let history = self.state_history.max(1);
+        while self.committed.len() > history {
             self.committed.pop_first();
+        }
+        let base = self.exec.state_mut().base_mut();
+        base.seal(height);
+        if history != ARCHIVE {
+            base.prune((height + 1).saturating_sub(history as u64));
         }
         let stored = self
             .block_by_number(height)?
             .ok_or(NodeError::Decode("stored header"))?;
-        let block_hash = keccak256(&stored.to_bytes());
+        let block_hash = solo_eth::header::block_hash(&stored, keccak256);
         for hash in &carried {
             self.pool.remove(hash);
         }
@@ -669,10 +701,32 @@ impl Node {
     /// See [`NodeError`]; a query that exhausts its budget is a
     /// [`NodeError::Kernel`] for which [`NodeError::is_out_of_gas`] holds.
     pub fn query(&mut self, method: &str, params: &[u8]) -> Result<QueryResult, NodeError> {
+        self.query_at(method, params, None)
+    }
+
+    /// Runs a kernel query within [`Node::query_gas`] over the state as it
+    /// was right after block `at` executed, or the current state for `None`
+    /// or the last executed height (spec 06 §6, spec 20 §5).
+    ///
+    /// # Errors
+    /// As [`Node::query`]; [`NodeError::StateUnavailable`] when the node no
+    /// longer keeps, or never had, the state of block `at`.
+    pub fn query_at(
+        &mut self,
+        method: &str,
+        params: &[u8],
+        at: Option<u64>,
+    ) -> Result<QueryResult, NodeError> {
+        let base = self.exec.state_mut().base_mut();
+        let view = at.filter(|h| base.versions().is_none_or(|(_, latest)| *h != latest));
+        base.set_view(view).map_err(|_| NodeError::StateUnavailable {
+            height: at.unwrap_or_default(),
+            oldest: self.oldest_state(),
+        })?;
         let args = QueryArgs {
             method: method.as_bytes().to_vec(),
             params: params.to_vec(),
-            at: None,
+            at,
         };
         let gas = self.query_gas.min(self.kernel_gas);
         // A query changes nothing (spec 06 §6): whatever the kernel writes,
@@ -682,10 +736,26 @@ impl Node {
         self.exec.state_mut().push();
         let r = self.call_with(exports::QUERY, &args.to_bytes(), gas);
         self.exec.state_mut().discard();
+        // The view only ever has a layer above it, so the base saw no writes.
+        let _ = self.exec.state_mut().base_mut().set_view(None);
         let r = r?;
         QueryResult::from_bytes(&r.output)
             .ok()
             .ok_or(NodeError::Decode(exports::QUERY))
+    }
+
+    /// The state commitment (spec 10) of the genesis state, which the
+    /// synthetic header of block 0 carries (spec 20 §3.1).
+    #[must_use]
+    pub fn genesis_state_root(&self) -> [u8; 32] {
+        self.genesis_root
+    }
+
+    /// The oldest height whose state the node keeps (spec 20 §5): queries
+    /// and proofs reach back to it, and no further.
+    #[must_use]
+    pub fn oldest_state(&self) -> u64 {
+        self.exec.state().base().versions().map_or(0, |(oldest, _)| oldest)
     }
 
     fn query_decoded<T: Decode>(
@@ -693,7 +763,16 @@ impl Node {
         method: &str,
         params: &[u8],
     ) -> Result<Option<T>, NodeError> {
-        let r = self.query(method, params)?;
+        self.query_decoded_at(method, params, None)
+    }
+
+    fn query_decoded_at<T: Decode>(
+        &mut self,
+        method: &str,
+        params: &[u8],
+        at: Option<u64>,
+    ) -> Result<Option<T>, NodeError> {
+        let r = self.query_at(method, params, at)?;
         if r.status != 0 {
             return Ok(None);
         }
@@ -731,8 +810,20 @@ impl Node {
         &mut self,
         address: &types::Address,
     ) -> Result<solo_abi::chain::Account, NodeError> {
+        self.account_at(address, None)
+    }
+
+    /// An account as it was after block `at` (see [`Node::query_at`]).
+    ///
+    /// # Errors
+    /// See [`Node::query_at`].
+    pub fn account_at(
+        &mut self,
+        address: &types::Address,
+        at: Option<u64>,
+    ) -> Result<solo_abi::chain::Account, NodeError> {
         Ok(self
-            .query_decoded(solo_abi::chain::query::ACCOUNT, address)?
+            .query_decoded_at(solo_abi::chain::query::ACCOUNT, address, at)?
             .unwrap_or_default())
     }
 
@@ -776,8 +867,20 @@ impl Node {
     /// # Errors
     /// See [`NodeError`].
     pub fn code(&mut self, address: &types::Address) -> Result<Vec<u8>, NodeError> {
+        self.code_at(address, None)
+    }
+
+    /// Contract code as it was after block `at` (see [`Node::query_at`]).
+    ///
+    /// # Errors
+    /// See [`Node::query_at`].
+    pub fn code_at(
+        &mut self,
+        address: &types::Address,
+        at: Option<u64>,
+    ) -> Result<Vec<u8>, NodeError> {
         Ok(self
-            .query_decoded(solo_abi::chain::query::CODE, address)?
+            .query_decoded_at(solo_abi::chain::query::CODE, address, at)?
             .unwrap_or_default())
     }
 
@@ -790,12 +893,25 @@ impl Node {
         address: &types::Address,
         slot: &types::Hash,
     ) -> Result<types::Hash, NodeError> {
+        self.storage_at(address, slot, None)
+    }
+
+    /// A storage slot as it was after block `at` (see [`Node::query_at`]).
+    ///
+    /// # Errors
+    /// See [`Node::query_at`].
+    pub fn storage_at(
+        &mut self,
+        address: &types::Address,
+        slot: &types::Hash,
+        at: Option<u64>,
+    ) -> Result<types::Hash, NodeError> {
         let params = StorageQuery {
             address: *address,
             slot: *slot,
         };
         Ok(self
-            .query_decoded(solo_abi::chain::query::STORAGE, &params.to_bytes())?
+            .query_decoded_at(solo_abi::chain::query::STORAGE, &params.to_bytes(), at)?
             .unwrap_or_default())
     }
 
@@ -806,7 +922,20 @@ impl Node {
     /// See [`NodeError`]; [`NodeError::Decode`] if the kernel does not answer
     /// the call query.
     pub fn call(&mut self, request: &CallRequest) -> Result<CallOutcome, NodeError> {
-        self.query_decoded(solo_abi::chain::query::CALL, &request.to_bytes())?
+        self.call_at(request, None)
+    }
+
+    /// Executes a message against the state after block `at`, in that
+    /// block's context (see [`Node::query_at`]).
+    ///
+    /// # Errors
+    /// As [`Node::call`] and [`Node::query_at`].
+    pub fn call_at(
+        &mut self,
+        request: &CallRequest,
+        at: Option<u64>,
+    ) -> Result<CallOutcome, NodeError> {
+        self.query_decoded_at(solo_abi::chain::query::CALL, &request.to_bytes(), at)?
             .ok_or(NodeError::Decode(solo_abi::chain::query::CALL))
     }
 
@@ -874,8 +1003,9 @@ impl Node {
 
     /// The proof for `key` against the root that executing block `height`
     /// returned, which is the `state_root` of that block's header for the
-    /// reference kernel (spec 06 §5, spec 10 §5). `None` unless this node
-    /// executed that block among its last [`Node::proof_history`].
+    /// reference kernel (spec 06 §5, spec 10 §5), or the genesis state for
+    /// height 0. `None` unless this node executed that block, or started
+    /// from genesis, within its last [`Node::state_history`].
     #[must_use]
     pub fn state_proof_at(&self, height: u64, key: &[u8]) -> Option<solo_trie::Proof> {
         self.committed.get(&height).map(|trie| trie.prove(key))

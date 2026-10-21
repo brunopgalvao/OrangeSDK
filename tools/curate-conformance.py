@@ -51,7 +51,7 @@ QUOTAS = {
     "osaka/eip7951_p256verify_precompiles": 40,
     "prague/eip2537_bls_12_381_precompiles": 30,
     "prague/eip7623_increase_calldata_cost": 30,
-    "prague/eip7702_set_code_tx": 5,
+    "prague/eip7702_set_code_tx": 40,
     "shanghai/eip3651_warm_coinbase": 8,
     "shanghai/eip3855_push0": 10,
     "shanghai/eip3860_initcode": 20,
