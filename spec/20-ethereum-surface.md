@@ -181,7 +181,7 @@ The last follows the wording of a pruned geth node, so tools that recognise `mis
 
 ## 6. Conformance
 
-The execution-spec state tests run set-code transactions through the kernel's own code (07 §4.2): `tx::decode_signed` recovers each authority through the host, and `native::run_in` hands revm the recovered list. The type-4 entry of the expected failures is gone; type 3 stays. The committed subset carries 35 more set-code cases (`prague/eip7702_set_code_tx`, 40 in all) and now passes 534 cases with 22 expected failures, all blob transactions (before: 490 and 31, 9 of the 31 being type-4 cases in other categories). The full pinned set passes 4 767 cases with 804 expected failures, all blob transactions, and none fail otherwise, on both backends with gate 2 active and inactive (2026-10-21; before: 4 223 and 1 348); every one of its 552 `prague/eip7702_set_code_tx` cases passes.
+The execution-spec state tests run set-code transactions through the kernel's own code (07 §4.2): `tx::decode_signed` recovers each authority through the host, and `native::run_in` hands revm the recovered list. The type-4 entry of the expected failures is gone; type 3 stays. The committed subset carries 35 more set-code cases (`prague/eip7702_set_code_tx`, 40 in all) and now passes 534 cases with 22 expected failures, all blob transactions (before: 490 and 31, 9 of the 31 being type-4 cases: 7 in other categories and 2 among the 5 set-code cases already committed). The full pinned set passes 4 767 cases with 804 expected failures, all blob transactions, and none fail otherwise, on both backends with gate 2 active and inactive (2026-10-21; before: 4 223 and 1 348); every one of its 552 `prague/eip7702_set_code_tx` cases passes.
 
 ## 7. Limits of this version
 
