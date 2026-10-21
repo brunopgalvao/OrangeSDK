@@ -11,9 +11,14 @@
 //!
 //! `governanceMode` is `key` (the default, for development chains: the
 //! `governance` key acts alone) or `stake` (validators vote; the key is the
-//! guardian). The other fields default to zero, which leaves the stake track
-//! unusable until `setParams` runs, so a chain that starts under it, or
-//! means to switch to it, sets `votingBlocks` at least.
+//! guardian). The other fields default to zero. The stake track needs
+//! `votingBlocks` and `quorumBps` above zero (spec 13 §9.1): a genesis that
+//! starts under it without them is refused here, and a chain that means to
+//! switch to it later sets them, at genesis or with `set-params`, first.
+//!
+//! Every call prints the address to send it to, its calldata and the gas
+//! limit it needs, the calldata's intrinsic gas plus the 50 000 gas
+//! surcharge of every governance call, which `eth_estimateGas` also gives.
 //!
 //! ```sh
 //! solo gov submit <target> <0x calldata>           # a proposal, or under the key an action executed at once
@@ -27,6 +32,7 @@
 //! ```
 
 use serde_json::Value;
+use solo_abi::chain::CallRequest;
 use solo_abi::governance::{Call, GOVERNANCE_ADDRESS, GovernanceParams, mode};
 
 fn address(text: &str, what: &str) -> Result<[u8; 20], String> {
@@ -112,14 +118,29 @@ pub fn parse(args: &[String]) -> Result<Call, String> {
     })
 }
 
-/// What `solo gov` prints: where to send the call and its calldata.
+/// What `solo gov` prints: where to send the call, its calldata, the least
+/// gas limit admission takes for it (the calldata's intrinsic gas at the
+/// EIP-7623 floor plus the governance surcharge, spec 13 §9.9, which
+/// `eth_estimateGas` also reports), and for a submission the value to send.
 #[must_use]
 pub fn describe(call: &Call) -> String {
-    format!(
-        "to       {}\ncalldata {}",
+    let data = call.encode();
+    let gas = solo_rpc::call::min_gas(&CallRequest {
+        to: Some(GOVERNANCE_ADDRESS),
+        data: data.clone(),
+        ..CallRequest::default()
+    });
+    let mut text = format!(
+        "to       {}\ncalldata {}\ngas      {gas}",
         solo_rpc::methods::data(&GOVERNANCE_ADDRESS),
-        solo_rpc::methods::data(&call.encode())
-    )
+        solo_rpc::methods::data(&data)
+    );
+    if matches!(call, Call::Submit { .. }) {
+        text.push_str(
+            "\nvalue    0 from the key or a validator; else the proposal deposit (solo_getGovernance)",
+        );
+    }
+    text
 }
 
 /// The governance parameters of a genesis document: `governanceMode`,
@@ -153,11 +174,22 @@ pub fn parse_governance(v: &Value) -> Result<GovernanceParams, String> {
             .into(),
         Some(_) => return Err("genesis: proposalDeposit must be a string or number".to_owned()),
     };
-    Ok(GovernanceParams {
+    let params = GovernanceParams {
         mode,
         voting_blocks: number("votingBlocks")?,
         timelock_blocks: number("timelockBlocks")?,
         quorum_bps: number("quorumBps")?,
         deposit,
-    })
+    };
+    // The kernel refuses to start under rules that cannot work (spec 13
+    // §9.1); say so here, before a node traps in `kernel_init`.
+    if mode == mode::STAKE && (params.voting_blocks == 0 || params.quorum_bps == 0) {
+        return Err(
+            "genesis: governanceMode stake needs votingBlocks and quorumBps above zero".to_owned(),
+        );
+    }
+    if params.quorum_bps > 10_000 {
+        return Err("genesis: quorumBps must be at most 10000".to_owned());
+    }
+    Ok(params)
 }

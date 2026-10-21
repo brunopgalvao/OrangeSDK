@@ -306,6 +306,9 @@ fn call(request: CallRequest) -> CallResult {
         })
         .collect();
     let tx_type = if authorization_list.is_empty() { u8::from(!access_list.is_empty()) } else { solo_eth::SET_CODE_TX_TYPE };
+    // A governance call's gas includes its surcharge (spec 13 §9.9), so that
+    // an estimate is a gas limit admission takes.
+    let surcharge = solo_abi::governance::surcharge(request.to.as_ref(), &request.data);
     let message = Message {
         tx_type,
         caller: request.from,
@@ -322,7 +325,7 @@ fn call(request: CallRequest) -> CallResult {
     // The host serves the gates active for the next block (spec 13 §7.1).
     crate::precompiles::begin(crate::governance::gate_active(solo_upgrade::gate::PRECOMPILES, height + 1));
     let outcome = crate::native::run(message, BlockFields { number: height, timestamp }, false);
-    CallResult { status: outcome.status, gas_used: outcome.gas_used, output: outcome.output }
+    CallResult { status: outcome.status, gas_used: outcome.gas_used + surcharge, output: outcome.output }
 }
 
 /// `kernel_query`.

@@ -52,9 +52,10 @@ pub fn mode() -> u8 {
     state::get(gov::keys::MODE).unwrap_or_else(|| state::params().governance.mode)
 }
 
-/// The proposal rules in force: as a `setParams` left them, else genesis's.
+/// The proposal rules in force, as a `setParams` left them, else genesis's,
+/// under the mode in force.
 fn rules() -> GovernanceParams {
-    state::get(gov::keys::PARAMS).unwrap_or_else(|| state::params().governance)
+    GovernanceParams { mode: mode(), ..state::get(gov::keys::PARAMS).unwrap_or_else(|| state::params().governance) }
 }
 
 /// The guardian under the stake track: the account a `setGuardian` named,
@@ -79,13 +80,20 @@ fn key_acts(from: &Address) -> bool {
     mode() == mode::KEY && key != [0; 20] && *from == key
 }
 
+/// Whether proposal rules can work under the stake track (spec 13 §9.1):
+/// a voting period, and a quorum that is neither nothing (then a single
+/// vote decides and no deposit is ever forfeited) nor more than the whole.
+fn workable(voting_blocks: u64, quorum_bps: u64) -> bool {
+    voting_blocks != 0 && (1..=10_000).contains(&quorum_bps)
+}
+
 /// Genesis (spec 13 §9.1): traps on parameters that cannot work, so the
 /// chain never starts with them: an unknown mode, a quorum above the whole,
-/// or the stake track with no voting period.
+/// or the stake track with rules that are not workable.
 pub fn init(genesis: &Genesis) {
     let Ok(params) = solo_abi::chain::GenesisParams::from_bytes(&genesis.params) else { solo_guest::trap() };
     let g = &params.governance;
-    if g.mode > mode::STAKE || g.quorum_bps > 10_000 || (g.mode == mode::STAKE && g.voting_blocks == 0) {
+    if g.mode > mode::STAKE || g.quorum_bps > 10_000 || (g.mode == mode::STAKE && !workable(g.voting_blocks, g.quorum_bps)) {
         solo_guest::trap();
     }
 }
@@ -267,7 +275,7 @@ fn apply_action(target: &Address, data: &[u8], block: BlockFields) -> Option<Vec
                 }
                 Call::SetMode { mode: m } => switch_to_stake(m),
                 Call::SetParams { voting_blocks, timelock_blocks, quorum_bps, deposit } => {
-                    if voting_blocks == 0 || quorum_bps > 10_000 {
+                    if !workable(voting_blocks, quorum_bps) {
                         return None;
                     }
                     let rules = GovernanceParams { mode: mode(), voting_blocks, timelock_blocks, quorum_bps, deposit };
@@ -288,10 +296,14 @@ fn apply_action(target: &Address, data: &[u8], block: BlockFields) -> Option<Vec
 /// their governance, and nothing but a kernel upgrade changes the mode again.
 fn switch_to_stake(to: u8) -> Option<Vec<Log>> {
     let rules = rules();
-    if to != mode::STAKE || mode() != mode::KEY || rules.voting_blocks == 0 || rules.quorum_bps > 10_000 {
+    if to != mode::STAKE || mode() != mode::KEY || !workable(rules.voting_blocks, rules.quorum_bps) {
         return None;
     }
     state::set(gov::keys::MODE, &mode::STAKE);
+    if state::get_raw(gov::keys::PARAMS).is_some() {
+        // Rules a `setParams` recorded under the key now read as the stake track's.
+        state::set(gov::keys::PARAMS, &GovernanceParams { mode: mode::STAKE, ..rules });
+    }
     if state::get_raw(gov::keys::GUARDIAN).is_none() {
         state::set(gov::keys::GUARDIAN, &key());
     }
@@ -371,7 +383,7 @@ fn call_allowed(call: &Call, s: &Signed, height: u64) -> bool {
         }
         Call::Vote { id, .. } => value == 0 && validator_of(from).is_some() && proposal(*id).is_some_and(|p| p.status == status::VOTING && height <= p.voting_end),
         Call::Execute { id } => value == 0 && proposal(*id).is_some_and(|p| p.status == status::PASSED && (p.executable_at..=p.expires_at).contains(&height)),
-        Call::Veto { id } => value == 0 && guardian_acts(from) && proposal(*id).is_some(),
+        Call::Veto { id } => value == 0 && guardian_acts(from) && proposal(*id).is_some_and(|p| vetoable(&p)),
         Call::Pause { target } => value == 0 && guardian_acts(from) && *target == VERIFIER_ADDRESS && crate::bridge::governed(target),
         Call::SetGuardian { .. } | Call::SetMode { .. } | Call::SetParams { .. } => false,
     }
@@ -382,11 +394,49 @@ fn guardian_acts(from: &Address) -> bool {
     guardian != [0; 20] && *from == guardian
 }
 
+/// Whether the guardian may veto `p` (spec 13 §9.3): a normal-track
+/// proposal, unless it names a guardian. So validators always replace a
+/// guardian that vetoes, and a guardian never protects what a majority
+/// stops on the fast track.
+fn vetoable(p: &Proposal) -> bool {
+    let names_guardian = p.target == GOVERNANCE_ADDRESS && matches!(Call::decode(&p.data), Some(Call::SetGuardian { .. }));
+    !p.fast_track && !names_guardian
+}
+
+/// The code hash an action runs staged code of: a `propose` or an `install`.
+fn code_of(target: &Address, data: &[u8]) -> Option<Hash> {
+    match *target {
+        GOVERNANCE_ADDRESS => match Action::decode(data)? {
+            Action::Propose { code_hash, .. } => Some(code_hash),
+            _ => None,
+        },
+        MODULE_ADDRESS => Install::decode(data).map(|install| install.code_hash),
+        _ => None,
+    }
+}
+
+/// Whether the code an action names is there to run (spec 13 §9.3): staged
+/// chunks that hash to `code_hash`, or for an install a module already in
+/// state under its hash.
+fn code_complete(code_hash: &Hash, module: bool) -> bool {
+    (module && state::get_raw(&state::code_key(code_hash)).is_some()) || assemble(code_hash).is_some_and(|(code, _)| state::keccak256(&code) == *code_hash)
+}
+
+/// Whether an open proposal names `code_hash`: its code is frozen while one does.
+fn claimed(code_hash: &Hash) -> bool {
+    open().into_iter().filter_map(|o| proposal(o.id)).any(|p| code_of(&p.target, &p.data) == Some(*code_hash))
+}
+
 /// Admission: a transaction to the governance or module address must be
-/// able to run in the next block.
+/// able to run in the next block. A governance call whose gas limit does
+/// not cover the surcharge is refused as the gas problem it is (spec 13
+/// §9.4), so the sender learns how much to attach.
 pub fn admit(s: &Signed) -> Result<(), u32> {
     let system = s.tx.to == Some(GOVERNANCE_ADDRESS) || s.tx.to == Some(MODULE_ADDRESS);
     let next = state::height().unwrap_or(0) + 1;
+    if system && s.tx.gas_limit < s.tx.min_gas_limit().saturating_add(gov::surcharge(s.tx.to.as_ref(), &s.tx.input)) {
+        return Err(reason::GAS_TOO_LOW);
+    }
     if system && request_of(s, next).is_none() { Err(reason::SYSTEM_ACTION) } else { Ok(()) }
 }
 
@@ -397,8 +447,9 @@ pub fn admit(s: &Signed) -> Result<(), u32> {
 /// been included; one that can runs through the EVM as a plain call (gas,
 /// fees, nonce, a deposit's value), then applies its action or call. One
 /// whose state checks fail reverts: the transaction keeps its gas and nonce
-/// and changes nothing else, except that an executed proposal is pruned
-/// whether or not its action's checks passed (spec 13 §9.5).
+/// and changes nothing else, the value it carried going back to the
+/// sender, except that an executed proposal is pruned whether or not its
+/// action's checks passed (spec 13 §9.5).
 pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Outcome {
     if s.tx.to != Some(GOVERNANCE_ADDRESS) && s.tx.to != Some(MODULE_ADDRESS) {
         return crate::native::run(message, block, true);
@@ -422,7 +473,16 @@ pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Out
         };
         match applied {
             Some(logs) => outcome.logs.extend(logs),
-            None => outcome.status = call_status::REVERT,
+            None => {
+                outcome.status = call_status::REVERT;
+                if let Some(to) = s.tx.to
+                    && s.tx.value > 0
+                {
+                    // The deposit of a submission that opened nothing.
+                    debit(&to, s.tx.value);
+                    credit(&s.from, s.tx.value);
+                }
+            }
         }
     }
     outcome
@@ -433,9 +493,17 @@ pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Out
 fn apply_upgrade(action: Action, from: &Address, height: u64) -> Option<Vec<Log>> {
     match action {
         Action::Stage { code_hash, index, chunk } => {
-            // The code of a pending upgrade, and of every enacted kernel, is frozen.
-            if pending().is_some_and(|p| p.code_hash == code_hash) || enacted(&code_hash) {
+            // Frozen code: the pending upgrade's, every enacted kernel's, and
+            // what an open proposal names. And a code hash belongs to the
+            // account that staged its first chunk, so nobody spoils another's
+            // upload by writing a chunk of their own under it (spec 13 §3).
+            if pending().is_some_and(|p| p.code_hash == code_hash) || enacted(&code_hash) || claimed(&code_hash) {
                 return None;
+            }
+            match state::get::<Address>(&keys::staker(&code_hash)) {
+                Some(staker) if staker != *from => return None,
+                Some(_) => {}
+                None => state::set(&keys::staker(&code_hash), from),
             }
             state::set_raw(&keys::chunk(&code_hash, index), &chunk);
             Some(Vec::new())
@@ -474,6 +542,14 @@ fn apply_call(call: Call, s: &Signed, block: BlockFields) -> Option<Vec<Log>> {
     match call {
         Call::Submit { target, data } if mode() == mode::KEY => enact(&s.from, &target, &data, block),
         Call::Submit { target, data } => {
+            // What a proposal runs code of is complete when the proposal
+            // opens, and frozen from then on, so validators vote on the code
+            // that is there (spec 13 §9.3).
+            if let Some(code_hash) = code_of(&target, &data)
+                && !code_complete(&code_hash, target == MODULE_ADDRESS)
+            {
+                return None;
+            }
             let rules = rules();
             let id: u64 = state::get(gov::keys::NEXT).unwrap_or(1);
             let fast = track_of(&target, &data, false) == Some(Track::Fast);

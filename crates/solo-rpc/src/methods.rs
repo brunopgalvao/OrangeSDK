@@ -557,7 +557,7 @@ impl Rpc {
             reason::GAS_TOO_LOW => format!(
                 "{text}: gas {}, minimum needed {}",
                 tx.gas_limit,
-                tx.min_gas_limit()
+                tx.min_gas_limit() + solo_abi::governance::surcharge(tx.to.as_ref(), &tx.input)
             ),
             reason::GAS_LIMIT_TOO_HIGH => format!(
                 "{text} (cap: {}, tx: {})",

@@ -148,40 +148,42 @@ pub fn call_request(value: Option<&Value>) -> Result<CallRequest, RpcError> {
 
 /// The least gas `request` can run with: the intrinsic cost, access and
 /// authorization lists included, or the EIP-7623 calldata floor, whichever
-/// is higher.
+/// is higher, plus the surcharge of a governance call (spec 13 §9.9).
 #[must_use]
 pub fn min_gas(request: &CallRequest) -> u64 {
-    Tx {
-        tx_type: 0,
-        chain_id: None,
-        nonce: 0,
-        gas_price: 0,
-        priority_fee: None,
-        gas_limit: 0,
-        to: request.to,
-        value: request.value,
-        input: request.data.clone(),
-        access_list: request
-            .access_list
-            .0
-            .iter()
-            .map(|item| solo_eth::AccessItem {
-                address: item.address,
-                keys: item.keys.0.clone(),
-            })
-            .collect(),
-        authorization_list: request
-            .authorization_list
-            .0
-            .iter()
-            .map(eth_authorization)
-            .collect(),
-        v: 0,
-        r: [0; 32],
-        s: [0; 32],
-        signing_payload: Vec::new(),
-    }
-    .min_gas_limit()
+    let surcharge = solo_abi::governance::surcharge(request.to.as_ref(), &request.data);
+    surcharge
+        + Tx {
+            tx_type: 0,
+            chain_id: None,
+            nonce: 0,
+            gas_price: 0,
+            priority_fee: None,
+            gas_limit: 0,
+            to: request.to,
+            value: request.value,
+            input: request.data.clone(),
+            access_list: request
+                .access_list
+                .0
+                .iter()
+                .map(|item| solo_eth::AccessItem {
+                    address: item.address,
+                    keys: item.keys.0.clone(),
+                })
+                .collect(),
+            authorization_list: request
+                .authorization_list
+                .0
+                .iter()
+                .map(eth_authorization)
+                .collect(),
+            v: 0,
+            r: [0; 32],
+            s: [0; 32],
+            signing_payload: Vec::new(),
+        }
+        .min_gas_limit()
 }
 
 /// A call's authorization as `solo-eth` reads one from a transaction.

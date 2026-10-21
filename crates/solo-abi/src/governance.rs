@@ -69,6 +69,19 @@ pub const GOVERNANCE_GAS: u64 = 50_000;
 /// when a proposal, the key or the guardian executes it.
 pub const ACTION_GAS: u64 = 1 << 26;
 
+/// The gas a message to `to` with calldata `data` pays beyond the plain
+/// call: [`GOVERNANCE_GAS`] for a governance call, nothing for anything
+/// else, upgrade actions included. Admission requires a gas limit that
+/// covers it, and the kernel's `call` query reports it, so that an
+/// `eth_estimateGas` is a gas limit the chain accepts (spec 13 §9.9).
+#[must_use]
+pub fn surcharge(to: Option<&Address>, data: &[u8]) -> u64 {
+    match to {
+        Some(to) if *to == GOVERNANCE_ADDRESS && Call::decode(data).is_some() => GOVERNANCE_GAS,
+        _ => 0,
+    }
+}
+
 /// Function selectors of the governance calls: the first four bytes of
 /// `keccak256` of each signature.
 pub mod selector {
@@ -888,6 +901,23 @@ mod tests {
         for (i, data) in bad.iter().enumerate() {
             assert_eq!(Call::decode(data), None, "case {i}");
         }
+    }
+
+    #[test]
+    fn only_governance_calls_pay_the_surcharge() {
+        let vote = Call::Vote {
+            id: 1,
+            support: true,
+        }
+        .encode();
+        assert_eq!(surcharge(Some(&GOVERNANCE_ADDRESS), &vote), GOVERNANCE_GAS);
+        assert_eq!(surcharge(Some(&[0x45; 20]), &vote), 0);
+        assert_eq!(surcharge(None, &vote), 0);
+        // An upgrade action (`cancel(bytes32)`), and calldata that is nothing.
+        let cancel = [&[0xc4, 0xd2, 0x52, 0xf5][..], &[7; 32]].concat();
+        assert_eq!(surcharge(Some(&GOVERNANCE_ADDRESS), &cancel), 0);
+        assert_eq!(surcharge(Some(&GOVERNANCE_ADDRESS), &vote[..67]), 0);
+        assert_eq!(surcharge(Some(&GOVERNANCE_ADDRESS), &[]), 0);
     }
 
     #[test]
