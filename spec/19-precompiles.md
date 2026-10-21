@@ -191,6 +191,8 @@ fusaka-devnet-5 v2.1.0, 5 571 cases, native backend, run locally on 2026-10-21 (
 | gate 2 inactive | 4 223 | 1 348 | 0 |
 | gate 2 active | 4 223 | 1 348 | 0 |
 
+With set-code transactions accepted (spec 20 §6), rerun on 2026-10-21 on both backends (`solo-conformance --both [--gated]`): 4 767 passed, 804 expected, 0 failed, with the gate inactive and active alike.
+
 A budget of 2^31, tried first, failed two cases with the gate inactive, single transactions of 129 and 454 BLS12-381 pairs whose bounds exceed it; hence 2^34.
 
 ## 7. Rationale (non-normative)

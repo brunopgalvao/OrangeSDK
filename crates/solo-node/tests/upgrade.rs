@@ -180,7 +180,10 @@ fn a_node_switches_kernels_at_the_activation_height() {
     // The chain goes on from the same state, finalizing as before.
     let at_h = node.block_by_number(h).unwrap().unwrap();
     let after = node.block_by_number(h + 1).unwrap().unwrap();
-    assert_eq!(after.parent_hash, solo_eth::header::block_hash(&at_h, keccak256));
+    assert_eq!(
+        after.parent_hash,
+        solo_eth::header::block_hash(&at_h, keccak256)
+    );
     assert!(node.finalized.contains(&h) && node.finalized.contains(&(h + 2)));
     assert_eq!(
         node.finalized_height().unwrap(),
