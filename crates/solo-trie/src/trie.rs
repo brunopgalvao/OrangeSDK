@@ -498,6 +498,9 @@ impl Trie {
 
 #[cfg(test)]
 mod tests {
+    // The test source counts in a cell; no thread shares it.
+    #![allow(clippy::arc_with_non_send_sync)]
+
     use alloc::collections::BTreeMap;
     use core::cell::RefCell;
 
@@ -613,20 +616,20 @@ mod tests {
         assert_eq!(lazy.prove(b"absent"), built.prove(b"absent"));
         let after_proofs = *store.reads.borrow();
         assert!(after_proofs > 40, "{after_proofs}");
-        assert_eq!(lazy.path_nodes(&refs[0]).len(), 1);
-        assert!(lazy.path_nodes(&refs[0])[0].preimage.is_none());
+        assert_eq!(lazy.path_nodes(refs[0]).len(), 1);
+        assert!(lazy.path_nodes(refs[0])[0].preimage.is_none());
         // Updates resolve the nodes they pass and agree with the built trie.
         built.insert(b"new", b"1");
         lazy.insert(b"new", b"1");
         assert_eq!(lazy.root(), built.root());
         assert_eq!(lazy.len(), 41);
-        built.insert(&refs[7], b"changed");
-        lazy.insert(&refs[7], b"changed");
-        lazy.insert(&refs[7], b"changed");
+        built.insert(refs[7], b"changed");
+        lazy.insert(refs[7], b"changed");
+        lazy.insert(refs[7], b"changed");
         assert_eq!(lazy.root(), built.root());
-        assert!(built.remove(&refs[3]));
-        assert!(lazy.remove(&refs[3]));
-        assert!(!lazy.remove(&refs[3]));
+        assert!(built.remove(refs[3]));
+        assert!(lazy.remove(refs[3]));
+        assert!(!lazy.remove(refs[3]));
         assert!(!lazy.remove(b"never"));
         assert_eq!(lazy.root(), built.root());
         assert_eq!(lazy.len(), 40);
@@ -649,7 +652,7 @@ mod tests {
         }
         assert!(fork.remove(b"new"));
         let mut only_first = Trie::new();
-        only_first.insert(&refs[0], &refs[0]);
+        only_first.insert(refs[0], refs[0]);
         assert_eq!(fork.root(), only_first.root());
         assert_eq!(fork.len(), 1);
         assert_eq!(lazy.root(), built.root());
