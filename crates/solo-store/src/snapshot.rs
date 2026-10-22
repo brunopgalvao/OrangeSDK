@@ -283,8 +283,6 @@ impl Snapshot {
                 record.height, kept
             ))
         })?;
-        let (anchor_proposal, certificate, record_proof) =
-            Self::finality(store, tables, &record, epoch)?;
         let head = |prefix: &[u8]| tables.get(&height_key(prefix, record.height)).cloned();
         let head_hash = head(b"final/").ok_or_else(|| {
             SnapshotError::Export(format!(
@@ -307,6 +305,11 @@ impl Snapshot {
                 record.height
             ))
         })?;
+        // A verifier bounds the head certificate's view by the anchoring
+        // proposal's (spec 22 §7.2).
+        let head_view = Certificate::from_bytes(&head_certificate).map_or(u64::MAX, |c| c.view);
+        let (anchor_proposal, certificate, record_proof) =
+            Self::finality(store, tables, &record, epoch, head_view)?;
         Ok(Snapshot {
             header: SnapshotHeader {
                 chain_id,
@@ -326,14 +329,16 @@ impl Snapshot {
     }
 
     /// The latest certified proposal whose anchor names a height above the
-    /// record's that the store keeps the trie of, its certificate (the
-    /// threshold certificate when the tables hold one, else the votes) and
-    /// the proof of the record against the anchor root.
+    /// record's that the store keeps the trie of, in a view at or above
+    /// `head_view`, its certificate (the threshold certificate when the
+    /// tables hold one, else the votes) and the proof of the record against
+    /// the anchor root.
     fn finality(
         store: &DiskStore,
         tables: &Tables,
         record: &SnapshotRecord,
         epoch: u64,
+        head_view: u64,
     ) -> Result<Finality, SnapshotError> {
         let key = record_key(epoch);
         let finalized = tables
@@ -352,7 +357,7 @@ impl Snapshot {
             let Ok(proposal) = Proposal::from_bytes(bytes) else {
                 continue;
             };
-            if proposal.anchor_height <= record.height {
+            if proposal.anchor_height <= record.height || proposal.view < head_view {
                 continue;
             }
             let Some(trie) = store.trie_at(proposal.anchor_height) else {
@@ -498,18 +503,39 @@ impl Snapshot {
                 "the entries do not hash to the record's root",
             ));
         }
-        let head = Proposal::from_bytes(&h.head_proposal)
+        Self::verify_head(h, &proposal, chain_id, trust)
+    }
+
+    /// Checks the head block's proposal and certificate (spec 22 §7.2, 6),
+    /// which seed the importing driver: its tip, entry certificate and
+    /// view. The trust does not vouch for them, so the certificate's view
+    /// is bounded by the anchoring proposal's, which it does vouch for: a
+    /// forged head cannot move a node past the views the chain has had.
+    /// The certificate may name a descendant that finalized the head, such
+    /// as a suffix proposal (spec 08 §3a); under the genesis set its votes
+    /// must also verify.
+    fn verify_head(
+        h: &SnapshotHeader,
+        anchoring: &Proposal,
+        chain_id: u64,
+        trust: &Trust,
+    ) -> Result<(), SnapshotError> {
+        if Proposal::from_bytes(&h.head_proposal).map(|p| p.height) != Ok(h.height) {
+            return Err(SnapshotError::Verify("the head proposal is not block's"));
+        }
+        let certificate = Certificate::from_bytes(&h.head_certificate)
             .ok()
-            .filter(|p| p.height == h.height)
-            .ok_or(SnapshotError::Verify("the head proposal is not block's"))?;
-        let head_hash = keccak256(&h.head_proposal);
-        let head_certificate = Certificate::from_bytes(&h.head_certificate)
-            .ok()
-            .filter(|c| c.kind == KIND_FINALIZE && c.hash == head_hash)
+            .filter(|c| c.kind == KIND_FINALIZE && c.view <= anchoring.view)
             .ok_or(SnapshotError::Verify(
-                "the head certificate is not the head proposal's",
+                "the head certificate is not a finalize certificate at or below the anchoring proposal's view",
             ))?;
-        drop((head, head_certificate));
+        if let Trust::Genesis(set) = trust
+            && !votes_certify(&certificate, &certificate.hash, chain_id, set)
+        {
+            return Err(SnapshotError::Verify(
+                "the head certificate is not a quorum of the genesis set",
+            ));
+        }
         Ok(())
     }
 
@@ -702,25 +728,8 @@ mod tests {
             why(Snapshot::export(&s, &Tables::new(), Some(5)))
                 .contains("no snapshot record for epoch 5")
         );
-        // Nothing certified above the record.
+        // The head block's entries, missing one by one.
         let mut tables = Tables::new();
-        assert!(why(Snapshot::export(&s, &tables, None)).contains("no certified proposal"));
-        // Candidates that do not do: one at the record's height, one that
-        // anchors the record's height, one anchoring a version with no
-        // trie, one with another root, one without a certificate, one whose
-        // proposal is missing, one whose proposal does not decode.
-        finalize(&mut tables, &proposal(0, 0, [0; 32]), true);
-        finalize(&mut tables, &proposal(2, 1, root2), true);
-        finalize(&mut tables, &proposal(3, 9, root3), true);
-        finalize(&mut tables, &proposal(4, 2, [9; 32]), true);
-        finalize(&mut tables, &proposal(5, 2, root2), false);
-        tables.insert(height_key(b"final/", 6), vec![1; 32]);
-        tables.insert(height_key(b"final/", 7), vec![2; 32]);
-        tables.insert([b"prop/".as_slice(), &[2; 32]].concat(), vec![0xFF]);
-        tables.insert(b"final/short".to_vec(), vec![3; 32]);
-        assert!(why(Snapshot::export(&s, &tables, None)).contains("no certified proposal"));
-        // A good candidate, but the head block's entries missing one by one.
-        finalize(&mut tables, &proposal(8, 3, root3), true);
         assert!(why(Snapshot::export(&s, &tables, None)).contains("do not hold block 1"));
         let head = proposal(1, 0, [0; 32]);
         finalize(&mut tables, &head, true);
@@ -731,6 +740,23 @@ mod tests {
         tables.remove(&height_key(b"cert/", 1));
         assert!(why(Snapshot::export(&s, &tables, None)).contains("the certificate of block 1"));
         finalize(&mut tables, &head, true);
+        // Nothing certified above the record.
+        assert!(why(Snapshot::export(&s, &tables, None)).contains("no certified proposal"));
+        // Candidates that do not do: one that anchors the record's height,
+        // one anchoring a version with no trie, one with another root, one
+        // without a certificate, one whose proposal is missing, one whose
+        // proposal does not decode.
+        finalize(&mut tables, &proposal(2, 1, root2), true);
+        finalize(&mut tables, &proposal(3, 9, root3), true);
+        finalize(&mut tables, &proposal(4, 2, [9; 32]), true);
+        finalize(&mut tables, &proposal(5, 2, root2), false);
+        tables.insert(height_key(b"final/", 6), vec![1; 32]);
+        tables.insert(height_key(b"final/", 7), vec![2; 32]);
+        tables.insert([b"prop/".as_slice(), &[2; 32]].concat(), vec![0xFF]);
+        tables.insert(b"final/short".to_vec(), vec![3; 32]);
+        assert!(why(Snapshot::export(&s, &tables, None)).contains("no certified proposal"));
+        // A good candidate.
+        finalize(&mut tables, &proposal(8, 3, root3), true);
         tables.insert(height_key(b"bcert/", 1), vec![2; 97]);
         let snapshot = Snapshot::export(&s, &tables, None).unwrap();
         assert_eq!(
@@ -742,6 +768,16 @@ mod tests {
             (7, 0, 1)
         );
         assert_eq!(snapshot.header.head_threshold, vec![2; 97]);
+        // A later candidate in a view below the head certificate's is
+        // passed over: a verifier bounds that view by the candidate's.
+        let mut low = proposal(9, 3, root3);
+        low.view = 0;
+        finalize(&mut tables, &low, true);
+        let snapshot = Snapshot::export(&s, &tables, None).unwrap();
+        assert_eq!(
+            snapshot.header.anchor_proposal,
+            proposal(8, 3, root3).to_bytes()
+        );
         assert_eq!(
             snapshot.entries,
             vec![

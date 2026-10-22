@@ -13,24 +13,27 @@
 //!
 //! The trust: `--trust-key` names a group key of the chain's threshold key
 //! (spec 15 §6), which a threshold certificate must verify under; without
-//! it the genesis validator set is trusted, which only a chain without
-//! staking keeps, and the certificate must be that set's votes.
+//! it the genesis validator set is trusted, and the certificate must be
+//! that set's votes. Only a chain without staking keeps its genesis set for
+//! good, so a chain with staking needs `--trust-key`: validators that have
+//! since left could otherwise sign a history of their own.
 
 use std::path::Path;
 
 use solo_abi::Decode;
-use solo_abi::chain::ValidatorSet;
+use solo_abi::chain::{GenesisParams, ValidatorSet};
 use solo_abi::types::Genesis;
 use solo_node::{Node, NodeConfig, StoreConfig};
 use solo_store::{Snapshot, Trust};
 
 use crate::{arg, load_kernel, parse_genesis, parse_number};
 
-/// The trust `--trust-key` names, or the genesis set without it.
+/// The trust `--trust-key` names, or the genesis set without it on a
+/// chain without staking.
 ///
 /// # Errors
-/// A message when the key is not 96 bytes of hex or the genesis set does
-/// not decode.
+/// A message when the key is not 96 bytes of hex, when it is missing on a
+/// chain with staking, or when the genesis set does not decode.
 pub fn trust(args: &[String], genesis: &Genesis) -> Result<Trust, String> {
     match arg(args, "--trust-key") {
         Some(hex) => solo_rpc::methods::parse_hex(&hex)
@@ -38,6 +41,14 @@ pub fn trust(args: &[String], genesis: &Genesis) -> Result<Trust, String> {
             .and_then(|b| <[u8; 96]>::try_from(b).ok())
             .map(Trust::Key)
             .ok_or_else(|| "--trust-key must be 96 bytes of 0x hex".to_owned()),
+        None if GenesisParams::from_bytes(&genesis.params)
+            .is_ok_and(|p| p.staking.epoch_blocks != 0) =>
+        {
+            Err(
+                "a chain with staking needs --trust-key: its genesis set is not its set for good"
+                    .to_owned(),
+            )
+        }
         None => ValidatorSet::from_bytes(&genesis.validators)
             .map(Trust::Genesis)
             .map_err(|_| "genesis: validators do not decode".to_owned()),

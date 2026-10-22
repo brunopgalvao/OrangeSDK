@@ -11,7 +11,10 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use k256::ecdsa::SigningKey;
-use solo_abi::chain::{Allocation, GenesisParams, UpgradeParams, Validator, ValidatorSet, keys};
+use solo_abi::chain::consensus::{KIND_FINALIZE, signing_preimage};
+use solo_abi::chain::{
+    Allocation, Certificate, GenesisParams, Proposal, UpgradeParams, Validator, ValidatorSet, keys,
+};
 use solo_abi::codec::Seq;
 use solo_abi::staking::{KeySetRecord, StakingParams, ValidatorKey, keys as skeys};
 use solo_abi::types::Genesis;
@@ -243,6 +246,39 @@ fn a_snapshot_exports_verifies_round_trips_and_refuses_forgeries() {
     refused(&|s| s.entries.swap(0, 1), "not in key order");
     refused(&|s| s.header.head_proposal.clear(), "head proposal");
     refused(&|s| s.header.head_certificate.clear(), "head certificate");
+    // A head certificate from a view the anchoring proposal does not reach
+    // would move the importing node past the chain's views; under the
+    // genesis set its votes must also hold.
+    refused(
+        &|s| {
+            let mut c = Certificate::from_bytes(&s.header.head_certificate).unwrap();
+            c.view = Proposal::from_bytes(&s.header.anchor_proposal)
+                .unwrap()
+                .view
+                + 1;
+            s.header.head_certificate = c.to_bytes();
+        },
+        "at or below the anchoring proposal's view",
+    );
+    refused(
+        &|s| {
+            let mut c = Certificate::from_bytes(&s.header.head_certificate).unwrap();
+            c.votes.0[0].signature.0[0] ^= 1;
+            s.header.head_certificate = c.to_bytes();
+        },
+        "the head certificate is not a quorum of the genesis set",
+    );
+    // A head finalized by a descendant (a suffix proposal, spec 08 §3a)
+    // carries that descendant's certificate, which verifies.
+    let mut descendant = snapshot.clone();
+    let mut c = Certificate::from_bytes(&descendant.header.head_certificate).unwrap();
+    c.hash = [7; 32];
+    let digest = keccak256(&signing_preimage(KIND_FINALIZE, CHAIN_ID, c.view, &c.hash));
+    let (signature, id) = keys(1)[0].sign_prehash_recoverable(&digest).unwrap();
+    c.votes.0[0].signature.0[..64].copy_from_slice(&signature.to_bytes());
+    c.votes.0[0].signature.0[64] = id.to_byte();
+    descendant.header.head_certificate = c.to_bytes();
+    descendant.verify(CHAIN_ID, &trust).unwrap();
     // A vote certificate verifies only against the genesis set, and only a
     // threshold certificate under a key.
     let other = Trust::Genesis(validator_set(&keys(2)));
