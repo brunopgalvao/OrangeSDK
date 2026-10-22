@@ -63,6 +63,11 @@ Names follow EIP-2159 where it defines a metric (`ethereum_*`); every other name
 | `solo_gate_active` | gauge | `gate` | `1` while the feature gate is active for the next block and served by this host (13 §8.6), else `0`. One series per gate the host release supports, from the moment the node opens. |
 | `solo_build_info` | gauge | `version` | Always `1`; `version` is the node release. |
 | `solo_node_start_time_seconds` | gauge | — | Unix time at which the node opened. |
+| `solo_node_open_seconds` | gauge | — | Seconds from opening the chain store to the node being ready to serve: the restart time (22 §5). |
+| `solo_store_size_bytes` | gauge | — | Size of the chain store file on disk (22 §4). Absent on a node that keeps its state in memory, as are the three below. |
+| `solo_store_write_bytes_total` | counter | — | Bytes of keys, values and trie nodes the chain store wrote since the node opened; per block, its write amplification (22 §8). |
+| `solo_store_versions` | gauge | — | Block versions the chain store keeps the state of (20 §5.1). |
+| `solo_store_nodes` | gauge | — | Trie nodes the chain store holds over every kept root. |
 
 Label values:
 

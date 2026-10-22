@@ -9,7 +9,7 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use solo_abi::chain::{Account, BlockHeader, UpgradeParams};
 use solo_host::hash::keccak256;
@@ -28,12 +28,12 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 /// A single validator's configuration over `dir`, keeping four heights.
-fn config(dir: &PathBuf) -> NodeConfig {
+fn config(dir: &Path) -> NodeConfig {
     NodeConfig {
         key: Some(keys(1)[0].clone()),
         now_ms: 1_000,
         state_history: 4,
-        store: StoreConfig::Disk(dir.clone()),
+        store: StoreConfig::Disk(dir.to_path_buf()),
         ..NodeConfig::default()
     }
 }
@@ -68,12 +68,7 @@ fn answers(node: &mut Node, bob: &[u8; 20]) -> Answers {
 }
 
 /// The node reopened over the same directory with the driver data it had.
-fn reopen(
-    dir: &PathBuf,
-    kernel: &[u8],
-    persisted: BTreeMap<Vec<u8>, Vec<u8>>,
-    now_ms: u64,
-) -> Node {
+fn reopen(dir: &Path, kernel: &[u8], persisted: BTreeMap<Vec<u8>, Vec<u8>>, now_ms: u64) -> Node {
     let config = NodeConfig {
         persisted,
         now_ms,

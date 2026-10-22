@@ -253,6 +253,7 @@ impl Node {
         genesis: &Genesis,
         config: NodeConfig,
     ) -> Result<Node, NodeError> {
+        let opening = std::time::Instant::now();
         let services = Rc::new(RefCell::new(NodeServices {
             now_ms: config.now_ms,
             key: config.key,
@@ -304,6 +305,7 @@ impl Node {
             node.resume()?;
         }
         node.kernel_gas = config.kernel_gas;
+        node.telemetry.opened_in(opening.elapsed().as_secs_f64());
         Ok(node)
     }
 
@@ -312,20 +314,21 @@ impl Node {
     /// holds, spec 13 §6), the gates active for the next block, a pending
     /// upgrade prepared again, and the head as finalized.
     fn resume(&mut self) -> Result<(), NodeError> {
+        let stored = self.exec.state().base().kernel();
+        self.take_up(stored)
+    }
+
+    /// Takes the node up at the store's head with `kernel`, the kernel that
+    /// wrote it, if the store names one other than the module loaded.
+    fn take_up(&mut self, kernel: Option<[u8; 32]>) -> Result<(), NodeError> {
         let head = self.exec.state().base().head();
         self.opened_at = head;
-        // The genesis kernel's view of the upgrade state serves to find the
-        // kernel that wrote the store and the gates it imports.
+        // The loaded kernel's view of the upgrade state serves to find the
+        // gates the kernel that wrote the store imports.
         let status = self.upgrade_status().unwrap_or_default();
         let gates = status.gates.active_at(head + 1) & self.upgrades.features;
         self.upgrades.active.set(gates);
-        if let Some(stored) = self
-            .exec
-            .state()
-            .base()
-            .kernel()
-            .filter(|k| *k != self.kernel)
-        {
+        if let Some(stored) = kernel.filter(|k| *k != self.kernel) {
             // A kernel that cannot serve the query, like code that does not
             // hash to the stored kernel, leaves nothing to compile.
             let code = self
@@ -339,9 +342,67 @@ impl Node {
                 ))
             })?;
             self.kernel = stored;
+            self.exec.state_mut().base_mut().set_kernel(stored);
         }
         self.after_executed(head)?;
         Ok(())
+    }
+
+    /// Loads a verified snapshot (spec 22 §7) into a node opened fresh over
+    /// a disk store, before it starts: the state becomes the snapshot's, the
+    /// kernel the one the chain had enacted by then, and the driver finds
+    /// the finalized head in the block log when it starts and syncs forward
+    /// from there. The caller verifies the snapshot first.
+    ///
+    /// # Errors
+    /// [`NodeError::Store`] unless the node holds the genesis alone on disk;
+    /// [`NodeError::Upgrade`] when the enacted kernel's code is not in the
+    /// snapshot's state.
+    pub fn import_snapshot(&mut self, snapshot: &solo_store::Snapshot) -> Result<(), NodeError> {
+        let state = self.exec.state_mut().base_mut();
+        let ChainState::Disk(store) = state else {
+            return Err(NodeError::Store(
+                "a snapshot loads into a chain store on disk".to_owned(),
+            ));
+        };
+        snapshot
+            .import(store)
+            .map_err(|e| NodeError::Store(e.to_string()))?;
+        // The kernel the chain ran at the snapshot: the latest enacted
+        // upgrade's, if any, whose code is in the state just loaded.
+        let status = self.upgrade_status().unwrap_or_default();
+        let enacted = status.enacted.map(|e| e.code_hash);
+        self.take_up(enacted)?;
+        self.exec.state_mut().base_mut().flush()?;
+        Ok(())
+    }
+
+    /// Exports the snapshot of `epoch` (the latest, for `None`) from this
+    /// node's chain store and driver tables (spec 22 §6).
+    ///
+    /// # Errors
+    /// [`NodeError::Store`] when the state is not on disk, and
+    /// [`solo_store::SnapshotError`]'s reasons as a store error otherwise.
+    pub fn export_snapshot(&self, epoch: Option<u64>) -> Result<solo_store::Snapshot, NodeError> {
+        let store = self.chain_store().ok_or_else(|| {
+            NodeError::Store("a snapshot exports from a chain store on disk".to_owned())
+        })?;
+        let tables = self.persisted();
+        solo_store::Snapshot::export(store, &tables, epoch)
+            .map_err(|e| NodeError::Store(e.to_string()))
+    }
+
+    /// The snapshot record of `epoch`, or of the latest completed epoch for
+    /// `None` (spec 22 §6); `None` before the chain recorded one.
+    ///
+    /// # Errors
+    /// See [`NodeError`].
+    pub fn snapshot_record(
+        &mut self,
+        epoch: Option<u64>,
+    ) -> Result<Option<solo_abi::chain::SnapshotRecord>, NodeError> {
+        let params = epoch.map(|e| e.to_bytes()).unwrap_or_default();
+        self.query_decoded(solo_abi::chain::query::SNAPSHOT, &params)
     }
 
     /// Runs the kernel, and every module it invokes, on `backend` from the

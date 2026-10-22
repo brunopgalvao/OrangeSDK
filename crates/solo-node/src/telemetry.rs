@@ -96,6 +96,14 @@ impl Node {
         let (count, bytes) = (self.mempool().len(), self.mempool().bytes());
         let timers = self.timers().len();
         self.telemetry.refresh(count, bytes, timers);
+        if let Some(stats) = self.exec.state().base().stats() {
+            self.telemetry.store(
+                stats.size_bytes,
+                stats.write_bytes,
+                stats.versions,
+                stats.nodes,
+            );
+        }
         let upgrades = &self.upgrades;
         self.telemetry
             .upgrade(upgrades.alert.is_some(), upgrades.missing_gates());

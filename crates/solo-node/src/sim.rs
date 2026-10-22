@@ -187,6 +187,42 @@ impl Sim {
         self.restart(index, kernel, genesis, false)
     }
 
+    /// Replaces node `index` by one that starts from `snapshot` (spec 22 §7)
+    /// in a fresh disk store at `dir`, with the same key and nothing else
+    /// of what the old node had: a validator reinstalled from a snapshot.
+    ///
+    /// # Errors
+    /// Whatever opening, importing into or starting the node reports.
+    pub fn revive_from_snapshot(
+        &mut self,
+        index: usize,
+        kernel: &[u8],
+        genesis: &Genesis,
+        snapshot: &solo_store::Snapshot,
+        dir: std::path::PathBuf,
+    ) -> Result<(), NodeError> {
+        let old = &self.nodes[index];
+        let config = NodeConfig {
+            now_ms: self.now_ms,
+            key: old.services_key(),
+            kernel_gas: old.kernel_gas,
+            query_gas: old.query_gas,
+            state_history: old.state_history,
+            history_keys_per_block: old.history_keys_per_block,
+            store: StoreConfig::Disk(dir.clone()),
+            ..NodeConfig::default()
+        };
+        self.stores[index] = StoreConfig::Disk(dir);
+        self.nodes[index].release_store();
+        let mut node = Node::open(kernel, genesis, config)?;
+        node.import_snapshot(snapshot)?;
+        node.start(None)?;
+        self.nodes[index] = node;
+        self.alive[index] = true;
+        self.collect();
+        Ok(())
+    }
+
     fn restart(
         &mut self,
         index: usize,

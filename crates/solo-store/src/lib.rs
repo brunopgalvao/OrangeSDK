@@ -20,5 +20,7 @@
 #![forbid(unsafe_code)]
 
 pub mod disk;
+pub mod snapshot;
 
 pub use disk::{CHAIN_FILE, DiskStore, Entries, Fault, StoreError, StoreStats};
+pub use snapshot::{Snapshot, SnapshotError, SnapshotHeader, Trust};
