@@ -71,7 +71,7 @@ The EVM charges the sender `gas_used · p`, credits the block beneficiary `gas_u
 - the **priority fee** reaches the **fee vault**, `0x0000000000000000000000000000000000004645` (`FEE_VAULT`), the beneficiary of every block on a chain with staking (15 §2: `epoch_blocks > 0`); it is `COINBASE`, and what a contract sends `block.coinbase` lands there too. At the end of the block, after the module hooks (16 §7) and the governance bookkeeping (13 §9.3) and before the staking bookkeeping (15 §4, §10), the kernel moves the vault's whole balance to the staking address and adds it to the reward pool, `stake/pool`, and deletes the vault's account, which holds nothing else. Every wei the vault received in a block is in the pool when the block ends, so the pool's growth over an epoch is exactly the priority fees, and coinbase transfers, of its blocks. On a chain without staking the beneficiary is the zero address, where fees went before this document, and no sweep runs;
 - the **surcharges** the kernel adds to a transaction's gas (`REPORT_GAS`, 15 §3.4; `GOVERNANCE_GAS`, 13 §9.9) are charged as the EVM charges gas: the sender pays `surcharge · p`, the beneficiary gets `surcharge · (p − base_fee)`, and the base part is burned or, with a treasury, credited with the rest of the transaction's base fee, since the treasury's credit counts the transaction's whole `gas_used`, surcharge included.
 
-So for every transaction that ran: `sender paid = treasury or burn + beneficiary`, exactly, and the supply shrinks by exactly the burned base fee. Within a block the staking address's balance is the bonded and unbonding stake plus the pool (15 §10.2); the vault's balance is what the block's transactions have paid so far.
+So for every transaction that ran: `sender paid = treasury or burn + beneficiary`, exactly, and the supply shrinks by exactly the burned base fee. Within a block the staking address's balance is at least the bonded and unbonding stake plus the pool (15 §10.2); a `treasury` set to the staking address adds to its balance and not to the pool, so that base fee is locked there, and governance names another account; the vault's balance is what the block's transactions have paid so far.
 
 ## 5. Governance
 
@@ -122,6 +122,7 @@ The reference host's take leaves out a sender whose next pending transaction's f
 ## 10. Limits of this version
 
 - The block gas limit is fixed (`BLOCK_GAS_LIMIT`); only the base fee moves.
+- `min_base_fee` has no upper bound: governance transactions pay the base fee like any other, so a floor set higher than the governance account can pay for leaves the chain without the transaction that would lower it. Governance checks a new floor against its own balance before it sets one.
 - A proposal is not run before it is made (20 §7): a transaction priced exactly at the base fee of the block the take was made for can land in a later block whose base fee rose past it, and is then recorded as failed instead of left out as a geth builder would.
 - The tip oracle reads receipts block by block on the thread that drives consensus; a node with many transactions per block pays for the first `eth_gasPrice` after each head.
 - The genesis block has no header (20 §7), so its base fee is the floor the RPC fills in, not a value any hash commits to.
