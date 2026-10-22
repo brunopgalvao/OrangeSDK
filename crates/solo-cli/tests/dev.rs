@@ -19,9 +19,10 @@ const HELLO: &str = concat!(
 );
 
 /// A kernel gas budget that lets the driver start (78 190) but not produce a block
-/// (287 342) with the pinned kernel fixture, bisected on 2026-10-22 after the block
-/// log and the snapshot record of spec 22 landed in the kernel; rebuilding the
-/// fixture may move both numbers.
+/// (273 830) with the pinned kernel fixture, bisected on 2026-10-22 in-process (the
+/// dev key, this genesis, 40 slots of 60 ms) after the block log and the snapshot
+/// record of spec 22 landed in the kernel; rebuilding the fixture may move both
+/// numbers.
 const STARVED_GAS: &str = "80000";
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4,
