@@ -986,6 +986,14 @@ impl Ctx {
             {
                 self.set_tip(&certificate, &p);
                 persist::set(ENTRY_KEY, &certificate);
+                // Views only increase: a node behind the certificate's view
+                // enters the one after it, as the certificate would have moved
+                // it (§5a); a tip from a higher view would otherwise never move.
+                if self.s.view <= certificate.view {
+                    self.s.view = certificate.view + 1;
+                    self.s.voted = false;
+                    self.s.timed_out = false;
+                }
             }
         }
     }

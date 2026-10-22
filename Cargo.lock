@@ -2935,6 +2935,7 @@ dependencies = [
  "solo-recompile",
  "solo-rlp",
  "solo-rpc",
+ "solo-store",
  "solo-upgrade",
 ]
 
