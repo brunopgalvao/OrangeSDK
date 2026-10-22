@@ -232,7 +232,7 @@ fn a_snapshot_exports_verifies_round_trips_and_refuses_forgeries() {
     );
     refused(
         &|s| s.header.certificate = vec![2; 97],
-        "needs a trusted group key",
+        "is not the anchoring proposal's",
     );
     refused(&|s| s.header.record_proof.clear(), "proof does not decode");
     refused(&|s| s.header.state_root[0] ^= 1, "proof does not verify");
@@ -293,6 +293,7 @@ fn a_fresh_node_imports_a_snapshot_serves_it_and_syncs_forward() {
     let snapshot = node.export_snapshot(None).unwrap();
     let height = snapshot.header.height;
     let head_hash = node.block_by_number(height).unwrap().unwrap();
+    let now = node.now_ms();
     drop(node);
     // Importing needs a store on disk holding the genesis alone.
     let mut memory = Node::new(v1(), &genesis, 0).unwrap();
@@ -303,7 +304,7 @@ fn a_fresh_node_imports_a_snapshot_serves_it_and_syncs_forward() {
     let target = scratch("import-target");
     let config = NodeConfig {
         key: Some(keys(1)[0].clone()),
-        now_ms: 1_000,
+        now_ms: now,
         store: StoreConfig::Disk(target.clone()),
         ..NodeConfig::default()
     };
@@ -341,11 +342,24 @@ fn a_fresh_node_imports_a_snapshot_serves_it_and_syncs_forward() {
     // and, alone as it is the only validator, goes on producing blocks whose
     // proofs it serves.
     fresh.start(None).unwrap();
+    // Alone as it is the only validator, it may already have proposed the
+    // next block in the step that started it.
     let state = fresh.simplex_state().unwrap();
-    assert_eq!((state.finalized_height, state.tip_height), (height, height));
-    include(&mut fresh, &alice().tx(10, bob.address, ETHER, 21_000, &[]));
+    assert!(state.finalized_height >= height && state.tip_height >= height);
+    // Alice's nonce at the snapshot is its height: one transfer per block.
+    include(
+        &mut fresh,
+        &alice().tx(height, bob.address, ETHER, 21_000, &[]),
+    );
+    let next = fresh.block_number().unwrap();
+    assert!(next > height);
+    // And the block after that: the tip moved to the block it proposed.
+    include(
+        &mut fresh,
+        &alice().tx(height + 1, bob.address, ETHER, 21_000, &[]),
+    );
     let later = fresh.block_number().unwrap();
-    assert!(later > height);
+    assert!(later > next);
     assert!(fresh.state_proof_at(later, b"meta/chain_id").is_some());
     assert_eq!(
         fresh

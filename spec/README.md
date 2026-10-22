@@ -27,6 +27,7 @@ This directory is normative. An implementation that disagrees with it is wrong; 
 | 19 | [Precompiles and kernel gas](19-precompiles.md) — kernel gas per EVM gas of every precompile and ordinary operation, the bound, the precompile host functions behind gate 2 and the module that reaches them, `KECCAK256` and `BLOCKHASH`, the per-block budget before the gate, the kernel gas of a block | draft |
 | 20 | [Ethereum surface](20-ethereum-surface.md) — the transaction types accepted (EIP-7702 set-code transactions, not blob ones), Ethereum block headers whose hash is the block hash, Merkle-Patricia transactions and receipts roots, `eth_getProof` with spec 10 proofs, historical state within a retention window | draft |
 | 21 | [Canonical token bridge](21-token-bridge.md) — the token gateways on Ethereum and on Solo over the message channels of 17 and 18, native and wrapped tokens, the wrapped token's `CREATE2` address, deposits, mints, burns and releases, owed releases, caps, pause, refused tokens, the value invariant | draft |
+| 22 | [Storage and snapshots](22-storage-and-snapshots.md) — the chain store on disk (flat state, reference-counted trie nodes per kept root, history, block log) written atomically per block, the restart that executes nothing again, the kernel's snapshot record per epoch, the snapshot file, its verification against a finality certificate and the join from it, bounds and telemetry | draft |
 
 ## Conventions
 

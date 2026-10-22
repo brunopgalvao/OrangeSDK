@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 solo-abi = { path = "../solo-abi" }
 solo-node = { path = "../solo-node" }
+solo-store = { path = "../solo-store" }
 solo-host = { path = "../solo-host" }
 solo-recompile = { path = "../solo-recompile" }
 solo-rpc = { path = "../solo-rpc" }

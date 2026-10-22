@@ -67,7 +67,17 @@ solo node --kernel kernel.elf --genesis genesis.json --key <seed 1> --data-dir n
 solo node --kernel kernel.elf --genesis genesis.json --key <seed 2> --data-dir node-2 --listen 127.0.0.1:30302 --rpc 127.0.0.1:8546 --peer 127.0.0.1:30301
 ```
 
-A node without `--key` follows the chain as an observer. A validator keeps its driver state in `--data-dir` (`driver.state`, the latest persisted state, and `persist.log`, a journal of the driver's node-local writes), written before anything it signs leaves the node, so a restarted validator resumes the view it left and never votes twice in one view (spec 08 §7). Chain state is not kept: a restarted node re-executes the blocks it had finalized from the proposals in its data directory, and a node that falls behind syncs the finalized blocks it misses from its peers.
+A node without `--key` follows the chain as an observer. A node keeps two stores in `--data-dir`: its driver state (`driver.state`, the latest persisted state, and `persist.log`, a journal of the driver's node-local writes), written before anything it signs leaves the node, so a restarted validator resumes the view it left and never votes twice in one view (spec 08 §7); and its chain state (`chain.redb`: the state, the trie behind every kept header root, the history window and a block log, one transaction per block), so a restarted node opens at the block it had executed in constant time, keeps its history and proofs, and executes nothing again (spec 22). A node that falls behind syncs the finalized blocks it misses from its peers. Without `--data-dir` (`solo dev`) the state stays in memory.
+
+The kernel records a snapshot of the state at the end of every epoch, and a certificate for any later block vouches for it. A stopped node exports one, anyone verifies it, and a new node starts from it instead of syncing from genesis:
+
+```sh
+solo snapshot export --data-dir node-1 --out epoch.snap
+solo snapshot verify --snapshot epoch.snap --genesis genesis.json --trust-key 0x<the chain's group key>
+solo node --kernel kernel.elf --genesis genesis.json --key <seed 3> --data-dir node-3 --snapshot epoch.snap --trust-key 0x<group key> --peer 127.0.0.1:30301
+```
+
+`--trust-key` is the group key of the chain's threshold key, as a node you trust or the light client on Ethereum holds it; a chain without staking verifies against its genesis validators instead.
 
 Watch it: every node serves Prometheus metrics at `GET /metrics` and a JSON status at `GET /status` on its JSON-RPC address (spec 11), and `solo doctor` turns both into a verdict, exiting non-zero when the node is unhealthy. `ops/` has the alert rules, a Prometheus configuration and a Grafana dashboard:
 
@@ -123,7 +133,7 @@ cargo test --release -p solo-jit --test bench --test guests -- --ignored --nocap
 
 ## Layout
 
-- `spec/` — normative specification (machine model, instruction set, module format, gas, host ABI, driver interface, conformance, consensus, transport, state commitment, telemetry, threshold certificates, kernel upgrades and feature gates, mempool, staking, kernel modules and native contracts, the bridge to Ethereum, the bridge from Ethereum, precompiles and kernel gas, the Ethereum surface, the token bridge).
+- `spec/` — normative specification (machine model, instruction set, module format, gas, host ABI, driver interface, conformance, consensus, transport, state commitment, telemetry, threshold certificates, kernel upgrades and feature gates, mempool, staking, kernel modules and native contracts, the bridge to Ethereum, the bridge from Ethereum, precompiles and kernel gas, the Ethereum surface, the token bridge, storage and snapshots).
 - `crates/solo-vm` — reference interpreter, `no_std`-capable, the oracle for every other backend.
 - `crates/solo-jit` — the native backend: compiles a program ahead of time to AArch64 (Apple silicon) or x86-64 (Unix) machine code and runs it with the interpreter's interface and results.
 - `crates/solo-recompile` — turns a linked RV64 ELF into a Solo module.
@@ -131,13 +141,14 @@ cargo test --release -p solo-jit --test bench --test guests -- --ignored --nocap
 - `crates/solo-abi` — the canonical codec and the types shared by host and kernel (spec 06 and the reference chain records).
 - `crates/solo-rlp` — Ethereum RLP.
 - `crates/solo-eth` — Ethereum transactions (every type the kernel accepts, EIP-7702 included), intrinsic gas, the Ethereum block header and receipt encodings, logs blooms and Merkle-Patricia roots (spec 20), `no_std`.
-- `crates/solo-trie` — the binary Merkle trie of the state commitment (spec 10), with inclusion and exclusion proofs, `no_std`.
+- `crates/solo-trie` — the binary Merkle trie of the state commitment (spec 10), with inclusion and exclusion proofs and nodes loaded on demand from a store, `no_std`.
+- `crates/solo-store` — the chain store on disk (spec 22): one `redb` file per node holding the flat state, reference-counted trie nodes per kept root, the history window and the version log, sealed in one transaction per block; and the committee-signed snapshot file with its export, verification and import.
 - `crates/solo-bls` — threshold BLS over BLS12-381: the DKG and resharing, finality certificates and their Ethereum verification inputs (spec 12), `no_std`.
 - `crates/solo-upgrade` — kernel upgrades and feature gates (spec 13): the upgrade-address actions, their records, the gate state machine.
 - `crates/solo-node` — the node host: privileged functions (including `sign`), the driver loop, the mempool of spec 14 (per-sender nonce queues, replacement, limits), queries, the kernel switchover and gated host functions of spec 13, telemetry, the threshold keystore behind `sign` key role 2 (spec 15 §6.4), the TCP transport, and `Sim`, an in-process network of nodes with a virtual clock.
 - `crates/solo-rpc` — Ethereum JSON-RPC over a node, including `txpool_status` and `txpool_content`, the bridge relayer's `solo_getFinalityProof`, `solo_getOutboxProof` and `solo_getRotation`, governance's `solo_getGovernance`, `solo_getProposals` and `solo_getProposal`, and `solo_upgradeStatus`, with a minimal HTTP server.
 - `crates/solo-bridge` — the relayer library of the bridge to Ethereum (spec 17): light-client submissions from threshold certificates, outbox proofs, and the calldata of every call to the contracts; and the token bridge's messages, wrapped-token addresses, calls and constructor arguments (spec 21, `solo_bridge::tokens`).
-- `crates/solo-cli` — the `solo` command (`solo dev`, `solo node`, `solo key`, `solo gov`, `solo doctor`, `solo upgrade`, `solo devnet`).
+- `crates/solo-cli` — the `solo` command (`solo dev`, `solo node`, `solo key`, `solo gov`, `solo doctor`, `solo upgrade`, `solo snapshot`, `solo devnet`).
 - `crates/solo-metrics` — telemetry: a metrics registry with Prometheus text exposition, the node's metric schema, and the health rules `solo doctor` applies.
 - `crates/solo-ethlc` — the Ethereum-to-Solo bridge (spec 18): SSZ, the Altair light-client sync protocol at the Electra format, Merkle-Patricia proofs, the light-client and message-verifier logic and the admission checks, `no_std`; with `testing`, a synthetic beacon chain, an Ethereum state with `eth_getProof` proofs and an EVM.
 - `crates/solo-conformance` — Ethereum execution-spec state tests through the whole pipeline: the kernel's EVM code recompiled to a module, on the interpreter and the native backend, compared by Ethereum state root and logs hash (spec 07 §4.2), with feature gate 2 inactive and active (`--gated`, spec 19).
