@@ -40,6 +40,14 @@ pub enum ChainState {
     Disk(Box<DiskStore>),
 }
 
+/// In memory: what the simulator, `solo dev` without a data directory and
+/// the host-function tests run over.
+impl Default for ChainState {
+    fn default() -> ChainState {
+        ChainState::Memory(Box::default())
+    }
+}
+
 /// A store error, as the node reports it; by value, as `map_err` takes it.
 #[allow(clippy::needless_pass_by_value)]
 fn store_error(e: StoreError) -> crate::NodeError {

@@ -23,7 +23,8 @@ use solo_abi::types::{Genesis, ModuleInstall};
 use solo_abi::{Decode, Encode};
 use solo_host::code::code_key;
 use solo_host::hash::keccak256;
-use solo_host::{Executor, Flags, MemStorage, ModuleCache};
+use solo_host::{Executor, Flags, ModuleCache};
+use solo_node::ChainState;
 use solo_node::{Node, NodeConfig, NodeError, Sim, SubmitError};
 use solo_upgrade::Action;
 use solo_vm::builder::ModuleBuilder;
@@ -744,7 +745,7 @@ fn failing_hooks_change_nothing_and_blocks_go_on() {
 /// The VM gas the module uses for `call`, run directly on a host executor
 /// over the same storage.
 fn module_vm_gas(call: &ModuleCall, storage: &[(Vec<u8>, Vec<u8>)]) -> u64 {
-    let mut exec = Executor::new(ModuleCache::default(), MemStorage::default());
+    let mut exec = Executor::new(ModuleCache::default(), ChainState::default());
     for (k, v) in storage {
         exec.state_mut().set(k, v);
     }

@@ -3,7 +3,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use solo_host::{Executor, Flags, MemStorage, ModuleCache, Overlay};
+use solo_host::{Executor, Flags, ModuleCache, Overlay};
+use solo_node::ChainState;
 use solo_node::extension::commitment;
 use solo_node::{NodeExtension, NodeServices};
 use solo_trie::{Proof, Trie, keccak256};
@@ -51,17 +52,17 @@ fn module(name: &str, body: &[Instruction], rodata: &[u8]) -> Vec<u8> {
     b.export("main", 0).build()
 }
 
-fn setup() -> (Executor<MemStorage>, Rc<RefCell<NodeServices>>) {
+fn setup() -> (Executor<ChainState>, Rc<RefCell<NodeServices>>) {
     let services = Rc::new(RefCell::new(NodeServices {
         now_ms: 42,
         ..NodeServices::default()
     }));
-    let mut exec = Executor::new(ModuleCache::default(), MemStorage::default());
+    let mut exec = Executor::new(ModuleCache::default(), ChainState::default());
     exec.set_extension(Box::new(NodeExtension::new(Rc::clone(&services))));
     (exec, services)
 }
 
-fn run(exec: &mut Executor<MemStorage>, bytes: &[u8]) -> (Termination, u64, u64) {
+fn run(exec: &mut Executor<ChainState>, bytes: &[u8]) -> (Termination, u64, u64) {
     let hash = exec
         .load(bytes, Capability::Privileged)
         .expect("privileged imports resolve");
@@ -385,7 +386,7 @@ fn storage_commit_is_deterministic_and_order_independent() {
         )
         .output;
     assert_ne!(root1, empty);
-    let mut other = Overlay::new(MemStorage::default());
+    let mut other = Overlay::new(ChainState::default());
     other.set(b"a", b"1");
     other.set(b"b", b"2");
     assert_eq!(root1, commitment(&mut other).to_vec());
@@ -478,7 +479,7 @@ fn proof_module(key_ptr: i64, key_len: i64, cap: i64) -> Vec<u8> {
 
 /// Runs a proof module: (status, root, returned length, proof bytes written).
 fn prove(
-    exec: &mut Executor<MemStorage>,
+    exec: &mut Executor<ChainState>,
     key_ptr: i64,
     key_len: i64,
     cap: i64,
@@ -602,7 +603,7 @@ fn storage_proof_proves_against_the_commitment() {
 /// Calls `storage_proof` directly with `gas`: the key "key" from rodata into
 /// a buffer of `cap` bytes. Returns the result and the gas left.
 fn proof_call(
-    exec: &mut Executor<MemStorage>,
+    exec: &mut Executor<ChainState>,
     cap: u64,
     gas: i64,
 ) -> (Result<(), Termination>, i64, u64) {

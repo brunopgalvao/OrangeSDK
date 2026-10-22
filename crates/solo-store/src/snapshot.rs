@@ -830,6 +830,7 @@ mod tests {
         for e in [
             SnapshotError::Io("x".into()),
             SnapshotError::Format("y"),
+            SnapshotError::Verify("v"),
             SnapshotError::Store("z".into()),
             SnapshotError::Export("w".into()),
         ] {
@@ -879,5 +880,42 @@ mod tests {
         c.votes.0.push(c.votes.0[0].clone());
         assert!(!votes_certify(&c, &hash, 7, &set));
         assert!(signer(&[0; 32], &[0; 65]).is_none());
+        // Signed votes: two of three equal weights are no quorum, three are;
+        // a validator named twice or a vote signed by another key is refused.
+        let keys: Vec<k256::ecdsa::SigningKey> = (1..=3u8)
+            .map(|i| k256::ecdsa::SigningKey::from_slice(&[i; 32]).unwrap())
+            .collect();
+        let id = |k: &k256::ecdsa::SigningKey| {
+            keccak256(&k.verifying_key().to_encoded_point(false).as_bytes()[1..])
+        };
+        let set = ValidatorSet {
+            validators: Seq(keys
+                .iter()
+                .map(|k| solo_abi::chain::Validator {
+                    id: id(k),
+                    weight: 1,
+                })
+                .collect()),
+        };
+        let digest = keccak256(&signing_preimage(KIND_FINALIZE, 7, 1, &hash));
+        let vote = |i: u32, k: &k256::ecdsa::SigningKey| {
+            let (sig, rid) = k.sign_prehash_recoverable(&digest).unwrap();
+            let mut bytes = [0u8; 65];
+            bytes[..64].copy_from_slice(&sig.to_bytes());
+            bytes[64] = rid.to_byte();
+            SignedVote {
+                validator: i,
+                signature: Signature(bytes),
+            }
+        };
+        let mut c = certificate(hash);
+        c.votes = Seq(vec![vote(0, &keys[0]), vote(1, &keys[1])]);
+        assert!(!votes_certify(&c, &hash, 7, &set));
+        c.votes.0.push(vote(2, &keys[2]));
+        assert!(votes_certify(&c, &hash, 7, &set));
+        c.votes.0[2] = vote(1, &keys[1]);
+        assert!(!votes_certify(&c, &hash, 7, &set));
+        c.votes.0[2] = vote(2, &keys[0]);
+        assert!(!votes_certify(&c, &hash, 7, &set));
     }
 }

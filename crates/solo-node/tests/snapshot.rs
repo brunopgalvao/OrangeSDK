@@ -236,6 +236,22 @@ fn a_snapshot_exports_verifies_round_trips_and_refuses_forgeries() {
         "not a quorum of the genesis set",
     );
     refused(
+        &|s| {
+            let mut c = Certificate::from_bytes(&s.header.certificate).unwrap();
+            c.kind = 1;
+            s.header.certificate = c.to_bytes();
+        },
+        "not a quorum of the genesis set",
+    );
+    refused(
+        &|s| {
+            let mut c = Certificate::from_bytes(&s.header.certificate).unwrap();
+            c.votes.0[0].validator = 5;
+            s.header.certificate = c.to_bytes();
+        },
+        "not a quorum of the genesis set",
+    );
+    refused(
         &|s| s.header.certificate.clear(),
         "certificate does not decode",
     );
@@ -300,11 +316,21 @@ fn a_snapshot_exports_verifies_round_trips_and_refuses_forgeries() {
             "a vote certificate needs the genesis validator set, and only a chain without staking keeps it"
         ))
     );
-    assert!(
-        SnapshotError::Verify("x")
-            .to_string()
-            .starts_with("snapshot does not verify")
-    );
+    for (e, text) in [
+        (SnapshotError::Io("a".into()), "snapshot file: a"),
+        (
+            SnapshotError::Format("b"),
+            "snapshot: not a snapshot file: b",
+        ),
+        (SnapshotError::Verify("c"), "snapshot does not verify: c"),
+        (SnapshotError::Store("d".into()), "snapshot: d"),
+        (
+            SnapshotError::Export("e".into()),
+            "snapshot: cannot export: e",
+        ),
+    ] {
+        assert_eq!(e.to_string(), text);
+    }
     drop(node);
     // Exports need the driver's tables and the store's history: a node
     // whose window no longer reaches the height has nothing to export.
