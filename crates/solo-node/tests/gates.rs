@@ -426,13 +426,14 @@ fn a_validator_signals_and_its_gate_activates_an_epoch_after_locking_in() {
 #[test]
 fn a_signal_is_a_legacy_transaction_to_the_upgrade_address() {
     let key = SigningKey::from_slice(&[0x11; 32]).unwrap();
-    let raw = signal_tx(&key, 1337, 4, 0b101);
-    let again = signal_tx(&key, 1337, 4, 0b101);
+    let raw = signal_tx(&key, 1337, 4, 0b101, 0);
+    let again = signal_tx(&key, 1337, 4, 0b101, 0);
     assert_eq!(
         raw, again,
         "deterministic signatures make resubmission idempotent"
     );
-    assert_ne!(raw, signal_tx(&key, 1337, 5, 0b101));
+    assert_ne!(raw, signal_tx(&key, 1337, 5, 0b101, 0));
+    assert_ne!(raw, signal_tx(&key, 1337, 4, 0b101, 1));
     let data = Action::Signal { features: 0b101 }.encode();
     assert!(raw.windows(data.len()).any(|w| w == data.as_slice()));
     assert!(raw.windows(20).any(|w| w == solo_upgrade::UPGRADE_ADDRESS));

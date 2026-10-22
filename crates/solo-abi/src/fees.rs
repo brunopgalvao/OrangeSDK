@@ -113,10 +113,9 @@ impl FeeParams {
     /// elasticity; the whole limit while the market is off.
     #[must_use]
     pub const fn gas_target(&self, gas_limit: u64) -> u64 {
-        if self.elasticity == 0 {
-            gas_limit
-        } else {
-            gas_limit / self.elasticity
+        match gas_limit.checked_div(self.elasticity) {
+            Some(target) => target,
+            None => gas_limit,
         }
     }
 

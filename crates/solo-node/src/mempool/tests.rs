@@ -299,13 +299,13 @@ fn take_orders_by_nonce_within_and_priority_across_senders() {
     for t in &txs {
         add(&mut pool, t).unwrap();
     }
-    let all = pool.take(usize::MAX, u64::MAX, &[]);
+    let all = pool.take(usize::MAX, u64::MAX, &[], 0);
     // Sender 3 is queued; 2 and 4 tie and go in arrival order; 1's second
     // transaction, the dearest, waits for its first, the cheapest.
     assert_eq!(nonces(&pool, &all), [(2, 0), (4, 0), (1, 0), (1, 1)]);
     assert_eq!(pool.len(), 5, "taking keeps them");
     // Gas: two transactions' worth.
-    let two = pool.take(usize::MAX, 2 * GAS, &[]);
+    let two = pool.take(usize::MAX, 2 * GAS, &[], 0);
     assert_eq!(nonces(&pool, &two), [(2, 0), (4, 0)]);
     // Bytes: a sender whose next transaction does not fit drops out, the
     // others continue.
@@ -315,10 +315,10 @@ fn take_orders_by_nonce_within_and_priority_across_senders() {
     add(&mut pool, &tx(2, 0, 1)).unwrap();
     add(&mut pool, &tx(2, 1, 1)).unwrap();
     assert_eq!(
-        nonces(&pool, &pool.take(2 * len, u64::MAX, &[])),
+        nonces(&pool, &pool.take(2 * len, u64::MAX, &[], 0)),
         [(2, 0), (2, 1)]
     );
-    assert!(pool.take(0, u64::MAX, &[]).is_empty());
+    assert!(pool.take(0, u64::MAX, &[], 0).is_empty());
 }
 
 #[test]
@@ -330,7 +330,7 @@ fn take_stops_a_sender_its_balance_cannot_cover() {
     pool.insert(tx(1, 1, 10), rich(0)).unwrap();
     pool.insert(tx(2, 0, 1), rich(0)).unwrap();
     assert_eq!(
-        nonces(&pool, &pool.take(usize::MAX, u64::MAX, &[])),
+        nonces(&pool, &pool.take(usize::MAX, u64::MAX, &[], 0)),
         [(1, 0), (2, 0)]
     );
 }
@@ -343,13 +343,13 @@ fn take_skips_what_an_unexecuted_block_carries() {
         add(&mut pool, t).unwrap();
     }
     // One transaction's budget: without the skip it goes to a0 again.
-    assert_eq!(nonces(&pool, &pool.take(usize::MAX, GAS, &[])), [(1, 0)]);
+    assert_eq!(nonces(&pool, &pool.take(usize::MAX, GAS, &[], 0)), [(1, 0)]);
     assert_eq!(
-        nonces(&pool, &pool.take(usize::MAX, GAS, &[a0.hash])),
+        nonces(&pool, &pool.take(usize::MAX, GAS, &[a0.hash], 0)),
         [(1, 1)]
     );
     assert_eq!(
-        nonces(&pool, &pool.take(usize::MAX, 2 * GAS, &[a0.hash, a1.hash])),
+        nonces(&pool, &pool.take(usize::MAX, 2 * GAS, &[a0.hash, a1.hash], 0)),
         [(2, 0)]
     );
     // A skipped transaction still spends its sender's balance.
@@ -357,7 +357,38 @@ fn take_skips_what_an_unexecuted_block_carries() {
     pool.insert(a0.clone(), funded(0, a0.cost + a1.cost - 1))
         .unwrap();
     pool.insert(a1.clone(), rich(0)).unwrap();
-    assert!(pool.take(usize::MAX, u64::MAX, &[a0.hash]).is_empty());
+    assert!(pool.take(usize::MAX, u64::MAX, &[a0.hash], 0).is_empty());
+}
+
+#[test]
+fn take_leaves_out_senders_priced_below_the_base_fee() {
+    let mut pool = Mempool::default();
+    let (a0, a1, b0, c0) = (tx(1, 0, 5), tx(1, 1, 50), tx(2, 0, 10), tx(3, 0, 20));
+    for t in [&a0, &a1, &b0, &c0] {
+        add(&mut pool, t).unwrap();
+    }
+    // Under a base fee of 10, sender 1's first transaction cannot run, so its
+    // dearer second one waits behind it; the pool keeps all of them for a
+    // block whose base fee is lower.
+    assert_eq!(
+        nonces(&pool, &pool.take(usize::MAX, u64::MAX, &[], 10)),
+        [(3, 0), (2, 0)]
+    );
+    assert_eq!(
+        nonces(&pool, &pool.take(usize::MAX, u64::MAX, &[], 11)),
+        [(3, 0)]
+    );
+    assert_eq!(
+        nonces(&pool, &pool.take(usize::MAX, u64::MAX, &[], 5)),
+        [(3, 0), (2, 0), (1, 0), (1, 1)]
+    );
+    assert_eq!(pool.len(), 4);
+    // A transaction an unexecuted block carries is skipped whatever its
+    // price: the block that carries it decides.
+    assert_eq!(
+        nonces(&pool, &pool.take(usize::MAX, u64::MAX, &[a0.hash], 10)),
+        [(3, 0), (1, 1), (2, 0)]
+    );
 }
 
 #[test]
@@ -504,7 +535,7 @@ fn delegated_senders_and_authorities_are_limited_as_geth_limits_them() {
 #[test]
 fn a_take_leaves_out_senders_that_an_authorization_ahead_names() {
     let everything =
-        |pool: &Mempool, skip: &[[u8; 32]]| nonces(pool, &pool.take(usize::MAX, u64::MAX, skip));
+        |pool: &Mempool, skip: &[[u8; 32]]| nonces(pool, &pool.take(usize::MAX, u64::MAX, skip, 0));
     // Sender 3's set-code transaction names sender 2 and comes first in the
     // order (same priority, earlier arrival): its authorization can move
     // 2's nonce, so 2's transaction is left out. Sender 1 is not named.
@@ -593,7 +624,7 @@ fn check(pool: &Mempool) {
     // binds insertions only; the total never grows past its limit.
     assert!(pool.len() <= pool.limits.max_txs);
     let mut next: BTreeMap<Address, u64> = BTreeMap::new();
-    for raw in pool.take(usize::MAX, u64::MAX, &[]) {
+    for raw in pool.take(usize::MAX, u64::MAX, &[], 0) {
         let t = pool.get(&keccak256(&raw)).unwrap();
         let expected = next
             .entry(t.sender)

@@ -177,7 +177,7 @@ The host functions of 05 §4 that carry no gate, the BLS12-381 functions include
 
 ### 8.2 Signalling
 
-A validator's host signals by sending a `signal(features)` transaction from the validator's account (§2.2), where `features` has one bit set per gate its release supports: a legacy EIP-155 transaction to the upgrade address with no value, gas price 0 and gas limit 100 000. The base fee of the reference kernel is zero, so signalling costs nothing and needs no balance. A signal counts for the epoch of the block that executes it. After every block `h` it executes, a validator's host sends a signal, with its account's next nonce, unless its latest signal on chain is for epoch `epoch(h + 1)` or later and names exactly its supported features. Resending the same transaction until it is included is idempotent.
+A validator's host signals by sending a `signal(features)` transaction from the validator's account (§2.2), where `features` has one bit set per gate its release supports: a legacy EIP-155 transaction to the upgrade address with no value, gas limit 100 000 and the base fee of the next block as its gas price (23 §7). On a chain whose base fee is zero signalling costs nothing and needs no balance; on one with a floor above zero a validator's account holds the funds for it, which `solo devnet init` gives it. A signal counts for the epoch of the block that executes it. After every block `h` it executes, a validator's host sends a signal, with its account's next nonce, unless its latest signal on chain is for epoch `epoch(h + 1)` or later and names exactly its supported features. Resending the same transaction until it is included is idempotent.
 
 ### 8.3 Epochs and tallies
 
@@ -225,6 +225,7 @@ interface ISoloGovernance {
     function setGuardian(address guardian) external;                                 // 0x8a0dac4a
     function setMode(uint8 mode) external;                                           // 0x21175b4a
     function setParams(uint64 votingBlocks, uint64 timelockBlocks, uint64 quorumBps, uint256 deposit) external; // 0x94bc43b4
+    function setFeeParams(uint64 denominator, uint64 elasticity, uint64 minBaseFee, address treasury) external; // 0x92106b6c (23 §5)
     event ProposalSubmitted(uint64 indexed id, address indexed proposer, address indexed target, bytes data, uint64 votingEnd);
     event Voted(uint64 indexed id, address indexed voter, bool support, uint64 weight);
     event ProposalExecuted(uint64 indexed id);
@@ -233,6 +234,7 @@ interface ISoloGovernance {
     event GuardianSet(address guardian);
     event ModeSet(uint8 mode);
     event ParamsSet(uint64 votingBlocks, uint64 timelockBlocks, uint64 quorumBps, uint256 deposit);
+    event FeeParamsSet(uint64 denominator, uint64 elasticity, uint64 minBaseFee, address treasury);
 }
 ```
 
@@ -244,7 +246,7 @@ An *action* is the pair `(target, data)` that `submit` carries: calldata to a sy
 |---|---|---|
 | the governance address | `propose(bytes32,uint64,uint64)` (§3) | normal |
 | the governance address | `cancel(bytes32)` (§3) | **fast** |
-| the governance address | `setGuardian(address)`, `setParams(uint64,uint64,uint64,uint256)` | normal |
+| the governance address | `setGuardian(address)`, `setParams(uint64,uint64,uint64,uint256)`, `setFeeParams(uint64,uint64,uint64,address)` (23 §5) | normal |
 | the governance address | `setMode(uint8)` | key track only (§9.6) |
 | the module address (16 §4.2) | `install(address,bytes32,uint64,bytes)` | normal |
 | the light-client address (18 §5.1) | `setCheckpoint(bytes)`, `setDelay(uint64)` | normal |
@@ -291,13 +293,13 @@ A governance call *can run* in the block at height `h` (for admission, the execu
 | `execute(id)` | never | no value; proposal `id` is open, passed, and `executable_at ≤ h ≤ expires_at` |
 | `veto(id)` | never | the sender is the guardian, no value; proposal `id` is open, on the normal track, and its action is not `setGuardian` |
 | `pause(target)` | never | the sender is the guardian, no value; `target` is the verifier address and the bridge is on (its address holds a module designator) |
-| `setGuardian`, `setMode`, `setParams` sent directly | never | never |
+| `setGuardian`, `setMode`, `setParams`, `setFeeParams` sent directly | never | never |
 
 A transaction to the module address (16 §4.2) can run only under the key track, from the governance key, with no value and an `install` as calldata. A governance call whose gas limit is below its intrinsic gas plus `GOVERNANCE_GAS` is refused at admission with reason 6 (`GAS_TOO_LOW`), before any other check; one that cannot run, to either address, with reason 12 (§2.3).
 
 ### 9.5 Execution
 
-A governance call that can run executes as §2.3 says: the plain call, then the call itself, which adds `GOVERNANCE_GAS` to the gas used and charges it at the transaction's gas price to the zero address, like every fee.
+A governance call that can run executes as §2.3 says: the plain call, then the call itself, which adds `GOVERNANCE_GAS` to the gas used and charges it at the transaction's price, routed like every fee (23 §4).
 
 - **`submit` under the key track** executes the action at once, as a proposal that passes under the key. The receipt carries `Enacted(key, target, data)` followed by the action's own logs; if the action's checks fail, the transaction reverts (status 0, nothing changed).
 - **`submit` under the stake track** opens the proposal (§9.3), unless its action names staged code that is not complete: then the transaction reverts, nothing opens, and the deposit it carried goes back to the sender. Every governance call that reverts returns the value it carried.
@@ -311,7 +313,7 @@ An action executes against the state at that point in the block, at that block's
 - `propose` and `cancel` as §3 says;
 - `install` as 16 §4.2 says, the `ModuleInstalled` log included;
 - a bridge action as a call to the native contract at `target` (16 §5) made by the *governance authority*: the governance key under the key track, the governance address itself under the stake track, which is the account the two modules' configuration names as their governance (18 §4.1, §9.6). The module runs sandboxed with `ACTION_GAS = 2^26` VM gas of the kernel's own, with no value, and its writes are applied if it returns; a module that reverts, fails or is not there (the bridge is off, or the light client's gate is not yet active) fails the action. Nothing is charged to anyone beyond the surcharge: the actions are bounded by the voting and by the proposal bound.
-- `setGuardian(guardian)` records the guardian (zero: none) and emits `GuardianSet`; `setParams(voting, timelock, quorum, deposit)` fails unless `voting ≥ 1` and `1 ≤ quorum ≤ 10 000`, else records the rules under the mode in force and emits `ParamsSet`; `setMode` is §9.6's.
+- `setGuardian(guardian)` records the guardian (zero: none) and emits `GuardianSet`; `setParams(voting, timelock, quorum, deposit)` fails unless `voting ≥ 1` and `1 ≤ quorum ≤ 10 000`, else records the rules under the mode in force and emits `ParamsSet`; `setFeeParams` fails unless its parameters are workable (23 §2), else records them, in force from the next block, and emits `FeeParamsSet` (23 §5); `setMode` is §9.6's.
 
 ### 9.6 The switch
 
@@ -356,7 +358,7 @@ A view's `yes`, `no` and `total` are the live tally over the current validator s
 | `MAX_OPEN_PROPOSALS` | 16 |
 | `MAX_PROPOSAL_DATA` | 32 768 bytes |
 
-A `vote(id, true)` transaction with no other calldata uses 71 860 gas: its intrinsic gas at the EIP-7623 floor, 21 860, plus the surcharge (`crates/solo-node/tests/governance.rs`, 2026-10-21). A `submit` pays for its calldata like any transaction, and an action with few zero bytes pays the floor: the largest action with none uses 1 382 960 gas, the floor of its 32 868 bytes of calldata, 1 332 960, plus the surcharge (the same test, 2026-10-22). The kernel's `call` query, so `eth_call` and `eth_estimateGas`, reports a governance call's gas with the surcharge, and admission refuses a gas limit below the intrinsic gas plus the surcharge as a gas shortfall (§9.4): an estimate is a limit the chain takes, and `solo gov` prints it. With the base fee of the reference kernel at zero the surcharge counts against the block gas limit, which bounds governance calls to 600 a block, and the deposit is what a proposal costs a sender that is not a validator.
+A `vote(id, true)` transaction with no other calldata uses 71 860 gas: its intrinsic gas at the EIP-7623 floor, 21 860, plus the surcharge (`crates/solo-node/tests/governance.rs`, 2026-10-21). A `submit` pays for its calldata like any transaction, and an action with few zero bytes pays the floor: the largest action with none uses 1 382 960 gas, the floor of its 32 868 bytes of calldata, 1 332 960, plus the surcharge (the same test, 2026-10-22). The kernel's `call` query, so `eth_call` and `eth_estimateGas`, reports a governance call's gas with the surcharge, and admission refuses a gas limit below the intrinsic gas plus the surcharge as a gas shortfall (§9.4): an estimate is a limit the chain takes, and `solo gov` prints it. The surcharge is paid at the transaction's price and routed like every fee (23 §4); it counts against the block gas limit, which bounds governance calls to 600 a block, and the deposit is what a proposal costs a sender that is not a validator.
 
 ### 9.10 Limits of this version
 
@@ -364,5 +366,5 @@ A `vote(id, true)` transaction with no other calldata uses 71 860 gas: its intri
 - A proposal carries one action. Several actions take several proposals, which may run at the same time within the bound.
 - The guardian's powers, veto and pause, cover normal-track proposals other than a change of guardian, and the inbox; they do not cancel a pending upgrade or stop a fast-track proposal (both are the validators' majority), nor pause the token gateways of spec 21, which have guardians of their own. A guardian that vetoes what it should not is replaced by a proposal it cannot veto, and delays until then.
 - The deposit is returned or burned, never paid to voters or to anyone who executes; nothing pays for governance beyond the proposer's interest.
-- Staged code is bounded by the block gas limit alone: under the stake track any validator stages any number of code hashes, each up to 7.5 MiB, at the calldata's gas, which at the reference kernel's zero base fee costs nothing, as every byte of state costs nothing then (contract creation included); the staker rule of §3 stops interference, not volume, and nothing deletes a chunk. A bound per account is a later change.
+- Staged code is bounded by the block gas limit alone: under the stake track any validator stages any number of code hashes, each up to 7.5 MiB, at the calldata's gas, which costs the base fee of the chain (23), nothing on a chain whose floor is zero; the staker rule of §3 stops interference, not volume, and nothing deletes a chunk. A bound per account is a later change.
 - The only way back from the stake track is a kernel upgrade, which the stake track itself must pass.

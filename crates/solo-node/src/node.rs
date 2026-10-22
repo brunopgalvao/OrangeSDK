@@ -9,6 +9,7 @@ use solo_abi::chain::{
     BlockHeader, CallRequest, CallResult as CallOutcome, Evidence, StorageQuery,
 };
 use solo_abi::codec::Seq;
+use solo_abi::fees::FeeStatus;
 use solo_abi::types::{
     self, Ahead, Block, Effect, ExecContext, ExecuteArgs, ExecuteResult, FinalizeArgs, Genesis,
     Input, QueryArgs, QueryResult, ValidateArgs, ValidateResult, exports,
@@ -213,6 +214,13 @@ pub struct Node {
     pub history_keys_per_block: usize,
     /// The state commitment of the genesis state, as `kernel_init` left it.
     genesis_root: [u8; 32],
+    /// The fee market as the kernel last reported it (spec 23 §7): the
+    /// parameters in force, the next block's base fee and the reward pool,
+    /// read at open and after every executed block.
+    fees: FeeStatus,
+    /// The base fee of the synthetic genesis block (spec 20 §3.1): the floor
+    /// the chain started with.
+    genesis_base_fee: u64,
     /// Telemetry (spec 11); consensus-ignored.
     pub(crate) telemetry: solo_metrics::NodeMetrics,
     /// Kernel switchover and feature-gate state (`crate::upgrade`).
@@ -277,6 +285,8 @@ impl Node {
             state_history: config.state_history.max(1),
             history_keys_per_block: config.history_keys_per_block,
             genesis_root: [0; 32],
+            fees: FeeStatus::default(),
+            genesis_base_fee: 0,
             telemetry: solo_metrics::NodeMetrics::new(),
             upgrades: Upgrades::new(active_gates),
             store: None,
@@ -288,6 +298,8 @@ impl Node {
         // does not serve it reads as the default (spec 06 §7.2), so the node
         // opens and its telemetry reports version 0 (spec 11 §4).
         node.upgrades.status = Some(node.upgrade_status().unwrap_or_default());
+        node.refresh_fees()?;
+        node.genesis_base_fee = node.fees.base_fee;
         node.kernel_gas = config.kernel_gas;
         // The genesis state is version 0; each executed block seals its height.
         node.exec.state_mut().base_mut().keep_history(0);
@@ -378,6 +390,31 @@ impl Node {
     /// queued ones stay local until they are executable (spec 14 §6).
     pub fn take_tx_gossip(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.tx_gossip)
+    }
+
+    /// The fee market as of the last executed block (spec 23 §7): the
+    /// parameters in force, the base fee of the next block, which admission
+    /// and the pool's take apply, and the reward pool. A kernel that does
+    /// not serve the `fees` query reads as a market that is off at a zero
+    /// base fee.
+    #[must_use]
+    pub fn fee_status(&self) -> &FeeStatus {
+        &self.fees
+    }
+
+    /// The base fee of the synthetic genesis block: the floor the chain
+    /// started with (spec 20 §3.1).
+    #[must_use]
+    pub fn genesis_base_fee(&self) -> u64 {
+        self.genesis_base_fee
+    }
+
+    /// Reads the fee market from the kernel; see [`Node::fee_status`].
+    pub(crate) fn refresh_fees(&mut self) -> Result<(), NodeError> {
+        self.fees = self
+            .query_decoded(solo_abi::fees::query::FEES, &[])?
+            .unwrap_or_default();
+        Ok(())
     }
 
     /// This node's validator id, if it has a consensus key.
@@ -571,7 +608,10 @@ impl Node {
                 max_gas,
                 skip,
             } => {
-                let txs = self.pool.take(max_bytes as usize, max_gas, &skip.0);
+                let base_fee = u128::from(self.fees.base_fee);
+                let txs = self
+                    .pool
+                    .take(max_bytes as usize, max_gas, &skip.0, base_fee);
                 Some(Input::MempoolContents { txs: Seq(txs) })
             }
             Effect::MempoolReject { tx_hash, .. } => {
@@ -680,6 +720,8 @@ impl Node {
         for hash in &carried {
             self.pool.remove(hash);
         }
+        // The next block's base fee follows from this one (spec 23 §3).
+        self.refresh_fees()?;
         self.reset_pool()?;
         self.executed.push((height, block_hash));
         let summary = &result.summary;

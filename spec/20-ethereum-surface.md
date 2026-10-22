@@ -76,8 +76,8 @@ The kernel stores, for each block, the record `solo_abi::chain::BlockHeader`:
 | `transactions_root` | §3.2 |
 | `logs_bloom` | the bloom of every log of the block, 256 bytes |
 | `gas_limit` | the block gas limit, 30 000 000 |
-| `base_fee` | the base fee, 0 (`solo_abi::chain::BASE_FEE`) |
-| `beneficiary` | the fee recipient, the zero address |
+| `base_fee` | the block's base fee per gas (23 §3) |
+| `beneficiary` | the fee recipient: the fee vault `0x…4645` on a chain with staking, the zero address without (23 §4) |
 
 The block's **Ethereum header** is the Prague/Osaka header with these values, in RLP order (`solo_eth::header::Header::of`):
 
@@ -107,7 +107,7 @@ The block's **Ethereum header** is the Prague/Osaka header with these values, in
 
 The **block hash** is `keccak256` of the header's RLP. The kernel computes it after storing the block's receipts, stores it beside the record (the `bnum/` and `bhash/` indexes) and as the next block's `parent_hash`; `BLOCKHASH` returns it (19 §4); the host reports it in `BlockExecuted` (06 §4.1) and the RPC serves it as `hash`. The RPC's block view is exactly the header's fields with that hash, plus `size` (the length of `rlp([header, transactions, [], []])`, a typed transaction as the string of its bytes), `totalDifficulty` 0, empty `uncles` and `withdrawals`, and the transactions. So `keccak256(rlp(header))`, rebuilt from the view by any Ethereum library, is the view's `hash`, and the parent link holds from block 1 on.
 
-**Genesis.** The kernel stores no record for height 0. The RPC serves a synthetic block 0: the genesis state root (the commitment of the state `kernel_init` left, which the node records when it starts), empty transactions and receipts roots, the chain's gas limit and base fee, a zero bloom, and hash zero, which is block 1's `parentHash`. Its hash is not the hash of its header. The zero hash names it wherever the RPC takes a block hash, as any block's hash names its block: `eth_getBlockByHash`, `eth_getBlockReceipts`, `eth_getLogs` with `blockHash`, and a state method's block parameter (§5.2).
+**Genesis.** The kernel stores no record for height 0. The RPC serves a synthetic block 0: the genesis state root (the commitment of the state `kernel_init` left, which the node records when it starts), empty transactions and receipts roots, the chain's gas limit, the base fee the chain started at (its floor at genesis, 23 §3), a zero bloom, a zero beneficiary, and hash zero, which is block 1's `parentHash`. Its hash is not the hash of its header. The zero hash names it wherever the RPC takes a block hash, as any block's hash names its block: `eth_getBlockByHash`, `eth_getBlockReceipts`, `eth_getLogs` with `blockHash`, and a state method's block parameter (§5.2).
 
 ### 3.2 Transactions and receipts roots
 
@@ -189,4 +189,4 @@ The execution-spec state tests run set-code transactions through the kernel's ow
 - `stateRoot` is not an Ethereum state root (§3.3), and `eth_getProof` answers in Solo's proof format, which Ethereum's verifiers do not read.
 - History is kept in memory beside the state; a node has no history from before it started, and while blocks write heavily its window is shorter than `state_history` (§5.1).
 - The pool's rules for delegation are geth's, plus the take's rule for authorities ahead (§2.4); a pool of another host may differ without affecting consensus (14 §1).
-- Proposals are not run before they are made: a delegated account's code can spend the account's balance, or move its nonce by creating a contract, during another sender's transaction, and a later transaction of that account in the same block is then recorded as failed (06 §5.1) where a geth builder would have left it out.
+- Proposals are not run before they are made: a delegated account's code can spend the account's balance, or move its nonce by creating a contract, during another sender's transaction, and a later transaction of that account in the same block is then recorded as failed (06 §5.1) where a geth builder would have left it out; so is a transaction priced below the base fee of the block it lands in (23 §10).

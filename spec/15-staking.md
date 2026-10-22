@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-This document specifies the validator lifecycle of the reference kernel: how validators bond and unbond stake through an Ethereum-callable system address, how the validator set of each epoch is decided at the end of the epoch before, how recorded equivocation evidence (08 §9) and evidence of threshold misbehaviour cut the offender's stake, how the validators of each epoch generate a fresh threshold key whose certificates (12 §7) the driver produces (08 §6a), and how the active key hands off to the next. The decisions behind it are recorded in codex ADRs 0024, 0025 and 0031.
+This document specifies the validator lifecycle of the reference kernel: how validators bond and unbond stake through an Ethereum-callable system address and other accounts delegate stake behind them (§10), how the validator set of each epoch is decided at the end of the epoch before, how recorded equivocation evidence (08 §9) and evidence of threshold misbehaviour cut the offender's stake, how the priority fees of an epoch's blocks are paid out to its set with stake (§10), how the validators of each epoch generate a fresh threshold key whose certificates (12 §7) the driver produces (08 §6a), and how the active key hands off to the next. The decisions behind it are recorded in codex ADRs 0024, 0025, 0031 and 0038.
 
 Everything here except the keystore (§6.4) is chain state, written by `kernel_stf_execute_block` and therefore identical on every node. The keystore is node-local and lives in the host, behind key role 2 of `sign` (05 §4.3).
 
@@ -41,15 +41,19 @@ interface ISoloStaking {
     function unbond(uint256 amount) external;            // 0x27de9e32
     function withdraw() external;                        // 0x3ccfd60b
     function report(bytes calldata evidence) external;   // 0xb5767166
+    function delegate(address validator) external payable;        // 0x5c19a95c (§10.1)
+    function undelegate(address validator, uint256 amount) external; // 0x4d99dd16
     event Registered(address indexed validator, bytes32 id);
     event Bonded(address indexed validator, uint256 amount);
     event Unbonded(address indexed validator, uint256 amount, uint64 releaseEpoch);
     event Withdrawn(address indexed validator, uint256 amount);
     event Reported(address indexed validator, uint8 kind, uint64 keySet);
+    event Delegated(address indexed delegator, address indexed validator, uint256 amount);
+    event Undelegated(address indexed delegator, address indexed validator, uint256 amount, uint64 releaseEpoch);
 }
 ```
 
-so `cast send 0x0000000000000000000000000000000000005354 "bond()" --value 1000gwei` works as is. Calldata is an action only if it is exactly the canonical encoding: `register` is 132 bytes with offset word 32, length word 48, the 48-byte key and 16 zero bytes of padding; `bond` and `withdraw` are the bare selector; `unbond` is the selector and one word whose high 16 bytes are zero; `report` is the selector, offset word 32, a length word of at most `MAX_REPORT = 131 072` with its high 16 bytes zero, the evidence, zero padding to a multiple of 32 bytes, and nothing after.
+so `cast send 0x0000000000000000000000000000000000005354 "bond()" --value 1000gwei` works as is. Calldata is an action only if it is exactly the canonical encoding: `register` is 132 bytes with offset word 32, length word 48, the 48-byte key and 16 zero bytes of padding; `bond` and `withdraw` are the bare selector; `unbond` is the selector and one word whose high 16 bytes are zero; `report` is the selector, offset word 32, a length word of at most `MAX_REPORT = 131 072` with its high 16 bytes zero, the evidence, zero padding to a multiple of 32 bytes, and nothing after; `delegate` is the selector and one address word whose high 12 bytes are zero; `undelegate` the selector, an address word and an amount word whose high 16 bytes are zero.
 
 Only a transaction sent directly to the staking address acts. A message call that reaches it from a contract is a plain value transfer to an account without code.
 
@@ -66,8 +70,10 @@ A transaction to the staking address *can run* in the block at height `h` (for a
 | `register(key)` | the key is valid; the sender is not jailed; a registered sender sends no value; a sender not yet registered sends a value of at least `max(min_stake, 1 gwei)` that is a multiple of 1 gwei, and needs fewer than 256 registered validators |
 | `bond()` | the sender is registered and not jailed; the value is non-zero and a multiple of 1 gwei |
 | `unbond(amount)` | no value; the sender is registered; `amount` is non-zero, a multiple of 1 gwei and at most its stake |
-| `withdraw()` | no value; the sender is registered; it has unbonding stake and `epoch(h) ≥ release_epoch` |
+| `withdraw()` | no value; the sender is registered with unbonding stake and `epoch(h) ≥ release_epoch`, or holds a delegation (§10.1) with unbonding stake and `epoch(h) ≥` its release epoch |
 | `report(evidence)` | no value; the gas limit is at least the transaction's intrinsic gas (with the EIP-7623 floor) plus `REPORT_GAS = 150 000`; `evidence` decodes as `ThresholdEvidence`, its offence is not on record, and it shows an offence in the block at `h` (§5.1). Any sender may report, registered or not |
+| `delegate(validator)` | `validator` is the account of a registered validator that is not jailed and is not the sender; the value is non-zero and a multiple of 1 gwei; for the sender's first delegation behind it, the validator has fewer than `MAX_DELEGATORS = 64` delegators and the sender fewer than `MAX_DELEGATIONS = 16` delegations (§10.1) |
+| `undelegate(validator, amount)` | no value; `validator` is the account of a registered validator the sender has a delegation behind; `amount` is non-zero, a multiple of 1 gwei and at most the delegation's stake |
 
 Admission (`kernel_stf_validate_tx`, and selection in `kernel_stf_build_block`) rejects one that cannot run with reason 13 (`STAKING_ACTION`), after the checks every transaction gets and before the checks against the sender's account. Execution of one that cannot run changes nothing, like any transaction that should not have been included.
 
@@ -80,14 +86,16 @@ A transaction that can run executes first as a plain EVM call to the staking add
 - `register`: a sender not yet registered becomes a validator: its id is `keccak256` of the public key that signed the transaction (the consensus key, 08 §2), its record is created with the value as its stake, and it is appended to the registration order. Events `Registered(sender, id)` and `Bonded(sender, value)`. A registered sender replaces its encryption key. Event `Registered(sender, id)`.
 - `bond`: the stake grows by the value. Event `Bonded(sender, value)`.
 - `unbond`: the stake shrinks by `amount`, the unbonding stake grows by it, and `release_epoch` becomes `epoch(h) + 1 + unbonding_epochs`, for all of the unbonding stake. Event `Unbonded(sender, amount, release_epoch)`.
-- `withdraw`: all unbonding stake moves from the staking address's balance to the sender's. Event `Withdrawn(sender, amount)`.
-- `report`: the evidence is recorded and its offender slashed (§5.2). The transaction's gas used is the plain call's plus `REPORT_GAS`, and the sender pays `REPORT_GAS` at its price on top of the plain call's fee, to the zero address like every fee. Event `Reported(offender, kind, key_set)`, with the offender's account as the indexed topic.
+- `withdraw`: every released amount, the sender's own unbonding stake if `epoch(h) ≥ release_epoch` and that of each of its delegations whose release epoch has come, moves from the staking address's balance to the sender's, in one sum. Event `Withdrawn(sender, amount)`.
+- `report`: the evidence is recorded and its offender slashed (§5.2). The transaction's gas used is the plain call's plus `REPORT_GAS`, and the sender pays `REPORT_GAS` at its price on top of the plain call's fee, routed like every fee (23 §4). Event `Reported(offender, kind, key_set)`, with the offender's account as the indexed topic.
+- `delegate`: the sender's delegation behind the validator (§10.1) grows by the value, and so does the validator's `delegated`; a first delegation adds the sender to the validator's delegators and the validator to the sender's delegations. Event `Delegated(sender, validator, value)`.
+- `undelegate`: the delegation's stake shrinks by `amount`, its unbonding stake grows by it, its release epoch becomes `epoch(h) + 1 + unbonding_epochs` for all of its unbonding stake, and the validator's `delegated` shrinks by `amount`. Event `Undelegated(sender, validator, amount, release_epoch)`.
 
-The staking address's balance is therefore always the sum of every validator's bonded and unbonding stake.
+The staking address's balance is therefore always the sum of every validator's and every delegation's bonded and unbonding stake, plus the reward pool (§10.2).
 
 ### 3.5 Registration slots
 
-At most 256 validators are registered at once, so the work at each epoch end (§4) stays bounded. A slot costs the stake a first registration bonds, and a validator that holds nothing gives it back: at the end of each epoch, after the next set is decided, every registered validator that is not jailed, has no stake and no unbonding stake, and is not in the next set is *pruned*: its record and its address entry are deleted and it leaves the registration order. It can register again later like any other sender. A jailed validator is never pruned, and a pruned one that is later found to have offended is jailed all the same (§5).
+At most 256 validators are registered at once, so the work at each epoch end (§4) stays bounded. A slot costs the stake a first registration bonds, and a validator that holds nothing gives it back: at the end of each epoch, after the next set is decided, every registered validator that is not jailed, has no stake and no unbonding stake, has no delegation behind it (§10.1), and is not in the next set is *pruned*: its record and its address entry are deleted and it leaves the registration order. It can register again later like any other sender. A jailed validator is never pruned, and a pruned one that is later found to have offended is jailed all the same (§5).
 
 ## 4. Epochs and validator sets
 
@@ -95,9 +103,9 @@ Epoch `e` holds the heights `e·L + 1` to `(e + 1)·L`, so `epoch(h) = (h − 1)
 
 At the end of the block at `end(e)`, after its transactions and the upgrade bookkeeping of 13 §8.3 and before the state commitment, the kernel decides the set of epoch `e + 1`:
 
-1. The candidates are the registered validators that are not jailed and whose stake is at least `max(min_stake, 1 gwei)`.
-2. They are ordered by stake, largest first, earlier registration first on a tie, and the first `max_validators` are kept (all of them when it is 0).
-3. The kept validators, in registration order, each with its weight, are the set of epoch `e + 1`. If no validator qualifies, the set of epoch `e` carries over.
+1. The candidates are the registered validators that are not jailed and whose own stake is at least `max(min_stake, 1 gwei)`: the minimum stake is a self-bond, delegated stake does not meet it.
+2. They are ordered by *total stake*, own and delegated (§10.1), largest first, earlier registration first on a tie, and the first `max_validators` are kept (all of them when it is 0).
+3. The kept validators, in registration order, each with its weight, its total stake in gwei, are the set of epoch `e + 1`. If no validator qualifies, the set of epoch `e` carries over.
 
 The set is stored as the set of epoch `e + 1` and becomes `meta/validators`, the set feature-gate tallies weigh (13 §8.3). Its order is the leader rotation of epoch `e + 1`'s views (08 §2). If `P > 0`, epoch `e + 1`'s DKG run is scheduled (§6.1). A set never changes within its epoch; stake bonded, unbonded or slashed during epoch `e` counts from epoch `e + 1` on.
 
@@ -105,7 +113,7 @@ The set is stored as the set of epoch `e + 1` and becomes `meta/validators`, the
 
 Recording a new equivocation offence (08 §9) is the slashing hook. In the same state transition, the offender, the validator its record's index names in the set of the epoch of its view, is slashed unless it is already jailed:
 
-- `SLASH_BPS = 1000`: a tenth of its bonded stake and a tenth of its unbonding stake, each rounded down, are burned: they move from the staking address's balance to the zero address, where fees go and nobody can spend them;
+- `SLASH_BPS = 1000`: a tenth of its bonded stake and a tenth of its unbonding stake, and a tenth of the bonded and of the unbonding stake of every delegation behind it (§10.1), each rounded down, are burned: they move from the staking address's balance to the zero address, where nobody can spend them, and the validator's `delegated` shrinks by what its delegations lost;
 - it is jailed: it is never selected again (§4), cannot bond or register, and is never slashed again. It can still unbond and withdraw what remains.
 
 An offender whose record was pruned (§3.5) holds nothing to burn; its record is created again, jailed, empty and outside the registration order, with its address entry, so it can never register again.
@@ -262,10 +270,14 @@ The shareholders of key set `k` are members of the set of epoch `k`, chosen at t
 
 | Key | Value |
 |---|---|
-| `stake/v/` + id | `StakeRecord { address: [20], stake: u128, unbonding: u128, release_epoch: u64, dkg_key: bytes, jailed: bool }` |
+| `stake/v/` + id | `StakeRecord { address: [20], stake: u128, unbonding: u128, release_epoch: u64, dkg_key: bytes, jailed: bool, delegated: u128 }` |
 | `stake/a/` + address | id |
 | `stake/ids` | `vec<[32]>`, registered ids in registration order |
 | `stake/set/` + epoch (big-endian u64) | `ValidatorSet` of that epoch |
+| `stake/d/` + id ‖ delegator address | `Delegation { stake: u128, unbonding: u128, release_epoch: u64 }` (§10.1) |
+| `stake/dl/` + id | `vec<[20]>`, the validator's delegators, in the order they first delegated |
+| `stake/dv/` + delegator address | `vec<[32]>`, the validators the account delegates to, in the order it first did |
+| `stake/pool` | `u128`, the reward pool (§10.2); absent when empty |
 | `dkg/run/` + epoch | `DkgRun` |
 | `dkg/msg/` + epoch ‖ phase (u8) ‖ sender index (big-endian u32) | the DKG message |
 | `dkg/vote/` + epoch ‖ id | hash of the `KeySetVote` the validator confirmed |
@@ -285,17 +297,37 @@ All of it is committed (10 §2).
 
 ## 8. Queries
 
-- `staking` takes nothing and returns `StakingStatus { epoch, params, validators, records: vec<StakeEntry { id, record }>, active: option<KeySetRecord>, group_key: bytes }`: the epoch of the next block, the parameters without the genesis keys, the current set, every registered validator in registration order, the active key set, and the group key (empty before the first).
+- `staking` takes nothing and returns `StakingStatus { epoch, params, validators, records: vec<StakeEntry { id, record }>, active: option<KeySetRecord>, group_key: bytes, pool: u128 }`: the epoch of the next block, the parameters without the genesis keys, the current set, every registered validator in registration order, the active key set, the group key (empty before the first), and the reward pool (§10.2).
 - `staking_set` takes a `u64` epoch and returns that epoch's `ValidatorSet`, status 1 if it is not decided yet, status 2 for malformed parameters.
+- `staking_delegations` takes an address and returns `vec<DelegationEntry { validator: [32], delegation: Delegation }>`, the account's delegations in the order it first made them; status 2 for malformed parameters.
 - `handoff` takes a `u64` key set id and returns the `Handoff` out of it, status 1 if none is recorded, status 2 for malformed parameters.
 - `threshold_evidence` takes a `u64` first index and returns `vec<ThresholdEvidence>`, the records from that index on, at most 64; status 2 for malformed parameters.
 
 ## 9. Limits of this version
 
-- Only self-bonding: no delegation, no rewards, no commission. Validator participation for rewards (codex ADR 0008) is not recorded.
+- Rewards are the priority fees alone (§10): there is no issuance, no commission, and no record of validator participation (codex ADR 0008), so a validator that misses its slots earns like one that does not. A validator has at most `MAX_DELEGATORS = 64` delegators and an account at most `MAX_DELEGATIONS = 16` delegations, which bounds the work of an epoch end and of a `withdraw`; a chain with more delegators than that needs an accounting that pays on demand, a later change. Rewards are paid to accounts at epoch ends and never compound into stake by themselves.
 - A jailed validator stays jailed for good; it can only withdraw.
 - The threshold counts shareholders, not stake: a certificate proves that `⌊2N/3⌋ + 1` of `N` shareholders signed, while finality needs more than two thirds of the stake (08 §1). Shareholders holding little stake together can therefore sign any block, and seats cost no more than `max(min_stake, 1 gwei)` each when `max_validators` is 0, so a chain that wants its certificates to mean something sets both. Full nodes never rely on a threshold certificate: sync always checks the vote certificate against the stake (08 §7a), and the threshold certificate is only an artifact for light clients and verifiers on other chains. They trust fewer than `N/3` shareholders of each key set to misbehave while that key set is in force, and slashing (§5.1) makes misbehaviour cost a tenth of the stake behind each offending share; how much that deters depends on that stake, which a chain sets with `min_stake` and `max_validators`.
 - Shareholders who leave the set must keep their nodes running until the handoff of the key they hold is recorded. Nothing makes them: if fewer than the threshold of them sign, no handoff to any target can be recorded, and the chain stays on that key until enough of them return or a governance kernel upgrade replaces the key (§6.6).
 - Slashing is a fixed tenth of the stake and the offender is jailed, whatever the damage of the offence; the slashed stake is burned, not paid to the reporter, so nothing but the reporter's own interest pays for `REPORT_GAS`.
 - Equivocation evidence of an epoch is checked against that epoch's set, which chain state keeps for good; there is no bound on how late evidence may arrive. Threshold evidence is likewise judged at any time, but it slashes only stake not yet withdrawn.
 - Anyone can send handoff and evidence envelopes, and each costs its receiver one BLS verification before the pool refuses an invalid one; peer scoring for them is left for later.
+
+## 10. Delegation and rewards
+
+### 10.1 Delegation
+
+Any account puts stake behind a registered validator with `delegate(validator)` (§3.3, §3.4) and takes it back with `undelegate(validator, amount)` and, once released, `withdraw()`. A *delegation* is the record `Delegation { stake, unbonding, release_epoch }` under `stake/d/` ‖ id ‖ delegator (§7), one per delegator and validator, deleted once both its stake and its unbonding stake are zero, when it also leaves both lists. A validator's `delegated` is the sum of the bonded stake of the delegations behind it; its *total stake* is `stake + delegated`.
+
+Delegated stake counts: it orders the candidates of an epoch's set and weighs the validator's votes (§4), and it is slashed with the validator's own (§5). It does not meet the minimum stake, which is the validator's own bond, and it earns nothing while unbonding. A validator with a delegation behind it keeps its registration slot (§3.5) until the last delegation is withdrawn, so a delegator can always undelegate and withdraw, from a jailed validator too.
+
+### 10.2 The reward pool
+
+The priority fees of every block on a chain with staking reach the staking address at the end of the block (23 §4): the kernel moves the fee vault's balance there and adds it to the *reward pool*, `stake/pool`. At the end of the block at `end(e)`, before the set of `e + 1` is decided (§4), the pool `P` is paid out to the set of epoch `e`, whose blocks filled it:
+
+1. With `W` the sum of the set's weights, validator `v` of weight `w` gets the share `s = ⌊P · w / W⌋`, computed exactly (`solo_abi::fees::mul_div`, a 256-bit product); a validator whose share is zero gets nothing.
+2. With `T = stake + delegated` of `v`'s record at that moment, each delegator behind `v` with bonded stake `d` is credited `⌊s · d / T⌋`, and `v`'s account the rest of `s`: its own part and what the delegators' rounding left. With `T = 0` (a member that unbonded everything during the epoch) `v`'s account gets all of `s`. A member whose record is gone is credited at the address its id names.
+3. The staking address is debited the sum of the shares, and the pool keeps the remainder `P − Σ s`, less than the number of validators in the set in wei, for the next epoch.
+
+Credits go to account balances at once, not to stake. The sums are exact: after every block, `pool + Σ credits since genesis = Σ priority fees and coinbase transfers since genesis`, and the staking address's balance is the stakes plus the pool (§3.4). With no stake in the set (`W = 0`) the pool waits for the next epoch end.
+

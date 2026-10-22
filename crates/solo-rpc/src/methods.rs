@@ -3,7 +3,7 @@
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use serde_json::{Value, json};
 use solo_abi::chain::{
-    BASE_FEE, BLOCK_GAS_LIMIT, BlockHeader, CallRequest, CallResult, Receipt, call_status, reason,
+    BLOCK_GAS_LIMIT, BlockHeader, CallRequest, CallResult, Receipt, call_status, reason,
 };
 use solo_eth::{MAX_INITCODE_SIZE, MAX_TX_GAS};
 use solo_host::hash::keccak256;
@@ -31,9 +31,6 @@ pub const MAX_BATCH: usize = 1000;
 /// consensus, so the server runs this between connections, and long requests
 /// run it between their steps (see [`Rpc::run_background`]).
 pub type Background = Box<dyn FnMut(&mut Node)>;
-
-/// Most blocks one `eth_feeHistory` request reports, as in geth.
-pub const MAX_FEE_HISTORY: u64 = 1024;
 
 /// Most storage keys one `eth_getProof` request may ask for (spec 20 §4.1):
 /// each costs a kernel query and a proof on the thread that drives
@@ -102,9 +99,8 @@ pub fn reason_text(code: u32) -> &'static str {
         reason::INSUFFICIENT_FUNDS => "insufficient funds for gas * price + value",
         reason::GAS_TOO_LOW => "intrinsic gas too low",
         reason::UNSUPPORTED => "transaction type not supported",
-        reason::FEE_TOO_LOW => {
-            "max fee per gas less than block base fee, or max priority fee per gas higher than max fee per gas"
-        }
+        reason::FEE_TOO_LOW => "max fee per gas less than block base fee",
+        reason::TIP_ABOVE_FEE_CAP => "max priority fee per gas higher than max fee per gas",
         reason::GAS_LIMIT_TOO_HIGH => "transaction gas limit too high",
         reason::INITCODE_TOO_LARGE => "max initcode size exceeded",
         reason::SENDER_NOT_EOA => "sender not an eoa",
@@ -149,69 +145,6 @@ fn hash_param(params: &[Value], index: usize) -> Result<[u8; 32], RpcError> {
     parse_hash(param_str(params, index)?)
 }
 
-/// `eth_feeHistory`'s block count: a quantity, a decimal string or a number.
-fn block_count(value: Option<&Value>) -> Result<u64, RpcError> {
-    let count = match value {
-        Some(Value::String(s)) if s.starts_with("0x") => return parse_quantity(s),
-        Some(Value::String(s)) => s.parse().ok(),
-        Some(Value::Number(n)) => n.as_u64(),
-        _ => None,
-    };
-    count.ok_or(RpcError::invalid_params("invalid block count"))
-}
-
-/// `eth_feeHistory`'s reward percentiles: increasing, within 0 to 100.
-fn percentiles(value: Option<&Value>) -> Result<Vec<f64>, RpcError> {
-    let invalid = || RpcError::invalid_params("invalid reward percentile");
-    let list = match value {
-        None | Some(Value::Null) => return Ok(Vec::new()),
-        Some(Value::Array(list)) => list,
-        Some(_) => return Err(invalid()),
-    };
-    let mut out: Vec<f64> = Vec::with_capacity(list.len());
-    for p in list.iter().map(Value::as_f64) {
-        match p {
-            Some(p) if (0.0..=100.0).contains(&p) && out.last().is_none_or(|last| p > *last) => {
-                out.push(p);
-            }
-            _ => return Err(invalid()),
-        }
-    }
-    Ok(out)
-}
-
-/// The priority fees paid at each percentile of a block's gas, as geth
-/// computes them: transactions sorted by tip, weighted by gas used.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-fn rewards(receipts: &[Receipt], gas_used: u64, percentiles: &[f64]) -> Vec<String> {
-    let mut sorted: Vec<(u128, u64)> = receipts
-        .iter()
-        .map(|r| {
-            let tip = r.effective_gas_price.saturating_sub(u128::from(BASE_FEE));
-            (tip, r.gas_used)
-        })
-        .collect();
-    sorted.sort_by_key(|(tip, _)| *tip);
-    let mut index = 0;
-    let mut sum = sorted.first().map_or(0, |(_, gas)| *gas);
-    let mut out = Vec::with_capacity(percentiles.len());
-    for p in percentiles {
-        // Gas amounts are far below 2^53, so the float arithmetic is exact
-        // enough, and the threshold is non-negative and at most `gas_used`.
-        let threshold = (gas_used as f64 * p / 100.0) as u64;
-        while sum < threshold && index + 1 < sorted.len() {
-            index += 1;
-            sum += sorted[index].1;
-        }
-        out.push(quantity(sorted.get(index).map_or(0, |(tip, _)| *tip)));
-    }
-    out
-}
-
 /// Serves Ethereum JSON-RPC over a node.
 ///
 /// Requests run on the caller's thread, which also drives the node, so what
@@ -223,9 +156,12 @@ fn rewards(receipts: &[Receipt], gas_used: u64, percentiles: &[f64]) -> Vec<Stri
 pub struct Rpc {
     node: Node,
     background: Option<Background>,
-    /// Priority fee the node suggests, in wei (`eth_maxPriorityFeePerGas`);
-    /// `eth_gasPrice` adds the base fee, zero in the reference kernel.
+    /// The priority fee the node suggests before any block carries a priced
+    /// transaction, in wei: the tip oracle's starting point (spec 23 §7.1,
+    /// [`Rpc::suggest_tip`]); one gwei unless changed.
     pub gas_price: u128,
+    /// The tip oracle's memory.
+    pub(crate) oracle: crate::fees::Oracle,
     /// Widest block range one `eth_getLogs` request may search, counted
     /// within the chain; [`MAX_LOG_RANGE`] unless changed.
     pub max_log_range: u64,
@@ -243,6 +179,7 @@ impl Rpc {
             node,
             background: None,
             gas_price: 1_000_000_000,
+            oracle: crate::fees::Oracle::default(),
             max_log_range: MAX_LOG_RANGE,
             max_batch: MAX_BATCH,
             stopped: false,
@@ -321,11 +258,11 @@ impl Rpc {
         }
     }
 
-    fn block_number(&mut self) -> Result<u64, RpcError> {
+    pub(crate) fn block_number(&mut self) -> Result<u64, RpcError> {
         Ok(self.node.block_number()?)
     }
 
-    fn resolve_block(&mut self, tag: &str) -> Result<u64, RpcError> {
+    pub(crate) fn resolve_block(&mut self, tag: &str) -> Result<u64, RpcError> {
         Ok(match tag {
             "latest" | "pending" => self.block_number()?,
             "safe" | "finalized" => self.node.finalized_height()?,
@@ -415,8 +352,8 @@ impl Rpc {
             "net_version" => json!(self.node.chain_id()?.to_string()),
             "web3_clientVersion" => json!("solo/0.0.1"),
             "eth_blockNumber" => json!(quantity(u128::from(self.block_number()?))),
-            "eth_gasPrice" => json!(quantity(u128::from(BASE_FEE) + self.gas_price)),
-            "eth_maxPriorityFeePerGas" => json!(quantity(self.gas_price)),
+            "eth_gasPrice" => json!(quantity(self.gas_price()?)),
+            "eth_maxPriorityFeePerGas" => json!(quantity(self.suggest_tip()?)),
             "eth_syncing" => json!(false),
             "solo_stop" => {
                 self.stopped = true;
@@ -568,6 +505,18 @@ impl Rpc {
             reason::INITCODE_TOO_LARGE => format!(
                 "{text}: code size {}, limit {MAX_INITCODE_SIZE}",
                 tx.input.len()
+            ),
+            reason::FEE_TOO_LOW => format!(
+                "{text}: address {}, maxFeePerGas: {}, baseFee: {}",
+                data(&sender(raw).unwrap_or_default()),
+                tx.gas_price,
+                self.node.fee_status().base_fee
+            ),
+            reason::TIP_ABOVE_FEE_CAP => format!(
+                "{text}: address {}, maxPriorityFeePerGas: {}, maxFeePerGas: {}",
+                data(&sender(raw).unwrap_or_default()),
+                tx.priority_fee.unwrap_or_default(),
+                tx.gas_price
             ),
             _ => text.to_owned(),
         };
@@ -736,9 +685,12 @@ impl Rpc {
 
     /// The header at `height` with its hash. Height 0 is the genesis, which
     /// the kernel does not store: a header of the genesis state root, empty
-    /// tries and the chain's gas limit and base fee, whose hash is zero, the
-    /// parent hash of block 1 (spec 20 §3.1).
-    fn header_at(&mut self, height: u64) -> Result<Option<(BlockHeader, [u8; 32])>, RpcError> {
+    /// tries, the chain's gas limit and the base fee it started at, whose
+    /// hash is zero, the parent hash of block 1 (spec 20 §3.1).
+    pub(crate) fn header_at(
+        &mut self,
+        height: u64,
+    ) -> Result<Option<(BlockHeader, [u8; 32])>, RpcError> {
         if height == 0 {
             let genesis = BlockHeader {
                 state_root: self.node.genesis_state_root(),
@@ -746,7 +698,7 @@ impl Rpc {
                 receipts_root: solo_eth::mpt::EMPTY_ROOT,
                 logs_bloom: vec![0; 256],
                 gas_limit: BLOCK_GAS_LIMIT,
-                base_fee: BASE_FEE,
+                base_fee: self.node.genesis_base_fee(),
                 ..BlockHeader::default()
             };
             return Ok(Some((genesis, [0; 32])));
@@ -758,7 +710,7 @@ impl Rpc {
     }
 
     /// The receipts of a block's transactions, in order.
-    fn receipts_of(&mut self, header: &BlockHeader) -> Result<Vec<Receipt>, RpcError> {
+    pub(crate) fn receipts_of(&mut self, header: &BlockHeader) -> Result<Vec<Receipt>, RpcError> {
         let mut out = Vec::with_capacity(header.tx_hashes.0.len());
         for hash in &header.tx_hashes.0 {
             out.push(self.node.receipt(hash)?.unwrap_or_default());
@@ -929,47 +881,6 @@ impl Rpc {
         Ok(Value::Array(out))
     }
 
-    #[allow(clippy::cast_precision_loss)]
-    fn fee_history(&mut self, params: &[Value]) -> Result<Value, RpcError> {
-        let count = block_count(params.first())?;
-        let newest = self.resolve_block(param_str(params, 1)?)?;
-        let percentiles = percentiles(params.get(2))?;
-        let head = self.block_number()?;
-        if newest > head {
-            return Err(RpcError::server(format!(
-                "request beyond head block: requested {newest}, head {head}"
-            )));
-        }
-        if count == 0 {
-            return Ok(
-                json!({ "oldestBlock": quantity(0), "baseFeePerGas": [], "gasUsedRatio": [] }),
-            );
-        }
-        let count = count.min(MAX_FEE_HISTORY).min(newest + 1);
-        let oldest = newest + 1 - count;
-        let mut ratios = Vec::new();
-        let mut reward = Vec::new();
-        for height in oldest..=newest {
-            self.run_background();
-            let (header, _) = self.header_at(height)?.unwrap_or_default();
-            // Gas amounts are far below 2^53: the ratio is exact enough.
-            ratios.push(header.gas_used as f64 / BLOCK_GAS_LIMIT as f64);
-            let receipts = self.receipts_of(&header)?;
-            reward.push(rewards(&receipts, header.gas_used, &percentiles));
-        }
-        let blocks = ratios.len();
-        let mut history = json!({
-            "oldestBlock": quantity(u128::from(oldest)),
-            "baseFeePerGas": vec![quantity(u128::from(BASE_FEE)); blocks + 1],
-            "gasUsedRatio": ratios,
-            "baseFeePerBlobGas": vec![quantity(0); blocks + 1],
-            "blobGasUsedRatio": vec![0.0; blocks],
-        });
-        if !percentiles.is_empty() {
-            history["reward"] = json!(reward);
-        }
-        Ok(history)
-    }
 }
 
 /// The error for a height whose state the node does not keep, in the words

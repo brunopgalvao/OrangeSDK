@@ -28,7 +28,9 @@
 //! installed at genesis (spec 16) are listed under `"modules"`; see [`modules`].
 //! The Ethereum-to-Solo bridge (spec 18) is configured under `"bridgeIn"`;
 //! see [`bridge`]. Staking, epochs and the threshold key (spec 15) under
-//! `"staking"`; see [`staking`].
+//! `"staking"`; see [`staking`]. The fee market (spec 23) under `"fees"`;
+//! see [`fees`]: without it the base fee is zero, as a development chain
+//! wants it.
 //!
 //! `solo upgrade` stages and proposes a kernel upgrade through governance
 //! (see [`upgrade`]), and `solo devnet` runs a network of validator
@@ -40,6 +42,7 @@ pub mod bridge;
 pub mod client;
 pub mod devnet;
 pub mod doctor;
+pub mod fees;
 pub mod gov;
 pub mod modules;
 pub mod staking;
@@ -99,7 +102,7 @@ pub const USAGE: &str = "usage:
   solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive] [--data-dir <dir>]
   solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
   solo key  <64 hex>
-  solo gov  submit <target> <0x calldata> | vote <id> yes|no | execute <id> | veto <id> | pause <target> | set-guardian <address> | set-mode stake | set-params <voting> <timelock> <quorumBps> <deposit>
+  solo gov  submit <target> <0x calldata> | vote <id> yes|no | execute <id> | veto <id> | pause <target> | set-guardian <address> | set-mode stake | set-params <voting> <timelock> <quorumBps> <deposit> | set-fee-params <denominator> <elasticity> <minBaseFee> <treasury|burn>
   solo doctor [--rpc 127.0.0.1:8545] [--max-head-age <s>] [--max-finality-lag <blocks>] [--min-peers <n>] [--max-mempool <txs>] [--max-call-ms <ms>]
   solo upgrade --kernel <kernel.elf|kernel.solo> (--key <64 hex> | --key-file <path>) [--rpc 127.0.0.1:8545] [--delay <blocks>] [--required-gates <g,g,...>] [--timeout <s>]
   solo devnet init --dir <dir> --kernel <kernel.elf|kernel.solo> [--validators 4] [--chain-id 1337] [--slot-ms 400] [--epoch-blocks 20] [--dkg-phase-blocks 5] [--upgrade-delay 2] [--host 127.0.0.1] [--p2p-port 30301] [--rpc-port 8545] [--seed <64 hex>] [--governance-key <64 hex>] [--force]
@@ -150,6 +153,7 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
         staking: staking::parse_staking(&v)?,
         bridge_in: bridge::parse_bridge(&v)?,
         governance: gov::parse_governance(&v)?,
+        fees: fees::parse_fees(&v)?,
     };
     let mut validators = Vec::new();
     match v.get("validators") {

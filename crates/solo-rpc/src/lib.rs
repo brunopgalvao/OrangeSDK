@@ -15,6 +15,7 @@
 
 pub mod bridge;
 pub mod call;
+pub mod fees;
 pub mod filter;
 pub mod governance;
 pub mod hex;

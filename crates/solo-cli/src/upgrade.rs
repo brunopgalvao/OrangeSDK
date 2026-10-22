@@ -70,13 +70,15 @@ pub fn parse_gates(text: &str) -> Result<u64, String> {
 }
 
 /// What the governance key sends: a legacy transaction to the upgrade
-/// address carrying `action`, with gas price zero (the reference kernel's
-/// base fee is zero, so actions cost the governance account nothing).
+/// address carrying `action` at `gas_price`, the node's `eth_gasPrice`
+/// (the base fee and the suggested tip, spec 23 §7), so that it runs on a
+/// chain whose base fee is above zero.
 #[must_use]
 pub fn action_tx(
     key: &SigningKey,
     chain_id: u64,
     nonce: u64,
+    gas_price: u128,
     gas: u64,
     action: &Action,
 ) -> Vec<u8> {
@@ -84,7 +86,7 @@ pub fn action_tx(
         key,
         chain_id,
         nonce,
-        0,
+        gas_price,
         gas,
         UPGRADE_ADDRESS,
         0,
@@ -130,6 +132,7 @@ pub fn submit(
     }
     let min_delay = status["params"]["minDelay"].as_u64().unwrap_or(0);
     let chain_id = quantity(&call(rpc, "eth_chainId", &json!([]))?)?;
+    let gas_price = u128::from(quantity(&call(rpc, "eth_gasPrice", &json!([]))?)?);
     let account = json!([data(&sender), "pending"]);
     let mut nonce = quantity(&call(rpc, "eth_getTransactionCount", &account)?)?;
     let code_hash = keccak256(code);
@@ -142,7 +145,7 @@ pub fn submit(
             index: u32::try_from(index).unwrap_or(u32::MAX),
             chunk: chunk.to_vec(),
         };
-        let raw = action_tx(key, chain_id, nonce, STAGE_GAS, &action);
+        let raw = action_tx(key, chain_id, nonce, gas_price, STAGE_GAS, &action);
         let hash = call(rpc, "eth_sendRawTransaction", &json!([data(&raw)]))?;
         hashes.push(hash.as_str().unwrap_or_default().to_owned());
         nonce += 1;
@@ -164,7 +167,7 @@ pub fn submit(
             activation_height,
             required_gates,
         };
-        let raw = action_tx(key, chain_id, nonce, PROPOSE_GAS, &propose);
+        let raw = action_tx(key, chain_id, nonce, gas_price, PROPOSE_GAS, &propose);
         nonce += 1;
         let hash = call(rpc, "eth_sendRawTransaction", &json!([data(&raw)]))?;
         let receipt = wait_receipt(rpc, hash.as_str().unwrap_or_default(), "proposal", deadline)?;
