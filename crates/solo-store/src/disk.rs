@@ -40,6 +40,9 @@ pub const CHAIN_FILE: &str = "chain.redb";
 /// Entries of the state in key order: what a scan or a snapshot holds.
 pub type Entries = Vec<(Vec<u8>, Vec<u8>)>;
 
+/// Where a new store file is laid out before it is renamed to [`CHAIN_FILE`].
+pub const CREATING_FILE: &str = "chain.redb.new";
+
 /// The store layout this release writes; a file of another format is refused.
 pub const FORMAT: u32 = 1;
 
@@ -88,6 +91,12 @@ impl std::error::Error for StoreError {}
 /// and it takes the error by value so that `map_err` takes it as a function.
 #[allow(clippy::needless_pass_by_value)]
 fn db(e: redb::Error) -> StoreError {
+    StoreError::Db(e.to_string())
+}
+
+/// A file system error, as a store error; by value, as `map_err` takes it.
+#[allow(clippy::needless_pass_by_value)]
+fn io_error(e: std::io::Error) -> StoreError {
     StoreError::Db(e.to_string())
 }
 
@@ -420,11 +429,40 @@ impl DiskStore {
     /// When the file cannot be created, opened or read, is of another
     /// format, or is held by another process.
     pub fn open(dir: &Path) -> Result<DiskStore, StoreError> {
-        std::fs::create_dir_all(dir).map_err(|e| StoreError::Db(e.to_string()))?;
+        std::fs::create_dir_all(dir).map_err(io_error)?;
         let path = dir.join(CHAIN_FILE);
-        let mut database = Database::create(&path)
+        if !path.exists() {
+            Self::create(dir, &path)?;
+        }
+        let database = Database::create(&path)
             .map_err(redb::Error::from)
             .map_err(db)?;
+        Self::over(path, database)
+    }
+
+    /// Creates a new store file at `path`, whole or not at all: a crash
+    /// while the database lays out a new file leaves one that does not open,
+    /// so the file is laid out and stamped under [`CREATING_FILE`] and only
+    /// then renamed into place, the directory synced after.
+    fn create(dir: &Path, path: &Path) -> Result<(), StoreError> {
+        let creating = dir.join(CREATING_FILE);
+        // What an earlier crash left half laid out.
+        let _ = std::fs::remove_file(&creating);
+        let mut database = Database::create(&creating)
+            .map_err(redb::Error::from)
+            .map_err(db)?;
+        Self::prepare(&mut database)?;
+        drop(database);
+        std::fs::rename(&creating, path).map_err(io_error)?;
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(io_error)
+    }
+
+    /// Opens the store over `database`, whose file is `path`: what
+    /// [`DiskStore::open`] does once the file is open, and what the crash
+    /// tests do over a database whose writes they cut short.
+    fn over(path: PathBuf, mut database: Database) -> Result<DiskStore, StoreError> {
         let (meta, written, nodes) = Self::prepare(&mut database)?;
         let db = database;
         let format = meta
@@ -1549,6 +1587,253 @@ mod tests {
         assert!(StoreError::Db("x".into()).to_string().contains('x'));
         assert!(StoreError::Format(3).to_string().contains("format 3"));
         assert!(StoreError::Corrupt("why").to_string().contains("why"));
+    }
+
+    /// A disk that loses power. What the database writes lands in the page
+    /// cache (`seen`); what it syncs reaches the platter (`durable`). After
+    /// `budget` writes, resizes and syncs the power fails: that call and
+    /// every later one is refused, and nothing more reaches either.
+    #[derive(Debug, Default)]
+    struct Platter {
+        durable: Vec<u8>,
+        seen: Vec<u8>,
+        ops: u64,
+        budget: Option<u64>,
+    }
+
+    /// The backend the crash tests open the store over: a [`Platter`]
+    /// shared with the test, which reads it after the crash.
+    #[derive(Debug, Clone, Default)]
+    struct PowerLoss(Arc<std::sync::Mutex<Platter>>);
+
+    impl PowerLoss {
+        /// A disk whose platter holds `image`, losing power after `budget`
+        /// operations, or never.
+        fn holding(image: Vec<u8>, budget: Option<u64>) -> PowerLoss {
+            PowerLoss(Arc::new(std::sync::Mutex::new(Platter {
+                durable: image.clone(),
+                seen: image,
+                ops: 0,
+                budget,
+            })))
+        }
+
+        fn platter(&self) -> std::sync::MutexGuard<'_, Platter> {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// Counts one operation, or refuses it once the power is gone.
+        fn operate(&self) -> Result<std::sync::MutexGuard<'_, Platter>, std::io::Error> {
+            let mut p = self.platter();
+            if p.budget.is_some_and(|budget| p.ops >= budget) {
+                return Err(std::io::Error::other("power lost"));
+            }
+            p.ops += 1;
+            Ok(p)
+        }
+
+        /// Opens the store over this disk.
+        fn open(&self) -> Result<DiskStore, StoreError> {
+            let database = redb::Builder::new()
+                .create_with_backend(self.clone())
+                .map_err(redb::Error::from)
+                .map_err(db)?;
+            DiskStore::over(PathBuf::from("power-loss"), database)
+        }
+    }
+
+    impl redb::StorageBackend for PowerLoss {
+        fn len(&self) -> Result<u64, std::io::Error> {
+            Ok(self.platter().seen.len() as u64)
+        }
+
+        fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+            let p = self.platter();
+            let start = usize::try_from(offset).expect("an offset in memory");
+            out.copy_from_slice(&p.seen[start..start + out.len()]);
+            Ok(())
+        }
+
+        fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+            let mut p = self.operate()?;
+            p.seen
+                .resize(usize::try_from(len).expect("a length in memory"), 0);
+            Ok(())
+        }
+
+        fn sync_data(&self) -> Result<(), std::io::Error> {
+            let mut p = self.operate()?;
+            p.durable = p.seen.clone();
+            Ok(())
+        }
+
+        fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+            let mut p = self.operate()?;
+            let start = usize::try_from(offset).expect("an offset in memory");
+            p.seen[start..start + data.len()].copy_from_slice(data);
+            Ok(())
+        }
+    }
+
+    /// Everything a store answers from what it committed: the versions it
+    /// keeps, the whole state as it is and as each kept version sealed it,
+    /// the current root and the kernel.
+    type Image = (Option<(u64, u64)>, Vec<Entries>, Hash, Option<Hash>);
+
+    fn image(s: &mut DiskStore) -> Image {
+        let mut states = vec![s.scan(&[])];
+        if let Some((oldest, latest)) = s.versions() {
+            for version in oldest..=latest {
+                s.set_view(Some(version)).unwrap();
+                states.push(s.scan(&[]));
+            }
+            s.set_view(None).unwrap();
+        }
+        (s.versions(), states, s.state_trie().root(), s.kernel())
+    }
+
+    type Step = fn(&mut DiskStore) -> Result<(), StoreError>;
+
+    /// What the crash sweep cuts short: a genesis, blocks that write,
+    /// delete and restore keys, a finalization's flush of a local key, a
+    /// kernel switch's flush of committed keys before the next block, a
+    /// prune that releases tries and a compaction.
+    const WORKLOAD: [Step; 9] = [
+        |s| {
+            s.set(b"acct/a", b"1");
+            s.set(b"acct/b", b"2");
+            s.set(b"local/finalized", b"0");
+            s.set_kernel([1; 32]);
+            s.seal(0, None)
+        },
+        |s| {
+            s.set(b"acct/c", b"3");
+            s.set(b"acct/a", b"4");
+            let header = s.state_trie();
+            s.set(b"block/1", b"h1");
+            s.seal(1, Some(&header))
+        },
+        |s| {
+            s.set(b"local/finalized", b"1");
+            s.flush()
+        },
+        |s| {
+            s.delete(b"acct/b");
+            let header = s.state_trie();
+            s.set(b"block/2", b"h2");
+            s.seal(2, Some(&header))
+        },
+        |s| {
+            // Back to the genesis values: the old nodes, counted again.
+            s.set(b"acct/b", b"2");
+            s.set(b"acct/a", b"1");
+            let header = s.state_trie();
+            s.seal(3, Some(&header))
+        },
+        |s| {
+            s.set(b"meta/switch", b"v2");
+            s.set_kernel([2; 32]);
+            s.flush()
+        },
+        |s| {
+            s.set(b"meta/switch", b"v2 active");
+            s.set(b"acct/d", b"5");
+            let header = s.state_trie();
+            s.seal(4, Some(&header))
+        },
+        |s| s.prune(3),
+        |s| s.compact().map(drop),
+    ];
+
+    /// Runs [`WORKLOAD`] over `disk`, recording the image after the open
+    /// and after every step, until the end or the first error.
+    fn run_workload(disk: &PowerLoss, images: &mut Vec<Image>) -> Result<(), StoreError> {
+        let mut s = disk.open()?;
+        images.push(image(&mut s));
+        for step in WORKLOAD {
+            step(&mut s)?;
+            images.push(image(&mut s));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_power_loss_at_any_write_leaves_the_commit_before_or_after_it_whole() {
+        // A new file is created whole by `DiskStore::open` (see the test
+        // below); the sweep starts from one just created.
+        let created = PowerLoss::default();
+        drop(created.open().unwrap());
+        let created = created.platter().durable.clone();
+        let mut whole = Vec::new();
+        let counting = PowerLoss::holding(created.clone(), None);
+        run_workload(&counting, &mut whole).unwrap();
+        let total = counting.platter().ops;
+        assert_eq!(whole.len(), WORKLOAD.len() + 1);
+        assert!(total > 50, "{total}");
+        let mut cut_short = BTreeSet::new();
+        for budget in 0..total {
+            let disk = PowerLoss::holding(created.clone(), Some(budget));
+            let mut images = Vec::new();
+            // The last operations come when the store is dropped, after the
+            // last step: a crash there leaves the last commit.
+            let _ = run_workload(&disk, &mut images);
+            // Every commit before the crash is the one the full run made.
+            let done = images.len();
+            cut_short.insert(done);
+            assert_eq!(images, whole[..done]);
+            let (durable, cached) = {
+                let p = disk.platter();
+                (p.durable.clone(), p.seen.clone())
+            };
+            // What the platter holds after the crash, and what it holds if
+            // the cache had reached it too: either way the store reopens as
+            // the last commit before the crash or the one in flight, whole.
+            for platter in [durable, cached] {
+                let mut s = PowerLoss::holding(platter, None).open().unwrap();
+                let got = image(&mut s);
+                let around = &whole[done.saturating_sub(1)..=done.min(WORKLOAD.len())];
+                assert!(around.contains(&got), "torn at operation {budget}");
+                // Every trie node the current root reaches is on the platter.
+                let root = s.state_trie().root();
+                for (key, value) in s.scan(&[]).iter().filter(|(k, _)| committed(k)) {
+                    let proof = s.state_trie().prove(key);
+                    assert_eq!(
+                        proof.verify(solo_trie::keccak256, &root, key),
+                        Ok(Some(solo_trie::keccak256(value)))
+                    );
+                }
+                // And the node goes on from it.
+                let next = s.versions().map_or(0, |(_, latest)| latest + 1);
+                s.set(b"acct/after", b"crash");
+                let header = s.state_trie();
+                s.seal(next, Some(&header)).unwrap();
+                assert_eq!(s.head(), next);
+            }
+        }
+        // The crashes cut every step short, the open's own commit included.
+        assert_eq!(cut_short, (0..=WORKLOAD.len() + 1).collect());
+    }
+
+    #[test]
+    fn a_new_file_is_created_whole_or_not_at_all() {
+        let dir = scratch("create");
+        std::fs::create_dir_all(&dir).unwrap();
+        // What a crash while laying out a new file leaves is not a database;
+        // the next open lays it out again and puts it in place.
+        std::fs::write(dir.join(CREATING_FILE), b"half a file").unwrap();
+        let mut s = DiskStore::open(&dir).unwrap();
+        assert!(s.is_fresh());
+        assert!(!dir.join(CREATING_FILE).exists());
+        s.set(b"k", b"v");
+        s.seal(0, None).unwrap();
+        drop(s);
+        // A file in place is never laid out again.
+        let s = DiskStore::open(&dir).unwrap();
+        assert_eq!((s.head(), s.get(b"k")), (0, Some(b"v".to_vec())));
+        // Where the new file cannot be put in place, nothing is opened.
+        let blocked = scratch("create-blocked");
+        std::fs::create_dir_all(blocked.join(CREATING_FILE)).unwrap();
+        assert!(matches!(DiskStore::open(&blocked), Err(StoreError::Db(_))));
     }
 
     #[test]
