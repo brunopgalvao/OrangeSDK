@@ -326,8 +326,13 @@ impl Node {
             .kernel()
             .filter(|k| *k != self.kernel)
         {
-            let r = self.query(solo_upgrade::query::CODE, &stored)?;
-            let code = Vec::<u8>::from_bytes(&r.body).unwrap_or_default();
+            // A kernel that cannot serve the query, like code that does not
+            // hash to the stored kernel, leaves nothing to compile.
+            let code = self
+                .query(solo_upgrade::query::CODE, &stored)
+                .ok()
+                .and_then(|r| Vec::<u8>::from_bytes(&r.body).ok())
+                .unwrap_or_default();
             self.compile(&code, &stored, gates).map_err(|why| {
                 NodeError::Upgrade(format!(
                     "the store was last written by a kernel that is neither the one given nor an upgrade in chain state: {why}"
@@ -506,6 +511,12 @@ impl Node {
         let cap = std::mem::replace(&mut self.query_gas, i64::MAX);
         let stepped = self.step_capless(input);
         self.query_gas = cap;
+        // A block the store refused is a block the driver believes executed:
+        // the node stops here, to be restarted over the store, which holds
+        // the block before (spec 22 §4).
+        if let Err(e @ NodeError::Store(_)) = &stepped {
+            self.upgrades.halt(e.clone());
+        }
         stepped
     }
 

@@ -277,6 +277,11 @@ impl Upgrades {
     pub fn halted(&self) -> Option<&NodeError> {
         self.halted.as_ref()
     }
+
+    /// Halts the node with `why`: every later step reports it.
+    pub(crate) fn halt(&mut self, why: NodeError) {
+        self.halted = Some(why);
+    }
 }
 
 /// The legacy EIP-155 transaction with which a validator's host signals
