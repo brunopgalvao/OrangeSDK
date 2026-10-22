@@ -11,9 +11,7 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use k256::ecdsa::SigningKey;
-use solo_abi::chain::{
-    Allocation, GenesisParams, SnapshotRecord, UpgradeParams, Validator, ValidatorSet, keys,
-};
+use solo_abi::chain::{Allocation, GenesisParams, UpgradeParams, Validator, ValidatorSet, keys};
 use solo_abi::codec::Seq;
 use solo_abi::staking::{KeySetRecord, StakingParams, ValidatorKey, keys as skeys};
 use solo_abi::types::Genesis;
@@ -476,7 +474,6 @@ fn staking_genesis(validators: &[SigningKey]) -> Genesis {
                     dkg_key: encryption_key(k).to_vec(),
                 })
                 .collect()),
-            ..StakingParams::default()
         },
         ..GenesisParams::default()
     };

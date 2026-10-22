@@ -604,3 +604,208 @@ impl Snapshot {
             .map_err(store_error)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use solo_abi::chain::{Certificate, Signature, SignedVote};
+    use solo_abi::codec::Seq;
+
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("solo-snapshot-unit-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// A proposal at `height` anchoring `anchor` with `root`.
+    fn proposal(height: u64, anchor: u64, root: [u8; 32]) -> Proposal {
+        Proposal {
+            view: height,
+            height,
+            anchor_height: anchor,
+            anchor_root: root,
+            ..Proposal::default()
+        }
+    }
+
+    fn certificate(hash: [u8; 32]) -> Certificate {
+        Certificate {
+            kind: KIND_FINALIZE,
+            view: 1,
+            hash,
+            votes: Seq(vec![SignedVote {
+                validator: 0,
+                signature: Signature([0; 65]),
+            }]),
+        }
+    }
+
+    /// Enters `p` as finalized at its height in `tables`, with a vote
+    /// certificate unless `certified` is false.
+    fn finalize(tables: &mut Tables, p: &Proposal, certified: bool) {
+        let bytes = p.to_bytes();
+        let hash = keccak256(&bytes);
+        tables.insert(height_key(b"final/", p.height), hash.to_vec());
+        tables.insert([b"prop/".as_slice(), &hash].concat(), bytes);
+        if certified {
+            tables.insert(height_key(b"cert/", p.height), certificate(hash).to_bytes());
+        }
+    }
+
+    /// A store with a chain id, three versions and the snapshot record of
+    /// epoch 0 at version 1; returns it with the header roots of versions
+    /// 2 and 3.
+    fn store(name: &str) -> (DiskStore, [u8; 32], [u8; 32]) {
+        let mut s = DiskStore::open(&scratch(name)).unwrap();
+        s.set(keys::CHAIN_ID, &7u64.to_bytes());
+        s.seal(0, None).unwrap();
+        s.set(b"acct/a", b"1");
+        s.seal(1, None).unwrap();
+        let record = SnapshotRecord {
+            height: 1,
+            state_root: s.state_trie().root(),
+        };
+        s.set(&record_key(0), &record.to_bytes());
+        s.set(keys::SNAPSHOT_LATEST, &0u64.to_bytes());
+        let committed = s.state_trie();
+        s.set(b"meta/height", b"2");
+        s.seal(2, Some(&committed)).unwrap();
+        let root2 = committed.root();
+        s.set(b"acct/b", b"2");
+        let committed = s.state_trie();
+        s.set(b"meta/height", b"3");
+        s.seal(3, Some(&committed)).unwrap();
+        (s, root2, committed.root())
+    }
+
+    #[test]
+    fn export_names_what_the_store_or_the_tables_lack() {
+        let (s, root2, root3) = store("export");
+        let why = |r: Result<Snapshot, SnapshotError>| match r {
+            Err(SnapshotError::Export(why)) => why,
+            other => panic!("{other:?}"),
+        };
+        // No chain, no record, no epoch: each named.
+        let empty = DiskStore::open(&scratch("empty")).unwrap();
+        assert!(why(Snapshot::export(&empty, &Tables::new(), None)).contains("no chain"));
+        let mut fresh = DiskStore::open(&scratch("fresh")).unwrap();
+        fresh.set(keys::CHAIN_ID, &7u64.to_bytes());
+        fresh.seal(0, None).unwrap();
+        assert!(
+            why(Snapshot::export(&fresh, &Tables::new(), None)).contains("recorded no snapshot")
+        );
+        assert!(
+            why(Snapshot::export(&s, &Tables::new(), Some(5)))
+                .contains("no snapshot record for epoch 5")
+        );
+        // Nothing certified above the record.
+        let mut tables = Tables::new();
+        assert!(why(Snapshot::export(&s, &tables, None)).contains("no certified proposal"));
+        // Candidates that do not do: one at the record's height, one that
+        // anchors the record's height, one anchoring a version with no
+        // trie, one with another root, one without a certificate, one whose
+        // proposal is missing, one whose proposal does not decode.
+        finalize(&mut tables, &proposal(0, 0, [0; 32]), true);
+        finalize(&mut tables, &proposal(2, 1, root2), true);
+        finalize(&mut tables, &proposal(3, 9, root3), true);
+        finalize(&mut tables, &proposal(4, 2, [9; 32]), true);
+        finalize(&mut tables, &proposal(5, 2, root2), false);
+        tables.insert(height_key(b"final/", 6), vec![1; 32]);
+        tables.insert(height_key(b"final/", 7), vec![2; 32]);
+        tables.insert([b"prop/".as_slice(), &[2; 32]].concat(), vec![0xFF]);
+        tables.insert(b"final/short".to_vec(), vec![3; 32]);
+        assert!(why(Snapshot::export(&s, &tables, None)).contains("no certified proposal"));
+        // A good candidate, but the head block's entries missing one by one.
+        finalize(&mut tables, &proposal(8, 3, root3), true);
+        assert!(why(Snapshot::export(&s, &tables, None)).contains("do not hold block 1"));
+        let head = proposal(1, 0, [0; 32]);
+        finalize(&mut tables, &head, true);
+        let hash = keccak256(&head.to_bytes());
+        tables.remove(&[b"prop/".as_slice(), &hash].concat());
+        assert!(why(Snapshot::export(&s, &tables, None)).contains("the proposal of block 1"));
+        finalize(&mut tables, &head, false);
+        tables.remove(&height_key(b"cert/", 1));
+        assert!(why(Snapshot::export(&s, &tables, None)).contains("the certificate of block 1"));
+        finalize(&mut tables, &head, true);
+        tables.insert(height_key(b"bcert/", 1), vec![2; 97]);
+        let snapshot = Snapshot::export(&s, &tables, None).unwrap();
+        assert_eq!(
+            (
+                snapshot.header.chain_id,
+                snapshot.header.epoch,
+                snapshot.header.height
+            ),
+            (7, 0, 1)
+        );
+        assert_eq!(snapshot.header.head_threshold, vec![2; 97]);
+        assert_eq!(
+            snapshot.entries,
+            vec![
+                (b"acct/a".to_vec(), b"1".to_vec()),
+                (keys::CHAIN_ID.to_vec(), 7u64.to_bytes())
+            ]
+        );
+        // The threshold certificate is preferred when the tables hold one.
+        tables.insert(height_key(b"bcert/", 8), vec![2; 97]);
+        let snapshot = Snapshot::export(&s, &tables, Some(0)).unwrap();
+        assert_eq!(snapshot.header.certificate, vec![2; 97]);
+        assert_eq!(snapshot.local_keys().len(), 4);
+        // The state of the record's height must still be kept.
+        let (mut pruned, _, _) = store("pruned");
+        pruned.prune(3).unwrap();
+        assert!(why(Snapshot::export(&pruned, &tables, None)).contains("no longer keeps"));
+        // Errors read as sentences.
+        for e in [
+            SnapshotError::Io("x".into()),
+            SnapshotError::Format("y"),
+            SnapshotError::Store("z".into()),
+            SnapshotError::Export("w".into()),
+        ] {
+            assert!(e.to_string().starts_with("snapshot"), "{e}");
+        }
+        assert_eq!(
+            store_error(StoreError::Injected).to_string(),
+            "snapshot: chain store: injected fault"
+        );
+    }
+
+    #[test]
+    fn a_file_too_large_for_the_format_is_refused() {
+        let snapshot = Snapshot {
+            header: SnapshotHeader::default(),
+            entries: Vec::new(),
+        };
+        // The header always fits; an entry longer than u32 cannot be built
+        // in a test, so the error paths of `write` end at the file system.
+        let path = scratch("write").join("missing-dir").join("x.snap");
+        assert!(matches!(snapshot.write(&path), Err(SnapshotError::Io(_))));
+        let dir = scratch("write-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.snap");
+        snapshot.write(&path).unwrap();
+        assert_eq!(Snapshot::read(&path).unwrap(), snapshot);
+        // A vote certificate's checks, one by one.
+        let hash = [5; 32];
+        let set = ValidatorSet {
+            validators: Seq(vec![solo_abi::chain::Validator {
+                id: [1; 32],
+                weight: 1,
+            }]),
+        };
+        let mut c = certificate(hash);
+        assert!(!votes_certify(&c, &hash, 7, &set));
+        c.kind = 1;
+        assert!(!votes_certify(&c, &hash, 7, &set));
+        c.kind = KIND_FINALIZE;
+        c.votes.0[0].validator = 3;
+        assert!(!votes_certify(&c, &hash, 7, &set));
+        c.votes.0[0].validator = 0;
+        c.votes.0.push(c.votes.0[0].clone());
+        assert!(!votes_certify(&c, &hash, 7, &set));
+        assert!(signer(&[0; 32], &[0; 65]).is_none());
+    }
+}

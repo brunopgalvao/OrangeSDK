@@ -53,12 +53,12 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use solo_abi::Encode;
 use solo_abi::chain::{
     Allocation, GenesisParams, StorageSlot, UpgradeParams, Validator, ValidatorSet,
 };
 use solo_abi::codec::Seq;
 use solo_abi::types::Genesis;
+use solo_abi::{Decode, Encode};
 
 /// A message for the user.
 #[derive(Debug)]
@@ -570,14 +570,21 @@ fn chain_store_arguments(
 /// resume, how many of its own finalized blocks it re-executed from its
 /// tables before anything else happened (spec 08 §7), and where the chain
 /// state lives and at which height it was opened (spec 22 §5).
-fn report_driver_state(node: &solo_node::Node, resuming: bool, opened_at: u64) {
+fn report_driver_state(node: &solo_node::Node, resumed: Option<&[u8]>, opened_at: u64) {
     if let Some(store) = node.store() {
         let view = node.simplex_state().map_or(0, |s| s.view);
-        let how = if resuming {
-            format!(
-                "resumed in view {view}, {} blocks re-executed from its tables",
-                node.executed.len()
-            )
+        let how = if let Some(resumed) = resumed {
+            // Re-executed blocks are at or below the height the driver had
+            // finalized when it stopped; blocks it proposed on starting are
+            // above it.
+            let remembered = solo_abi::chain::SimplexState::from_bytes(resumed)
+                .map_or(0, |s| s.finalized_height);
+            let replayed = node
+                .executed
+                .iter()
+                .filter(|(height, _)| *height <= remembered)
+                .count();
+            format!("resumed in view {view}, {replayed} blocks re-executed from its tables")
         } else {
             format!("new, from view {view}")
         };
@@ -695,9 +702,8 @@ pub(crate) fn run_inner(
     if let Some(store) = store {
         node.attach_store(store);
     }
-    let resuming = resumed.is_some();
-    node.start(resumed)?;
-    report_driver_state(&node, resuming, opened_at);
+    node.start(resumed.clone())?;
+    report_driver_state(&node, resumed.as_deref(), opened_at);
     let mut transport = if command == "node" {
         Some(bind_transport(args, &node, chain_id, peers)?)
     } else {
