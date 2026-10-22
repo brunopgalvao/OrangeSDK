@@ -2308,6 +2308,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redb"
+version = "4.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39178e0a867f9e3eaa6292a4ab1dd3613f2519c5b564341e1e7b29b270736cc4"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "ref-cast"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3071,6 +3080,18 @@ dependencies = [
  "solo-rlp",
  "solo-trie",
  "tiny-keccak",
+]
+
+[[package]]
+name = "solo-store"
+version = "0.0.1"
+dependencies = [
+ "k256",
+ "redb",
+ "solo-abi",
+ "solo-bls",
+ "solo-host",
+ "solo-trie",
 ]
 
 [[package]]
