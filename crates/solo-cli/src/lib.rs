@@ -691,10 +691,15 @@ pub(crate) fn run_inner(
     )?;
     if let Some(snapshot) = &snapshot {
         // A directory that already holds a chain keeps it; the snapshot is
-        // for an empty one.
-        match snapshot::import_into(&mut node, snapshot) {
-            Ok(()) => eprintln!("{} imported", snapshot::describe(snapshot)),
-            Err(why) => eprintln!("--snapshot ignored: {why}"),
+        // for an empty one, and an import that fails there stops the node.
+        match node.chain_store().map_or(0, solo_store::DiskStore::head) {
+            0 => {
+                snapshot::import_into(&mut node, snapshot)?;
+                eprintln!("{} imported", snapshot::describe(snapshot));
+            }
+            head => eprintln!(
+                "--snapshot ignored: the data directory already holds chain state at height {head}"
+            ),
         }
     }
     let opened_at = node.block_number().unwrap_or(0);

@@ -155,6 +155,11 @@ fn io_error(e: io::Error) -> SnapshotError {
     SnapshotError::Io(e.to_string())
 }
 
+/// An entry longer than a `u32` length can say: not one a chain holds.
+fn entry_too_long() -> SnapshotError {
+    SnapshotError::Io("an entry does not fit the format".to_owned())
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn store_error(e: StoreError) -> SnapshotError {
     SnapshotError::Store(e.to_string())
@@ -283,6 +288,19 @@ impl Snapshot {
                 record.height, kept
             ))
         })?;
+        // The record is the root as the next block began; a kernel switch
+        // between the two blocks wrote into it after the version was sealed
+        // (spec 22 §7.1), and a file of these entries would not verify.
+        let mut trie = Trie::new();
+        for (key, value) in &entries {
+            trie.insert(key, value);
+        }
+        if trie.root() != record.state_root {
+            return Err(SnapshotError::Export(format!(
+                "the state sealed at block {} does not hash to epoch {epoch}'s record: a kernel switch after that block wrote into it; export another epoch",
+                record.height
+            )));
+        }
         let head = |prefix: &[u8]| tables.get(&height_key(prefix, record.height)).cloned();
         let head_hash = head(b"final/").ok_or_else(|| {
             SnapshotError::Export(format!(
@@ -399,9 +417,7 @@ impl Snapshot {
         out.write_all(&header).map_err(io_error)?;
         for (key, value) in &self.entries {
             for part in [key, value] {
-                let len = u32::try_from(part.len()).map_err(|_| {
-                    SnapshotError::Io("an entry does not fit the format".to_owned())
-                })?;
+                let len = u32::try_from(part.len()).map_err(|_| entry_too_long())?;
                 out.write_all(&len.to_le_bytes()).map_err(io_error)?;
                 out.write_all(part).map_err(io_error)?;
             }
@@ -711,10 +727,7 @@ mod tests {
     #[test]
     fn export_names_what_the_store_or_the_tables_lack() {
         let (s, root2, root3) = store("export");
-        let why = |r: Result<Snapshot, SnapshotError>| match r {
-            Err(SnapshotError::Export(why)) => why,
-            other => panic!("{other:?}"),
-        };
+        let why = |r: Result<Snapshot, SnapshotError>| r.unwrap_err().to_string();
         // No chain, no record, no epoch: each named.
         let empty = DiskStore::open(&scratch("empty")).unwrap();
         assert!(why(Snapshot::export(&empty, &Tables::new(), None)).contains("no chain"));
@@ -727,6 +740,24 @@ mod tests {
         assert!(
             why(Snapshot::export(&s, &Tables::new(), Some(5)))
                 .contains("no snapshot record for epoch 5")
+        );
+        // A record whose root is not the sealed state's: what a kernel
+        // switch right after the epoch's last block leaves.
+        let mut switched = DiskStore::open(&scratch("switched")).unwrap();
+        switched.set(keys::CHAIN_ID, &7u64.to_bytes());
+        switched.seal(0, None).unwrap();
+        switched.set(b"acct/a", b"1");
+        switched.seal(1, None).unwrap();
+        let stale = SnapshotRecord {
+            height: 1,
+            state_root: [3; 32],
+        };
+        switched.set(&record_key(0), &stale.to_bytes());
+        switched.set(keys::SNAPSHOT_LATEST, &0u64.to_bytes());
+        switched.seal(2, None).unwrap();
+        assert!(
+            why(Snapshot::export(&switched, &Tables::new(), None))
+                .contains("a kernel switch after that block wrote into it")
         );
         // The head block's entries, missing one by one.
         let mut tables = Tables::new();
@@ -819,6 +850,10 @@ mod tests {
         // in a test, so the error paths of `write` end at the file system.
         let path = scratch("write").join("missing-dir").join("x.snap");
         assert!(matches!(snapshot.write(&path), Err(SnapshotError::Io(_))));
+        assert_eq!(
+            entry_too_long().to_string(),
+            "snapshot file: an entry does not fit the format"
+        );
         let dir = scratch("write-ok");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("empty.snap");

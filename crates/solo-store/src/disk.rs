@@ -158,6 +158,7 @@ struct Reader {
     _txn: ReadTransaction,
     state: ReadOnlyTable<&'static [u8], &'static [u8]>,
     history: ReadOnlyTable<(&'static [u8], u64), &'static [u8]>,
+    versions: ReadOnlyTable<u64, &'static [u8]>,
 }
 
 impl Reader {
@@ -176,6 +177,10 @@ impl Reader {
             .open_table(HISTORY)
             .map_err(redb::Error::from)
             .map_err(db)?;
+        let versions = txn
+            .open_table(VERSIONS)
+            .map_err(redb::Error::from)
+            .map_err(db)?;
         let table = txn
             .open_table(NODES)
             .map_err(redb::Error::from)
@@ -185,6 +190,7 @@ impl Reader {
             _txn: txn,
             state,
             history,
+            versions,
         })
     }
 }
@@ -373,9 +379,10 @@ fn release(table: &mut NodesTable<'_>, hash: &Hash) -> Result<u64, StoreError> {
     Ok(freed)
 }
 
-/// What [`DiskStore::prepare`] reads: the metadata, the write count of
-/// every kept version and the node count.
-type Prepared = (BTreeMap<String, Vec<u8>>, BTreeMap<u64, u32>, u64);
+/// What [`DiskStore::prepare`] reads: the metadata and the node count, and
+/// nothing whose size grows with the chain, so that an open takes the same
+/// time at any height.
+type Prepared = (BTreeMap<String, Vec<u8>>, u64);
 
 /// The chain store of one node.
 pub struct DiskStore {
@@ -400,8 +407,6 @@ pub struct DiskStore {
     sealed: bool,
     /// Committed entries in the state.
     entries: u64,
-    /// Keys each kept version's span wrote.
-    written: BTreeMap<u64, u32>,
     view: Option<u64>,
     kernel: Option<Hash>,
     genesis: Option<Hash>,
@@ -463,7 +468,7 @@ impl DiskStore {
     /// [`DiskStore::open`] does once the file is open, and what the crash
     /// tests do over a database whose writes they cut short.
     fn over(path: PathBuf, mut database: Database) -> Result<DiskStore, StoreError> {
-        let (meta, written, nodes) = Self::prepare(&mut database)?;
+        let (meta, nodes) = Self::prepare(&mut database)?;
         let db = database;
         let format = meta
             .get("format")
@@ -506,7 +511,6 @@ impl DiskStore {
             latest,
             sealed,
             entries,
-            written,
             view: None,
             kernel: hash("kernel"),
             genesis: hash("genesis"),
@@ -540,6 +544,9 @@ impl DiskStore {
         txn.open_table(WRITTEN)
             .map_err(redb::Error::from)
             .map_err(db)?;
+        txn.open_table(VERSIONS)
+            .map_err(redb::Error::from)
+            .map_err(db)?;
         let meta: BTreeMap<String, Vec<u8>> = {
             let mut table = txn
                 .open_table(META)
@@ -565,27 +572,6 @@ impl DiskStore {
                 .map_err(redb::Error::from)
                 .map_err(db)?
         };
-        let written: BTreeMap<u64, u32> = {
-            let table = txn
-                .open_table(VERSIONS)
-                .map_err(redb::Error::from)
-                .map_err(db)?;
-            table
-                .iter()
-                .map_err(redb::Error::from)
-                .map_err(db)?
-                .map(|r| {
-                    r.map(|(k, v)| {
-                        (
-                            k.value(),
-                            VersionRow::decode(v.value()).map_or(0, |row| row.written),
-                        )
-                    })
-                })
-                .collect::<Result<_, _>>()
-                .map_err(redb::Error::from)
-                .map_err(db)?
-        };
         let stats = txn.stats().map_err(redb::Error::from).map_err(db)?;
         let nodes = txn
             .open_table(NODES)
@@ -598,7 +584,7 @@ impl DiskStore {
         if stats.fragmented_bytes() > stats.stored_bytes() + COMPACTION_SLACK {
             database.compact().map_err(redb::Error::from).map_err(db)?;
         }
-        Ok((meta, written, nodes))
+        Ok((meta, nodes))
     }
 
     /// Compacts the file now, giving freed pages back to the file system.
@@ -684,10 +670,21 @@ impl DiskStore {
     /// [`solo_host::MemStorage::history_keys`]).
     #[must_use]
     pub fn history_keys(&self) -> usize {
-        self.written
-            .range(self.oldest + 1..)
-            .map(|(_, n)| *n as usize)
-            .sum()
+        self.span_writes().map(|(_, n)| n).sum()
+    }
+
+    /// The key writes of each kept version's span above the oldest, latest
+    /// first, from the version rows: read from the file as the window needs
+    /// them, so that neither memory nor the time to open grows with the
+    /// versions an archive node keeps.
+    fn span_writes(&self) -> impl Iterator<Item = (u64, usize)> + '_ {
+        read(self.reader().versions.range(self.oldest + 1..))
+            .rev()
+            .map(|row| {
+                let (version, row) = read(row);
+                let row = VersionRow::decode(row.value());
+                (version.value(), row.map_or(0, |r| r.written as usize))
+            })
     }
 
     /// The oldest version the store can still read as while holding at most
@@ -696,10 +693,10 @@ impl DiskStore {
     #[must_use]
     pub fn oldest_within(&self, keys: usize) -> u64 {
         let mut held = 0usize;
-        for (version, written) in self.written.range(self.oldest + 1..).rev() {
-            held += *written as usize;
+        for (version, written) in self.span_writes() {
+            held += written;
             if held > keys {
-                return *version;
+                return version;
             }
         }
         self.oldest
@@ -815,7 +812,7 @@ impl DiskStore {
         let mut bytes = 0u64;
         let mut entries = self.entries;
         let committed_root = header_trie.map(Trie::root);
-        let (node_bytes, nodes_written, node_count, span_writes) = {
+        let (node_bytes, nodes_written, node_count) = {
             let mut state = txn
                 .open_table(STATE)
                 .map_err(redb::Error::from)
@@ -943,17 +940,10 @@ impl DiskStore {
                     .map_err(db)?;
             }
             let (node_bytes, nodes_written) = persist.finish()?;
-            let span_writes = written
-                .range::<(u64, &[u8])>((span, &[][..])..(span + 1, &[][..]))
-                .map_err(redb::Error::from)
-                .map_err(db)?
-                .count();
-            let span_writes = u32::try_from(span_writes).unwrap_or(u32::MAX);
             (
                 node_bytes,
                 nodes_written,
                 nodes.len().map_err(redb::Error::from).map_err(db)?,
-                span_writes,
             )
         };
         if self.fault.take() == Some(Fault::DropNextCommit) {
@@ -972,7 +962,6 @@ impl DiskStore {
             }
             self.sealed = true;
             self.latest = v;
-            self.written.insert(v, span_writes);
             self.pending_old.clear();
         }
         bytes += node_bytes;
@@ -1061,7 +1050,6 @@ impl DiskStore {
         }
         txn.commit().map_err(redb::Error::from).map_err(db)?;
         self.reader = Some(Reader::open(&self.db, &self.nodes)?);
-        self.written = self.written.split_off(&oldest);
         self.oldest = oldest;
         self.stats.commits += 1;
         self.stats.versions = self.latest - self.oldest + 1;
