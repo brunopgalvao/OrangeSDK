@@ -296,6 +296,10 @@ impl Chain {
             ..NodeConfig::default()
         };
         let mut node = Node::open(kernel_module(), genesis, config).unwrap();
+        // Blocks full of burning run on the native backend, which agrees
+        // with the interpreter to the gas (spec 07 §4.1) and takes a fraction
+        // of the time.
+        node.set_backend(solo_host::Backend::Native);
         node.start(None).unwrap();
         Chain {
             node,

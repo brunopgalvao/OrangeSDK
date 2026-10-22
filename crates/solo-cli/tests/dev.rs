@@ -18,11 +18,11 @@ const HELLO: &str = concat!(
     "/../solo-recompile/tests/fixtures/hello.elf"
 );
 
-/// A kernel gas budget that lets the driver start (78 170) but not produce a block
-/// (260 880) with the pinned kernel fixture, bisected on 2026-10-22 after governance's
-/// staker, veto and quorum rules and the driver's replay of its own finalized blocks
-/// landed; rebuilding the fixture may move both numbers.
-const STARVED_GAS: &str = "80000";
+/// A kernel gas budget that lets the driver start (its `Started` step takes 79 379)
+/// but not produce a block (the driver steps and the execution of a slot take
+/// 389 672 together) with the pinned kernel fixture, measured on 2026-10-22 after the
+/// fee market (spec 23) landed; rebuilding the fixture may move both numbers.
+const STARVED_GAS: &str = "100000";
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4,
   "alloc": {"0x1111111111111111111111111111111111111111": "1000000000000000000", "0x2222222222222222222222222222222222222222": 5,

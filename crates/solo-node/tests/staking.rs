@@ -673,9 +673,9 @@ fn an_equivocator_is_slashed_once_and_excluded() {
             .unwrap()
     );
     let byzantine = validator_id(&keys[4]);
-    // An outsider delegates behind the offender-to-be (spec 15 §10.1): its
-    // stake is slashed with the validator's own.
-    let delegator = SigningKey::from_slice(&[0x77; 32]).unwrap();
+    // Validator 1's account delegates behind the offender-to-be (spec 15
+    // §10.1): a delegation's stake is slashed with the validator's own.
+    let delegator = keys[1].clone();
     let delegated = 1_000 * GWEI;
     let delegation = action(
         &delegator,
