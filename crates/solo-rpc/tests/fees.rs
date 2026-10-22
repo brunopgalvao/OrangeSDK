@@ -129,7 +129,7 @@ fn reference_tip(blocks: &[(solo_abi::chain::BlockHeader, Vec<Receipt>)], defaul
     let mut want = ORACLE_BLOCKS.min(blocks.len() as u64);
     let mut height = blocks.len() as u64;
     while looked < want && height > 0 {
-        let (header, receipts) = &blocks[height as usize - 1];
+        let (header, receipts) = &blocks[usize::try_from(height).unwrap() - 1];
         let mut tips: Vec<u128> = receipts
             .iter()
             .filter(|r| r.from != header.beneficiary)

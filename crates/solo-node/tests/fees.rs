@@ -271,13 +271,15 @@ fn genesis(validators: &[SigningKey], weights: &[u64], setup: Setup) -> Genesis 
 fn reference(params: &FeeParams, parent_fee: u64, parent_used: u64) -> u64 {
     let target = BLOCK_GAS_LIMIT / params.elasticity;
     let (fee, denominator) = (u128::from(parent_fee), u128::from(params.denominator));
-    let next = if parent_used == target {
-        fee
-    } else if parent_used > target {
-        let delta = fee * u128::from(parent_used - target) / u128::from(target) / denominator;
-        fee + delta.max(1)
-    } else {
-        fee - fee * u128::from(target - parent_used) / u128::from(target) / denominator
+    let next = match parent_used.cmp(&target) {
+        std::cmp::Ordering::Equal => fee,
+        std::cmp::Ordering::Greater => {
+            let delta = fee * u128::from(parent_used - target) / u128::from(target) / denominator;
+            fee + delta.max(1)
+        }
+        std::cmp::Ordering::Less => {
+            fee - fee * u128::from(target - parent_used) / u128::from(target) / denominator
+        }
     };
     u64::try_from(next).unwrap().max(params.min_base_fee)
 }
@@ -380,7 +382,7 @@ fn the_base_fee_follows_eip_1559_above_the_floor() {
         governance: GovernanceParams::default(),
         key: [0; 20],
     };
-    let genesis = genesis(&[key.clone()], &[1], setup);
+    let genesis = genesis(std::slice::from_ref(&key), &[1], setup);
     let mut chain = Chain::new(&genesis, &key);
     let start = chain.balance(alice.address);
     let price = 2 * u128::from(FLOOR);
@@ -458,6 +460,7 @@ fn the_base_fee_follows_eip_1559_above_the_floor() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn transactions_below_the_base_fee_are_refused_and_wait_in_the_pool() {
     let key = SigningKey::from_slice(&[0x42; 32]).unwrap();
     let alice = Wallet::new(1);
@@ -474,7 +477,7 @@ fn transactions_below_the_base_fee_are_refused_and_wait_in_the_pool() {
         governance: GovernanceParams::default(),
         key: [0; 20],
     };
-    let genesis = genesis(&[key.clone()], &[1], setup);
+    let genesis = genesis(std::slice::from_ref(&key), &[1], setup);
     let mut chain = Chain::new(&genesis, &key);
     let floor = u128::from(FLOOR);
     let price = 2 * floor;
@@ -573,6 +576,7 @@ fn transactions_below_the_base_fee_are_refused_and_wait_in_the_pool() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn the_treasury_takes_the_base_fee_and_governance_changes_the_parameters() {
     let key = SigningKey::from_slice(&[0x42; 32]).unwrap();
     let alice = Wallet::new(1);
@@ -587,7 +591,7 @@ fn the_treasury_takes_the_base_fee_and_governance_changes_the_parameters() {
         governance: GovernanceParams::default(),
         key: alice.address,
     };
-    let genesis = genesis(&[key.clone()], &[1], setup);
+    let genesis = genesis(std::slice::from_ref(&key), &[1], setup);
     let mut chain = Chain::new(&genesis, &key);
     let floor = u128::from(FLOOR);
     let price = 2 * floor;
@@ -886,11 +890,7 @@ fn payout(
         let mut rest = share;
         let mut mine = Vec::new();
         for d in &delegated[i] {
-            let part = if totals[i] == 0 {
-                0
-            } else {
-                share * d / totals[i]
-            };
+            let part = (share * d).checked_div(totals[i]).unwrap_or(0);
             rest -= part;
             mine.push(part);
         }
@@ -931,7 +931,7 @@ fn priority_fees_are_paid_out_with_stake_to_validators_and_delegators() {
     let mut sim = Sim::new(kernel_module(), &genesis, &keys, 0, &at(START_MS), 20).unwrap();
     let floor = u128::from(FLOOR);
     let price = 2 * floor;
-    let gwei = u128::from(GWEI);
+    let gwei = GWEI;
     let delegators = [d1.address, d2.address];
     let stakes: Vec<u128> = weights.iter().map(|w| u128::from(*w) * gwei).collect();
     let delegate = |w: &Wallet, to: [u8; 20], value: u128| {

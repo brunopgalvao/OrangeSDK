@@ -30,7 +30,7 @@ pub const ORACLE_MAX_TIP: u128 = 500_000_000_000;
 pub const ORACLE_IGNORE_TIP: u128 = 2;
 
 /// The tip oracle's memory between requests.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Oracle {
     /// The head and the default tip the price was last computed for.
     at: Option<(u64, u128)>,

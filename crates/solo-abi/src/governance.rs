@@ -866,6 +866,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn only_canonical_encodings_within_limits_decode() {
         let submit = Call::Submit {
             target: [0x50; 20],

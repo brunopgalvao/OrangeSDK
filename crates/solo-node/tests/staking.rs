@@ -662,6 +662,7 @@ fn signed(key: &SigningKey, kind: u8, view: u64, hash: [u8; 32]) -> Signature {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn an_equivocator_is_slashed_once_and_excluded() {
     // Five equal validators; the fifth has no node, and its key signs what the test wants.
     let keys = keys(5);
