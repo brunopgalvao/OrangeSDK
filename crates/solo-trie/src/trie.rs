@@ -149,7 +149,6 @@ enum Edit {
 /// Inserts `leaf` into the subtree `node` at `depth`, whose entries all share
 /// the leaf's first `depth` path bits, rehashing the nodes it passes.
 fn insert(node: &mut Node, depth: usize, leaf: Arc<Leaf>, ctx: Ctx<'_>) -> Edit {
-    resolve(node, ctx);
     match node {
         Node::Empty => {
             *node = Node::Leaf(leaf);
@@ -180,7 +179,12 @@ fn insert(node: &mut Node, depth: usize, leaf: Arc<Leaf>, ctx: Ctx<'_>) -> Edit 
             }
             edit
         }
-        Node::Stub(_) => unreachable!("resolved above"),
+        // A subtree not loaded yet: load it, then go on as if it had been.
+        Node::Stub(hash) => {
+            let hash = *hash;
+            *node = ctx.load(&hash);
+            insert(node, depth, leaf, ctx)
+        }
     }
 }
 
@@ -208,7 +212,6 @@ fn split(a: Arc<Leaf>, b: Arc<Leaf>, depth: usize, hash: HashFn) -> Node {
 /// whether it was there. A branch left with one leaf and an empty side
 /// becomes that leaf, which then rises as far as its new siblings allow.
 fn remove(node: &mut Node, depth: usize, path: &Hash, ctx: Ctx<'_>) -> bool {
-    resolve(node, ctx);
     match node {
         Node::Empty => false,
         Node::Leaf(leaf) => {
@@ -248,7 +251,12 @@ fn remove(node: &mut Node, depth: usize, path: &Hash, ctx: Ctx<'_>) -> bool {
             }
             true
         }
-        Node::Stub(_) => unreachable!("resolved above"),
+        // A subtree not loaded yet: load it, then go on as if it had been.
+        Node::Stub(hash) => {
+            let hash = *hash;
+            *node = ctx.load(&hash);
+            remove(node, depth, path, ctx)
+        }
     }
 }
 

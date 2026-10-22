@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use solo_abi::chain::{Account, BlockHeader, UpgradeParams};
+use solo_host::Storage;
 use solo_host::hash::keccak256;
 use solo_node::{Node, NodeConfig, NodeError, Sim, StoreConfig};
 use solo_store::Fault;
@@ -100,6 +101,10 @@ fn a_node_resumes_from_its_store_with_the_same_state_history_and_proofs() {
     assert_eq!(node.oldest_state(), head - 3);
     let before = answers(&mut node, &bob.address);
     let (root, genesis_root) = (node.state_root(), node.genesis_state_root());
+    // The flat state and the window's key writes, as the store holds them.
+    let accounts = node.state().base().scan(b"acct/");
+    let history = node.state().base().history_keys();
+    assert!(accounts.len() >= 2 && history > 0, "{history}");
     let stats = node.chain_store().unwrap().stats();
     assert!(stats.write_bytes > 0 && stats.versions == 4, "{stats:?}");
     let (persisted, resumed, now) = (
@@ -120,6 +125,8 @@ fn a_node_resumes_from_its_store_with_the_same_state_history_and_proofs() {
     assert_eq!(again.oldest_state(), head - 3);
     assert_eq!(again.kernel_hash(), keccak256(v1()));
     assert_eq!(again.chain_store().unwrap().stats().versions, 4);
+    assert_eq!(again.state().base().scan(b"acct/"), accounts);
+    assert_eq!(again.state().base().history_keys(), history);
     again.start(resumed).unwrap();
     assert!(again.executed.is_empty(), "{:?}", again.executed);
     assert_eq!(again.finalized_height().unwrap(), head);

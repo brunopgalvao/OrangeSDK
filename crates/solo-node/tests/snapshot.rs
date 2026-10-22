@@ -228,6 +228,14 @@ fn a_snapshot_exports_verifies_round_trips_and_refuses_forgeries() {
         "not a quorum of the genesis set",
     );
     refused(
+        &|s| {
+            let mut c = Certificate::from_bytes(&s.header.certificate).unwrap();
+            c.votes.0.push(c.votes.0[0].clone());
+            s.header.certificate = c.to_bytes();
+        },
+        "not a quorum of the genesis set",
+    );
+    refused(
         &|s| s.header.certificate.clear(),
         "certificate does not decode",
     );
@@ -567,12 +575,16 @@ fn a_threshold_certificate_vouches_for_a_staking_chains_snapshot() {
     let group_key: [u8; 96] = record.key_set[..96].try_into().unwrap();
     snapshot.verify(CHAIN_ID, &Trust::Key(group_key)).unwrap();
     // The wrong key, a key that is not a point, and the genesis set refuse it.
-    let mut other = group_key;
-    other[95] ^= 1;
-    assert!(matches!(
+    let other = solo_bls::SecretKey::generate(&[7; 32], b"")
+        .unwrap()
+        .public_key()
+        .to_bytes();
+    assert_eq!(
         snapshot.verify(CHAIN_ID, &Trust::Key(other)),
-        Err(SnapshotError::Verify(_))
-    ));
+        Err(SnapshotError::Verify(
+            "the threshold certificate does not verify under the trusted key"
+        ))
+    );
     assert_eq!(
         snapshot.verify(CHAIN_ID, &Trust::Key([0xFF; 96])),
         Err(SnapshotError::Verify("the trusted key is not a group key"))

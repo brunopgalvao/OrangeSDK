@@ -848,3 +848,95 @@ fn state_methods_answer_at_older_blocks_until_pruned() {
         format!("{:#x}", 5 * ETHER)
     );
 }
+
+/// Every state and block method's answer at every height the node keeps.
+fn answers_at_every_height(rpc: &mut Rpc, alice: &Wallet, counter: &[u8; 20]) -> Vec<Value> {
+    let head = number(&ok(rpc, "eth_blockNumber", json!([])));
+    let (a, c) = (data(&alice.address), data(counter));
+    let mut all = vec![json!(head)];
+    for height in 0..=head {
+        let at = json!(format!("{height:#x}"));
+        all.extend([
+            ok(rpc, "eth_getBlockByNumber", json!([at, true])),
+            ok(rpc, "eth_getBlockReceipts", json!([at])),
+            ok(rpc, "eth_getBalance", json!([a, at])),
+            ok(rpc, "eth_getTransactionCount", json!([a, at])),
+            ok(rpc, "eth_getCode", json!([c, at])),
+            ok(rpc, "eth_getStorageAt", json!([c, "0x0", at])),
+            ok(rpc, "eth_getProof", json!([c, ["0x0", "0x05"], at])),
+            ok(rpc, "eth_getProof", json!([a, [], at])),
+            ok(
+                rpc,
+                "eth_call",
+                json!([{"to": c, "data": data(&calldata("count()", &[]))}, at]),
+            ),
+        ]);
+    }
+    all.push(ok(
+        rpc,
+        "eth_getLogs",
+        json!([{"fromBlock": "0x0", "toBlock": "latest"}]),
+    ));
+    all
+}
+
+#[test]
+fn a_node_restarted_over_its_chain_store_answers_every_method_as_before() {
+    let dir = std::env::temp_dir().join(format!("solo-rpc-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let alice = Wallet::new(1);
+    let config = |persisted| solo_node::NodeConfig {
+        now_ms: 1_000,
+        key: Some(common::node_key()),
+        persisted,
+        store: solo_node::StoreConfig::Disk(dir.clone()),
+        ..solo_node::NodeConfig::default()
+    };
+    let genesis = common::genesis(&alice);
+    let mut node = solo_node::Node::open(
+        &common::kernel_module(),
+        &genesis,
+        config(std::collections::BTreeMap::default()),
+    )
+    .unwrap();
+    node.start(None).unwrap();
+    let mut rpc = Rpc::new(node);
+    let mut now = 1_000;
+    let counter = created_address(&alice.address, 0);
+    let create = Fields {
+        nonce: 0,
+        to: None,
+        value: 0,
+        gas_limit: 1_000_000,
+        data: &counter_initcode(5),
+    };
+    mine(&mut rpc, &mut now, &[alice.legacy(&create)]);
+    let increment = calldata("increment(uint256)", &[2]);
+    let inc = Fields {
+        nonce: 1,
+        to: Some(counter),
+        value: 0,
+        gas_limit: 200_000,
+        data: &increment,
+    };
+    mine(&mut rpc, &mut now, &[alice.legacy(&inc)]);
+    mine(
+        &mut rpc,
+        &mut now,
+        &[alice.transfer(2, [9; 20], ETHER, 21_000)],
+    );
+    let before = answers_at_every_height(&mut rpc, &alice, &counter);
+    let persisted = rpc.node().persisted();
+    let resumed = rpc.node().persisted_driver_state.clone();
+    drop(rpc);
+    // Reopened over the same directory: the same answer to every question,
+    // at every height, before the driver starts and after, with nothing
+    // executed again.
+    let node =
+        solo_node::Node::open(&common::kernel_module(), &genesis, config(persisted)).unwrap();
+    let mut rpc = Rpc::new(node);
+    assert_eq!(answers_at_every_height(&mut rpc, &alice, &counter), before);
+    rpc.node_mut().start(resumed).unwrap();
+    assert!(rpc.node().executed.is_empty());
+    assert_eq!(answers_at_every_height(&mut rpc, &alice, &counter), before);
+}

@@ -893,4 +893,8 @@ fn snapshots_export_verify_import_and_start_a_node() {
     assert!(err.contains("needs --trust-key"), "{err}");
     let kept = opened(&genesis, &source, &["--snapshot", &first]);
     assert!(kept >= 16, "{kept}");
+    // A threshold certificate is named as one.
+    let mut threshold = solo_store::Snapshot::read(std::path::Path::new(&file)).unwrap();
+    threshold.header.certificate = vec![2; 97];
+    assert!(snapshot::describe(&threshold).ends_with(", threshold certificate"));
 }
