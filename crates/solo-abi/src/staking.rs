@@ -46,6 +46,14 @@ pub const SLASH_BPS: u128 = 1_000;
 /// that hold nothing are pruned at epoch ends.
 pub const MAX_REGISTERED: usize = 256;
 
+/// Most delegators one validator has at once (spec 15 §10.1), so that the
+/// work of an epoch end, which pays every one of them, stays bounded.
+pub const MAX_DELEGATORS: usize = 64;
+
+/// Most validators one account delegates to at once, so that `withdraw`
+/// looks at a bounded number of delegations.
+pub const MAX_DELEGATIONS: usize = 16;
+
 /// Most DKG envelopes one proposal carries; a proposal with more gets no votes.
 pub const MAX_DKG: usize = 16;
 
@@ -82,6 +90,9 @@ pub mod query {
     pub const STAKING: &str = "staking";
     /// `(u64 epoch) -> ValidatorSet` the validator set of an epoch, if decided.
     pub const STAKING_SET: &str = "staking_set";
+    /// `(Address) -> vec<DelegationEntry>` the delegations of an account,
+    /// in the order they were made.
+    pub const DELEGATIONS: &str = "staking_delegations";
 }
 
 /// Function selectors of the staking interface: the first four bytes of
@@ -97,6 +108,10 @@ pub mod selector {
     pub const WITHDRAW: [u8; 4] = [0x3c, 0xcf, 0xd6, 0x0b];
     /// `report(bytes)`.
     pub const REPORT: [u8; 4] = [0xb5, 0x76, 0x71, 0x66];
+    /// `delegate(address)`.
+    pub const DELEGATE: [u8; 4] = [0x5c, 0x19, 0xa9, 0x5c];
+    /// `undelegate(address,uint256)`.
+    pub const UNDELEGATE: [u8; 4] = [0x4d, 0x99, 0xdd, 0x16];
 }
 
 /// Event topics of the staking interface: `keccak256` of each event signature.
@@ -132,6 +147,19 @@ pub mod event {
         0x6c, 0x00, 0x70, 0xf6, 0x7c, 0xd1, 0x94, 0x46, 0xdb, 0xdc, 0x0b, 0x7a, 0x4a, 0xeb, 0xa0,
         0x70, 0xd5, 0xa9, 0x8e, 0x17, 0xee, 0xbc, 0x23, 0x15, 0x8c, 0xbf, 0xd8, 0xa9, 0xfb, 0x98,
         0x1c, 0xfe,
+    ];
+    /// `Delegated(address,address,uint256)`: delegator, validator, amount.
+    pub const DELEGATED: Hash = [
+        0xe5, 0x54, 0x1a, 0x6b, 0x61, 0x03, 0xd4, 0xfa, 0x7e, 0x02, 0x1e, 0xd5, 0x4f, 0xad, 0x39,
+        0xc6, 0x6f, 0x27, 0xa7, 0x6b, 0xd1, 0x3d, 0x37, 0x4c, 0xf6, 0x24, 0x0a, 0xe6, 0xbd, 0x0b,
+        0xb7, 0x2b,
+    ];
+    /// `Undelegated(address,address,uint256,uint64)`: delegator, validator,
+    /// amount, release epoch.
+    pub const UNDELEGATED: Hash = [
+        0xa4, 0x10, 0xe3, 0x21, 0x57, 0xa4, 0x44, 0x14, 0xa5, 0x02, 0xbb, 0x47, 0xd7, 0x75, 0x23,
+        0x4d, 0xe1, 0xaa, 0x7d, 0xa1, 0x23, 0xf5, 0xad, 0xfe, 0x42, 0x68, 0x98, 0xf1, 0x60, 0x18,
+        0x83, 0xfd,
     ];
 }
 
@@ -201,6 +229,17 @@ pub mod keys {
     pub const ACTIVE: &[u8] = b"dkg/active";
     /// `dkg/group_key` → the 96-byte group public key of the active key set.
     pub const GROUP_KEY: &[u8] = b"dkg/group_key";
+    /// `stake/d/` + validator id ‖ delegator address → `Delegation` (spec 15 §10.1).
+    pub const DELEGATION: &[u8] = b"stake/d/";
+    /// `stake/dl/` + validator id → `vec<Address>`, the validator's
+    /// delegators in the order they first delegated.
+    pub const DELEGATORS: &[u8] = b"stake/dl/";
+    /// `stake/dv/` + delegator address → `vec<Hash>`, the validators the
+    /// account delegates to, in the order it first did.
+    pub const DELEGATED_TO: &[u8] = b"stake/dv/";
+    /// `stake/pool` → `u128`, the priority fees collected since the last
+    /// epoch end, held by the staking address (spec 15 §10.2).
+    pub const POOL: &[u8] = b"stake/pool";
 }
 
 record! {
@@ -253,6 +292,33 @@ record! {
         dkg_key: Vec<u8>,
         /// Slashed: never selected again, never slashed again.
         jailed: bool,
+        /// Stake delegated to it, in wei: the sum of its delegations' bonded
+        /// stake (spec 15 §10.1). It counts in its total stake, not in the
+        /// self-bond the minimum stake asks for.
+        delegated: u128,
+    }
+}
+
+record! {
+    /// One account's stake behind one validator (spec 15 §10.1).
+    Delegation {
+        /// Bonded stake in wei.
+        stake: u128,
+        /// Undelegated stake in wei still waiting to be withdrawn.
+        unbonding: u128,
+        /// The epoch from which `unbonding` can be withdrawn.
+        release_epoch: u64,
+    }
+}
+
+record! {
+    /// A delegation with the validator it is behind, as the `staking_delegations`
+    /// query lists them.
+    DelegationEntry {
+        /// Validator id.
+        validator: Hash,
+        /// The delegation.
+        delegation: Delegation,
     }
 }
 
@@ -382,6 +448,9 @@ record! {
         active: Option<KeySetRecord>,
         /// The group public key, or empty before the first key set.
         group_key: Vec<u8>,
+        /// The reward pool: priority fees collected since the last epoch
+        /// end, in wei (spec 15 §10.2).
+        pool: u128,
     }
 }
 
@@ -466,6 +535,19 @@ pub enum StakingAction {
         /// The encoded evidence.
         evidence: Vec<u8>,
     },
+    /// Puts the transaction's value behind the validator whose account
+    /// this is (spec 15 §10.1).
+    Delegate {
+        /// The validator's account.
+        validator: Address,
+    },
+    /// Moves `amount` wei of the sender's delegation to unbonding.
+    Undelegate {
+        /// The validator's account.
+        validator: Address,
+        /// Wei.
+        amount: u128,
+    },
 }
 
 /// The canonical ABI encoding of one `bytes` argument of at most
@@ -490,6 +572,30 @@ pub fn word(value: u128) -> [u8; 32] {
     let mut w = [0u8; 32];
     w[16..].copy_from_slice(&value.to_be_bytes());
     w
+}
+
+/// The word holding `address`.
+#[must_use]
+pub fn address_word(address: &Address) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[12..].copy_from_slice(address);
+    w
+}
+
+/// The address an ABI word holds, if its high 12 bytes are zero.
+fn address_of(w: &[u8]) -> Option<Address> {
+    w[..12]
+        .iter()
+        .all(|b| *b == 0)
+        .then(|| w[12..32].try_into().expect("20 bytes"))
+}
+
+/// The `u128` an ABI word holds, if its high 16 bytes are zero.
+fn u128_of(w: &[u8]) -> Option<u128> {
+    w[..16]
+        .iter()
+        .all(|b| *b == 0)
+        .then(|| u128::from_be_bytes(w[16..32].try_into().expect("16 bytes")))
 }
 
 impl StakingAction {
@@ -524,12 +630,22 @@ impl StakingAction {
                     0,
                 );
             }
+            StakingAction::Delegate { validator } => {
+                out.extend_from_slice(&selector::DELEGATE);
+                out.extend_from_slice(&address_word(validator));
+            }
+            StakingAction::Undelegate { validator, amount } => {
+                out.extend_from_slice(&selector::UNDELEGATE);
+                out.extend_from_slice(&address_word(validator));
+                out.extend_from_slice(&word(*amount));
+            }
         }
         out
     }
 
     /// Decodes calldata that is exactly the canonical encoding of an action:
-    /// `register` with a 48-byte key, `unbond` with an amount below 2^128.
+    /// `register` with a 48-byte key, `unbond` and `undelegate` with an
+    /// amount below 2^128, addresses with zero high bytes.
     ///
     /// # Panics
     /// Never: every slice is taken after its length is checked.
@@ -545,11 +661,16 @@ impl StakingAction {
                 })
             }
             selector::BOND if body.is_empty() => Some(StakingAction::Bond),
-            selector::UNBOND if body.len() == 32 && body[..16].iter().all(|b| *b == 0) => {
-                Some(StakingAction::Unbond {
-                    amount: u128::from_be_bytes(body[16..].try_into().expect("16 bytes")),
-                })
-            }
+            selector::UNBOND if body.len() == 32 => Some(StakingAction::Unbond {
+                amount: u128_of(body)?,
+            }),
+            selector::DELEGATE if body.len() == 32 => Some(StakingAction::Delegate {
+                validator: address_of(body)?,
+            }),
+            selector::UNDELEGATE if body.len() == 64 => Some(StakingAction::Undelegate {
+                validator: address_of(&body[..32])?,
+                amount: u128_of(&body[32..])?,
+            }),
             selector::WITHDRAW if body.is_empty() => Some(StakingAction::Withdraw),
             selector::REPORT => {
                 decode_bytes(body).map(|evidence| StakingAction::Report { evidence })
@@ -733,8 +854,17 @@ mod tests {
             release_epoch: 7,
             dkg_key: vec![8; 48],
             jailed: true,
+            delegated: 9,
         };
         roundtrip(&record);
+        roundtrip(&DelegationEntry {
+            validator: [4; 32],
+            delegation: Delegation {
+                stake: 1,
+                unbonding: 2,
+                release_epoch: 3,
+            },
+        });
         let key_set = KeySetRecord {
             id: 2,
             key_set: vec![9; 192],
@@ -755,6 +885,7 @@ mod tests {
             }]),
             active: Some(key_set),
             group_key: vec![9; 96],
+            pool: 1 << 90,
         });
         roundtrip(&DkgRun {
             epoch: 3,
@@ -791,6 +922,8 @@ mod tests {
             (GWEI, SLASH_BPS, MAX_REGISTERED, MAX_DKG),
             (1_000_000_000, 1_000, 256, 16)
         );
+        assert_eq!((MAX_DELEGATORS, MAX_DELEGATIONS), (64, 16));
+        assert_ne!(event::DELEGATED, event::UNDELEGATED);
         assert_eq!(
             (KIND_DKG, KEY_ROLE_THRESHOLD, G1_LENGTH, G2_LENGTH),
             (3, 2, 48, 96)
@@ -806,8 +939,8 @@ mod tests {
         );
         assert_ne!(event::REPORTED, event::WITHDRAWN);
         assert_eq!(
-            (query::STAKING, query::STAKING_SET),
-            ("staking", "staking_set")
+            (query::STAKING, query::STAKING_SET, query::DELEGATIONS),
+            ("staking", "staking_set", "staking_delegations")
         );
         for key in [
             keys::RECORD,
@@ -821,6 +954,10 @@ mod tests {
             keys::KEY_SET,
             keys::ACTIVE,
             keys::GROUP_KEY,
+            keys::DELEGATION,
+            keys::DELEGATORS,
+            keys::DELEGATED_TO,
+            keys::POOL,
         ] {
             assert!(!key.is_empty());
         }
@@ -880,6 +1017,13 @@ mod tests {
                 evidence: vec![9; 40],
             },
             StakingAction::Report { evidence: vec![] },
+            StakingAction::Delegate {
+                validator: [0x11; 20],
+            },
+            StakingAction::Undelegate {
+                validator: [0x12; 20],
+                amount: u128::MAX,
+            },
         ];
         for action in &actions {
             assert_eq!(
@@ -929,6 +1073,25 @@ mod tests {
         huge[4 + 60] = 0x10;
         assert_eq!(StakingAction::decode(&huge), None);
         assert_eq!(StakingAction::decode(&[1, 2]), None);
+        // Addresses are words with zero high bytes, amounts below 2^128.
+        let delegate = actions[6].encode();
+        assert_eq!(delegate.len(), 36);
+        assert_eq!(&delegate[4 + 12..], &[0x11; 20]);
+        let mut bad = delegate.clone();
+        bad[4] = 1;
+        assert_eq!(StakingAction::decode(&bad), None);
+        assert_eq!(StakingAction::decode(&delegate[..35]), None);
+        let undelegate = actions[7].encode();
+        assert_eq!(undelegate.len(), 68);
+        assert_eq!(&undelegate[4 + 32 + 16..], &[0xFF; 16]);
+        let mut bad = undelegate.clone();
+        bad[4 + 32 + 15] = 1;
+        assert_eq!(StakingAction::decode(&bad), None);
+        let mut bad = undelegate.clone();
+        bad[4 + 11] = 1;
+        assert_eq!(StakingAction::decode(&bad), None);
+        assert_eq!(StakingAction::decode(&undelegate[..67]), None);
+        assert_eq!(address_word(&[0x11; 20])[12..], [0x11; 20]);
     }
 
     #[test]

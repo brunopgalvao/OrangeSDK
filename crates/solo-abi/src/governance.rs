@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 
 use crate::chain::Log;
 use crate::codec::{Decode, DecodeError, Decoder, Encode, Encoder, Seq};
+use crate::fees::FeeParams;
 use crate::types::{Address, Hash};
 
 macro_rules! record {
@@ -101,6 +102,8 @@ pub mod selector {
     pub const SET_MODE: [u8; 4] = [0x21, 0x17, 0x5b, 0x4a];
     /// `setParams(uint64,uint64,uint64,uint256)`.
     pub const SET_PARAMS: [u8; 4] = [0x94, 0xbc, 0x43, 0xb4];
+    /// `setFeeParams(uint64,uint64,uint64,address)`.
+    pub const SET_FEE_PARAMS: [u8; 4] = [0x92, 0x10, 0x6b, 0x6c];
 }
 
 /// Event topics: `keccak256` of each event signature.
@@ -155,6 +158,13 @@ pub mod event {
         0xe2, 0xbb, 0x55, 0x2b, 0xca, 0x62, 0xbf, 0x3e, 0xb3, 0xbc, 0x44, 0x24, 0x8b, 0x74, 0xdb,
         0xb7, 0x90, 0x14, 0x3a, 0xc2, 0x23, 0x07, 0x6a, 0xdd, 0x4c, 0xc5, 0x5c, 0x38, 0xbe, 0x3c,
         0xba, 0x18,
+    ];
+    /// `FeeParamsSet(uint64 denominator, uint64 elasticity, uint64 minBaseFee, address treasury)`
+    /// (spec 23 §5).
+    pub const FEE_PARAMS_SET: Hash = [
+        0xcc, 0x7e, 0x28, 0xc1, 0x18, 0xac, 0xfb, 0x02, 0xd3, 0x64, 0x8a, 0xe5, 0xd9, 0x95, 0xa8,
+        0x16, 0x6f, 0x73, 0x41, 0x3d, 0xfa, 0x1e, 0x90, 0xdb, 0xee, 0x1a, 0x24, 0xff, 0x2e, 0xfe,
+        0xb4, 0xd8,
     ];
 }
 
@@ -390,6 +400,11 @@ pub enum Call {
         /// The deposit.
         deposit: u128,
     },
+    /// Changes the fee market's parameters (an action, spec 23 §5).
+    SetFeeParams {
+        /// The new parameters.
+        params: FeeParams,
+    },
 }
 
 /// A 32-byte big-endian ABI word holding `value`.
@@ -487,6 +502,13 @@ impl Call {
                 out.extend_from_slice(&word(u128::from(*quorum_bps)));
                 out.extend_from_slice(&word(*deposit));
             }
+            Call::SetFeeParams { params } => {
+                out.extend_from_slice(&selector::SET_FEE_PARAMS);
+                out.extend_from_slice(&word(u128::from(params.denominator)));
+                out.extend_from_slice(&word(u128::from(params.elasticity)));
+                out.extend_from_slice(&word(u128::from(params.min_base_fee)));
+                out.extend_from_slice(&address_word(&params.treasury));
+            }
         }
         out
     }
@@ -544,6 +566,14 @@ impl Call {
                 timelock_blocks: u64_of(w(1))?,
                 quorum_bps: u64_of(w(2))?,
                 deposit: uint(w(3), 16)?,
+            }),
+            selector::SET_FEE_PARAMS if body.len() == 128 => Some(Call::SetFeeParams {
+                params: FeeParams {
+                    denominator: u64_of(w(0))?,
+                    elasticity: u64_of(w(1))?,
+                    min_base_fee: u64_of(w(2))?,
+                    treasury: address_of(w(3))?,
+                },
             }),
             _ => None,
         }
@@ -652,6 +682,16 @@ pub fn params_log(p: &GovernanceParams) -> Log {
     data.extend_from_slice(&word(u128::from(p.quorum_bps)));
     data.extend_from_slice(&word(p.deposit));
     log(vec![event::PARAMS_SET], data)
+}
+
+/// The log of `setFeeParams` (spec 23 §5).
+#[must_use]
+pub fn fee_params_log(p: &FeeParams) -> Log {
+    let mut data = word(u128::from(p.denominator)).to_vec();
+    data.extend_from_slice(&word(u128::from(p.elasticity)));
+    data.extend_from_slice(&word(u128::from(p.min_base_fee)));
+    data.extend_from_slice(&address_word(&p.treasury));
+    log(vec![event::FEE_PARAMS_SET], data)
 }
 
 #[cfg(test)]
@@ -789,6 +829,14 @@ mod tests {
                 quorum_bps: 3,
                 deposit: u128::MAX,
             },
+            Call::SetFeeParams {
+                params: FeeParams {
+                    denominator: 125,
+                    elasticity: 2,
+                    min_base_fee: u64::MAX,
+                    treasury: [0x7; 20],
+                },
+            },
         ];
         for call in &calls {
             assert_eq!(
@@ -811,6 +859,10 @@ mod tests {
         assert_eq!((vote[4 + 31], vote[4 + 63]), (3, 1));
         assert_eq!(calls[6].encode().len(), 36);
         assert_eq!(calls[11].encode().len(), 4 + 128);
+        let fees = calls[12].encode();
+        assert_eq!(fees.len(), 4 + 128);
+        assert_eq!(&fees[..4], &selector::SET_FEE_PARAMS);
+        assert_eq!((fees[4 + 31], fees[4 + 63], fees[4 + 108]), (125, 2, 7));
     }
 
     #[test]
@@ -895,6 +947,16 @@ mod tests {
         bad.push(params[..4 + 96].to_vec());
         for (at, byte) in [(4, 1), (4 + 32, 1), (4 + 64, 1), (4 + 96 + 15, 1)] {
             let mut v = params.clone();
+            v[at] = byte;
+            bad.push(v);
+        }
+        let fees = Call::SetFeeParams {
+            params: FeeParams::production(),
+        }
+        .encode();
+        bad.push(fees[..4 + 96].to_vec());
+        for (at, byte) in [(4 + 23, 1), (4 + 32 + 23, 1), (4 + 64 + 23, 1), (4 + 96 + 11, 1)] {
+            let mut v = fees.clone();
             v[at] = byte;
             bad.push(v);
         }
@@ -990,5 +1052,16 @@ mod tests {
         });
         assert_eq!(l.data, [word(1), word(2), word(3), word(4)].concat());
         assert_eq!(l.topics.0, vec![event::PARAMS_SET]);
+        let l = fee_params_log(&FeeParams {
+            denominator: 5,
+            elasticity: 6,
+            min_base_fee: 7,
+            treasury: [8; 20],
+        });
+        assert_eq!(
+            l.data,
+            [word(5), word(6), word(7), address_word(&[8; 20])].concat()
+        );
+        assert_eq!(l.topics.0, vec![event::FEE_PARAMS_SET]);
     }
 }
