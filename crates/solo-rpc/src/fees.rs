@@ -8,9 +8,9 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 use solo_abi::chain::{BLOCK_GAS_LIMIT, Receipt};
 
+use crate::Rpc;
 use crate::hex::{parse_quantity, quantity};
 use crate::methods::{RpcError, param_str};
-use crate::Rpc;
 
 /// Most blocks one `eth_feeHistory` request reports, as in geth.
 pub const MAX_FEE_HISTORY: u64 = 1024;

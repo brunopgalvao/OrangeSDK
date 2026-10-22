@@ -155,6 +155,9 @@ pub struct BlockFields {
     pub base_fee: u64,
     /// Fee recipient (`COINBASE`): the fee vault or the zero address (spec 23 §4).
     pub beneficiary: Address,
+    /// Where the base fee goes: the treasury the parameters named when the
+    /// block began, or the zero address for a burn (spec 23 §4).
+    pub treasury: Address,
 }
 
 /// A message to execute.
@@ -319,7 +322,7 @@ pub fn run_in<P: Precompiles>(message: Message, env: &Env, commit_state: bool) -
         .with_db(StateDb)
         .build_mainnet()
         .with_precompiles(P::for_message(
-            BlockFields { number: env.number, timestamp: env.timestamp, base_fee: env.basefee, beneficiary: env.beneficiary },
+            BlockFields { number: env.number, timestamp: env.timestamp, base_fee: env.basefee, beneficiary: env.beneficiary, treasury: [0; 20] },
             !commit_state,
         ));
     let Ok(result) = evm.transact(tx) else {

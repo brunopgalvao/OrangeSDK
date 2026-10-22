@@ -222,9 +222,16 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let chain_id = state::chain_id();
     let template = BlockHeader::from_bytes(&args.block.header).unwrap_or_else(|_| solo_guest::trap());
     let height = template.height;
-    // The base fee follows from the parent's header (spec 23 §3), read before
-    // anything in this block is written.
-    let block = BlockFields { number: height, timestamp: template.timestamp_ms / 1000, base_fee: fees::next_base_fee(), beneficiary: fees::beneficiary() };
+    // The base fee follows from the parent's header and the treasury from the
+    // parameters in force (spec 23 §3), both read before anything in this
+    // block is written.
+    let block = BlockFields {
+        number: height,
+        timestamp: template.timestamp_ms / 1000,
+        base_fee: fees::next_base_fee(),
+        beneficiary: fees::beneficiary(),
+        treasury: fees::params().treasury,
+    };
     crate::precompiles::begin(crate::governance::gate_active(solo_upgrade::gate::PRECOMPILES, height));
     record_participation(&args.block.participation, height);
     crate::modules::begin_block(height, template.timestamp_ms);
@@ -309,7 +316,7 @@ fn bad_params() -> QueryResult {
 fn call(request: CallRequest) -> CallResult {
     let height = state::height().unwrap_or(0);
     let timestamp = state::block_by_number(height).map_or(0, |h| h.timestamp_ms / 1000);
-    let block = BlockFields { number: height, timestamp, base_fee: fees::head_base_fee(), beneficiary: fees::beneficiary() };
+    let block = BlockFields { number: height, timestamp, base_fee: fees::head_base_fee(), beneficiary: fees::beneficiary(), treasury: [0; 20] };
     let gas = if request.gas == 0 { MAX_TX_GAS } else { request.gas.min(MAX_TX_GAS) };
     let access_list: Vec<solo_eth::AccessItem> = request.access_list.0.into_iter().map(|item| solo_eth::AccessItem { address: item.address, keys: item.keys.0 }).collect();
     let authorization_list: Vec<_> = request

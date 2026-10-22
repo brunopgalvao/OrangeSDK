@@ -955,7 +955,12 @@ mod tests {
         }
         .encode();
         bad.push(fees[..4 + 96].to_vec());
-        for (at, byte) in [(4 + 23, 1), (4 + 32 + 23, 1), (4 + 64 + 23, 1), (4 + 96 + 11, 1)] {
+        for (at, byte) in [
+            (4 + 23, 1),
+            (4 + 32 + 23, 1),
+            (4 + 64 + 23, 1),
+            (4 + 96 + 11, 1),
+        ] {
             let mut v = fees.clone();
             v[at] = byte;
             bad.push(v);

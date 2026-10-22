@@ -349,7 +349,10 @@ fn take_skips_what_an_unexecuted_block_carries() {
         [(1, 1)]
     );
     assert_eq!(
-        nonces(&pool, &pool.take(usize::MAX, 2 * GAS, &[a0.hash, a1.hash], 0)),
+        nonces(
+            &pool,
+            &pool.take(usize::MAX, 2 * GAS, &[a0.hash, a1.hash], 0)
+        ),
         [(2, 0)]
     );
     // A skipped transaction still spends its sender's balance.
@@ -384,10 +387,11 @@ fn take_leaves_out_senders_priced_below_the_base_fee() {
     );
     assert_eq!(pool.len(), 4);
     // A transaction an unexecuted block carries is skipped whatever its
-    // price: the block that carries it decides.
+    // price: the block that carries it decides, and the one behind it is
+    // taken (in its sender's turn, which the skipped one's priority sets).
     assert_eq!(
         nonces(&pool, &pool.take(usize::MAX, u64::MAX, &[a0.hash], 10)),
-        [(3, 0), (1, 1), (2, 0)]
+        [(3, 0), (2, 0), (1, 1)]
     );
 }
 

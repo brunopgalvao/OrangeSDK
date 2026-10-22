@@ -880,7 +880,6 @@ impl Rpc {
         }
         Ok(Value::Array(out))
     }
-
 }
 
 /// The error for a height whose state the node does not keep, in the words

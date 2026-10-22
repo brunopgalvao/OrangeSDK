@@ -83,12 +83,11 @@ pub fn pay_surcharge(s: &Signed, gas: u64, block: BlockFields) {
 }
 
 /// The base fee of a transaction that used `gas_used` in `block`: credited
-/// to the treasury when the parameters name one, else burned, which the
-/// EVM already did by crediting nobody.
+/// to the block's treasury, the one the parameters named when the block
+/// began, else burned, which the EVM already did by crediting nobody.
 pub fn route_base_fee(block: BlockFields, gas_used: u64) {
-    let p = params();
-    if p.treasury != [0; 20] && block.base_fee != 0 && gas_used != 0 {
-        credit(&p.treasury, u128::from(gas_used) * u128::from(block.base_fee));
+    if block.treasury != [0; 20] && block.base_fee != 0 && gas_used != 0 {
+        credit(&block.treasury, u128::from(gas_used) * u128::from(block.base_fee));
     }
 }
 

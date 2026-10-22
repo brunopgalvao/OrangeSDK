@@ -673,6 +673,27 @@ fn an_equivocator_is_slashed_once_and_excluded() {
             .unwrap()
     );
     let byzantine = validator_id(&keys[4]);
+    // An outsider delegates behind the offender-to-be (spec 15 §10.1): its
+    // stake is slashed with the validator's own.
+    let delegator = SigningKey::from_slice(&[0x77; 32]).unwrap();
+    let delegated = 1_000 * GWEI;
+    let delegation = action(
+        &delegator,
+        0,
+        delegated,
+        &StakingAction::Delegate {
+            validator: address(&keys[4]),
+        },
+    );
+    let hash = sim.submit(0, &delegation).unwrap();
+    assert!(
+        sim.run_until(40 * SLOT_MS, |s| s.nodes[0]
+            .receipt(&hash)
+            .unwrap()
+            .is_some())
+            .unwrap()
+    );
+    assert_eq!(record_of(&mut sim.nodes[0], &keys[4]).delegated, delegated);
     let ahead = sim.nodes[0].simplex_state().unwrap().view + 40;
     // Three offences: two block votes in each of two views, and two finalize votes.
     for (kind, view, hashes) in [
@@ -707,15 +728,33 @@ fn an_equivocator_is_slashed_once_and_excluded() {
         })
         .unwrap();
     assert!(recorded);
-    // One slash for all three offences: a tenth of the stake burned, and the validator jailed.
+    // One slash for all three offences: a tenth of the stake burned, the
+    // delegation's tenth with it, and the validator jailed.
     let r = record_of(&mut sim.nodes[1], &keys[4]);
     assert!(r.jailed);
     assert_eq!(r.stake, u128::from(STAKE) * GWEI * 9 / 10);
+    assert_eq!(r.delegated, delegated * 9 / 10);
+    let delegations = {
+        let r = sim.nodes[1]
+            .query(query::DELEGATIONS, &address(&delegator))
+            .unwrap();
+        Seq::<solo_abi::staking::DelegationEntry>::from_bytes(&r.body)
+            .unwrap()
+            .0
+    };
+    assert_eq!(delegations.len(), 1);
+    assert_eq!(delegations[0].delegation.stake, delegated * 9 / 10);
+    // The staking address holds the stakes left and the reward pool, which
+    // the delegation's priority fee filled (spec 15 §10.2).
+    let pool = status(&mut sim.nodes[1]).pool;
     assert_eq!(
         balance(&mut sim.nodes[1], STAKING_ADDRESS),
-        u128::from(STAKE) * GWEI * 49 / 10
+        u128::from(STAKE) * GWEI * 49 / 10 + delegated * 9 / 10 + pool
     );
-    assert!(balance(&mut sim.nodes[1], [0; 20]) >= zero_before + u128::from(STAKE) * GWEI / 10);
+    assert!(
+        balance(&mut sim.nodes[1], [0; 20])
+            >= zero_before + u128::from(STAKE) * GWEI / 10 + delegated / 10
+    );
     // A jailed validator can no longer bond or re-register, and the next set leaves it out.
     let rebond = action(&keys[4], 0, GWEI, &StakingAction::Bond);
     assert_eq!(
@@ -1679,9 +1718,13 @@ fn threshold_misbehaviour_is_slashed_once() {
     let after = record_of(&mut sim.nodes[0], &keys[3]);
     assert!(after.jailed);
     assert_eq!(after.stake, before.stake - before.stake / 10);
+    // The staking address lost the burned tenth and gained the reward pool:
+    // the report's priority fee, `REPORT_GAS` included (spec 15 §10.2).
+    let pool = status(&mut sim.nodes[0]).pool;
+    assert_eq!(pool, u128::from(receipt.gas_used) * 1_000_000_000);
     assert_eq!(
         balance(&mut sim.nodes[0], STAKING_ADDRESS),
-        pot - before.stake / 10
+        pot - before.stake / 10 + pool
     );
     assert_eq!(evidence_count(&mut sim.nodes[0]), 1);
     // Once: the same offence cannot be reported again.

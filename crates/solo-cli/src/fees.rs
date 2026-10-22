@@ -20,9 +20,9 @@ use solo_abi::fees::{DEFAULT_DENOMINATOR, DEFAULT_ELASTICITY, DEFAULT_MIN_BASE_F
 fn number(fields: &Map<String, Value>, name: &str) -> Result<u64, String> {
     match fields.get(name) {
         None => Ok(0),
-        Some(n) => n
-            .as_u64()
-            .ok_or(format!("genesis: fees.{name} must be a non-negative integer")),
+        Some(n) => n.as_u64().ok_or(format!(
+            "genesis: fees.{name} must be a non-negative integer"
+        )),
     }
 }
 

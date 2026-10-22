@@ -674,7 +674,8 @@ impl Mempool {
                 (tx.raw.len(), tx.gas)
             };
             let underpriced = !skipped && tx.fee_cap < base_fee;
-            if bytes + len > max_bytes || gas + used > max_gas || cost > runs[run].1 || underpriced {
+            if bytes + len > max_bytes || gas + used > max_gas || cost > runs[run].1 || underpriced
+            {
                 continue;
             }
             bytes += len;

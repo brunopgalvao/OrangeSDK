@@ -172,7 +172,10 @@ fn init_writes_a_reproducible_devnet_and_names_mistakes() {
     );
     assert_eq!(params.allocations.0.len(), 4);
     assert_eq!(params.fees, solo_abi::fees::FeeParams::production());
-    assert!(report.contains("base fee floor 1000000000 wei, burned"), "{report}");
+    assert!(
+        report.contains("base fee floor 1000000000 wei, burned"),
+        "{report}"
+    );
     // The key files are the governance account and the validators.
     let governance = std::fs::read_to_string(devnet.governance_key()).unwrap();
     assert_eq!(governance, STRANGER[2..]);

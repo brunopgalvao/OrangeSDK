@@ -135,13 +135,15 @@ impl FeeParams {
         let fee = match parent_gas_used.cmp(&target) {
             core::cmp::Ordering::Equal => parent,
             core::cmp::Ordering::Greater => {
-                let delta =
-                    parent * u128::from(parent_gas_used - target) / u128::from(target) / denominator;
+                let delta = parent * u128::from(parent_gas_used - target)
+                    / u128::from(target)
+                    / denominator;
                 parent + delta.max(1)
             }
             core::cmp::Ordering::Less => {
-                let delta =
-                    parent * u128::from(target - parent_gas_used) / u128::from(target) / denominator;
+                let delta = parent * u128::from(target - parent_gas_used)
+                    / u128::from(target)
+                    / denominator;
                 parent - delta
             }
         };
@@ -253,7 +255,12 @@ mod tests {
         assert_eq!(FEE_VAULT[18..], [0x46, 0x45]);
         assert!(FEE_VAULT[..18].iter().all(|b| *b == 0));
         assert_eq!(
-            (MIN_DENOMINATOR, MAX_DENOMINATOR, MIN_ELASTICITY, MAX_ELASTICITY),
+            (
+                MIN_DENOMINATOR,
+                MAX_DENOMINATOR,
+                MIN_ELASTICITY,
+                MAX_ELASTICITY
+            ),
             (100, 125, 2, 4)
         );
         assert_eq!(
@@ -308,10 +315,20 @@ mod tests {
         assert_eq!(params.next_base_fee(gwei, LIMIT, LIMIT), gwei + gwei / 125);
         assert_eq!(params.next_base_fee(gwei, 15_000_000, LIMIT), gwei);
         assert_eq!(params.next_base_fee(gwei, 0, LIMIT), gwei);
-        assert_eq!(params.next_base_fee(2 * gwei, 0, LIMIT), 2 * gwei - 2 * gwei / 125);
-        assert_eq!(params.next_base_fee(0, 0, LIMIT), gwei, "the genesis parent");
+        assert_eq!(
+            params.next_base_fee(2 * gwei, 0, LIMIT),
+            2 * gwei - 2 * gwei / 125
+        );
+        assert_eq!(
+            params.next_base_fee(0, 0, LIMIT),
+            gwei,
+            "the genesis parent"
+        );
         // Half way between target and limit: half the largest increase.
-        assert_eq!(params.next_base_fee(gwei, 22_500_000, LIMIT), gwei + gwei / 250);
+        assert_eq!(
+            params.next_base_fee(gwei, 22_500_000, LIMIT),
+            gwei + gwei / 250
+        );
         // The increase is at least one wei, as in EIP-1559.
         let tiny = FeeParams {
             min_base_fee: 0,
@@ -319,7 +336,11 @@ mod tests {
         };
         assert_eq!(tiny.next_base_fee(0, LIMIT, LIMIT), 1);
         assert_eq!(tiny.next_base_fee(1, LIMIT, LIMIT), 2);
-        assert_eq!(tiny.next_base_fee(1, 0, LIMIT), 1, "and a decrease rounds down");
+        assert_eq!(
+            tiny.next_base_fee(1, 0, LIMIT),
+            1,
+            "and a decrease rounds down"
+        );
         assert_eq!(tiny.next_base_fee(0, 0, LIMIT), 0);
         // The fee saturates at the widest the header field holds.
         assert_eq!(tiny.next_base_fee(u64::MAX, LIMIT, LIMIT), u64::MAX);

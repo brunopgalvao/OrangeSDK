@@ -409,11 +409,14 @@ impl Node {
         self.genesis_base_fee
     }
 
-    /// Reads the fee market from the kernel; see [`Node::fee_status`].
+    /// Reads the fee market from the kernel; see [`Node::fee_status`]. A
+    /// read the host makes for itself: it runs under the kernel budget, not
+    /// the cap `--query-gas` puts on what clients ask for.
     pub(crate) fn refresh_fees(&mut self) -> Result<(), NodeError> {
-        self.fees = self
-            .query_decoded(solo_abi::fees::query::FEES, &[])?
-            .unwrap_or_default();
+        let cap = std::mem::replace(&mut self.query_gas, i64::MAX);
+        let fees = self.query_decoded(solo_abi::fees::query::FEES, &[]);
+        self.query_gas = cap;
+        self.fees = fees?.unwrap_or_default();
         Ok(())
     }
 
