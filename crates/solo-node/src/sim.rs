@@ -12,6 +12,7 @@ use solo_abi::types::{Genesis, Input};
 
 use crate::extension::{Outbound, validator_id};
 use crate::node::{Node, NodeConfig, NodeError, SubmitError};
+use crate::state::StoreConfig;
 
 /// What travels between two nodes.
 #[derive(Debug, Clone)]
@@ -46,6 +47,9 @@ pub struct Sim {
     pub nodes: Vec<Node>,
     ids: Vec<[u8; 32]>,
     alive: Vec<bool>,
+    /// Where each node keeps its chain state; a node revived over a disk
+    /// store resumes from it.
+    stores: Vec<StoreConfig>,
     /// Virtual clock in milliseconds.
     pub now_ms: u64,
     /// Delivery latency applied to every message.
@@ -88,15 +92,38 @@ impl Sim {
         template: &NodeConfig,
         latency_ms: u64,
     ) -> Result<Sim, NodeError> {
+        Sim::with_stores(kernel, genesis, keys, observers, template, latency_ms, &[])
+    }
+
+    /// [`Sim::new`] with the chain state of node `i` kept where `stores[i]`
+    /// says (in memory for a node `stores` does not name): a node with a
+    /// disk store that crashes and is revived resumes from it, as a
+    /// restarted validator does (spec 22 §5).
+    ///
+    /// # Errors
+    /// Whatever opening or starting a node reports.
+    pub fn with_stores(
+        kernel: &[u8],
+        genesis: &Genesis,
+        keys: &[SigningKey],
+        observers: usize,
+        template: &NodeConfig,
+        latency_ms: u64,
+        stores: &[StoreConfig],
+    ) -> Result<Sim, NodeError> {
         let mut nodes = Vec::new();
         let mut ids = Vec::new();
+        let mut configs = Vec::new();
         for i in 0..keys.len() + observers {
             let key = keys.get(i).cloned();
             ids.push(key.as_ref().map_or([0xEE; 32], validator_id));
+            let store = stores.get(i).cloned().unwrap_or_default();
             let config = NodeConfig {
                 key,
+                store: store.clone(),
                 ..template.clone()
             };
+            configs.push(store);
             nodes.push(Self::open_started(kernel, genesis, config, None)?);
         }
         let alive = vec![true; nodes.len()];
@@ -104,6 +131,7 @@ impl Sim {
             nodes,
             ids,
             alive,
+            stores: configs,
             now_ms: template.now_ms,
             latency_ms,
             queue: VecDeque::new(),
@@ -181,7 +209,11 @@ impl Sim {
             query_gas: old.query_gas,
             state_history: old.state_history,
             history_keys_per_block: old.history_keys_per_block,
+            store: self.stores[index].clone(),
         };
+        // A disk store is held by one node at a time: the old one lets go
+        // before the new one opens it.
+        self.nodes[index].release_store();
         self.nodes[index] = Self::open_started(kernel, genesis, config, resumed)?;
         self.ids[index] = key;
         self.alive[index] = true;

@@ -11,6 +11,7 @@ pub mod mempool;
 pub mod net;
 pub mod node;
 pub mod sim;
+pub mod state;
 pub mod store;
 pub mod telemetry;
 pub mod upgrade;
@@ -23,5 +24,6 @@ pub use node::{
     SubmitError,
 };
 pub use sim::Sim;
+pub use state::{ChainState, StoreConfig};
 pub use store::DriverStore;
 pub use upgrade::{GatedExtension, Switch, Upgrades};

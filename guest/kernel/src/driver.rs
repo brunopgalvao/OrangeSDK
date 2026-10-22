@@ -48,6 +48,15 @@ const WEAK_SYNC_KEY: &[u8] = b"simplex/weak_sync";
 /// The height a restarted node re-executes its own finalized blocks up to
 /// (spec 08 §7), while it does; 0 or absent otherwise.
 const REPLAY_KEY: &[u8] = b"simplex/replay";
+/// The block log (spec 22 §5): per finalized height, under `local/` in chain
+/// state so that it reaches the disk with the block it names, the proposal,
+/// its finalize certificate and its threshold certificate. A node whose
+/// chain state is ahead of its tables takes the heights between from here.
+const LOG_PROPOSAL: &[u8] = b"local/log/prop/";
+const LOG_CERTIFICATE: &[u8] = b"local/log/cert/";
+const LOG_THRESHOLD: &[u8] = b"local/log/bcert/";
+/// Heights the block log keeps behind the finalized head.
+const LOG_WINDOW: u64 = 64;
 const ZERO: Hash = [0; 32];
 
 /// The anchor a leader puts in its proposal (spec 08 §5): its executed
@@ -929,8 +938,55 @@ impl Ctx {
             if let Some(bytes) = threshold {
                 persist::set_raw(&key(b"bcert/", &[&p.height.to_le_bytes()]), bytes);
             }
+            Self::log_block(&p, certificate, threshold);
             self.s.finalized_height = p.height;
             self.execute(p);
+        }
+    }
+
+    /// Writes the block log entry of `p` (spec 22 §5) and drops the one
+    /// `LOG_WINDOW` heights behind it.
+    fn log_block(p: &Proposal, certificate: &Certificate, threshold: Option<&[u8]>) {
+        let height = p.height.to_le_bytes();
+        state::set_raw(&key(LOG_PROPOSAL, &[&height]), &p.to_bytes());
+        state::set(&key(LOG_CERTIFICATE, &[&height]), certificate);
+        if let Some(bytes) = threshold {
+            state::set_raw(&key(LOG_THRESHOLD, &[&height]), bytes);
+        }
+        if p.height > LOG_WINDOW {
+            let old = (p.height - LOG_WINDOW).to_le_bytes();
+            for prefix in [LOG_PROPOSAL, LOG_CERTIFICATE, LOG_THRESHOLD] {
+                state::delete(&key(prefix, &[&old]));
+            }
+        }
+    }
+
+    /// Takes the heights `from` to `to` from the block log into the tables
+    /// (spec 22 §5): chain state holds them executed, so they were
+    /// finalized, whatever the tables remember. The last one becomes the
+    /// tip when the tip is behind it.
+    fn recover_log(&mut self, from: u64, to: u64) {
+        for height in from..=to {
+            let h = height.to_le_bytes();
+            let Some(bytes) = state::get_raw(&key(LOG_PROPOSAL, &[&h])) else { continue };
+            let hash = state::keccak256(&bytes);
+            persist::set_raw(&key(b"prop/", &[&hash]), &bytes);
+            persist::set(&key(b"final/", &[&h]), &hash);
+            let certificate = state::get::<Certificate>(&key(LOG_CERTIFICATE, &[&h]));
+            if let Some(certificate) = &certificate {
+                persist::set(&key(b"cert/", &[&h]), certificate);
+            }
+            if let Some(threshold) = state::get_raw(&key(LOG_THRESHOLD, &[&h])) {
+                persist::set_raw(&key(b"bcert/", &[&h]), &threshold);
+            }
+            if height == to
+                && self.s.tip_height < height
+                && let Ok(p) = Proposal::from_bytes(&bytes)
+                && let Some(certificate) = certificate
+            {
+                self.set_tip(&certificate, &p);
+                persist::set(ENTRY_KEY, &certificate);
+            }
         }
     }
 
@@ -1169,6 +1225,12 @@ pub fn step(input: &Input) -> Seq<Effect> {
             let executed = state::height().unwrap_or(0);
             let remembered = c.s.finalized_height.max(persist::get(REPLAY_KEY).unwrap_or(0));
             if remembered > executed {
+                c.s.finalized_height = executed;
+            } else if executed > c.s.finalized_height {
+                // Chain state is ahead of what the tables remember (a restart
+                // between a block's write and the driver's, or a snapshot): the
+                // blocks were finalized, and the block log says by what.
+                c.recover_log(c.s.finalized_height + 1, executed);
                 c.s.finalized_height = executed;
             }
             c.load_set();

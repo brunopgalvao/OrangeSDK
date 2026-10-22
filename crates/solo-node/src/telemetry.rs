@@ -5,7 +5,9 @@
 
 use std::time::Instant;
 
-use solo_host::{CallResult, Executor, MemStorage};
+use solo_host::{CallResult, Executor};
+
+use crate::state::ChainState;
 use solo_metrics::{NodeMetrics, Origin, PendingUpgrade, Status, VERSION};
 use solo_vm::host::Capability;
 use solo_vm::status::Termination;
@@ -31,7 +33,7 @@ pub fn fault_label(status: Termination) -> &'static str {
 /// the call emitted through `metric_emit` and `log_emit`.
 pub(crate) fn record_call(
     telemetry: &mut NodeMetrics,
-    exec: &mut Executor<MemStorage>,
+    exec: &mut Executor<ChainState>,
     export: &str,
     started: Instant,
     r: &CallResult,
@@ -176,7 +178,10 @@ mod tests {
 
     #[test]
     fn calls_record_what_the_instance_emitted() {
-        let mut exec = Executor::new(ModuleCache::default(), MemStorage::default());
+        let mut exec = Executor::new(
+            ModuleCache::default(),
+            ChainState::open(&crate::state::StoreConfig::Memory).unwrap(),
+        );
         let mut telemetry = NodeMetrics::new();
         let hash = exec.load(&emitter(), Capability::Sandboxed).unwrap();
         for (capability, gas) in [

@@ -313,6 +313,9 @@ pub mod query {
     /// in the order recorded, from index `first`, at most
     /// [`EVIDENCE_PAGE`](super::consensus::EVIDENCE_PAGE) records.
     pub const EVIDENCE: &str = "evidence";
+    /// `(u64 epoch) -> SnapshotRecord`, or `() -> SnapshotRecord` for the
+    /// latest: the snapshot record of a completed epoch (spec 22 §6).
+    pub const SNAPSHOT: &str = "snapshot";
 }
 
 /// Validation failure reasons reported by the reference kernel.
@@ -404,6 +407,29 @@ pub mod keys {
     pub const EVIDENCE_COUNT: &[u8] = b"meta/evidence_count";
     /// `evseen/` + `Evidence::id` → u64 index: one record per offence.
     pub const EVIDENCE_SEEN: &[u8] = b"evseen/";
+    /// `snap/` + epoch (big-endian u64) → [`SnapshotRecord`](super::SnapshotRecord):
+    /// the state root at the end of that epoch (spec 22 §6).
+    pub const SNAPSHOT: &[u8] = b"snap/";
+    /// `meta/snapshot` → u64, the epoch of the latest snapshot record.
+    pub const SNAPSHOT_LATEST: &[u8] = b"meta/snapshot";
+}
+
+/// Blocks between snapshot records on a chain with neither staking epochs
+/// nor feature-gate epochs (spec 22 §6).
+pub const SNAPSHOT_INTERVAL: u64 = 1024;
+
+record! {
+    /// What a snapshot of the chain is identified by (spec 22 §6): the
+    /// state commitment of the whole state as it was after the last block
+    /// of an epoch, as the kernel committed it at the start of the next
+    /// block. Written under `snap/` + epoch, so that a certificate for any
+    /// later proposal vouches for it through its anchor and a spec 10 proof.
+    SnapshotRecord {
+        /// The epoch's last block.
+        height: u64,
+        /// The state commitment of the state after that block.
+        state_root: Hash,
+    }
 }
 
 /// Intrinsic gas of a value transfer.

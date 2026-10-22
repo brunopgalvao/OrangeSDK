@@ -3038,6 +3038,7 @@ dependencies = [
  "solo-metrics",
  "solo-recompile",
  "solo-rlp",
+ "solo-store",
  "solo-trie",
  "solo-upgrade",
  "solo-vm",
