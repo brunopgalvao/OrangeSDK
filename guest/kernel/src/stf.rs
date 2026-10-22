@@ -10,12 +10,13 @@ use solo_abi::types::{Address, Ahead, Block, BuildArgs, ExecuteArgs, ExecuteResu
 use solo_abi::{Decode, Encode};
 use solo_eth::{MAX_TX_GAS, header, mpt};
 
-use crate::evm::{self, BASE_FEE, BlockFields, Message};
-use crate::state;
+use crate::evm::{self, BlockFields, Message};
 use crate::tx::{self, Signed, decode_signed};
+use crate::{fees, state};
 
-/// The checks that do not depend on the sender's account.
-fn well_formed(s: &Signed) -> Result<(), u32> {
+/// The checks that do not depend on the sender's account, under the base
+/// fee of the block the transaction would run in (spec 23 §3).
+fn well_formed(s: &Signed, base_fee: u64) -> Result<(), u32> {
     let tx = &s.tx;
     if tx.gas_limit > MAX_TX_GAS || tx.gas_limit > BLOCK_GAS_LIMIT {
         return Err(reason::GAS_LIMIT_TOO_HIGH);
@@ -26,7 +27,10 @@ fn well_formed(s: &Signed) -> Result<(), u32> {
     if tx.gas_limit < tx.min_gas_limit() {
         return Err(reason::GAS_TOO_LOW);
     }
-    if tx.effective_gas_price(u128::from(BASE_FEE)).is_none() || tx.priority_fee.is_some_and(|tip| tip > tx.gas_price) {
+    if tx.priority_fee.is_some_and(|tip| tip > tx.gas_price) {
+        return Err(reason::TIP_ABOVE_FEE_CAP);
+    }
+    if tx.effective_gas_price(u128::from(base_fee)).is_none() {
         return Err(reason::FEE_TOO_LOW);
     }
     Ok(())
@@ -50,9 +54,9 @@ fn admissible(s: &Signed, account: &Account) -> Result<(), u32> {
     }
 }
 
-fn check(raw: &[u8]) -> Result<Signed, u32> {
+fn check(raw: &[u8], base_fee: u64) -> Result<Signed, u32> {
     let s = decode_signed(raw, state::chain_id())?;
-    well_formed(&s)?;
+    well_formed(&s, base_fee)?;
     crate::governance::admit(&s)?;
     crate::staking::admit(&s)?;
     crate::outbox::admit(&s)?;
@@ -76,11 +80,13 @@ fn ahead_of(account: Account, ahead: &Ahead) -> Result<Account, u32> {
 /// transaction against the state as it is, so a mempool that reports it
 /// wrongly can delay its own transactions but never make a block invalid.
 pub fn validate(args: &ValidateArgs) -> ValidateResult {
-    match check(&args.tx).and_then(|s| admissible(&s, &ahead_of(state::account(&s.from), &args.ahead)?).map(|()| s)) {
+    let base_fee = fees::next_base_fee();
+    match check(&args.tx, base_fee).and_then(|s| admissible(&s, &ahead_of(state::account(&s.from), &args.ahead)?).map(|()| s)) {
         Ok(s) => {
-            let price = s.tx.effective_gas_price(u128::from(BASE_FEE)).unwrap_or(0);
+            // The priority is the tip the transaction pays over the base fee.
+            let price = s.tx.effective_gas_price(u128::from(base_fee)).unwrap_or(0);
             ValidateResult::Valid {
-                priority: u64::try_from(price - u128::from(BASE_FEE)).unwrap_or(u64::MAX),
+                priority: u64::try_from(price - u128::from(base_fee)).unwrap_or(u64::MAX),
                 reserved_fee: u64::try_from(s.tx.max_cost().unwrap_or(u128::MAX)).unwrap_or(u64::MAX),
             }
         }
@@ -94,11 +100,12 @@ pub fn build(args: &BuildArgs) -> Block {
     let mut accounts: BTreeMap<Address, Account> = BTreeMap::new();
     let mut selected = Vec::new();
     let mut gas = 0u64;
+    let base_fee = fees::next_base_fee();
     for raw in &args.candidates.0 {
         if selected.len() >= max {
             break;
         }
-        let Ok(s) = check(raw) else { continue };
+        let Ok(s) = check(raw, base_fee) else { continue };
         if gas + s.tx.gas_limit > BLOCK_GAS_LIMIT {
             continue;
         }
@@ -158,7 +165,7 @@ pub fn has_run(tx_hash: &Hash) -> bool {
 /// if it cannot run, in which case nothing changed.
 fn run_tx(raw: &[u8], chain_id: u64, block: BlockFields, index: u32, cumulative: u64) -> Option<Receipt> {
     let s = decode_signed(raw, chain_id).ok()?;
-    if well_formed(&s).is_err() || cumulative + s.tx.gas_limit > BLOCK_GAS_LIMIT {
+    if well_formed(&s, block.base_fee).is_err() || cumulative + s.tx.gas_limit > BLOCK_GAS_LIMIT {
         return None;
     }
     let message = Message {
@@ -184,6 +191,9 @@ fn run_tx(raw: &[u8], chain_id: u64, block: BlockFields, index: u32, cumulative:
     if outcome.status == call_status::INVALID {
         return None;
     }
+    // The EVM credited the beneficiary the priority fee and nobody the base
+    // fee; a treasury, if the parameters name one, gets the base fee now.
+    fees::route_base_fee(block, outcome.gas_used);
     Some(Receipt {
         status: u8::from(outcome.status == call_status::SUCCESS),
         gas_used: outcome.gas_used,
@@ -196,7 +206,7 @@ fn run_tx(raw: &[u8], chain_id: u64, block: BlockFields, index: u32, cumulative:
         contract: outcome.contract,
         logs: Seq(outcome.logs),
         tx_type: s.tx.tx_type,
-        effective_gas_price: s.tx.effective_gas_price(u128::from(BASE_FEE)).unwrap_or(0),
+        effective_gas_price: s.tx.effective_gas_price(u128::from(block.base_fee)).unwrap_or(0),
     })
 }
 
@@ -212,7 +222,9 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let chain_id = state::chain_id();
     let template = BlockHeader::from_bytes(&args.block.header).unwrap_or_else(|_| solo_guest::trap());
     let height = template.height;
-    let block = BlockFields { number: height, timestamp: template.timestamp_ms / 1000 };
+    // The base fee follows from the parent's header (spec 23 §3), read before
+    // anything in this block is written.
+    let block = BlockFields { number: height, timestamp: template.timestamp_ms / 1000, base_fee: fees::next_base_fee(), beneficiary: fees::beneficiary() };
     crate::precompiles::begin(crate::governance::gate_active(solo_upgrade::gate::PRECOMPILES, height));
     record_participation(&args.block.participation, height);
     crate::modules::begin_block(height, template.timestamp_ms);
@@ -244,6 +256,9 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let transactions_root = mpt::ordered_root(&listed, state::keccak256);
     crate::modules::end_block(height, template.timestamp_ms);
     crate::governance::end_block(height);
+    // What the vault collected joins the reward pool before an epoch end
+    // distributes it (spec 15 §10.2).
+    fees::sweep();
     crate::staking::end_block(height);
     let state_root = state::commit();
     let header = BlockHeader {
@@ -257,8 +272,8 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
         transactions_root,
         logs_bloom: logs_bloom.to_vec(),
         gas_limit: BLOCK_GAS_LIMIT,
-        base_fee: BASE_FEE,
-        beneficiary: [0; 20],
+        base_fee: block.base_fee,
+        beneficiary: block.beneficiary,
     };
     let block_hash = header::block_hash(&header, state::keccak256);
     state::put_block(&header, &block_hash);
@@ -286,13 +301,15 @@ fn bad_params() -> QueryResult {
 }
 
 /// Runs a call against the head state without keeping its effects. The EVM
-/// sees the head block (its number and timestamp), as `eth_call` at `latest`
-/// does. A message with an access list runs as an EIP-2930 transaction, the
-/// only way the EVM charges and warms one, and one with an authorization list
-/// as an EIP-7702 transaction, each authority recovered as for a transaction.
+/// sees the head block (its number, timestamp and base fee), as `eth_call`
+/// at `latest` does, and the message pays nothing (spec 23 §3). A message
+/// with an access list runs as an EIP-2930 transaction, the only way the EVM
+/// charges and warms one, and one with an authorization list as an EIP-7702
+/// transaction, each authority recovered as for a transaction.
 fn call(request: CallRequest) -> CallResult {
     let height = state::height().unwrap_or(0);
     let timestamp = state::block_by_number(height).map_or(0, |h| h.timestamp_ms / 1000);
+    let block = BlockFields { number: height, timestamp, base_fee: fees::head_base_fee(), beneficiary: fees::beneficiary() };
     let gas = if request.gas == 0 { MAX_TX_GAS } else { request.gas.min(MAX_TX_GAS) };
     let access_list: Vec<solo_eth::AccessItem> = request.access_list.0.into_iter().map(|item| solo_eth::AccessItem { address: item.address, keys: item.keys.0 }).collect();
     let authorization_list: Vec<_> = request
@@ -324,7 +341,7 @@ fn call(request: CallRequest) -> CallResult {
     };
     // The host serves the gates active for the next block (spec 13 §7.1).
     crate::precompiles::begin(crate::governance::gate_active(solo_upgrade::gate::PRECOMPILES, height + 1));
-    let outcome = crate::native::run(message, BlockFields { number: height, timestamp }, false);
+    let outcome = crate::native::run(message, block, false);
     CallResult { status: outcome.status, gas_used: outcome.gas_used + surcharge, output: outcome.output }
 }
 
@@ -375,6 +392,7 @@ pub fn query(args: &QueryArgs) -> QueryResult {
             Ok(height) => found(crate::driver::finality_proof(height)),
             Err(_) => bad_params(),
         },
+        solo_abi::fees::query::FEES => found(Some(fees::status())),
         _ => crate::staking::query(method, &args.params)
             .or_else(|| crate::rotation::query(method, &args.params))
             .or_else(|| crate::modules::query(method, &args.params))

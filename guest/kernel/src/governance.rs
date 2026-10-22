@@ -25,7 +25,7 @@ use solo_upgrade::action::{cancelled_log, proposed_log};
 use solo_upgrade::gates::{ended_epoch, epoch_of};
 use solo_upgrade::{Action, EnactedUpgrade, GateBook, MAX_CHUNKS, PendingUpgrade, Signal, UpgradeStatus, ValidatorSignal, keys, query};
 
-use crate::evm::{BASE_FEE, BlockFields, Message, Outcome};
+use crate::evm::{BlockFields, Message, Outcome};
 use crate::state;
 use crate::tx::Signed;
 
@@ -246,7 +246,7 @@ fn track_of(target: &Address, data: &[u8], switch: bool) -> Option<Track> {
             Some(Action::Cancel { .. }) => Some(Track::Fast),
             Some(_) => None,
             None => match Call::decode(data)? {
-                Call::SetGuardian { .. } | Call::SetParams { .. } => Some(Track::Normal),
+                Call::SetGuardian { .. } | Call::SetParams { .. } | Call::SetFeeParams { .. } => Some(Track::Normal),
                 Call::SetMode { .. } if switch => Some(Track::Normal),
                 _ => None,
             },
@@ -282,6 +282,8 @@ fn apply_action(target: &Address, data: &[u8], block: BlockFields) -> Option<Vec
                     state::set(gov::keys::PARAMS, &rules);
                     Some(vec![gov::params_log(&rules)])
                 }
+                // The fee market's parameters, from the next block on (spec 23 §5).
+                Call::SetFeeParams { params } => crate::fees::set_params(&params).then(|| vec![gov::fee_params_log(&params)]),
                 _ => None,
             },
         },
@@ -385,7 +387,7 @@ fn call_allowed(call: &Call, s: &Signed, height: u64) -> bool {
         Call::Execute { id } => value == 0 && proposal(*id).is_some_and(|p| p.status == status::PASSED && (p.executable_at..=p.expires_at).contains(&height)),
         Call::Veto { id } => value == 0 && guardian_acts(from) && proposal(*id).is_some_and(|p| vetoable(&p)),
         Call::Pause { target } => value == 0 && guardian_acts(from) && *target == VERIFIER_ADDRESS && crate::bridge::governed(target),
-        Call::SetGuardian { .. } | Call::SetMode { .. } | Call::SetParams { .. } => false,
+        Call::SetGuardian { .. } | Call::SetMode { .. } | Call::SetParams { .. } | Call::SetFeeParams { .. } => false,
     }
 }
 
@@ -469,9 +471,7 @@ pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Out
             Request::Call(call) => {
                 // The governance surcharge, paid like every fee (spec 13 §9.9).
                 outcome.gas_used += GOVERNANCE_GAS;
-                let fee = u128::from(GOVERNANCE_GAS) * s.tx.effective_gas_price(u128::from(BASE_FEE)).unwrap_or(0);
-                debit(&s.from, fee);
-                credit(&[0; 20], fee);
+                crate::fees::pay_surcharge(s, GOVERNANCE_GAS, block);
                 apply_call(call, s, block)
             }
         };
@@ -619,7 +619,7 @@ fn apply_call(call: Call, s: &Signed, block: BlockFields) -> Option<Vec<Log>> {
             Some(vec![gov::vetoed_log(id)])
         }
         Call::Pause { target } => enact(&s.from, &target, &lcabi::PAUSE, block),
-        Call::SetGuardian { .. } | Call::SetMode { .. } | Call::SetParams { .. } => None,
+        Call::SetGuardian { .. } | Call::SetMode { .. } | Call::SetParams { .. } | Call::SetFeeParams { .. } => None,
     }
 }
 
