@@ -168,6 +168,8 @@ fn a_crash_inside_a_block_write_leaves_the_block_before() {
             failed = Some(e);
             break;
         }
+        // A transport would have synced and sent these.
+        node.take_outbound();
     }
     let failed = failed.expect("the block's write fails");
     assert!(
@@ -175,6 +177,9 @@ fn a_crash_inside_a_block_write_leaves_the_block_before() {
         "{failed}"
     );
     assert_eq!(node.tick(node.now_ms() + SLOT_MS), Err(failed));
+    // Nothing the failed step signed leaves the node: its driver state never
+    // reached the disk, so a restart could sign otherwise in the same view.
+    assert!(node.take_outbound().is_empty());
     drop(node);
     // Reopened: the state of the block before; the driver finalizes the
     // block again and the transaction lands.

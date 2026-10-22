@@ -574,9 +574,12 @@ impl Node {
         self.query_gas = cap;
         // A block the store refused is a block the driver believes executed:
         // the node stops here, to be restarted over the store, which holds
-        // the block before (spec 22 §4).
+        // the block before (spec 22 §4). What the step queued for peers goes
+        // too: its driver state never reached the driver store, so a
+        // restarted node could sign otherwise in a view it signed in here.
         if let Err(e @ NodeError::Store(_)) = &stepped {
             self.upgrades.halt(e.clone());
+            self.take_outbound();
         }
         stepped
     }
