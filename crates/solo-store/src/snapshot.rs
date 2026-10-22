@@ -155,9 +155,11 @@ fn io_error(e: io::Error) -> SnapshotError {
     SnapshotError::Io(e.to_string())
 }
 
-/// An entry longer than a `u32` length can say: not one a chain holds.
-fn entry_too_long() -> SnapshotError {
-    SnapshotError::Io("an entry does not fit the format".to_owned())
+/// A header or an entry longer than a `u32` length can say: not one a
+/// chain holds.
+#[allow(clippy::needless_pass_by_value)]
+fn too_long(_: std::num::TryFromIntError) -> SnapshotError {
+    SnapshotError::Io("a length does not fit the format's u32".to_owned())
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -411,13 +413,12 @@ impl Snapshot {
         let header = self.header.to_bytes();
         out.write_all(MAGIC).map_err(io_error)?;
         out.write_all(&FORMAT.to_le_bytes()).map_err(io_error)?;
-        let len = u32::try_from(header.len())
-            .map_err(|_| SnapshotError::Io("the header does not fit the format".to_owned()))?;
+        let len = u32::try_from(header.len()).map_err(too_long)?;
         out.write_all(&len.to_le_bytes()).map_err(io_error)?;
         out.write_all(&header).map_err(io_error)?;
         for (key, value) in &self.entries {
             for part in [key, value] {
-                let len = u32::try_from(part.len()).map_err(|_| entry_too_long())?;
+                let len = u32::try_from(part.len()).map_err(too_long)?;
                 out.write_all(&len.to_le_bytes()).map_err(io_error)?;
                 out.write_all(part).map_err(io_error)?;
             }
@@ -851,8 +852,8 @@ mod tests {
         let path = scratch("write").join("missing-dir").join("x.snap");
         assert!(matches!(snapshot.write(&path), Err(SnapshotError::Io(_))));
         assert_eq!(
-            entry_too_long().to_string(),
-            "snapshot file: an entry does not fit the format"
+            too_long(u32::try_from(u64::MAX).unwrap_err()).to_string(),
+            "snapshot file: a length does not fit the format's u32"
         );
         let dir = scratch("write-ok");
         std::fs::create_dir_all(&dir).unwrap();

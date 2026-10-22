@@ -259,7 +259,7 @@ impl<S: Storage> Extension<S> for NodeExtension {
                 let reply = match ctx.arg(Reg::A0) {
                     0 => match (&services.key, <[u8; 32]>::try_from(msg.as_slice())) {
                         (Some(key), Ok(digest)) if cap >= 65 => {
-                            sign_recoverable(key, &digest).map(|sig| sig.to_vec())
+                            sign_recoverable(key, &digest).map(Vec::from)
                         }
                         _ => None,
                     },

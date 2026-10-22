@@ -782,14 +782,6 @@ fn snapshots_export_verify_import_and_start_a_node() {
     ])
     .unwrap_err();
     assert_eq!(err, "--trust-key must be 96 bytes of 0x hex");
-    let bad_set = genesis_file(
-        "snap-bad-set.json",
-        &EPOCHS.replace(
-            "\"epochBlocks\": 4",
-            "\"epochBlocks\": 4, \"validators\": [\"0x01\"]",
-        ),
-    );
-    assert!(snap(&["verify", "--snapshot", &file, "--genesis", &bad_set]).is_err());
     // Arguments and files that are missing or wrong.
     assert_eq!(snap(&[]).unwrap_err(), USAGE);
     assert_eq!(
@@ -894,6 +886,18 @@ fn snapshots_export_verify_import_and_start_a_node() {
     assert!(err.contains("needs --trust-key"), "{err}");
     let kept = opened(&genesis, &source, &["--snapshot", &first]);
     assert!(kept >= 16, "{kept}");
+    // A node that keeps its state in memory has nowhere to load it.
+    let mut memory = solo_node::Node::open(
+        &load_kernel(KERNEL).unwrap(),
+        &parse_genesis(EPOCHS).unwrap(),
+        solo_node::NodeConfig::default(),
+    )
+    .unwrap();
+    let loaded = solo_store::Snapshot::read(std::path::Path::new(&file)).unwrap();
+    assert_eq!(
+        snapshot::import_into(&mut memory, &loaded).unwrap_err(),
+        "a snapshot loads into a chain store on disk"
+    );
     // A threshold certificate is named as one.
     let mut threshold = solo_store::Snapshot::read(std::path::Path::new(&file)).unwrap();
     threshold.header.certificate = vec![2; 97];

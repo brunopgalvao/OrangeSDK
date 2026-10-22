@@ -49,9 +49,12 @@ pub fn trust(args: &[String], genesis: &Genesis) -> Result<Trust, String> {
                     .to_owned(),
             )
         }
+        // A genesis file always names a set that decodes (parse_genesis
+        // builds it); a genesis from elsewhere may not.
         None => ValidatorSet::from_bytes(&genesis.validators)
+            .ok()
             .map(Trust::Genesis)
-            .map_err(|_| "genesis: validators do not decode".to_owned()),
+            .ok_or("genesis: validators do not decode".to_owned()),
     }
 }
 
