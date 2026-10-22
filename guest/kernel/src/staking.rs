@@ -733,8 +733,10 @@ fn distribute(epoch: u64) {
                 }
             }
         }
-        let own = if r.address == [0; 20] { address_of(&v.id) } else { r.address };
-        credit(&own, rest);
+        if rest != 0 {
+            let own = if r.address == [0; 20] { address_of(&v.id) } else { r.address };
+            credit(&own, rest);
+        }
         paid += share;
     }
     debit(&STAKING_ADDRESS, paid);
