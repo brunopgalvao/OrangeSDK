@@ -17,7 +17,7 @@ use solo_abi::rotation::{HANDOFF_EPOCHS, REPORT_GAS, ThresholdEvidence};
 use solo_abi::staking::{
     Delegation, DelegationEntry, DkgEnvelope, DkgRun, G1_LENGTH, G2_LENGTH, GWEI, KIND_DKG, KeySetRecord, KeySetVote, MAX_DELEGATIONS, MAX_DELEGATORS,
     MAX_DKG, MAX_REGISTERED, SLASH_BPS, STAKING_ADDRESS, StakeEntry, StakeRecord, StakingAction, StakingParams, StakingStatus, address_word,
-    dkg_header, dkg_threshold, envelope, epoch_of, epoch_start, event, keys, query, session_preimage, view_epoch, word,
+    dkg_header, envelope, epoch_of, epoch_start, event, keys, query, session_preimage, stake_shares, view_epoch, word,
 };
 use solo_abi::types::{Address, Genesis, Hash, QueryResult};
 use solo_abi::{Decode, Encode};
@@ -647,30 +647,38 @@ fn select(p: &StakingParams) -> Option<ValidatorSet> {
 
 /// Schedules epoch `epoch`'s DKG run for `set`: always a fresh key among
 /// the set (spec 15 §6.1), which the active key hands off to once it is
-/// adopted. The recipients, who are also the dealers, are the members with
-/// an encryption key; with none there is no run.
+/// adopted. Shares follow stake: a member with an encryption key gets
+/// `⌊w · 4n / W⌋` of them and the threshold is `⌊2 · 4n / 3⌋ + 1`, so any
+/// threshold of shares belongs to more than two thirds of the set's weight
+/// (spec 15 §6.8). The recipients, who are also the dealers, are the
+/// members with a share; when they hold fewer shares than the threshold
+/// there is no run.
 fn schedule_run(epoch: u64, set: &ValidatorSet) {
+    let records: Vec<Option<StakeRecord>> = set.validators.0.iter().map(|v| record(&v.id).filter(|r| !r.dkg_key.is_empty())).collect();
+    let members: Vec<(u64, bool)> = set.validators.0.iter().zip(&records).map(|(v, r)| (v.weight, r.is_some())).collect();
+    let (counts, threshold) = stake_shares(&members);
     let mut recipients = Vec::new();
     let mut keys_of = Vec::new();
-    for v in &set.validators.0 {
-        if let Some(r) = record(&v.id)
-            && !r.dkg_key.is_empty()
-        {
+    let mut shares = Vec::new();
+    for ((v, r), count) in set.validators.0.iter().zip(records).zip(counts) {
+        if let (Some(r), 1..) = (r, count) {
             recipients.push(v.id);
             keys_of.push(r.dkg_key);
+            shares.push(count);
         }
     }
-    if recipients.is_empty() {
+    if shares.iter().sum::<u32>() < threshold {
         return;
     }
     let run = DkgRun {
         epoch,
         session: state::keccak256(&session_preimage(state::chain_id(), epoch)),
-        threshold: dkg_threshold(recipients.len()) as u32,
+        threshold,
         dealers: Seq(recipients.clone()),
         recipients: Seq(recipients),
         keys: Seq(keys_of),
         previous: None,
+        shares: Seq(shares),
     };
     state::set(&run_key(epoch), &run);
 }
@@ -829,17 +837,20 @@ fn confirm(run: &DkgRun, body: &[u8], signer: &Hash, height: u64) {
     }
 }
 
-/// Adopts a confirmed key set when its shape fits the run. The first key
-/// set becomes active at once; a later one waits for the active key to hand
-/// off to it (spec 15 §6.6).
+/// Adopts a confirmed key set when its shape fits the run: one public key
+/// share per share index. Share `x` is held by `shareholders[x − 1]`, each
+/// recipient repeated once per share it holds. The first key set becomes
+/// active at once; a later one waits for the active key to hand off to it
+/// (spec 15 §6.6).
 fn adopt(run: &DkgRun, vote: KeySetVote, height: u64) {
+    let shareholders: Vec<Hash> = run.recipients.0.iter().zip(&run.shares.0).flat_map(|(id, &m)| core::iter::repeat_n(*id, m as usize)).collect();
     let shaped = vote.key_set.len() == run.threshold as usize * G2_LENGTH
-        && vote.public_shares.0.len() == run.recipients.0.len()
+        && vote.public_shares.0.len() == shareholders.len()
         && vote.public_shares.0.iter().all(|s| s.len() == G2_LENGTH);
     if !shaped {
         return;
     }
-    let record = KeySetRecord { id: run.epoch, key_set: vote.key_set, public_shares: vote.public_shares, shareholders: run.recipients.clone() };
+    let record = KeySetRecord { id: run.epoch, key_set: vote.key_set, public_shares: vote.public_shares, shareholders: Seq(shareholders) };
     state::set(&key_set_key(run.epoch), &record);
     rotation::adopted(&record, height);
 }

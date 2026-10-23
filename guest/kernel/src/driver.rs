@@ -564,8 +564,8 @@ impl Ctx {
                     self.check_notarization(view, &hash);
                 }
             }
-            ConsensusMessage::Finalize { view, hash, signature } => self.on_finalize(view, hash, signature, None),
-            ConsensusMessage::FinalizeShare { view, hash, signature, partial } => self.on_finalize(view, hash, signature, Some(partial)),
+            ConsensusMessage::Finalize { view, hash, signature } => self.on_finalize(view, hash, signature, Vec::new()),
+            ConsensusMessage::FinalizeShare { view, hash, signature, partials } => self.on_finalize(view, hash, signature, partials.0),
             ConsensusMessage::Certificate { certificate, proposal } => self.on_certificate(certificate, proposal),
             ConsensusMessage::Dkg { envelope } => {
                 for envelope in dkg::receive(self.chain_id, envelope) {
@@ -575,21 +575,23 @@ impl Ctx {
         }
     }
 
-    /// A finalize vote, with the voter's partial signature when it holds a
-    /// share. Finalize votes of an epoch this node has left only matter as
-    /// evidence.
-    fn on_finalize(&mut self, view: u64, hash: Hash, signature: Signature, partial: Option<PartialShare>) {
+    /// A finalize vote, with the voter's partial signatures when it holds
+    /// shares, one per share. Finalize votes of an epoch this node has left
+    /// only matter as evidence.
+    fn on_finalize(&mut self, view: u64, hash: Hash, signature: Signature, partials: Vec<PartialShare>) {
         let Some(validator) = self.verify(KIND_FINALIZE, view, &hash, &signature) else { return };
         self.observe(KIND_FINALIZE, view, validator, SignedHash { hash, signature });
         if self.view_epoch(view) < self.epoch {
             return;
         }
-        if let Some(partial) = partial
-            && dkg::belongs(&partial, &self.set[validator as usize].0)
-        {
-            // A partial no honest shareholder signs is evidence (spec 15 §5.1).
-            if let Some(p) = Self::proposal(&hash) {
+        let mut reported = false;
+        let voter = self.set[validator as usize].0;
+        for partial in partials.into_iter().filter(|p| dkg::belongs(p, &voter)) {
+            // A partial no honest shareholder signs is evidence (spec 15
+            // §5.1); one piece per vote is enough.
+            if !reported && let Some(p) = Self::proposal(&hash) {
                 for envelope in dkg::inspect(self.chain_id, &partial, &p) {
+                    reported = true;
                     self.broadcast(&ConsensusMessage::Dkg { envelope });
                 }
             }
@@ -782,8 +784,8 @@ impl Ctx {
 
     /// Signs and broadcasts a vote of `kind`, counting it locally. Signing is
     /// deterministic, so casting the same vote again repeats one message. A
-    /// finalize vote carries this node's partial signature when it holds a
-    /// share of the active key set and the proposal is not a suffix.
+    /// finalize vote carries this node's partial signatures when it holds
+    /// shares of the active key set and the proposal is not a suffix.
     fn cast(&mut self, kind: u8, view: u64, hash: Hash) {
         let Some(me) = self.s.me else { return };
         let Some(signature) = self.sign(kind, view, &hash) else { return };
@@ -793,16 +795,18 @@ impl Ctx {
             Self::add_vote(b"votes/", view, &hash, vote);
             return;
         }
-        let partial = Self::proposal(&hash)
+        let partials = Self::proposal(&hash)
             .filter(|p| !self.is_suffix(p) && anchored(p))
             .zip(dkg::my_id(self.chain_id))
-            .and_then(|(p, id)| dkg::partial(self.chain_id, &id, p.height, &hash));
-        match partial {
-            Some(partial) => {
+            .map(|(p, id)| dkg::partials(self.chain_id, &id, p.height, &hash))
+            .unwrap_or_default();
+        if partials.is_empty() {
+            self.broadcast(&ConsensusMessage::Finalize { view, hash, signature });
+        } else {
+            for partial in &partials {
                 Self::add_partial(view, &hash, partial.clone());
-                self.broadcast(&ConsensusMessage::FinalizeShare { view, hash, signature, partial });
             }
-            None => self.broadcast(&ConsensusMessage::Finalize { view, hash, signature }),
+            self.broadcast(&ConsensusMessage::FinalizeShare { view, hash, signature, partials: Seq(partials) });
         }
         Self::add_vote(b"fin/", view, &hash, vote);
     }
@@ -1115,9 +1119,9 @@ impl Ctx {
 
     /// Verifies and adopts a sync response; asks for more if the peer is
     /// further ahead. The finalize votes must verify against the set of
-    /// their view's epoch, always: a threshold certificate counts
-    /// shareholders, not stake, so it never stands in for them (spec 08
-    /// §7a). One that also verifies under the group key is kept, for this
+    /// their view's epoch, always: a threshold certificate stands for the
+    /// stake of its key set's epoch, which a key can outlive, so it never
+    /// stands in for them (spec 08 §7a). One that also verifies under the group key is kept, for this
     /// node to pass on. Only votes of its current epoch move its tip and view.
     fn on_response(&mut self, request_id: u64, payload: &[u8]) {
         if !self.s.sync_pending || request_id != self.s.sync_request_id {

@@ -99,8 +99,16 @@ pub struct Config {
     /// Number of dealers, indexed `1..=dealers`.
     pub dealers: u32,
     /// Recipients' encryption keys: recipient `j` has index `j` and key
-    /// `recipients[j − 1]`. The new key has one share per recipient.
+    /// `recipients[j − 1]`.
     pub recipients: Vec<EncryptionKey>,
+    /// Shares per recipient (spec 12 §4): recipient `j` holds `shares[j − 1]`
+    /// consecutive share indices, after those of the recipients before it.
+    /// Empty means one share each, so that share `j` is recipient `j`'s.
+    pub shares: Vec<u32>,
+    /// Each dealer's weight (spec 12 §5): a fresh key needs qualified
+    /// dealers whose weights sum to the threshold. Empty means one each;
+    /// a resharing takes no weights.
+    pub weights: Vec<u32>,
     /// For a resharing, the current key set: the dealers are its
     /// shareholders and the group key stays the same.
     pub previous: Option<PublicKeySet>,
@@ -125,7 +133,8 @@ impl Drop for Dealer {
 /// This node's recipient role.
 #[derive(Debug)]
 pub struct Recipient {
-    /// Recipient index.
+    /// Recipient index; the recipient holds the share indices
+    /// [`Config::shares`] assigns it.
     pub index: u32,
     /// The key matching `Config::recipients[index − 1]`.
     pub key: DecryptionKey,
@@ -168,8 +177,8 @@ pub enum DkgError {
     TooFewQualified,
 }
 
-/// A dealer's broadcast: its Feldman commitment and every recipient's
-/// encrypted share.
+/// A dealer's broadcast: its Feldman commitment and every share,
+/// encrypted to the recipient that holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dealing {
     /// Run.
@@ -180,7 +189,7 @@ pub struct Dealing {
     pub commitment: Vec<[u8; 96]>,
     /// The compressed G1 point `e · g1` for the dealer's ephemeral scalar `e`.
     pub ephemeral: [u8; 48],
-    /// Recipient `j`'s share plus its pad, as a big-endian scalar, at `j − 1`.
+    /// Share `x` plus its pad, as a big-endian scalar, at `x − 1`.
     pub shares: Vec<[u8; 32]>,
 }
 
@@ -198,8 +207,8 @@ pub struct Complaints {
 /// A share revealed in answer to a complaint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RevealedShare {
-    /// The recipient who complained.
-    pub recipient: u32,
+    /// The share index, one of the accuser's.
+    pub index: u32,
     /// The share in the clear, as a big-endian scalar.
     pub share: [u8; 32],
 }
@@ -211,7 +220,7 @@ pub struct Justification {
     pub session: [u8; 32],
     /// Dealer index.
     pub dealer: u32,
-    /// One revealed share per complaint.
+    /// Every share of every accuser, ascending by index.
     pub shares: Vec<RevealedShare>,
 }
 
@@ -242,9 +251,10 @@ pub enum Step {
 pub struct Output {
     /// The new key set; for a resharing its group key is the previous one.
     pub key_set: PublicKeySet,
-    /// This node's share, if it is a recipient and holds a verified share
-    /// from every qualified dealer.
-    pub share: Option<SecretShare>,
+    /// This node's shares, ascending by index, if it is a recipient and holds
+    /// a verified share from every qualified dealer for each of them; empty
+    /// otherwise.
+    pub shares: Vec<SecretShare>,
     /// The qualified dealers, ascending. Every other dealer was absent or
     /// disqualified.
     pub qualified: Vec<u32>,
@@ -260,18 +270,41 @@ struct Received {
 /// One participant's run.
 pub struct Dkg {
     config: Config,
+    /// Share count of each recipient, one each when the config gives none.
+    shares: Vec<u32>,
+    /// Weight of each dealer, one each when the config gives none.
+    weights: Vec<u32>,
     dealer: Option<(u32, Polynomial)>,
     recipient: Option<Recipient>,
     phase: Phase,
     dealings: BTreeMap<u32, Received>,
-    /// This recipient's verified share from each dealer.
-    mine: BTreeMap<u32, Scalar>,
+    /// This recipient's verified shares from each dealer, ascending by index.
+    mine: BTreeMap<u32, Vec<Scalar>>,
     /// Accusers per accused dealer.
     complaints: BTreeMap<u32, BTreeSet<u32>>,
     accusers: BTreeSet<u32>,
     justified: BTreeSet<u32>,
-    /// Valid revealed shares by `(dealer, recipient)`.
+    /// Valid revealed shares by `(dealer, share index)`.
     revealed: BTreeMap<(u32, u32), Scalar>,
+}
+
+/// The share indices recipient `j` holds: `first..first + count`.
+fn range_of(shares: &[u32], j: u32) -> core::ops::Range<u32> {
+    let first = 1 + shares[..j as usize - 1].iter().sum::<u32>();
+    first..first + shares[j as usize - 1]
+}
+
+/// The recipient holding share index `x`, or `None` for zero or past the
+/// last share.
+fn owner_of(shares: &[u32], x: u32) -> Option<u32> {
+    let mut end = 0u32;
+    for (j, &m) in (1u32..).zip(shares) {
+        end += m;
+        if x != 0 && x <= end {
+            return Some(j);
+        }
+    }
+    None
 }
 
 impl Dkg {
@@ -279,10 +312,13 @@ impl Dkg {
     /// it is a dealer.
     ///
     /// # Errors
-    /// [`DkgError::InvalidConfig`] unless `1 ≤ threshold ≤ recipients`, the
-    /// dealers number at least one (for a resharing, at least the previous
-    /// threshold), the roles' indices are in range, and a dealer carries a
-    /// current share with its own index exactly when resharing.
+    /// [`DkgError::InvalidConfig`] unless the share counts, if given, are
+    /// one per recipient and each at least 1, with fewer than `2^32` shares
+    /// in all, `1 ≤ threshold ≤` that number of shares, the weights, if
+    /// given, are one per dealer, each at least 1, and not for a resharing,
+    /// the dealers number at least one (for a resharing, at least the
+    /// previous threshold), the roles' indices are in range, and a dealer
+    /// carries a current share with its own index exactly when resharing.
     pub fn new(
         config: Config,
         dealer: Option<Dealer>,
@@ -291,7 +327,27 @@ impl Dkg {
         let n = u32::try_from(config.recipients.len()).ok();
         let resharing = config.previous.is_some();
         let min_dealers = config.previous.as_ref().map_or(1, PublicKeySet::threshold);
-        let config_ok = n.is_some_and(|n| config.threshold >= 1 && config.threshold <= n)
+        let shares = if config.shares.is_empty() {
+            alloc::vec![1; config.recipients.len()]
+        } else {
+            config.shares.clone()
+        };
+        let weights = if config.weights.is_empty() {
+            alloc::vec![1; config.dealers as usize]
+        } else {
+            config.weights.clone()
+        };
+        let total = shares.iter().try_fold(
+            0u32,
+            |sum, &m| if m == 0 { None } else { sum.checked_add(m) },
+        );
+        let counts_ok = shares.len() == config.recipients.len()
+            && weights.len() == config.dealers as usize
+            && weights.iter().all(|&w| w >= 1)
+            && (!resharing || config.weights.is_empty());
+        let config_ok = n.is_some()
+            && counts_ok
+            && total.is_some_and(|m| config.threshold >= 1 && config.threshold <= m)
             && config.dealers >= min_dealers;
         let dealer_ok = dealer.as_ref().is_none_or(|d| {
             d.index >= 1
@@ -310,13 +366,15 @@ impl Dkg {
                 let constant = d.share.as_ref().map(|s| s.secret);
                 let f = Polynomial::derive(&d.seed, &context, config.threshold, constant);
                 let ephemeral = hash::to_scalar(&[&d.seed, &context], DST_EPHEMERAL);
-                let dealing = make_dealing(&config, d.index, &f, ephemeral);
+                let dealing = make_dealing(&config, &shares, d.index, &f, ephemeral);
                 (Some((d.index, f)), Some(Message::Dealing(dealing)))
             }
             None => (None, None),
         };
         let dkg = Dkg {
             config,
+            shares,
+            weights,
             dealer,
             recipient,
             phase: Phase::Dealing,
@@ -400,8 +458,9 @@ impl Dkg {
         if self.dealings.contains_key(&d.dealer) {
             return Err(DkgError::Duplicate);
         }
+        let total: u32 = self.shares.iter().sum();
         let shape_ok = d.commitment.len() == self.config.threshold as usize
-            && d.shares.len() == self.config.recipients.len();
+            && d.shares.len() == total as usize;
         let commitment: Option<Vec<G2Affine>> = d.commitment.iter().map(point::g2).collect();
         let shares: Option<Vec<Scalar>> = d.shares.iter().map(point::scalar).collect();
         let (true, Some(commitment), Some(ephemeral), Some(shares)) =
@@ -429,19 +488,27 @@ impl Dkg {
             return Step::Idle;
         };
         let me = recipient.index;
+        let mine = range_of(&self.shares, me);
         let mut accused = Vec::new();
         for (&dealer, received) in &self.dealings {
             let shared: G1Affine = (received.ephemeral * recipient.key.0).into();
-            let pad = pad(
-                &self.config.session,
-                dealer,
-                me,
-                &received.ephemeral,
-                &shared,
-            );
-            let share = received.shares[me as usize - 1] - pad;
-            if poly::share_matches(&received.commitment, me, &share) {
-                self.mine.insert(dealer, share);
+            let mut verified = Vec::new();
+            for x in mine.clone() {
+                let pad = pad(
+                    &self.config.session,
+                    dealer,
+                    x,
+                    &received.ephemeral,
+                    &shared,
+                );
+                let share = received.shares[x as usize - 1] - pad;
+                if !poly::share_matches(&received.commitment, x, &share) {
+                    break;
+                }
+                verified.push(share);
+            }
+            if verified.len() == mine.len() {
+                self.mine.insert(dealer, verified);
             } else {
                 accused.push(dealer);
             }
@@ -484,9 +551,10 @@ impl Dkg {
         };
         let shares = accusers
             .iter()
-            .map(|&recipient| RevealedShare {
-                recipient,
-                share: point::scalar_bytes(&f.evaluate(recipient)),
+            .flat_map(|&accuser| range_of(&self.shares, accuser))
+            .map(|index| RevealedShare {
+                index,
+                share: point::scalar_bytes(&f.evaluate(index)),
             })
             .collect();
         Step::Broadcast(Message::Justification(Justification {
@@ -509,10 +577,12 @@ impl Dkg {
         };
         for revealed in &j.shares {
             let share = point::scalar(&revealed.share);
-            if let (true, Some(share)) = (accusers.contains(&revealed.recipient), share)
-                && poly::share_matches(&received.commitment, revealed.recipient, &share)
+            let accused =
+                owner_of(&self.shares, revealed.index).is_some_and(|o| accusers.contains(&o));
+            if let (true, Some(share)) = (accused, share)
+                && poly::share_matches(&received.commitment, revealed.index, &share)
             {
-                self.revealed.insert((j.dealer, revealed.recipient), share);
+                self.revealed.insert((j.dealer, revealed.index), share);
             }
         }
         Ok(())
@@ -521,12 +591,15 @@ impl Dkg {
     fn finish(&mut self) -> Result<Output, DkgError> {
         let me = self.recipient.as_ref().map(|r| r.index);
         for (dealer, accusers) in &self.complaints {
-            if accusers
-                .iter()
-                .all(|a| self.revealed.contains_key(&(*dealer, *a)))
-            {
+            let answered = accusers.iter().all(|&a| {
+                range_of(&self.shares, a).all(|x| self.revealed.contains_key(&(*dealer, x)))
+            });
+            if answered {
                 if let Some(me) = me.filter(|m| accusers.contains(m)) {
-                    self.mine.insert(*dealer, self.revealed[&(*dealer, me)]);
+                    let revealed = range_of(&self.shares, me)
+                        .map(|x| self.revealed[&(*dealer, x)])
+                        .collect();
+                    self.mine.insert(*dealer, revealed);
                 }
             } else {
                 self.dealings.remove(dealer);
@@ -538,7 +611,11 @@ impl Dkg {
             .previous
             .as_ref()
             .map_or(self.config.threshold, PublicKeySet::threshold);
-        if qualified.len() < required as usize {
+        let weight: u64 = qualified
+            .iter()
+            .map(|&i| u64::from(self.weights[i as usize - 1]))
+            .sum();
+        if weight < u64::from(required) {
             return Err(DkgError::TooFewQualified);
         }
         // A fresh key sums the qualified dealings; a resharing interpolates
@@ -555,59 +632,77 @@ impl Dkg {
                 };
             }
         }
-        let share = me.and_then(|me| self.my_share(me, weights.as_deref()));
+        let shares = me
+            .and_then(|me| self.my_shares(me, weights.as_deref()))
+            .unwrap_or_default();
         Ok(Output {
             key_set: PublicKeySet {
                 commitment: poly::normalize(&sum),
             },
-            share,
+            shares,
             qualified,
         })
     }
 
-    /// This recipient's new share, or `None` if a qualified dealer's share
+    /// This recipient's new shares, or `None` if a qualified dealer's shares
     /// to it never verified (its complaint was lost).
-    fn my_share(&self, me: u32, weights: Option<&[Scalar]>) -> Option<SecretShare> {
-        let mut secret = Scalar::zero();
+    fn my_shares(&self, me: u32, weights: Option<&[Scalar]>) -> Option<Vec<SecretShare>> {
+        let range = range_of(&self.shares, me);
+        let mut secrets = alloc::vec![Scalar::zero(); range.len()];
         for (k, dealer) in self.dealings.keys().enumerate() {
-            let s = self.mine.get(dealer)?;
-            secret += match weights {
-                None => *s,
-                Some(w) => s * w[k],
-            };
+            let shares = self.mine.get(dealer)?;
+            for (secret, s) in secrets.iter_mut().zip(shares) {
+                *secret += match weights {
+                    None => *s,
+                    Some(w) => s * w[k],
+                };
+            }
         }
-        Some(SecretShare { index: me, secret })
+        Some(
+            range
+                .zip(secrets)
+                .map(|(index, secret)| SecretShare { index, secret })
+                .collect(),
+        )
     }
 }
 
-/// Builds a dealing: commitment, ephemeral point, encrypted shares.
-fn make_dealing(config: &Config, index: u32, f: &Polynomial, ephemeral: Scalar) -> Dealing {
+/// Builds a dealing: commitment, ephemeral point, and every share
+/// encrypted to the recipient holding it.
+fn make_dealing(
+    config: &Config,
+    counts: &[u32],
+    index: u32,
+    f: &Polynomial,
+    ephemeral: Scalar,
+) -> Dealing {
     let r: G1Affine = (G1Affine::generator() * ephemeral).into();
-    let shares = config
-        .recipients
-        .iter()
-        .zip(1u32..)
-        .map(|(key, j)| {
-            let shared: G1Affine = (key.0 * ephemeral).into();
-            point::scalar_bytes(&(f.evaluate(j) + pad(&config.session, index, j, &r, &shared)))
-        })
-        .collect();
+    let mut encrypted = Vec::new();
+    let mut x = 0u32;
+    for (key, &m) in config.recipients.iter().zip(counts) {
+        let dh: G1Affine = (key.0 * ephemeral).into();
+        for _ in 0..m {
+            x += 1;
+            let pad = pad(&config.session, index, x, &r, &dh);
+            encrypted.push(point::scalar_bytes(&(f.evaluate(x) + pad)));
+        }
+    }
     Dealing {
         session: config.session,
         dealer: index,
         commitment: f.commit().iter().map(G2Affine::to_compressed).collect(),
         ephemeral: r.to_compressed(),
-        shares,
+        shares: encrypted,
     }
 }
 
-/// The pad that encrypts dealer `dealer`'s share to recipient `recipient`:
-/// a hash of the run, both indices, the ephemeral point and the shared
-/// point `e · ek = dk · R`.
+/// The pad that encrypts dealer `dealer`'s share `index` to the recipient
+/// holding it: a hash of the run, the dealer and share indices, the
+/// ephemeral point and the shared point `e · ek = dk · R`.
 fn pad(
     session: &[u8; 32],
     dealer: u32,
-    recipient: u32,
+    index: u32,
     ephemeral: &G1Affine,
     shared: &G1Affine,
 ) -> Scalar {
@@ -615,7 +710,7 @@ fn pad(
         &[
             session,
             &dealer.to_be_bytes(),
-            &recipient.to_be_bytes(),
+            &index.to_be_bytes(),
             &ephemeral.to_compressed(),
             &shared.to_compressed(),
         ],
@@ -641,14 +736,14 @@ fn get_all<T: Decode>(d: &mut Decoder<'_>) -> Result<Vec<T>, DecodeError> {
 
 impl Encode for RevealedShare {
     fn encode(&self, e: &mut Encoder) {
-        e.put(&self.recipient).put(&self.share);
+        e.put(&self.index).put(&self.share);
     }
 }
 
 impl Decode for RevealedShare {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         Ok(RevealedShare {
-            recipient: d.get()?,
+            index: d.get()?,
             share: d.get()?,
         })
     }

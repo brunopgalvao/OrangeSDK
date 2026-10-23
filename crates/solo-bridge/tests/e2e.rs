@@ -503,7 +503,7 @@ fn shareholders_do_not_certify_a_proposal_with_a_false_anchor() {
     // forged proposal. The nodes see that the anchor is not what they executed, put the
     // evidence in a proposal, and the chain slashes validator 3 (spec 15 §5.1).
     let message = certificate_message(CHAIN_ID, 0, h, &hash);
-    let partial = partial_of(&sim.nodes[0], &validators[3], 0, &message);
+    let partials = partials_of(&sim.nodes[0], &validators[3], 0, &message);
     let digest = keccak256(&signing_preimage(
         solo_abi::chain::consensus::KIND_FINALIZE,
         CHAIN_ID,
@@ -518,7 +518,7 @@ fn shareholders_do_not_certify_a_proposal_with_a_false_anchor() {
         view: forged.view,
         hash,
         signature: Signature(signature),
-        partial,
+        partials: Seq(partials),
     }
     .to_bytes();
     for i in 0..3 {
@@ -536,9 +536,10 @@ fn shareholders_do_not_certify_a_proposal_with_a_false_anchor() {
     assert!(sim.run_until(40 * SLOT_MS, jailed).unwrap());
 }
 
-/// Validator `key`'s partial signature over `message` with its share of key
-/// set `id`, its keystore having replayed the run from `node`'s chain state.
-fn partial_of(node: &Node, key: &SigningKey, id: u64, message: &[u8]) -> PartialShare {
+/// Validator `key`'s partial signatures over `message` with every share it
+/// holds of key set `id`, its keystore having replayed the run from `node`'s
+/// chain state.
+fn partials_of(node: &Node, key: &SigningKey, id: u64, message: &[u8]) -> Vec<PartialShare> {
     let run = DkgRun::from_bytes(
         &node
             .state_get(&[skeys::RUN, &id.to_be_bytes()].concat())
@@ -556,29 +557,29 @@ fn partial_of(node: &Node, key: &SigningKey, id: u64, message: &[u8]) -> Partial
         .iter()
         .position(|r| *r == validator_id(key))
         .unwrap();
-    let index = u32::try_from(position).unwrap() + 1;
     let mut store = Keystore::default();
-    let replay = KeystoreRequest::Dkg(DkgRequest {
-        key_set: id,
-        session: run.session,
-        threshold: run.threshold,
-        dealers: u32::try_from(run.dealers.0.len()).unwrap(),
-        recipients: run.keys.clone(),
-        recipient: index,
-        transcript: Seq(transcript),
-        upto: 3,
-        ..DkgRequest::default()
-    });
+    let replay = KeystoreRequest::WeightedDkg {
+        request: DkgRequest {
+            key_set: id,
+            session: run.session,
+            threshold: run.threshold,
+            dealers: u32::try_from(run.dealers.0.len()).unwrap(),
+            recipients: run.keys.clone(),
+            recipient: u32::try_from(position).unwrap() + 1,
+            transcript: Seq(transcript),
+            upto: 3,
+            ..DkgRequest::default()
+        },
+        shares: run.shares.clone(),
+    };
     store.handle(Some(key), &replay.to_bytes()).unwrap();
-    let sign = KeystoreRequest::Sign {
+    let sign = KeystoreRequest::SignAll {
         key_set: id,
         message: message.to_vec(),
     };
-    PartialShare {
-        key_set: id,
-        index,
-        signature: store.handle(Some(key), &sign.to_bytes()).unwrap(),
-    }
+    Seq::<PartialShare>::from_bytes(&store.handle(Some(key), &sign.to_bytes()).unwrap())
+        .unwrap()
+        .0
 }
 
 /// The group signature, in EIP-2537 encoding, that the shareholders of key set
@@ -599,7 +600,7 @@ fn forged(node: &Node, signers: &[SigningKey], id: u64, message: &[u8]) -> solo_
     let record = key_set_record(node, id);
     let partials = signers
         .iter()
-        .map(|k| partial_of(node, k, id, message))
+        .flat_map(|k| partials_of(node, k, id, message))
         .collect();
     let combine = KeystoreRequest::Combine {
         key_set: record.key_set,

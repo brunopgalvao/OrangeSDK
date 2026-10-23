@@ -332,26 +332,64 @@ record! {
     }
 }
 
-record! {
-    /// One epoch's DKG run (spec 15 §6.1): a fresh key (the reference
-    /// kernel's only kind since key rotation), or a resharing of
-    /// the active one.
-    DkgRun {
-        /// The epoch it runs in; also the id of the key set it makes.
-        epoch: u64,
-        /// The session of spec 12 §5.
-        session: Hash,
-        /// Threshold of the key it makes.
-        threshold: u32,
-        /// Dealer `i` is `dealers[i − 1]`.
-        dealers: Seq<Hash>,
-        /// Recipient `j` is `recipients[j − 1]`.
-        recipients: Seq<Hash>,
-        /// Recipient `j`'s encryption key is `keys[j − 1]`.
-        keys: Seq<Vec<u8>>,
-        /// The key set being reshared, by id; `None` for a fresh key, as
-        /// in every run the reference kernel schedules.
-        previous: Option<u64>,
+/// One epoch's DKG run (spec 15 §6.1): a fresh key (the reference
+/// kernel's only kind since key rotation), or a resharing of
+/// the active one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DkgRun {
+    /// The epoch it runs in; also the id of the key set it makes.
+    pub epoch: u64,
+    /// The session of spec 12 §5.
+    pub session: Hash,
+    /// Threshold of the key it makes.
+    pub threshold: u32,
+    /// Dealer `i` is `dealers[i − 1]`.
+    pub dealers: Seq<Hash>,
+    /// Recipient `j` is `recipients[j − 1]`.
+    pub recipients: Seq<Hash>,
+    /// Recipient `j`'s encryption key is `keys[j − 1]`.
+    pub keys: Seq<Vec<u8>>,
+    /// The key set being reshared, by id; `None` for a fresh key, as
+    /// in every run the reference kernel schedules.
+    pub previous: Option<u64>,
+    /// Recipient `j` holds `shares[j − 1]` shares of the key (spec 15
+    /// §6.1), and as dealer `j` weighs as much. A run recorded before
+    /// shares followed stake ends after `previous`; it decodes with one
+    /// share per recipient, which is what it dealt.
+    pub shares: Seq<u32>,
+}
+
+impl Encode for DkgRun {
+    fn encode(&self, e: &mut Encoder) {
+        e.put(&self.epoch)
+            .put(&self.session)
+            .put(&self.threshold)
+            .put(&self.dealers);
+        e.put(&self.recipients)
+            .put(&self.keys)
+            .put(&self.previous)
+            .put(&self.shares);
+    }
+}
+
+impl Decode for DkgRun {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let mut run = DkgRun {
+            epoch: d.get()?,
+            session: d.get()?,
+            threshold: d.get()?,
+            dealers: d.get()?,
+            recipients: d.get()?,
+            keys: d.get()?,
+            previous: d.get()?,
+            shares: Seq(Vec::new()),
+        };
+        run.shares = if d.remaining() == 0 {
+            Seq(alloc::vec![1; run.recipients.0.len()])
+        } else {
+            d.get()?
+        };
+        Ok(run)
     }
 }
 
@@ -362,9 +400,10 @@ record! {
         id: u64,
         /// The public key set of spec 12 §4: `threshold` compressed G2 points.
         key_set: Vec<u8>,
-        /// Public key share of shareholder `j` at `j − 1`, compressed G2.
+        /// Public key share of share `x` at `x − 1`, compressed G2.
         public_shares: Seq<Vec<u8>>,
-        /// Shareholder `j` is `shareholders[j − 1]`.
+        /// Share `x` is held by `shareholders[x − 1]`; a validator holding
+        /// several shares appears once for each, consecutively.
         shareholders: Seq<Hash>,
     }
 }
@@ -389,7 +428,7 @@ record! {
     KeySetVote {
         /// The public key set.
         key_set: Vec<u8>,
-        /// Every recipient's public key share, in recipient order.
+        /// The public key share of every share index, in order.
         public_shares: Seq<Vec<u8>>,
     }
 }
@@ -426,7 +465,7 @@ record! {
     PartialShare {
         /// Id of the key set the share belongs to.
         key_set: u64,
-        /// Shareholder index, from 1.
+        /// Share index, from 1.
         index: u32,
         /// Compressed G1 partial signature (48 bytes).
         signature: Vec<u8>,
@@ -485,10 +524,37 @@ pub const fn first_view(epoch: u64) -> u64 {
     (epoch << 32) + 1
 }
 
-/// The threshold of a key with `n` shareholders: more than two thirds.
+/// Shares per member of a set (spec 15 §6.1): a set of `n` members divides
+/// its stake into `Q = 4n` steps.
+pub const SHARES_PER_MEMBER: u64 = 4;
+
+/// The share counts of the members of a set and the threshold of its key
+/// (spec 15 §6.1), from each member's weight and whether it has an
+/// encryption key. With `n` members, `W` their total weight and `Q = 4n`,
+/// a member of weight `w` with a key gets `⌊w · Q / W⌋` shares, one without
+/// a key none, and every member none when `W = 0`; the threshold is
+/// `⌊2Q/3⌋ + 1`. Rounding down makes any shares numbering the threshold
+/// belong to more than two thirds of `W` (spec 15 §6.8).
+///
+/// # Panics
+/// Never for a set of fewer than `2^30` members: every count is at most `Q`.
 #[must_use]
-pub const fn dkg_threshold(n: usize) -> usize {
-    n * 2 / 3 + 1
+pub fn stake_shares(members: &[(u64, bool)]) -> (Vec<u32>, u32) {
+    let q = SHARES_PER_MEMBER * members.len() as u64;
+    let total: u128 = members.iter().map(|&(w, _)| u128::from(w)).sum();
+    let counts = members
+        .iter()
+        .map(|&(w, keyed)| {
+            let count = if keyed && total != 0 {
+                u128::from(w) * u128::from(q) / total
+            } else {
+                0
+            };
+            u32::try_from(count).expect("a share count is at most Q")
+        })
+        .collect();
+    let threshold = u32::try_from(q * 2 / 3 + 1).expect("Q is far below 2^32");
+    (counts, threshold)
 }
 
 /// The bytes whose `keccak256` is the session of epoch `epoch`'s run.
@@ -716,7 +782,8 @@ record! {
 pub enum KeystoreRequest {
     /// This node's DKG encryption key (48 bytes).
     EncryptionKey,
-    /// Runs the DKG for this node up to a phase boundary; answers a `DkgReply`.
+    /// Runs the DKG for this node up to a phase boundary, one share per
+    /// recipient; answers a `DkgReply`.
     Dkg(DkgRequest),
     /// A partial signature (48 bytes) with the share of a key set.
     Sign {
@@ -732,8 +799,24 @@ pub enum KeystoreRequest {
         key_set: Vec<u8>,
         /// The message.
         message: Vec<u8>,
-        /// Partial signatures with their shareholder indices.
+        /// Partial signatures with their share indices.
         partials: Seq<PartialShare>,
+    },
+    /// [`KeystoreRequest::Dkg`] with recipient `j` holding `shares[j − 1]`
+    /// shares, and for a fresh key dealer `j` weighing as much (spec 15 §6.4).
+    WeightedDkg {
+        /// The run and this node's roles.
+        request: DkgRequest,
+        /// Shares per recipient, each at least 1.
+        shares: Seq<u32>,
+    },
+    /// The partial signatures of every share of a key set the node holds,
+    /// ascending by index, as an encoded `vec<PartialShare>`.
+    SignAll {
+        /// Key set id.
+        key_set: u64,
+        /// The message.
+        message: Vec<u8>,
     },
 }
 
@@ -759,6 +842,14 @@ impl Encode for KeystoreRequest {
                 e.raw(&[3]);
                 e.put(key_set).put(message).put(partials);
             }
+            KeystoreRequest::WeightedDkg { request, shares } => {
+                e.raw(&[4]);
+                e.put(request).put(shares);
+            }
+            KeystoreRequest::SignAll { key_set, message } => {
+                e.raw(&[5]);
+                e.put(key_set).put(message);
+            }
         }
     }
 }
@@ -776,6 +867,14 @@ impl Decode for KeystoreRequest {
                 key_set: d.get()?,
                 message: d.get()?,
                 partials: d.get()?,
+            },
+            4 => KeystoreRequest::WeightedDkg {
+                request: d.get()?,
+                shares: d.get()?,
+            },
+            5 => KeystoreRequest::SignAll {
+                key_set: d.get()?,
+                message: d.get()?,
             },
             tag => return Err(DecodeError::BadTag(tag)),
         })
@@ -895,7 +994,19 @@ mod tests {
             recipients: Seq(vec![[8; 32]]),
             keys: Seq(vec![vec![1; 48]]),
             previous: Some(2),
+            shares: Seq(vec![4]),
         });
+        // A run recorded before shares followed stake: one share per recipient.
+        let old = DkgRun {
+            recipients: Seq(vec![[8; 32]; 3]),
+            ..DkgRun::default()
+        };
+        let bytes = old.to_bytes();
+        let legacy = &bytes[..bytes.len() - 1];
+        assert_eq!(
+            DkgRun::from_bytes(legacy).unwrap().shares,
+            Seq(vec![1, 1, 1])
+        );
         roundtrip(&DkgEnvelope {
             epoch: 1,
             kind: envelope::CONFIRM,
@@ -966,7 +1077,7 @@ mod tests {
         assert_eq!((epoch_start(2, 24), epoch_end(2, 24)), (49, 72));
         assert_eq!((view_epoch(7), view_epoch(first_view(3) + 9)), (0, 3));
         assert_eq!(first_view(0), 1);
-        assert_eq!([1, 3, 4, 7].map(dkg_threshold), [1, 3, 3, 5]);
+        assert_eq!(stake_shares(&[]), (vec![], 1));
         let preimage = session_preimage(1337, 2);
         assert_eq!(&preimage[..16], b"SOLO-DKG-SESSION");
         assert_eq!(&preimage[16..24], &1337u64.to_be_bytes());
@@ -1094,6 +1205,92 @@ mod tests {
         assert_eq!(address_word(&[0x11; 20])[12..], [0x11; 20]);
     }
 
+    /// Checks spec 15 §6.8 on one set by brute force: every subset whose
+    /// shares reach the threshold holds more than two thirds of the weight,
+    /// and every subset of keyed members holding more than
+    /// `2/3 + rounded/Q` of it reaches the threshold.
+    fn check_stake_shares(members: &[(u64, bool)]) {
+        let (counts, t) = stake_shares(members);
+        let q = 4 * members.len() as u128;
+        let total: u128 = members.iter().map(|m| u128::from(m.0)).sum();
+        assert!(counts.iter().map(|&c| u128::from(c)).sum::<u128>() <= q);
+        for mask in 0u32..(1 << members.len()) {
+            let chosen = |i: &usize| mask & (1 << i) != 0;
+            let weight: u128 = (0..members.len())
+                .filter(chosen)
+                .map(|i| u128::from(members[i].0))
+                .sum();
+            let shares: u32 = (0..members.len()).filter(chosen).map(|i| counts[i]).sum();
+            if shares >= t {
+                assert!(3 * weight > 2 * total, "{members:?} {mask:b}");
+            }
+            let keyed = (0..members.len()).filter(chosen).all(|i| members[i].1);
+            let rounded = (0..members.len())
+                .filter(chosen)
+                .filter(|&i| !(u128::from(members[i].0) * q).is_multiple_of(total.max(1)))
+                .count() as u128;
+            if keyed && total != 0 && 3 * weight * q > (2 * q + 3 * rounded) * total {
+                assert!(shares >= t, "{members:?} {mask:b}");
+            }
+        }
+    }
+
+    #[test]
+    fn stake_shares_put_more_than_two_thirds_of_the_stake_behind_a_threshold() {
+        // Equal weights: four shares each, and the threshold is the old
+        // count of members, floor(2n/3) + 1 of n.
+        for n in 1..=9usize {
+            let (counts, t) = stake_shares(&vec![(7, true); n]);
+            assert!(counts.iter().all(|&c| c == 4));
+            assert_eq!(t.div_ceil(4) as usize, n * 2 / 3 + 1);
+        }
+        // Three small members hold three of four seats but 30% of the
+        // stake: one share each, against a threshold of 11.
+        assert_eq!(
+            stake_shares(&[(10, true), (10, true), (10, true), (70, true)]),
+            (vec![1, 1, 1, 11], 11)
+        );
+        // A member without an encryption key, or weighing less than W/Q,
+        // gets nothing; with no weight at all nobody does.
+        assert_eq!(stake_shares(&[(50, false), (50, true)]), (vec![0, 4], 6));
+        assert_eq!(stake_shares(&[(1, true), (99, true)]).0, vec![0, 7]);
+        assert_eq!(stake_shares(&[(0, true), (0, true)]), (vec![0, 0], 6));
+        // Weights at the top of u64 do not overflow.
+        assert_eq!(stake_shares(&[(u64::MAX, true); 3]).0, vec![4, 4, 4]);
+        assert_eq!(stake_shares(&[(u64::MAX, true), (1, true)]).0, vec![7, 0]);
+        // A full set of 256 members: Q = 1024, the threshold 683.
+        let (counts, t) = stake_shares(&vec![(3, true); 256]);
+        assert_eq!((counts.iter().sum::<u32>(), t), (1024, 683));
+        // The bound itself, exhaustively over small sets: edge cases and a
+        // deterministic spread of skewed weights.
+        let mut cases: Vec<Vec<(u64, bool)>> = vec![
+            vec![(1, true)],
+            vec![(1, true), (2, true)],
+            vec![(1, true); 3],
+            vec![(3, true), (3, true), (3, true), (1, false)],
+            vec![(u64::MAX, true), (u64::MAX - 1, true), (1, true)],
+            vec![(0, true), (5, true), (0, false)],
+        ];
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for n in 1..=7 {
+            for _ in 0..40 {
+                cases.push(
+                    (0..n)
+                        .map(|_| {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            (1 + (x % 1000) * (x % 7 + 1).pow(3), !x.is_multiple_of(11))
+                        })
+                        .collect(),
+                );
+            }
+        }
+        for members in &cases {
+            check_stake_shares(members);
+        }
+    }
+
     #[test]
     fn keystore_messages_roundtrip() {
         let request = DkgRequest {
@@ -1111,6 +1308,14 @@ mod tests {
         };
         for message in [
             KeystoreRequest::EncryptionKey,
+            KeystoreRequest::WeightedDkg {
+                request: request.clone(),
+                shares: Seq(vec![2]),
+            },
+            KeystoreRequest::SignAll {
+                key_set: 1,
+                message: vec![2],
+            },
             KeystoreRequest::Dkg(request),
             KeystoreRequest::Sign {
                 key_set: 1,

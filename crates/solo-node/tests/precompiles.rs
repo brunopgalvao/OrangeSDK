@@ -171,7 +171,7 @@ fn blocks_of_point_evaluations_execute_within_the_kernel_gas() {
         "{heaviest}"
     );
     // Spec 19 §5.1 states this block's kernel gas.
-    assert_eq!(heaviest, 17_113_662_508);
+    assert_eq!(heaviest, 17_113_662_672);
 
     // Once gate 2 is active, the module is in state and every call succeeds.
     for _ in 0..40 {
@@ -196,7 +196,7 @@ fn blocks_of_point_evaluations_execute_within_the_kernel_gas() {
     let heaviest = *blocks.iter().max().unwrap();
     assert!(heaviest < BLOCK_KERNEL_GAS as u64, "{heaviest}");
     // Spec 19 §5.1: the heaviest block once gate 2 is active.
-    assert_eq!(*blocks[before_gate..].iter().max().unwrap(), 56_766_838);
+    assert_eq!(*blocks[before_gate..].iter().max().unwrap(), 56_767_038);
 
     // Every block was finalized, and the chain goes on.
     let height = node.executed.last().unwrap().0;

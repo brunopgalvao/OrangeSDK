@@ -40,7 +40,20 @@ impl Party {
     }
 
     fn dkg(&mut self, request: DkgRequest) -> Option<DkgReply> {
-        self.ask(&KeystoreRequest::Dkg(request))
+        self.weighted(request, &[])
+    }
+
+    /// A `WeightedDkg` request with `shares`, or a plain `Dkg` one when empty.
+    fn weighted(&mut self, request: DkgRequest, shares: &[u32]) -> Option<DkgReply> {
+        let request = if shares.is_empty() {
+            KeystoreRequest::Dkg(request)
+        } else {
+            KeystoreRequest::WeightedDkg {
+                request,
+                shares: Seq(shares.to_vec()),
+            }
+        };
+        self.ask(&request)
             .map(|r| DkgReply::from_bytes(&r).unwrap())
     }
 }
@@ -94,6 +107,18 @@ fn run_dkg(
     recipients: &[usize],
     bad: Option<usize>,
 ) -> Vec<KeySetVote> {
+    run_weighted(parties, template, &[], dealers, recipients, bad)
+}
+
+/// [`run_dkg`] with recipient `j` holding `shares[j − 1]` shares.
+fn run_weighted(
+    parties: &mut [Party],
+    template: &DkgRequest,
+    shares: &[u32],
+    dealers: &[usize],
+    recipients: &[usize],
+    bad: Option<usize>,
+) -> Vec<KeySetVote> {
     let mut transcript = Vec::new();
     for (i, &p) in dealers.iter().enumerate() {
         let request = DkgRequest {
@@ -101,7 +126,7 @@ fn run_dkg(
             upto: 0,
             ..template.clone()
         };
-        let mut dealing = message(parties[p].dkg(request)).unwrap();
+        let mut dealing = message(parties[p].weighted(request, shares)).unwrap();
         if bad == Some(p) {
             // The share to recipient 1 sits right after the commitment and ephemeral point.
             let t = template.threshold as usize;
@@ -119,7 +144,7 @@ fn run_dkg(
             upto: 1,
             ..template.clone()
         };
-        if let Some(complaints) = message(parties[p].dkg(request)) {
+        if let Some(complaints) = message(parties[p].weighted(request, shares)) {
             transcript.push(complaints);
         }
     }
@@ -130,7 +155,7 @@ fn run_dkg(
             upto: 2,
             ..template.clone()
         };
-        if let Some(justification) = message(parties[p].dkg(request))
+        if let Some(justification) = message(parties[p].weighted(request, shares))
             && bad != Some(p)
         {
             transcript.push(justification);
@@ -146,7 +171,7 @@ fn run_dkg(
                 upto: 3,
                 ..template.clone()
             };
-            finished(parties[p].dkg(request))
+            finished(parties[p].weighted(request, shares))
         })
         .collect()
 }
@@ -278,6 +303,91 @@ fn a_dkg_and_a_resharing_through_keystores() {
         combine(&reshared[0].key_set, &msg, fresh).unwrap(),
         signature
     );
+}
+
+#[test]
+fn a_weighted_dkg_through_keystores() {
+    // Three parties holding 1, 3 and 2 shares of a key with threshold 4; dealers weigh
+    // their share counts.
+    let keys = keys(3);
+    let mut parties = parties(&keys);
+    let template = DkgRequest {
+        threshold: 4,
+        ..base(&keys, 3, 0)
+    };
+    let shares = [1, 3, 2];
+    let outcomes = run_weighted(
+        &mut parties,
+        &template,
+        &shares,
+        &[0, 1, 2],
+        &[0, 1, 2],
+        None,
+    );
+    assert!(outcomes.windows(2).all(|w| w[0] == w[1]));
+    let vote = outcomes[0].clone();
+    assert_eq!(
+        (vote.key_set.len(), vote.public_shares.0.len()),
+        (4 * 96, 6)
+    );
+    let msg = certificate_message(1337, 5, &[7; 32]);
+    let sign_all = |party: &mut Party| {
+        let reply = party
+            .ask(&KeystoreRequest::SignAll {
+                key_set: 0,
+                message: msg.clone(),
+            })
+            .unwrap();
+        Seq::<PartialShare>::from_bytes(&reply).unwrap().0
+    };
+    let held: Vec<Vec<PartialShare>> = parties.iter_mut().map(sign_all).collect();
+    let indices: Vec<Vec<u32>> = held
+        .iter()
+        .map(|h| h.iter().map(|p| p.index).collect())
+        .collect();
+    assert_eq!(indices, [vec![1], vec![2, 3, 4], vec![5, 6]]);
+    for p in held.iter().flatten() {
+        let share = &vote.public_shares.0[p.index as usize - 1];
+        let key = solo_bls::PublicKey::from_bytes(share.as_slice().try_into().unwrap()).unwrap();
+        let sig =
+            solo_bls::Signature::from_bytes(p.signature.as_slice().try_into().unwrap()).unwrap();
+        assert_eq!(p.key_set, 0);
+        assert!(key.verify(&msg, &sig));
+    }
+    // `Sign` answers the partial of the lowest share a party holds.
+    assert_eq!(
+        partials(&mut parties, &[(1, 2)], 0, &msg),
+        held[1][..1].to_vec()
+    );
+    // Parties 2 and 3 hold five shares and sign; parties 1 and 3 hold three and do not.
+    let group_key = vote.key_set[..96].to_vec();
+    let signature = combine(
+        &vote.key_set,
+        &msg,
+        [held[1].clone(), held[2].clone()].concat(),
+    )
+    .unwrap();
+    assert!(verifies(&group_key, &msg, &signature));
+    assert_eq!(
+        combine(
+            &vote.key_set,
+            &msg,
+            [held[0].clone(), held[2].clone()].concat()
+        ),
+        None
+    );
+    // `SignAll` needs the node key and a share of the key set.
+    let request = KeystoreRequest::SignAll {
+        key_set: 0,
+        message: msg.clone(),
+    }
+    .to_bytes();
+    assert_eq!(parties[0].store.handle(None, &request), None);
+    let other = KeystoreRequest::SignAll {
+        key_set: 1,
+        message: msg,
+    };
+    assert_eq!(parties[0].ask(&other), None);
 }
 
 #[test]
