@@ -24,11 +24,28 @@ fn ssz<T: PartialEq + std::fmt::Debug>(
     decode: impl Fn(&[u8]) -> Option<T>,
     encode: impl Fn(&T) -> Vec<u8>,
 ) {
+    ssz_with(name, cases, seeds, decode, encode, |_, _| false);
+}
+
+/// [`ssz`], where `other(input, encoding)` names the other encodings the
+/// spec accepts on purpose.
+fn ssz_with<T: PartialEq + std::fmt::Debug>(
+    name: &str,
+    cases: u64,
+    seeds: Vec<Vec<u8>>,
+    decode: impl Fn(&[u8]) -> Option<T>,
+    encode: impl Fn(&T) -> Vec<u8>,
+    other: impl Fn(&[u8], &[u8]) -> bool,
+) {
     let accepted = evolve(name, cases, seeds, |bytes| {
         let Some(value) = decode(bytes) else {
             return false;
         };
         let again = encode(&value);
+        if again != bytes && other(bytes, &again) {
+            assert_eq!(decode(&again).as_ref(), Some(&value));
+            return true;
+        }
         let at = again.iter().zip(bytes).position(|(a, b)| a != b);
         assert!(
             again == bytes,
@@ -67,12 +84,21 @@ fn light_client_containers_decode_only_canonical_bytes() {
         |b| ExecutionPayloadHeader::decode(b).ok(),
         ExecutionPayloadHeader::encode,
     );
-    ssz(
+    // An update with a zero committee branch does not read its committee
+    // field (spec 18 §3), so any bytes there re-encode as zeros.
+    let committee = 4 + 48 * size + 48;
+    ssz_with(
         "ethlc-update",
         1_500,
         vec![with_next.encode_update(size), without.encode_update(size)],
         |b| Update::decode_update(b, size).ok(),
         |u| u.encode_update(size),
+        move |input, encoding| {
+            input.len() == encoding.len()
+                && input[..4] == encoding[..4]
+                && input[committee..] == encoding[committee..]
+                && encoding[4..committee].iter().all(|b| *b == 0)
+        },
     );
     ssz(
         "ethlc-finality-update",
