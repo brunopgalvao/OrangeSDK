@@ -614,9 +614,8 @@ impl Node {
     /// Serves an exported snapshot. A file just exported reads; if it did
     /// not, or the export failed, the next record is exported in its place.
     fn serve(&mut self, exported: Result<solo_store::Snapshot, solo_store::SnapshotError>) {
-        if let Ok(snapshot) = exported {
-            let _ = self.server.as_mut().map(|s| s.add(snapshot));
-        }
+        let server = self.server.as_mut();
+        let _ = exported.map(|snapshot| server.map(|s| s.add(snapshot)));
     }
 
     /// How many DKG computations the keystore is running off the node loop.

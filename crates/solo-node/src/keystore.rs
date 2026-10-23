@@ -13,8 +13,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{Receiver, channel};
+use std::time::Duration;
 
 use k256::ecdsa::SigningKey;
 use solo_abi::codec::Seq;
@@ -70,27 +70,20 @@ pub struct Keystore {
 /// hash of the request.
 #[derive(Debug)]
 struct Background {
-    answers: BTreeMap<[u8; 32], Answer>,
+    /// Answers of computations that ended, `None` for a run that failed.
+    answers: BTreeMap<[u8; 32], Option<Vec<u8>>>,
+    /// The latest of them, oldest first, at most [`KEPT_ANSWERS`].
     finished: VecDeque<[u8; 32]>,
-    done_tx: Sender<Done>,
-    done_rx: Receiver<Done>,
+    /// Where each running computation will send what it produced.
+    computing: BTreeMap<[u8; 32], Receiver<Done>>,
     hold: Arc<AtomicBool>,
-}
-
-/// Where a request's computation is.
-#[derive(Debug, Clone)]
-enum Answer {
-    Computing,
-    /// Ended, with the answer, `None` for a run that failed.
-    Ended(Option<Vec<u8>>),
 }
 
 /// The shares a finished run gave this node, with their key set's id.
 type Made = Option<(u64, Vec<SecretShare>)>;
 
-/// A computation that ended: the request's hash, the answer and the
-/// shares it made.
-type Done = ([u8; 32], Option<Vec<u8>>, Made);
+/// What a computation produced: the answer and the shares it made.
+type Done = (Option<Vec<u8>>, Made);
 
 impl Keystore {
     /// Whether the keystore holds a share of key set `key_set`.
@@ -106,27 +99,18 @@ impl Keystore {
     /// again after its next block and gets the answer once it is ready,
     /// the same bytes it would have got at once.
     pub fn set_background(&mut self, on: bool) {
-        self.background = on.then(|| {
-            let (done_tx, done_rx) = channel();
-            Background {
-                answers: BTreeMap::new(),
-                finished: VecDeque::new(),
-                done_tx,
-                done_rx,
-                hold: Arc::default(),
-            }
+        self.background = on.then(|| Background {
+            answers: BTreeMap::new(),
+            finished: VecDeque::new(),
+            computing: BTreeMap::new(),
+            hold: Arc::default(),
         });
     }
 
     /// How many DKG computations are running in the background.
     #[must_use]
     pub fn busy(&self) -> usize {
-        self.background.as_ref().map_or(0, |b| {
-            b.answers
-                .values()
-                .filter(|a| matches!(a, Answer::Computing))
-                .count()
-        })
+        self.background.as_ref().map_or(0, |b| b.computing.len())
     }
 
     /// Holds background computations before they start while `hold` is
@@ -143,16 +127,25 @@ impl Keystore {
     /// they made, which later requests sign with. The node calls this
     /// between steps; every request does it first.
     pub fn drain(&mut self) {
-        while let Some(done) = self
-            .background
-            .as_ref()
-            .and_then(|b| b.done_rx.try_recv().ok())
-        {
-            self.finish(done);
+        let Some(b) = &mut self.background else {
+            return;
+        };
+        let mut ended = Vec::new();
+        b.computing.retain(|id, done| match done.try_recv() {
+            Ok(done) => {
+                ended.push((*id, done));
+                false
+            }
+            Err(_) => true,
+        });
+        for (id, done) in ended {
+            self.finish(id, done);
         }
     }
 
-    fn finish(&mut self, (id, answer, made): Done) {
+    /// Keeps what the computation for request `id` produced: its shares,
+    /// and its answer among the latest [`KEPT_ANSWERS`].
+    fn finish(&mut self, id: [u8; 32], (answer, made): Done) {
         if let Some((key_set, shares)) = made {
             self.shares.insert(key_set, shares);
         }
@@ -160,7 +153,7 @@ impl Keystore {
             .background
             .as_mut()
             .expect("computed in the background");
-        b.answers.insert(id, Answer::Ended(answer));
+        b.answers.insert(id, answer);
         b.finished.push_back(id);
         while b.finished.len() > KEPT_ANSWERS {
             let old = b.finished.pop_front().expect("over the cap");
@@ -225,39 +218,34 @@ impl Keystore {
             return Some(reply.to_bytes());
         };
         let id = solo_host::hash::keccak256(raw);
-        match b.answers.get(&id) {
-            Some(Answer::Ended(answer)) => return answer.clone(),
-            Some(Answer::Computing) => return None,
-            None => {}
+        if let Some(answer) = b.answers.get(&id) {
+            return answer.clone();
         }
-        b.answers.insert(id, Answer::Computing);
+        if b.computing.contains_key(&id) {
+            return None;
+        }
         let (key, r, shares) = (key.clone(), r.clone(), shares.to_vec());
-        let (done, hold) = (b.done_tx.clone(), Arc::clone(&b.hold));
+        let hold = Arc::clone(&b.hold);
+        let (done_tx, done_rx) = channel();
         std::thread::spawn(move || {
             while hold.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            let (answer, made) = match run(&key, &r, &shares, current) {
+            let done = match run(&key, &r, &shares, current) {
                 Some((reply, made)) => (Some(reply.to_bytes()), made),
                 None => (None, None),
             };
             // A keystore that is gone wants no answer.
-            let _ = done.send((id, answer, made));
+            let _ = done_tx.send(done);
         });
         // A computation that ends quickly is answered now.
-        let deadline = Instant::now() + Duration::from_millis(QUICK_MS);
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let b = self.background.as_ref().expect("in the background");
-            let Ok(done) = b.done_rx.recv_timeout(left) else {
-                return None;
-            };
-            let (ended, answer) = (done.0, done.1.clone());
-            self.finish(done);
-            if ended == id {
-                return answer;
-            }
-        }
+        let Ok(done) = done_rx.recv_timeout(Duration::from_millis(QUICK_MS)) else {
+            b.computing.insert(id, done_rx);
+            return None;
+        };
+        let answer = done.0.clone();
+        self.finish(id, done);
+        answer
     }
 
     /// The share a resharing dealer deals, copied: `Ok(None)` when the
