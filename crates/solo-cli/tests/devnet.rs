@@ -16,7 +16,7 @@ use std::time::Duration;
 use solo_abi::Decode;
 use solo_abi::chain::GenesisParams;
 use solo_cli::client;
-use solo_cli::devnet::{Conditions, Devnet, FUNDED, MANIFEST};
+use solo_cli::devnet::{Conditions, Devnet, FUNDED, LIFELINE, MANIFEST};
 use solo_cli::upgrade::PROPOSE_GAS;
 use solo_cli::{USAGE, parse_genesis, parse_key, run};
 use solo_rpc::methods::data;
@@ -65,8 +65,47 @@ fn scratch(name: &str) -> PathBuf {
     dir.join(name)
 }
 
+/// A command whose nodes, however it starts them, stop when this test
+/// process ends, even when it is killed: their lifeline is this process.
+fn command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.env(LIFELINE, std::process::id().to_string());
+    command
+}
+
 fn solo(args: &[&str]) -> Output {
-    Command::new(SOLO).args(args).output().unwrap()
+    command(SOLO).args(args).output().unwrap()
+}
+
+/// Kills its process when dropped.
+struct Kills(Child);
+
+impl Drop for Kills {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Stops every node of a devnet when dropped, whatever stopped the test:
+/// a failed assertion must not leave the nodes it started running.
+struct Stops(PathBuf);
+
+impl Drop for Stops {
+    fn drop(&mut self) {
+        if let Ok(devnet) = Devnet::load(&self.0) {
+            for i in 0..devnet.nodes.len() {
+                let _ = solo(&[
+                    "devnet",
+                    "stop",
+                    "--dir",
+                    str_of(&self.0),
+                    "--node",
+                    &i.to_string(),
+                ]);
+            }
+        }
+    }
 }
 
 /// Runs `solo` with `args`, expecting success; its standard output.
@@ -736,7 +775,7 @@ fn manifest_and_argument_errors() {
     assert!(ok(&["devnet", "stop", "--dir", d, "--node", "0"]).contains("node 0 is not running"));
     assert!(ok(&["devnet", "down", "--dir", d]).contains("node 0 is not running"));
     // Starting needs the solo binary, and a node directory for the log.
-    let out = Command::new(SOLO)
+    let out = command(SOLO)
         .args(["devnet", "start", "--dir", d, "--node", "0"])
         .env("SOLO_BIN", "/nonexistent/solo")
         .output()
@@ -744,7 +783,7 @@ fn manifest_and_argument_errors() {
     let text = String::from_utf8(out.stderr).unwrap();
     assert!(text.contains("node-0/log"), "{text}");
     std::fs::create_dir_all(dir.join("node-0")).unwrap();
-    let out = Command::new(SOLO)
+    let out = command(SOLO)
         .args(["devnet", "start", "--dir", d, "--node", "0"])
         .env("SOLO_BIN", "/nonexistent/solo")
         .output()
@@ -753,7 +792,7 @@ fn manifest_and_argument_errors() {
     assert!(text.contains("cannot start node 0"), "{text}");
     // `up` fails when a node cannot start, and when one dies at once (no
     // kernel in this directory).
-    let out = Command::new(SOLO)
+    let out = command(SOLO)
         .args(["devnet", "up", "--dir", d])
         .env("SOLO_BIN", "/nonexistent/solo")
         .output()
@@ -924,6 +963,7 @@ fn manifest_and_argument_errors() {
 fn up_stops_only_what_it_started_and_stop_falls_back_on_the_pid_file() {
     let dir = scratch("orphans");
     init(&dir, "2", &[]);
+    let _stops = Stops(dir.clone());
     let d = str_of(&dir);
     let devnet = Devnet::load(&dir).unwrap();
     // Node 1 runs already: `up` refuses, kills the node 0 it had started
@@ -968,6 +1008,52 @@ fn up_stops_only_what_it_started_and_stop_falls_back_on_the_pid_file() {
     assert!(ok(&["devnet", "status", "--dir", d]).contains("node 1  down"));
 }
 
+#[test]
+fn nodes_stop_when_their_lifeline_goes() {
+    let dir = scratch("lifeline");
+    init(&dir, "1", &[]);
+    let _stops = Stops(dir.clone());
+    let devnet = Devnet::load(&dir).unwrap();
+    let rpc = devnet.nodes[0].rpc.clone();
+    // `up` runs with a lifeline of its own, a process this test ends.
+    let mut line = Kills(Command::new("sleep").arg("600").spawn().unwrap());
+    let up = Command::new(SOLO)
+        .args(["devnet", "up", "--dir", str_of(&dir)])
+        .env(LIFELINE, line.0.id().to_string())
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    client::poll_until(Duration::from_mins(2), "node 0 up", &mut || {
+        client::status(&rpc).is_ok()
+    })
+    .unwrap();
+    let pid: u32 = std::fs::read_to_string(dir.join("node-0/pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // Once the lifeline goes, `up` fails, and its node, whose lifeline is
+    // `up`, follows it down.
+    line.0.kill().unwrap();
+    line.0.wait().unwrap();
+    let out = up.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("up stopped by its lifeline"), "{text}");
+    let mut gone = || {
+        !Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    client::poll_until(Duration::from_mins(1), "node 0 gone", &mut gone).unwrap();
+    let log = std::fs::read_to_string(dir.join("node-0/log")).unwrap();
+    assert!(log.contains("is gone; stopping"), "{log}");
+}
+
 /// Sends `action` from the governance key and returns its receipt.
 fn send_action(rpc: &str, key: &k256::ecdsa::SigningKey, action: &Action) -> serde_json::Value {
     let ask = |method: &str, params: serde_json::Value| {
@@ -998,7 +1084,7 @@ struct Up {
 
 impl Up {
     fn start(dir: &Path) -> Up {
-        let child = Command::new(SOLO)
+        let child = command(SOLO)
             .args(["devnet", "up", "--dir"])
             .arg(dir)
             .stdin(Stdio::null())
@@ -1033,6 +1119,7 @@ impl Drop for Up {
 fn a_single_validator_devnet_runs_restarts_and_upgrades() {
     let dir = scratch("single");
     init(&dir, "1", &["--upgrade-delay", "1"]);
+    let _stops = Stops(dir.clone());
     let d = str_of(&dir);
     let devnet = Devnet::load(&dir).unwrap();
     let rpc = devnet.nodes[0].rpc.clone();
@@ -1311,8 +1398,9 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
 fn the_rehearsal_passes_on_a_four_validator_devnet() {
     let dir = scratch("rehearsal");
     init(&dir, "4", &[]);
+    let _stops = Stops(dir.clone());
     let up = Up::start(&dir);
-    let out = Command::new(REHEARSAL)
+    let out = command(REHEARSAL)
         .arg(&dir)
         .arg(KERNEL_V2)
         .env("SOLO", SOLO)

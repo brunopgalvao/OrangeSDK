@@ -58,6 +58,15 @@
 //!
 //! `status` and `wait` take `--rpc <addr,...>` instead of `--dir` for nodes
 //! that run elsewhere, such as the compose stack in `ops/`.
+//!
+//! A *lifeline* keeps nodes from outliving whoever runs them: when
+//! [`LIFELINE`] (`SOLO_DEVNET_LIFELINE`) names a pid, `solo devnet node`
+//! stops, and `up` stops waiting and fails, within a second or so of that
+//! process going away, however it went. `up` gives its own nodes its own
+//! pid as their lifeline, so they go down with it; `start` passes on the
+//! lifeline it was given, if any, and its node otherwise runs until stopped.
+//! A test or script that starts nodes sets the variable to its own pid, so
+//! that nothing of its own is left running when it is killed.
 
 use std::fmt::Write as _;
 use std::fs::{self, File};
@@ -92,6 +101,42 @@ pub const OPERATOR_FUNDING: &str = "1000000000000000000000";
 
 /// How long `start` waits for a node to answer, and `stop` for it to go.
 pub const NODE_TIMEOUT: Duration = Duration::from_mins(2);
+
+/// The environment variable naming a devnet process's lifeline: a pid
+/// whose end ends it (see the module documentation).
+pub const LIFELINE: &str = "SOLO_DEVNET_LIFELINE";
+
+/// The process [`LIFELINE`] names, checked at most once a second.
+struct Lifeline {
+    pid: Option<u32>,
+    checked: Instant,
+}
+
+impl Lifeline {
+    fn from_env() -> Lifeline {
+        Lifeline {
+            pid: std::env::var(LIFELINE).ok().and_then(|v| v.parse().ok()),
+            checked: Instant::now(),
+        }
+    }
+
+    /// Whether the lifeline still holds: no lifeline, a check less than a
+    /// second ago, or its process alive. Says so on stderr when it broke.
+    fn holds(&mut self) -> bool {
+        let Some(pid) = self.pid else {
+            return true;
+        };
+        if self.checked.elapsed() < Duration::from_secs(1) {
+            return true;
+        }
+        self.checked = Instant::now();
+        let holds = alive(pid);
+        if !holds {
+            eprintln!("devnet: lifeline {pid} is gone; stopping");
+        }
+        holds
+    }
+}
 
 /// One node of the manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,8 +466,9 @@ fn solo_binary() -> PathBuf {
 }
 
 /// Starts node `index` as a process; its pid goes to `node-<i>/pid`, its
-/// output to `node-<i>/log`.
-fn spawn(devnet: &Devnet, index: usize) -> Result<Child, String> {
+/// output to `node-<i>/log`. With `lifeline`, the node stops when that
+/// process goes; without, it keeps the lifeline this process has, if any.
+fn spawn(devnet: &Devnet, index: usize, lifeline: Option<u32>) -> Result<Child, String> {
     let node = devnet.node(index)?;
     if client::status(&node.rpc).is_ok() {
         return Err(format!("node {index} is already running on {}", node.rpc));
@@ -437,7 +483,11 @@ fn spawn(devnet: &Devnet, index: usize) -> Result<Child, String> {
         .map_err(fail)?;
     let stderr = log.try_clone().map_err(fail)?;
     let binary = solo_binary();
-    let child = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    if let Some(pid) = lifeline {
+        command.env(LIFELINE, pid.to_string());
+    }
+    let child = command
         .args(["devnet", "node", "--dir"])
         .arg(&devnet.dir)
         .arg("--index")
@@ -516,7 +566,7 @@ fn stop_all(devnet: &Devnet) -> Result<String, String> {
 fn start_node(devnet: &Devnet, index: usize) -> Result<String, String> {
     let rpc = devnet.node(index)?.rpc.clone();
     // The process outlives this command; nothing waits for it.
-    drop(spawn(devnet, index)?);
+    drop(spawn(devnet, index, None)?);
     let what = format!("node {index} did not answer on {rpc}");
     poll_until(NODE_TIMEOUT, &what, &mut || client::status(&rpc).is_ok())?;
     Ok(format!("node {index} started on {rpc}"))
@@ -528,7 +578,7 @@ fn up(args: &[String]) -> Result<String, String> {
     let blocks = crate::parse_number(args, "--blocks")?;
     let mut children: Vec<(usize, Child, Option<std::process::ExitStatus>)> = Vec::new();
     for i in 0..devnet.nodes.len() {
-        match spawn(&devnet, i) {
+        match spawn(&devnet, i, Some(std::process::id())) {
             Ok(child) => children.push((i, child, None)),
             Err(e) => {
                 // Leave nothing of this command's behind: the nodes it
@@ -549,7 +599,12 @@ fn up(args: &[String]) -> Result<String, String> {
         devnet.dir.display()
     );
     let mut stopping = false;
+    let mut lifeline = Lifeline::from_env();
     loop {
+        // Its nodes' lifeline is this process: they follow it down.
+        if !lifeline.holds() {
+            return Err("devnet: up stopped by its lifeline".to_owned());
+        }
         for (_, child, exit) in &mut children {
             if exit.is_none() {
                 *exit = child.try_wait().ok().flatten();
@@ -987,7 +1042,8 @@ fn node(args: &[String], keep_going: &mut dyn FnMut(&solo_rpc::Rpc) -> bool) -> 
     for peer in &spec.peers {
         line.extend(["--peer".to_owned(), peer.clone()]);
     }
-    crate::run_inner(&line, keep_going).map_err(|CliError(m)| m)
+    let mut lifeline = Lifeline::from_env();
+    crate::run_inner(&line, &mut |rpc| keep_going(rpc) && lifeline.holds()).map_err(|CliError(m)| m)
 }
 
 /// Runs `solo devnet <subcommand>`; every subcommand but `node` prints its
