@@ -26,6 +26,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use solo_abi::chain::consensus::{KIND_FINALIZE, signing_preimage};
@@ -321,6 +322,8 @@ pub enum SnapshotError {
     Store(String),
     /// The node's store or tables lack what an export needs.
     Export(String),
+    /// The export was called off before it finished (spec 22 §7.4).
+    Cancelled,
 }
 
 impl fmt::Display for SnapshotError {
@@ -331,6 +334,7 @@ impl fmt::Display for SnapshotError {
             SnapshotError::Verify(why) => write!(f, "snapshot does not verify: {why}"),
             SnapshotError::Store(why) => write!(f, "snapshot: {why}"),
             SnapshotError::Export(why) => write!(f, "snapshot: cannot export: {why}"),
+            SnapshotError::Cancelled => write!(f, "snapshot: export cancelled"),
         }
     }
 }
@@ -581,6 +585,14 @@ fn merge_runs(
     Ok(())
 }
 
+/// [`SnapshotError::Cancelled`] once `cancel` is set.
+fn cancelled(cancel: &AtomicBool) -> Result<(), SnapshotError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(SnapshotError::Cancelled);
+    }
+    Ok(())
+}
+
 /// Writes one sorted run of `records` to `path`.
 fn write_run(
     path: &Path,
@@ -600,17 +612,19 @@ fn write_run(
 /// sorting them through runs in `dir` within `limits`: the entry count and
 /// the root they hash to.
 fn sorted_entries(
-    store: &DiskStore,
+    store: &crate::disk::Frozen,
     version: u64,
     dir: &Path,
     out: &Path,
     limits: ExportLimits,
+    cancel: &AtomicBool,
 ) -> Result<(u64, Hash), SnapshotError> {
     let fan_in = limits.fan_in.max(2);
     let mut runs: Vec<PathBuf> = Vec::new();
     let mut records = Vec::new();
     let mut held = 0usize;
     store.each_entry_at(version, |key, value| {
+        cancelled(cancel)?;
         held += 32 + key.len() + value.len();
         records.push((keccak256(key), key.to_vec(), value.to_vec()));
         if held >= limits.chunk_bytes {
@@ -635,6 +649,7 @@ fn sorted_entries(
             let path = dir.join(format!("run-{pass}-{i}"));
             let mut w = BufWriter::new(File::create(&path).map_err(io_error)?);
             let written = merge_runs(group, &mut |p, key, value| {
+                cancelled(cancel)?;
                 w.write_all(&p).map_err(io_error)?;
                 write_part(&mut w, &key)?;
                 write_part(&mut w, &value)
@@ -651,6 +666,7 @@ fn sorted_entries(
     let mut root = SortedRoot::new(keccak256);
     let mut none = |_: &Hash, _: &[u8; NODE_LEN]| {};
     let written = merge_runs(&runs, &mut |path, key, value| {
+        cancelled(cancel)?;
         // Two keys on one path would take a Keccak collision; the push
         // would refuse the second, and the root would not be the record's.
         let _ = root.push(path, keccak256(&value), &mut none);
@@ -659,6 +675,66 @@ fn sorted_entries(
     });
     written.and_then(|()| w.flush().map_err(io_error))?;
     Ok((root.len(), root.finish(&mut none)))
+}
+
+/// A snapshot export whose record and certificate are found, waiting for
+/// its entries: [`Snapshot::prepare_export`] makes it on the node's
+/// thread, and [`Export::run`] finishes it on any other.
+pub struct Export {
+    frozen: crate::disk::Frozen,
+    header: SnapshotHeader,
+    out: PathBuf,
+}
+
+impl Export {
+    /// The epoch of the snapshot being exported.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.header.epoch
+    }
+
+    /// Walks the frozen store's entries at the record's height into path
+    /// order within `limits` and writes the file. Setting `cancel` stops
+    /// it at the next entry, leaving no file and no scratch behind.
+    ///
+    /// # Errors
+    /// [`SnapshotError::Cancelled`] once `cancel` is set; as
+    /// [`Snapshot::export`] otherwise.
+    pub fn run(self, limits: ExportLimits, cancel: &AtomicBool) -> Result<Snapshot, SnapshotError> {
+        let Export {
+            frozen,
+            mut header,
+            out,
+        } = self;
+        let scratch = Scratch(out.with_extension("runs"));
+        let _ = std::fs::remove_dir_all(&scratch.0);
+        std::fs::create_dir_all(&scratch.0).map_err(io_error)?;
+        let body = scratch.0.join("entries");
+        let (count, root) =
+            sorted_entries(&frozen, header.height, &scratch.0, &body, limits, cancel)?;
+        // The record is the root as the next block began; a kernel switch
+        // between the two blocks wrote into it after the version was sealed
+        // (spec 22 §7.1), and a file of these entries would not verify.
+        if root != header.state_root {
+            return Err(SnapshotError::Export(format!(
+                "the state sealed at block {} does not hash to epoch {}'s record: a kernel switch after that block wrote into it; export another epoch",
+                header.height, header.epoch
+            )));
+        }
+        header.entries = count;
+        let partial = scratch.0.join("snapshot");
+        let mut w = BufWriter::new(File::create(&partial).map_err(io_error)?);
+        let body_at = Snapshot::write_header(&mut w, &header)?;
+        io::copy(&mut File::open(&body).map_err(io_error)?, &mut w).map_err(io_error)?;
+        w.flush().map_err(io_error)?;
+        drop(w);
+        std::fs::rename(&partial, &out).map_err(io_error)?;
+        Ok(Snapshot {
+            header,
+            path: out,
+            body: body_at,
+        })
+    }
 }
 
 impl Snapshot {
@@ -733,6 +809,22 @@ impl Snapshot {
         out: &Path,
         limits: ExportLimits,
     ) -> Result<Snapshot, SnapshotError> {
+        Self::prepare_export(store, tables, epoch, out)?.run(limits, &AtomicBool::new(false))
+    }
+
+    /// The cheap half of [`Snapshot::export`]: finds the record, the head
+    /// and what vouches for them, and freezes the store (see
+    /// [`DiskStore::frozen`]), leaving the entries, the expensive half, to
+    /// [`Export::run`] on any thread while the store goes on.
+    ///
+    /// # Errors
+    /// As [`Snapshot::export`], but for the entries and the file.
+    pub fn prepare_export(
+        store: &DiskStore,
+        tables: &Tables,
+        epoch: Option<u64>,
+        out: &Path,
+    ) -> Result<Export, SnapshotError> {
         let chain_id = store
             .get(keys::CHAIN_ID)
             .and_then(|b| u64::from_bytes(&b).ok())
@@ -784,26 +876,12 @@ impl Snapshot {
         // What vouches for the record is found before the entries are
         // sorted, the expensive part: a serving node tries again after every
         // block until a certificate covers the record (spec 22 §7.4).
-        let scratch = Scratch(out.with_extension("runs"));
-        let _ = std::fs::remove_dir_all(&scratch.0);
-        std::fs::create_dir_all(&scratch.0).map_err(io_error)?;
-        let body = scratch.0.join("entries");
-        let (count, root) = sorted_entries(store, record.height, &scratch.0, &body, limits)?;
-        // The record is the root as the next block began; a kernel switch
-        // between the two blocks wrote into it after the version was sealed
-        // (spec 22 §7.1), and a file of these entries would not verify.
-        if root != record.state_root {
-            return Err(SnapshotError::Export(format!(
-                "the state sealed at block {} does not hash to epoch {epoch}'s record: a kernel switch after that block wrote into it; export another epoch",
-                record.height
-            )));
-        }
         let header = SnapshotHeader {
             chain_id,
             epoch,
             height: record.height,
             state_root: record.state_root,
-            entries: count,
+            entries: 0,
             anchor_proposal,
             certificate,
             record_proof,
@@ -812,17 +890,10 @@ impl Snapshot {
             head_threshold: head(b"bcert/").unwrap_or_default(),
             links: Seq(links),
         };
-        let partial = scratch.0.join("snapshot");
-        let mut w = BufWriter::new(File::create(&partial).map_err(io_error)?);
-        let body_at = Self::write_header(&mut w, &header)?;
-        io::copy(&mut File::open(&body).map_err(io_error)?, &mut w).map_err(io_error)?;
-        w.flush().map_err(io_error)?;
-        drop(w);
-        std::fs::rename(&partial, out).map_err(io_error)?;
-        Ok(Snapshot {
+        Ok(Export {
+            frozen: store.frozen()?,
             header,
-            path: out.to_path_buf(),
-            body: body_at,
+            out: out.to_path_buf(),
         })
     }
 
@@ -1193,6 +1264,57 @@ mod tests {
 
     fn entries(snapshot: &Snapshot) -> Vec<(Vec<u8>, Vec<u8>)> {
         snapshot.entries().unwrap().map(Result::unwrap).collect()
+    }
+
+    /// Tables that certify the record of [`store`]: the head at 1, the
+    /// proposals between and a certified one at 4 anchoring version 3.
+    fn certifying(root3: [u8; 32]) -> Tables {
+        let mut tables = Tables::new();
+        finalize(&mut tables, &proposal(1, 0, [0; 32]), true);
+        finalize(&mut tables, &proposal(2, 0, [0; 32]), false);
+        finalize(&mut tables, &proposal(3, 0, [0; 32]), false);
+        finalize(&mut tables, &proposal(4, 3, root3), true);
+        tables
+    }
+
+    /// The expensive half of an export runs on another thread over the
+    /// store as it was frozen, while the store seals and prunes on; a
+    /// cancelled one stops and leaves nothing behind.
+    #[test]
+    fn an_export_runs_apart_from_a_store_that_goes_on() {
+        let (mut s, _, root3) = store("apart");
+        let tables = certifying(root3);
+        let dir = scratch("apart-out");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("x.snap");
+        let mut before = s.entries_at(1).unwrap();
+        let export = Snapshot::prepare_export(&s, &tables, None, &out).unwrap();
+        assert_eq!(export.epoch(), 0);
+        // The store changes the record's block's keys and prunes its
+        // version after the freeze.
+        s.set(b"acct/a", b"changed");
+        s.seal(4, None).unwrap();
+        s.prune(4).unwrap();
+        assert!(s.entries_at(1).is_err());
+        let ran = std::thread::spawn(move || {
+            export.run(ExportLimits::default(), &AtomicBool::new(false))
+        });
+        let snapshot = ran.join().unwrap().unwrap();
+        let mut exported = entries(&snapshot);
+        exported.sort();
+        before.sort();
+        assert_eq!(exported, before);
+        assert!(before.contains(&(b"acct/a".to_vec(), b"1".to_vec())));
+        // Cancelled before it starts, cancelled during the merge of runs and
+        // during the final merge: no file, no scratch.
+        let (s, _, root3) = store("cancelled");
+        let tables = certifying(root3);
+        let out = dir.join("y.snap");
+        let cancel = AtomicBool::new(true);
+        let export = Snapshot::prepare_export(&s, &tables, None, &out).unwrap();
+        let err = export.run(ExportLimits::default(), &cancel).unwrap_err();
+        assert_eq!(err.to_string(), "snapshot: export cancelled");
+        assert!(!out.exists() && !out.with_extension("runs").exists());
     }
 
     #[test]

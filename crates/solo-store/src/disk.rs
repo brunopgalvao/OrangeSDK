@@ -169,7 +169,7 @@ impl NodeSource for Nodes {
 /// The read side: one transaction and its tables, renewed after each commit
 /// so that reads see what was written and cost no transaction each.
 struct Reader {
-    _txn: ReadTransaction,
+    txn: ReadTransaction,
     state: ReadOnlyTable<&'static [u8], &'static [u8]>,
     history: ReadOnlyTable<(&'static [u8], u64), &'static [u8]>,
     versions: ReadOnlyTable<u64, &'static [u8]>,
@@ -179,6 +179,18 @@ impl Reader {
     /// Opens a reader on the database as it is, and points `nodes` at the
     /// same snapshot's node table.
     fn open(database: &Database, nodes: &Nodes) -> Result<Reader, StoreError> {
+        let reader = Reader::begin(database)?;
+        let table = reader
+            .txn
+            .open_table(NODES)
+            .map_err(redb::Error::from)
+            .map_err(db)?;
+        *nodes.table.write().unwrap_or_else(PoisonError::into_inner) = Some(table);
+        Ok(reader)
+    }
+
+    /// A reader on the database as it is, leaving the node table alone.
+    fn begin(database: &Database) -> Result<Reader, StoreError> {
         let txn = database
             .begin_read()
             .map_err(redb::Error::from)
@@ -195,17 +207,131 @@ impl Reader {
             .open_table(VERSIONS)
             .map_err(redb::Error::from)
             .map_err(db)?;
-        let table = txn
-            .open_table(NODES)
-            .map_err(redb::Error::from)
-            .map_err(db)?;
-        *nodes.table.write().unwrap_or_else(PoisonError::into_inner) = Some(table);
         Ok(Reader {
-            _txn: txn,
+            txn,
             state,
             history,
             versions,
         })
+    }
+}
+
+/// What reads as of a version see: the committed tables of one read
+/// transaction and the writes buffered above them.
+struct View<'a> {
+    reader: &'a Reader,
+    pending: &'a Writes,
+    pending_old: &'a BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    kept: Option<(u64, u64)>,
+}
+
+impl View<'_> {
+    /// The value `key` held when version `at` was sealed, given `current`.
+    fn value_at(&self, key: &[u8], at: u64, current: Option<Vec<u8>>) -> Option<Vec<u8>> {
+        let later = read(
+            self.reader
+                .history
+                .range::<(&[u8], u64)>((key, at + 1)..=(key, u64::MAX)),
+        )
+        .next();
+        if let Some(row) = later {
+            let (_, old) = read(row);
+            return decode_old(old.value());
+        }
+        match self.pending_old.get(key) {
+            Some(old) => old.clone(),
+            None => current,
+        }
+    }
+
+    /// See [`DiskStore::each_entry_at`].
+    fn each_entry_at<E: From<NotKept>>(
+        &self,
+        version: u64,
+        mut f: impl FnMut(&[u8], &[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if !self
+            .kept
+            .is_some_and(|(oldest, latest)| (oldest..=latest).contains(&version))
+        {
+            return Err(NotKept(self.kept).into());
+        }
+        // The state as it is: the table, overlaid by the pending writes.
+        let table = read(self.reader.state.iter()).map(|row| {
+            let (key, value) = read(row);
+            (key.value().to_vec(), Some(value.value().to_vec()))
+        });
+        let pending = self.pending.iter().map(|(k, v)| (k.clone(), v.clone()));
+        let mut current = merge(table, pending, |a, b| a.0.cmp(&b.0))
+            .filter(|(key, _)| committed(key))
+            .peekable();
+        // The keys written since `version`: their value then is in history.
+        let written = read(self.reader.history.iter()).filter_map(|row| {
+            let (key, _) = read(row);
+            let (key, at) = key.value();
+            (at > version).then(|| key.to_vec())
+        });
+        let mut rewound = merge(written, self.pending_old.keys().cloned(), Ord::cmp).peekable();
+        loop {
+            let next_current = current.peek().map(|(k, _)| k.clone());
+            let next_rewound = rewound.peek().cloned();
+            let from_current = match (&next_current, &next_rewound) {
+                (None, None) => return Ok(()),
+                (Some(c), Some(r)) => c < r,
+                (c, _) => c.is_some(),
+            };
+            let (key, value) = if from_current {
+                current.next().expect("peeked")
+            } else {
+                // Every row of the key goes; the value as of `version`
+                // starts from the current one when the state has it.
+                let r = next_rewound.expect("peeked");
+                while rewound.peek() == Some(&r) {
+                    rewound.next();
+                }
+                let now = if next_current.as_ref() == Some(&r) {
+                    current.next().and_then(|(_, v)| v)
+                } else {
+                    None
+                };
+                let then = self.value_at(&r, version, now);
+                (r, then)
+            };
+            if let Some(value) = value {
+                f(&key, &value)?;
+            }
+        }
+    }
+}
+
+/// A chain store frozen as it was when [`DiskStore::frozen`] was called:
+/// what a snapshot export reads on a thread of its own while the node goes
+/// on (spec 22 §7.4).
+pub struct Frozen {
+    reader: Reader,
+    pending: Writes,
+    pending_old: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    kept: Option<(u64, u64)>,
+}
+
+impl Frozen {
+    /// [`DiskStore::each_entry_at`] as of the freeze, whatever the store
+    /// has done since.
+    ///
+    /// # Errors
+    /// As [`DiskStore::each_entry_at`].
+    pub fn each_entry_at<E: From<NotKept>>(
+        &self,
+        version: u64,
+        f: impl FnMut(&[u8], &[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        View {
+            reader: &self.reader,
+            pending: &self.pending,
+            pending_old: &self.pending_old,
+            kept: self.kept,
+        }
+        .each_entry_at(version, f)
     }
 }
 
@@ -777,20 +903,35 @@ impl DiskStore {
 
     /// The value `key` held when version `at` was sealed, given `current`.
     fn value_at(&self, key: &[u8], at: u64, current: Option<Vec<u8>>) -> Option<Vec<u8>> {
-        let later = read(
-            self.reader()
-                .history
-                .range::<(&[u8], u64)>((key, at + 1)..=(key, u64::MAX)),
-        )
-        .next();
-        if let Some(row) = later {
-            let (_, old) = read(row);
-            return decode_old(old.value());
+        self.view().value_at(key, at, current)
+    }
+
+    /// What reads as of a version see: the committed tables and the buffer.
+    fn view(&self) -> View<'_> {
+        View {
+            reader: self.reader(),
+            pending: &self.pending,
+            pending_old: &self.pending_old,
+            kept: self.versions(),
         }
-        match self.pending_old.get(key) {
-            Some(old) => old.clone(),
-            None => current,
-        }
+    }
+
+    /// The store as it is now, frozen: a read transaction of its own over
+    /// what is committed and a copy of what is buffered, that another
+    /// thread walks while this store goes on executing, sealing and
+    /// pruning. The engine keeps the pages it reads alive until it is
+    /// dropped, so a long walk holds the file's freed space that long; a
+    /// compaction waits until it is gone.
+    ///
+    /// # Errors
+    /// When the database refuses a read transaction.
+    pub fn frozen(&self) -> Result<Frozen, StoreError> {
+        Ok(Frozen {
+            reader: Reader::begin(&self.db)?,
+            pending: self.pending.clone(),
+            pending_old: self.pending_old.clone(),
+            kept: self.versions(),
+        })
     }
 
     /// Seals `version`: writes the pending state, its history as
@@ -1108,56 +1249,9 @@ impl DiskStore {
     pub fn each_entry_at<E: From<NotKept>>(
         &self,
         version: u64,
-        mut f: impl FnMut(&[u8], &[u8]) -> Result<(), E>,
+        f: impl FnMut(&[u8], &[u8]) -> Result<(), E>,
     ) -> Result<(), E> {
-        if !(self.sealed && (self.oldest..=self.latest).contains(&version)) {
-            return Err(NotKept(self.versions()).into());
-        }
-        // The state as it is: the table, overlaid by the pending writes.
-        let table = read(self.reader().state.iter()).map(|row| {
-            let (key, value) = read(row);
-            (key.value().to_vec(), Some(value.value().to_vec()))
-        });
-        let pending = self.pending.iter().map(|(k, v)| (k.clone(), v.clone()));
-        let mut current = merge(table, pending, |a, b| a.0.cmp(&b.0))
-            .filter(|(key, _)| committed(key))
-            .peekable();
-        // The keys written since `version`: their value then is in history.
-        let written = read(self.reader().history.iter()).filter_map(|row| {
-            let (key, _) = read(row);
-            let (key, at) = key.value();
-            (at > version).then(|| key.to_vec())
-        });
-        let mut rewound = merge(written, self.pending_old.keys().cloned(), Ord::cmp).peekable();
-        loop {
-            let next_current = current.peek().map(|(k, _)| k.clone());
-            let next_rewound = rewound.peek().cloned();
-            let from_current = match (&next_current, &next_rewound) {
-                (None, None) => return Ok(()),
-                (Some(c), Some(r)) => c < r,
-                (c, _) => c.is_some(),
-            };
-            let (key, value) = if from_current {
-                current.next().expect("peeked")
-            } else {
-                // Every row of the key goes; the value as of `version`
-                // starts from the current one when the state has it.
-                let r = next_rewound.expect("peeked");
-                while rewound.peek() == Some(&r) {
-                    rewound.next();
-                }
-                let now = if next_current.as_ref() == Some(&r) {
-                    current.next().and_then(|(_, v)| v)
-                } else {
-                    None
-                };
-                let then = self.value_at(&r, version, now);
-                (r, then)
-            };
-            if let Some(value) = value {
-                f(&key, &value)?;
-            }
-        }
+        self.view().each_entry_at(version, f)
     }
 
     /// Replaces the state with `entries`, the whole committed state of
