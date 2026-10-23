@@ -148,6 +148,154 @@ impl Decode for SnapshotHeader {
     }
 }
 
+impl SnapshotHeader {
+    /// Verifies everything the header vouches for (spec 22 §7.2, checks 1
+    /// to 4 and 6): the chain, the certificate for the anchoring proposal
+    /// under `trust`, the proof of the record against its anchor root, and
+    /// the head linked to the anchoring proposal. The entries, check 5, are
+    /// checked as they are read ([`Snapshot::verify`]), or slice by slice as
+    /// they are fetched from peers (spec 22 §7.4).
+    ///
+    /// # Errors
+    /// [`SnapshotError::Verify`] naming the first check that fails.
+    pub fn verify(&self, chain_id: u64, trust: &Trust) -> Result<(), SnapshotError> {
+        if self.chain_id != chain_id {
+            return Err(SnapshotError::Verify("another chain"));
+        }
+        let proposal =
+            Proposal::from_bytes(&self.anchor_proposal)
+                .ok()
+                .ok_or(SnapshotError::Verify(
+                    "the anchoring proposal does not decode",
+                ))?;
+        if proposal.anchor_height <= self.height {
+            return Err(SnapshotError::Verify(
+                "the anchoring proposal anchors no height above the snapshot",
+            ));
+        }
+        let hash = keccak256(&self.anchor_proposal);
+        self.verify_certificate(&proposal, &hash, chain_id, trust)?;
+        let record = SnapshotRecord {
+            height: self.height,
+            state_root: self.state_root,
+        };
+        let proof = Proof::decode(&self.record_proof)
+            .ok()
+            .ok_or(SnapshotError::Verify("the record's proof does not decode"))?;
+        let proven = proof.verify(keccak256, &proposal.anchor_root, &record_key(self.epoch));
+        if proven != Ok(Some(keccak256(&record.to_bytes()))) {
+            return Err(SnapshotError::Verify(
+                "the record's proof does not verify against the anchor root",
+            ));
+        }
+        self.verify_head(&proposal, chain_id, trust)
+    }
+
+    /// Checks the head block's proposal and certificate (spec 22 §7.2, 6),
+    /// which seed the importing driver: its tip, entry certificate and
+    /// view. The head proposal is the trust's through the links: each link
+    /// names the one before it as its parent, the first the head, and the
+    /// anchoring proposal, which the certificate vouches for, the last. The
+    /// head certificate's view is bounded by the anchoring proposal's: a
+    /// forged one cannot move a node past the views the chain has had. It
+    /// may name a descendant that finalized the head, such as a suffix
+    /// proposal (spec 08 §3a); under the genesis set its votes must verify.
+    fn verify_head(
+        &self,
+        anchoring: &Proposal,
+        chain_id: u64,
+        trust: &Trust,
+    ) -> Result<(), SnapshotError> {
+        let head = Proposal::from_bytes(&self.head_proposal)
+            .ok()
+            .filter(|p| p.height == self.height)
+            .ok_or(SnapshotError::Verify("the head proposal is not block's"))?;
+        let mut parent = (head.height, keccak256(&self.head_proposal));
+        for link in &self.links.0 {
+            let p = Proposal::from_bytes(link)
+                .ok()
+                .ok_or(SnapshotError::Verify("a link does not decode"))?;
+            if (p.height, p.parent) != (parent.0 + 1, parent.1) {
+                return Err(SnapshotError::Verify(
+                    "the links do not join the head to the anchoring proposal",
+                ));
+            }
+            parent = (p.height, keccak256(link));
+        }
+        if (anchoring.height, anchoring.parent) != (parent.0 + 1, parent.1) {
+            return Err(SnapshotError::Verify(
+                "the links do not join the head to the anchoring proposal",
+            ));
+        }
+        let certificate = Certificate::from_bytes(&self.head_certificate)
+            .ok()
+            .filter(|c| c.kind == KIND_FINALIZE && c.view <= anchoring.view)
+            .ok_or(SnapshotError::Verify(
+                "the head certificate is not a finalize certificate at or below the anchoring proposal's view",
+            ))?;
+        if let Trust::Genesis(set) = trust
+            && !votes_certify(&certificate, &certificate.hash, chain_id, set)
+        {
+            return Err(SnapshotError::Verify(
+                "the head certificate is not a quorum of the genesis set",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks the anchoring proposal's certificate under `trust`.
+    fn verify_certificate(
+        &self,
+        proposal: &Proposal,
+        hash: &[u8; 32],
+        chain_id: u64,
+        trust: &Trust,
+    ) -> Result<(), SnapshotError> {
+        let bytes = &self.certificate;
+        if let Some(threshold) = threshold_certificate(bytes) {
+            if threshold.height != proposal.height || threshold.block_hash != *hash {
+                return Err(SnapshotError::Verify(
+                    "the threshold certificate is not the anchoring proposal's",
+                ));
+            }
+            let Trust::Key(key) = trust else {
+                return Err(SnapshotError::Verify(
+                    "a threshold certificate needs a trusted group key",
+                ));
+            };
+            let group_key = PublicKey::from_bytes(key)
+                .ok()
+                .ok_or(SnapshotError::Verify("the trusted key is not a group key"))?;
+            let certificate =
+                CertificateV2::from_bytes(bytes)
+                    .ok()
+                    .ok_or(SnapshotError::Verify(
+                        "the threshold certificate does not decode",
+                    ))?;
+            if !certificate.verify(chain_id, &group_key) {
+                return Err(SnapshotError::Verify(
+                    "the threshold certificate does not verify under the trusted key",
+                ));
+            }
+            return Ok(());
+        }
+        let Trust::Genesis(set) = trust else {
+            return Err(SnapshotError::Verify(
+                "a vote certificate needs the genesis validator set, and only a chain without staking keeps it",
+            ));
+        };
+        let certificate = Certificate::from_bytes(bytes)
+            .ok()
+            .ok_or(SnapshotError::Verify("the certificate does not decode"))?;
+        if !votes_certify(&certificate, hash, chain_id, set) {
+            return Err(SnapshotError::Verify(
+                "the vote certificate is not a quorum of the genesis set for the anchoring proposal",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// What a verifier trusts (spec 22 §7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Trust {
@@ -520,6 +668,39 @@ impl Snapshot {
         &self.path
     }
 
+    /// Where the entries start in the file: what a server that reads one
+    /// slice of them (spec 22 §7.4) seeks from.
+    #[must_use]
+    pub fn body_offset(&self) -> u64 {
+        self.body
+    }
+
+    /// Writes a snapshot file at `path` from `header` and the files `parts`,
+    /// whose bytes are entries in the file's encoding and follow one another
+    /// in path order: how a node that fetched a snapshot slice by slice
+    /// (spec 22 §7.4) puts it together. Nothing is checked; the import
+    /// checks the order and the root.
+    ///
+    /// # Errors
+    /// What the file system reports.
+    pub fn assemble(
+        path: &Path,
+        header: &SnapshotHeader,
+        parts: &[PathBuf],
+    ) -> Result<Snapshot, SnapshotError> {
+        let mut out = BufWriter::new(File::create(path).map_err(io_error)?);
+        let body = Self::write_header(&mut out, header)?;
+        for part in parts {
+            io::copy(&mut File::open(part).map_err(io_error)?, &mut out).map_err(io_error)?;
+        }
+        out.flush().map_err(io_error)?;
+        Ok(Snapshot {
+            header: header.clone(),
+            path: path.to_path_buf(),
+            body,
+        })
+    }
+
     /// Exports the snapshot of `epoch` (the latest recorded, for `None`)
     /// from a node's store and driver tables to the file `out`, within the
     /// default [`ExportLimits`]: the state at the record's height, a
@@ -573,20 +754,6 @@ impl Snapshot {
                     "the chain has no snapshot record for epoch {epoch}"
                 ))
             })?;
-        let scratch = Scratch(out.with_extension("runs"));
-        let _ = std::fs::remove_dir_all(&scratch.0);
-        std::fs::create_dir_all(&scratch.0).map_err(io_error)?;
-        let body = scratch.0.join("entries");
-        let (count, root) = sorted_entries(store, record.height, &scratch.0, &body, limits)?;
-        // The record is the root as the next block began; a kernel switch
-        // between the two blocks wrote into it after the version was sealed
-        // (spec 22 §7.1), and a file of these entries would not verify.
-        if root != record.state_root {
-            return Err(SnapshotError::Export(format!(
-                "the state sealed at block {} does not hash to epoch {epoch}'s record: a kernel switch after that block wrote into it; export another epoch",
-                record.height
-            )));
-        }
         let head = |prefix: &[u8]| tables.get(&height_key(prefix, record.height)).cloned();
         let head_hash = head(b"final/").ok_or_else(|| {
             SnapshotError::Export(format!(
@@ -614,6 +781,23 @@ impl Snapshot {
         let head_view = Certificate::from_bytes(&head_certificate).map_or(u64::MAX, |c| c.view);
         let (anchor_proposal, certificate, record_proof, links) =
             Self::finality(store, tables, &record, epoch, head_view)?;
+        // What vouches for the record is found before the entries are
+        // sorted, the expensive part: a serving node tries again after every
+        // block until a certificate covers the record (spec 22 §7.4).
+        let scratch = Scratch(out.with_extension("runs"));
+        let _ = std::fs::remove_dir_all(&scratch.0);
+        std::fs::create_dir_all(&scratch.0).map_err(io_error)?;
+        let body = scratch.0.join("entries");
+        let (count, root) = sorted_entries(store, record.height, &scratch.0, &body, limits)?;
+        // The record is the root as the next block began; a kernel switch
+        // between the two blocks wrote into it after the version was sealed
+        // (spec 22 §7.1), and a file of these entries would not verify.
+        if root != record.state_root {
+            return Err(SnapshotError::Export(format!(
+                "the state sealed at block {} does not hash to epoch {epoch}'s record: a kernel switch after that block wrote into it; export another epoch",
+                record.height
+            )));
+        }
         let header = SnapshotHeader {
             chain_id,
             epoch,
@@ -818,35 +1002,7 @@ impl Snapshot {
     /// reading the file reports.
     pub fn verify(&self, chain_id: u64, trust: &Trust) -> Result<(), SnapshotError> {
         let h = &self.header;
-        if h.chain_id != chain_id {
-            return Err(SnapshotError::Verify("another chain"));
-        }
-        let proposal =
-            Proposal::from_bytes(&h.anchor_proposal)
-                .ok()
-                .ok_or(SnapshotError::Verify(
-                    "the anchoring proposal does not decode",
-                ))?;
-        if proposal.anchor_height <= h.height {
-            return Err(SnapshotError::Verify(
-                "the anchoring proposal anchors no height above the snapshot",
-            ));
-        }
-        let hash = keccak256(&h.anchor_proposal);
-        self.verify_certificate(&proposal, &hash, chain_id, trust)?;
-        let record = SnapshotRecord {
-            height: h.height,
-            state_root: h.state_root,
-        };
-        let proof = Proof::decode(&h.record_proof)
-            .ok()
-            .ok_or(SnapshotError::Verify("the record's proof does not decode"))?;
-        let proven = proof.verify(keccak256, &proposal.anchor_root, &record_key(h.epoch));
-        if proven != Ok(Some(keccak256(&record.to_bytes()))) {
-            return Err(SnapshotError::Verify(
-                "the record's proof does not verify against the anchor root",
-            ));
-        }
+        h.verify(chain_id, trust)?;
         let mut root = SortedRoot::new(keccak256);
         let mut none = |_: &Hash, _: &[u8; NODE_LEN]| {};
         for entry in self.entries()? {
@@ -860,110 +1016,6 @@ impl Snapshot {
         if root.finish(&mut none) != h.state_root {
             return Err(SnapshotError::Verify(
                 "the entries do not hash to the record's root",
-            ));
-        }
-        Self::verify_head(h, &proposal, chain_id, trust)
-    }
-
-    /// Checks the head block's proposal and certificate (spec 22 §7.2, 6),
-    /// which seed the importing driver: its tip, entry certificate and
-    /// view. The head proposal is the trust's through the links: each link
-    /// names the one before it as its parent, the first the head, and the
-    /// anchoring proposal, which the certificate vouches for, the last. The
-    /// head certificate's view is bounded by the anchoring proposal's: a
-    /// forged one cannot move a node past the views the chain has had. It
-    /// may name a descendant that finalized the head, such as a suffix
-    /// proposal (spec 08 §3a); under the genesis set its votes must verify.
-    fn verify_head(
-        h: &SnapshotHeader,
-        anchoring: &Proposal,
-        chain_id: u64,
-        trust: &Trust,
-    ) -> Result<(), SnapshotError> {
-        let head = Proposal::from_bytes(&h.head_proposal)
-            .ok()
-            .filter(|p| p.height == h.height)
-            .ok_or(SnapshotError::Verify("the head proposal is not block's"))?;
-        let mut parent = (head.height, keccak256(&h.head_proposal));
-        for link in &h.links.0 {
-            let p = Proposal::from_bytes(link)
-                .ok()
-                .ok_or(SnapshotError::Verify("a link does not decode"))?;
-            if (p.height, p.parent) != (parent.0 + 1, parent.1) {
-                return Err(SnapshotError::Verify(
-                    "the links do not join the head to the anchoring proposal",
-                ));
-            }
-            parent = (p.height, keccak256(link));
-        }
-        if (anchoring.height, anchoring.parent) != (parent.0 + 1, parent.1) {
-            return Err(SnapshotError::Verify(
-                "the links do not join the head to the anchoring proposal",
-            ));
-        }
-        let certificate = Certificate::from_bytes(&h.head_certificate)
-            .ok()
-            .filter(|c| c.kind == KIND_FINALIZE && c.view <= anchoring.view)
-            .ok_or(SnapshotError::Verify(
-                "the head certificate is not a finalize certificate at or below the anchoring proposal's view",
-            ))?;
-        if let Trust::Genesis(set) = trust
-            && !votes_certify(&certificate, &certificate.hash, chain_id, set)
-        {
-            return Err(SnapshotError::Verify(
-                "the head certificate is not a quorum of the genesis set",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Checks the anchoring proposal's certificate under `trust`.
-    fn verify_certificate(
-        &self,
-        proposal: &Proposal,
-        hash: &[u8; 32],
-        chain_id: u64,
-        trust: &Trust,
-    ) -> Result<(), SnapshotError> {
-        let bytes = &self.header.certificate;
-        if let Some(threshold) = threshold_certificate(bytes) {
-            if threshold.height != proposal.height || threshold.block_hash != *hash {
-                return Err(SnapshotError::Verify(
-                    "the threshold certificate is not the anchoring proposal's",
-                ));
-            }
-            let Trust::Key(key) = trust else {
-                return Err(SnapshotError::Verify(
-                    "a threshold certificate needs a trusted group key",
-                ));
-            };
-            let group_key = PublicKey::from_bytes(key)
-                .ok()
-                .ok_or(SnapshotError::Verify("the trusted key is not a group key"))?;
-            let certificate =
-                CertificateV2::from_bytes(bytes)
-                    .ok()
-                    .ok_or(SnapshotError::Verify(
-                        "the threshold certificate does not decode",
-                    ))?;
-            if !certificate.verify(chain_id, &group_key) {
-                return Err(SnapshotError::Verify(
-                    "the threshold certificate does not verify under the trusted key",
-                ));
-            }
-            return Ok(());
-        }
-        let Trust::Genesis(set) = trust else {
-            return Err(SnapshotError::Verify(
-                "a vote certificate needs the genesis validator set, and only a chain without staking keeps it",
-            ));
-        };
-        let certificate = Certificate::from_bytes(bytes)
-            .ok()
-            .ok_or(SnapshotError::Verify("the certificate does not decode"))?;
-        if !votes_certify(&certificate, hash, chain_id, set) {
-            return Err(SnapshotError::Verify(
-                "the vote certificate is not a quorum of the genesis set for the anchoring proposal",
             ));
         }
         Ok(())
@@ -1172,9 +1224,15 @@ mod tests {
         };
         switched.set(&record_key(0), &stale.to_bytes());
         switched.set(keys::SNAPSHOT_LATEST, &0u64.to_bytes());
-        switched.seal(2, None).unwrap();
+        let committed = switched.state_trie();
+        switched.seal(2, Some(&committed)).unwrap();
+        // The certificate is found first; the entries, sorted after it,
+        // do not hash to the record.
+        let mut certified = Tables::new();
+        finalize(&mut certified, &proposal(1, 0, [0; 32]), true);
+        finalize(&mut certified, &proposal(2, 2, committed.root()), true);
         assert!(
-            why(export(&switched, &Tables::new(), None, "d"))
+            why(export(&switched, &certified, None, "d"))
                 .contains("a kernel switch after that block wrote into it")
         );
         // The head block's entries, missing one by one.

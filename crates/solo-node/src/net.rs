@@ -18,6 +18,7 @@ use solo_metrics::{Direction, Traffic};
 
 use crate::extension::Outbound;
 use crate::node::{Node, NodeError};
+use crate::statesync::StateSync;
 
 /// Largest frame accepted, in bytes.
 pub const MAX_FRAME: usize = 16 << 20;
@@ -34,6 +35,8 @@ pub enum Frame {
     Tx { raw: Vec<u8> },
     Request { request_id: u64, payload: Vec<u8> },
     Response { request_id: u64, payload: Vec<u8> },
+    SyncRequest { request_id: u64, payload: Vec<u8> },
+    SyncResponse { request_id: u64, payload: Vec<u8> },
 }
 
 impl Encode for Frame {
@@ -65,6 +68,20 @@ impl Encode for Frame {
                 e.raw(&[4]);
                 e.put(request_id).put(payload);
             }
+            Frame::SyncRequest {
+                request_id,
+                payload,
+            } => {
+                e.raw(&[5]);
+                e.put(request_id).put(payload);
+            }
+            Frame::SyncResponse {
+                request_id,
+                payload,
+            } => {
+                e.raw(&[6]);
+                e.put(request_id).put(payload);
+            }
         }
     }
 }
@@ -86,6 +103,14 @@ impl Decode for Frame {
                 payload: d.get()?,
             },
             4 => Frame::Response {
+                request_id: d.get()?,
+                payload: d.get()?,
+            },
+            5 => Frame::SyncRequest {
+                request_id: d.get()?,
+                payload: d.get()?,
+            },
+            6 => Frame::SyncResponse {
                 request_id: d.get()?,
                 payload: d.get()?,
             },
@@ -306,8 +331,106 @@ impl Transport {
                 request_id,
                 payload,
             })?,
+            Frame::SyncRequest {
+                request_id,
+                payload,
+            } => {
+                let payload = node.answer_sync(&payload);
+                self.conns[index].send(&Frame::SyncResponse {
+                    request_id,
+                    payload,
+                });
+                self.traffic.frame(Direction::Out, "sync_response");
+            }
+            // A running node fetches no snapshot.
+            Frame::SyncResponse { .. } => {}
         }
         Ok(())
+    }
+
+    /// Handles one frame while the node joins from its peers' snapshots
+    /// (spec 09 §6): state-sync answers go to `sync`, requests get the
+    /// answer of a node that serves nothing, and everything else is
+    /// dropped until the driver runs.
+    fn handle_syncing(&mut self, index: usize, frame: Frame, sync: &mut StateSync, now_ms: u64) {
+        let conn = &mut self.conns[index];
+        let Some(peer) = conn.peer else {
+            match frame {
+                Frame::Hello { id, chain_id } if chain_id == self.chain_id => conn.peer = Some(id),
+                _ => conn.dead = true,
+            }
+            return;
+        };
+        match frame {
+            Frame::Hello { .. } => conn.dead = true,
+            Frame::SyncResponse {
+                request_id,
+                payload,
+            } => sync.on_response(peer, request_id, &payload, now_ms),
+            Frame::SyncRequest {
+                request_id,
+                payload,
+            } => {
+                conn.send(&Frame::SyncResponse {
+                    request_id,
+                    payload: crate::statesync::answer_unserved(&payload),
+                });
+                self.traffic.frame(Direction::Out, "sync_response");
+            }
+            _ => {}
+        }
+    }
+
+    /// Accepts, dials, reads and flushes like [`Transport::poll`], for a
+    /// node that is not running yet and joins from its peers' snapshots
+    /// (spec 22 §7.4): it hands `sync` the handshaken peers and their
+    /// answers, and sends the requests `sync` returns.
+    pub fn poll_sync(&mut self, sync: &mut StateSync, now_ms: u64) {
+        self.accept();
+        self.redial(now_ms);
+        for i in 0..self.conns.len() {
+            for frame in self.read_frames(i) {
+                self.handle_syncing(i, frame, sync, now_ms);
+            }
+        }
+        self.conns.retain(|c| !c.dead);
+        for (peer, request_id, payload) in sync.poll(now_ms, &self.connected()) {
+            self.send_to(
+                &peer,
+                &Frame::SyncRequest {
+                    request_id,
+                    payload,
+                },
+            );
+        }
+        self.flush_all();
+    }
+
+    /// Reads what connection `i` has and splits off its complete frames;
+    /// a connection that sends a bad frame is marked dead.
+    fn read_frames(&mut self, i: usize) -> Vec<Frame> {
+        let before = self.conns[i].inbuf.len();
+        self.conns[i].read();
+        let read = self.conns[i].inbuf.len() - before;
+        self.traffic.bytes(Direction::In, read);
+        let frames = take_frames(&mut self.conns[i].inbuf).unwrap_or_else(|_| {
+            self.conns[i].dead = true;
+            Vec::new()
+        });
+        for frame in &frames {
+            self.traffic.frame(Direction::In, frame.kind());
+        }
+        frames
+    }
+
+    /// Writes what every connection has queued.
+    fn flush_all(&mut self) {
+        for conn in &mut self.conns {
+            let before = conn.outbuf.len();
+            conn.flush();
+            self.traffic
+                .bytes(Direction::Out, before - conn.outbuf.len());
+        }
     }
 
     fn send_to(&mut self, peer: &[u8; 32], frame: &Frame) {
@@ -332,16 +455,7 @@ impl Transport {
         self.accept();
         self.redial(now_ms);
         for i in 0..self.conns.len() {
-            let before = self.conns[i].inbuf.len();
-            self.conns[i].read();
-            let read = self.conns[i].inbuf.len() - before;
-            self.traffic.bytes(Direction::In, read);
-            let frames = take_frames(&mut self.conns[i].inbuf).unwrap_or_else(|_| {
-                self.conns[i].dead = true;
-                Vec::new()
-            });
-            for frame in frames {
-                self.traffic.frame(Direction::In, frame.kind());
+            for frame in self.read_frames(i) {
                 self.handle(i, frame, node)?;
             }
         }
@@ -389,12 +503,7 @@ impl Transport {
         for raw in node.take_tx_gossip() {
             self.broadcast(&Frame::Tx { raw });
         }
-        for conn in &mut self.conns {
-            let before = conn.outbuf.len();
-            conn.flush();
-            self.traffic
-                .bytes(Direction::Out, before - conn.outbuf.len());
-        }
+        self.flush_all();
         self.conns.retain(|c| !c.dead);
         node.telemetry
             .p2p(self.connected().len(), &mut self.traffic);

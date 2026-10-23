@@ -417,7 +417,8 @@ fn a_snapshot_exports_verifies_round_trips_and_refuses_forgeries() {
     }
     drop(node);
     // Exports need the driver's tables and the store's history: a node
-    // whose window no longer reaches the height has nothing to export.
+    // whose window no longer reaches the height has nothing to export, and
+    // no kept trie for a certificate's anchor, which is looked for first.
     let validators = keys(1);
     let short = scratch("export-short");
     let config = NodeConfig {
@@ -438,7 +439,11 @@ fn a_snapshot_exports_verifies_round_trips_and_refuses_forgeries() {
     let err = short
         .export_snapshot(None, &dir.join("short.snap"))
         .unwrap_err();
-    assert!(err.to_string().contains("no longer keeps"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("no certified proposal anchors a kept height"),
+        "{err}"
+    );
 }
 
 /// The finalized heights the driver's tables of `node` hold.

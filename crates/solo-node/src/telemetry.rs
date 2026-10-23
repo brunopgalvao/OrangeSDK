@@ -60,6 +60,8 @@ impl Frame {
             Frame::Tx { .. } => "tx",
             Frame::Request { .. } => "request",
             Frame::Response { .. } => "response",
+            Frame::SyncRequest { .. } => "sync_request",
+            Frame::SyncResponse { .. } => "sync_response",
         }
     }
 }

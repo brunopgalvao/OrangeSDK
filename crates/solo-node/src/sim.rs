@@ -13,6 +13,7 @@ use solo_abi::types::{Genesis, Input};
 use crate::extension::{Outbound, validator_id};
 use crate::node::{Node, NodeConfig, NodeError, SubmitError};
 use crate::state::StoreConfig;
+use crate::statesync::{StateSync, SyncEvent};
 
 /// What travels between two nodes.
 #[derive(Debug, Clone)]
@@ -31,7 +32,24 @@ enum Wire {
         request_id: u64,
         payload: Vec<u8>,
     },
+    /// A state-sync request or answer (spec 09 §6): the host's, never the
+    /// driver's.
+    SyncRequest {
+        from: usize,
+        request_id: u64,
+        payload: Vec<u8>,
+    },
+    SyncResponse {
+        from: usize,
+        request_id: u64,
+        payload: Vec<u8>,
+    },
 }
+
+/// What may happen to a state-sync answer on its way: given the index of
+/// the node that answered, it may change the payload, and drops the answer
+/// by returning `false`. Tests make lying and silent peers with it.
+pub type SyncFilter = Box<dyn FnMut(usize, &mut Vec<u8>) -> bool>;
 
 /// A message in flight.
 #[derive(Debug, Clone)]
@@ -61,6 +79,11 @@ pub struct Sim {
     /// Requests a node is serving: `(node, local id)` to `(requester, its id)`.
     serving: BTreeMap<(usize, u64), (usize, u64)>,
     next_local_id: u64,
+    /// The node joining from its peers' snapshots, and its state sync.
+    joining: Option<(usize, StateSync)>,
+    /// What the state sync reported, in order.
+    pub sync_events: Vec<SyncEvent>,
+    sync_filter: Option<SyncFilter>,
 }
 
 impl Sim {
@@ -139,6 +162,9 @@ impl Sim {
             delivered: 0,
             serving: BTreeMap::new(),
             next_local_id: 0,
+            joining: None,
+            sync_events: Vec::new(),
+            sync_filter: None,
         };
         sim.collect();
         Ok(sim)
@@ -220,6 +246,94 @@ impl Sim {
         self.nodes[index] = node;
         self.alive[index] = true;
         self.collect();
+        Ok(())
+    }
+
+    /// Replaces node `index` by one that joins from its peers' snapshots
+    /// (spec 22 §7.4) in a fresh disk store at `dir`, with the same key and
+    /// nothing else of what the old node had: it takes no part in the
+    /// network until its state sync has fetched, verified and imported a
+    /// snapshot, then starts and syncs blocks as any node does. The sync
+    /// works in `dir/statesync`. [`Sim::advance`] reports a sync that fails.
+    ///
+    /// # Errors
+    /// Whatever opening the node or its sync directory reports.
+    pub fn join_from_peers(
+        &mut self,
+        index: usize,
+        kernel: &[u8],
+        genesis: &Genesis,
+        dir: std::path::PathBuf,
+        trust: solo_store::Trust,
+    ) -> Result<(), NodeError> {
+        let old = &self.nodes[index];
+        let config = NodeConfig {
+            now_ms: self.now_ms,
+            key: old.services_key(),
+            kernel_gas: old.kernel_gas,
+            query_gas: old.query_gas,
+            state_history: old.state_history,
+            history_keys_per_block: old.history_keys_per_block,
+            store: StoreConfig::Disk(dir.clone()),
+            ..NodeConfig::default()
+        };
+        self.stores[index] = StoreConfig::Disk(dir);
+        self.nodes[index].release_store();
+        let mut node = Node::open(kernel, genesis, config)?;
+        let sync = StateSync::new(node.sync_config(trust)?)
+            .map_err(|e| NodeError::Store(e.to_string()))?;
+        self.nodes[index] = node;
+        self.alive[index] = false;
+        self.joining = Some((index, sync));
+        Ok(())
+    }
+
+    /// The state sync of the node joining from its peers, while it runs.
+    #[must_use]
+    pub fn joining(&self) -> Option<&StateSync> {
+        self.joining.as_ref().map(|(_, sync)| sync)
+    }
+
+    /// Passes every state-sync answer through `filter` from now on.
+    pub fn filter_sync(&mut self, filter: SyncFilter) {
+        self.sync_filter = Some(filter);
+    }
+
+    /// Moves the joining node's state sync on: hands it the peers that are
+    /// up and queues its requests; once it holds a snapshot, imports it and
+    /// starts the node.
+    fn step_sync(&mut self) -> Result<(), NodeError> {
+        let Some((index, sync)) = self.joining.as_mut() else {
+            return Ok(());
+        };
+        let index = *index;
+        let connected: Vec<[u8; 32]> = (0..self.nodes.len())
+            .filter(|i| *i != index && self.alive[*i])
+            .map(|i| self.ids[i])
+            .collect();
+        let requests = sync.poll(self.now_ms, &connected);
+        self.sync_events.extend(sync.take_events());
+        if let Some(why) = sync.failed() {
+            return Err(NodeError::Store(format!("state sync: {why}")));
+        }
+        if let Some(snapshot) = sync.done().cloned() {
+            self.joining = None;
+            crate::statesync::finish(&mut self.nodes[index], &snapshot)?;
+            self.alive[index] = true;
+            self.collect();
+            return Ok(());
+        }
+        for (peer, request_id, payload) in requests {
+            let to = self.index_of(&peer).expect("a connected node");
+            self.enqueue(
+                to,
+                Wire::SyncRequest {
+                    from: index,
+                    request_id,
+                    payload,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -364,6 +478,35 @@ impl Sim {
 
     fn deliver(&mut self, to: usize, wire: Wire) -> Result<(), NodeError> {
         let input = match wire {
+            Wire::SyncRequest {
+                from,
+                request_id,
+                payload,
+            } => {
+                let mut answer = self.nodes[to].answer_sync(&payload);
+                if self.sync_filter.as_mut().is_none_or(|f| f(to, &mut answer)) {
+                    self.enqueue(
+                        from,
+                        Wire::SyncResponse {
+                            from: to,
+                            request_id,
+                            payload: answer,
+                        },
+                    );
+                }
+                return Ok(());
+            }
+            Wire::SyncResponse {
+                from,
+                request_id,
+                payload,
+            } => {
+                let (now, peer) = (self.now_ms, self.ids[from]);
+                if let Some((_, sync)) = self.joining.as_mut() {
+                    sync.on_response(peer, request_id, &payload, now);
+                }
+                return Ok(());
+            }
             Wire::Message {
                 from,
                 topic,
@@ -421,12 +564,16 @@ impl Sim {
                 due
             };
             for m in due {
-                if self.alive[m.to] {
+                let to_joining = self.joining.as_ref().is_some_and(|(i, _)| *i == m.to);
+                if to_joining && matches!(m.wire, Wire::SyncResponse { .. }) {
+                    self.deliver(m.to, m.wire)?;
+                } else if self.alive[m.to] {
                     self.nodes[m.to].tick(self.now_ms)?;
                     self.deliver(m.to, m.wire)?;
                     self.delivered += 1;
                 }
             }
+            self.step_sync()?;
             let mut rest = VecDeque::new();
             for (due_ms, to, raw) in self.gossip.drain(..) {
                 if due_ms <= self.now_ms {

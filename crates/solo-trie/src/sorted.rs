@@ -165,13 +165,25 @@ impl SortedRoot {
     }
 
     /// The root of everything pushed, completing the nodes still pending.
-    pub fn finish(mut self, on_node: &mut dyn FnMut(&Hash, &[u8; NODE_LEN])) -> Hash {
+    pub fn finish(self, on_node: &mut dyn FnMut(&Hash, &[u8; NODE_LEN])) -> Hash {
+        self.finish_at(0, on_node)
+    }
+
+    /// The subtree hash `T(S, depth)` (spec 10 §4) of everything pushed,
+    /// whose paths must all share their first `depth` bits: the node at
+    /// that depth above them, as a slice of a snapshot's manifest names it
+    /// (spec 22 §7.4). At depth 0 it is the root.
+    pub fn finish_at(
+        mut self,
+        depth: usize,
+        on_node: &mut dyn FnMut(&Hash, &[u8; NODE_LEN]),
+    ) -> Hash {
         while self.stack.len() >= 2 {
             self.merge(on_node);
         }
         match self.stack.pop() {
             None => EMPTY,
-            Some(top) => self.lift(&top, 0, on_node),
+            Some(top) => self.lift(&top, depth, on_node),
         }
     }
 }
@@ -251,6 +263,36 @@ mod tests {
             trie.insert_hashed(*p, *v);
         }
         assert_eq!(streamed(&by_path).0, trie.root());
+        // Subtrees at a depth their paths all share: the slices of a
+        // snapshot's manifest (spec 22 §7.4).
+        let mut none = |_: &Hash, _: &[u8; NODE_LEN]| {};
+        let pair = crate::branch_hash(
+            keccak256,
+            &crate::leaf_hash(keccak256, &b, &[1; 32]),
+            &crate::leaf_hash(keccak256, &a, &[2; 32]),
+        );
+        let subtree = |entries: &[(Hash, Hash)], depth: usize| {
+            let mut root = SortedRoot::new(keccak256);
+            for (p, v) in entries {
+                root.push(*p, *v, &mut |_: &Hash, _: &[u8; NODE_LEN]| {})
+                    .unwrap();
+            }
+            root.finish_at(depth, &mut |_: &Hash, _: &[u8; NODE_LEN]| {})
+        };
+        assert_eq!(subtree(&by_path[..2], 255), pair);
+        let lifted = (201..255).fold(pair, |h, _| crate::branch_hash(keccak256, &h, &EMPTY));
+        assert_eq!(subtree(&by_path[..2], 201), lifted);
+        let three = crate::branch_hash(
+            keccak256,
+            &lifted,
+            &crate::leaf_hash(keccak256, &c, &[3; 32]),
+        );
+        assert_eq!(subtree(&by_path[..3], 200), three);
+        assert_eq!(
+            subtree(&by_path[2..3], 200),
+            crate::leaf_hash(keccak256, &c, &[3; 32])
+        );
+        assert_eq!(SortedRoot::new(keccak256).finish_at(9, &mut none), EMPTY);
         assert_eq!(common_bits(&a, &a), 256);
         assert_eq!(common_bits(&a, &b), 255);
     }
