@@ -194,17 +194,10 @@ pub fn sync_from_peers(
     let dir = config.dir.clone();
     let mut sync = StateSync::new(config).map_err(|e| format!("{}: {e}", dir.display()))?;
     eprintln!("state sync: asking peers for snapshots");
-    let mut reported = 0;
     let snapshot = loop {
         transport.poll_sync(&mut sync, now());
         for event in sync.take_events() {
             eprintln!("state sync: {}", describe_event(&event));
-        }
-        if let Some((done, total)) = sync.progress()
-            && done * 10 / total.max(1) > reported
-        {
-            reported = done * 10 / total.max(1);
-            eprintln!("state sync: {done} of {total} slices verified");
         }
         if let Some(why) = sync.failed() {
             return Err(format!("state sync: {why}"));

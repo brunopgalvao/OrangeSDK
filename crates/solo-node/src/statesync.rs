@@ -1169,20 +1169,10 @@ impl StateSync {
             .active
             .get_mut(&slice)
             .expect("a slice asked for is active");
-        match Self::ingest(active, slice, depth, &summary, entries, more) {
+        match Self::ingest(active, &parts, slice, depth, &summary, entries, more) {
             Ok(None) => active.waiting = false,
             Ok(Some(count)) => {
-                let mut active = f.active.remove(&slice).expect("active");
-                let kept = active.file.flush().and_then(|()| {
-                    fs::rename(
-                        parts.join(format!("{slice}.tmp")),
-                        parts.join(format!("{slice}-{count}")),
-                    )
-                });
-                if let Err(e) = kept {
-                    self.phase = Phase::Failed(e.to_string());
-                    return;
-                }
+                let active = f.active.remove(&slice).expect("active");
                 f.done.insert(slice, count);
                 if slice == f.genesis_slice {
                     self.check_genesis(active.genesis.as_ref());
@@ -1206,6 +1196,7 @@ impl StateSync {
     /// is complete and verified.
     fn ingest(
         active: &mut Active,
+        parts: &Path,
         slice: u32,
         depth: u8,
         summary: &Summary,
@@ -1245,7 +1236,12 @@ impl StateSync {
         if root.finish_at(usize::from(depth), &mut none) != summary_hash(summary) {
             return Err(Fault::Peer("a slice that does not hash to its summary"));
         }
-        Ok(Some(active.count))
+        // Verified: the part file is flushed and renamed into place.
+        active.file.flush()?;
+        let count = active.count;
+        let tmp = parts.join(format!("{slice}.tmp"));
+        fs::rename(tmp, parts.join(format!("{slice}-{count}")))?;
+        Ok(Some(count))
     }
 
     /// Puts the snapshot file together once every slice is verified.
@@ -1468,9 +1464,7 @@ mod tests {
             manifest,
             BTreeMap::new(),
         );
-        let Phase::Fetch(f) = &mut s.phase else {
-            panic!("fetching")
-        };
+        let f = s.fetch_mut().unwrap();
         f.todo.clear();
         f.active.insert(
             0,
@@ -1490,5 +1484,6 @@ mod tests {
         };
         s.on_slice([1; 32], 0, &[entry], true);
         assert_eq!(s.failed(), Some("the disk is full"));
+        assert!(Full.flush().is_ok());
     }
 }

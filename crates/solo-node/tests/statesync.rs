@@ -113,9 +113,26 @@ fn peer(i: u8) -> [u8; 32] {
 /// `now`, the peers `connected(round)` names connected, until it is done,
 /// failed, or `rounds` passed. Returns the time reached and the requests
 /// sent.
+/// What answers a peer's requests: a node, or a server of its own.
+trait Answers {
+    fn answer(&self, payload: &[u8]) -> Vec<u8>;
+}
+
+impl Answers for Node {
+    fn answer(&self, payload: &[u8]) -> Vec<u8> {
+        self.answer_sync(payload)
+    }
+}
+
+impl Answers for SnapshotServer {
+    fn answer(&self, payload: &[u8]) -> Vec<u8> {
+        SnapshotServer::answer(self, payload)
+    }
+}
+
 fn drive(
     sync: &mut StateSync,
-    node: &Node,
+    node: &dyn Answers,
     peers: &mut [Behaviour],
     mut now: u64,
     rounds: usize,
@@ -134,7 +151,7 @@ fn drive(
             sent += 1;
             let request = SyncRequest::from_bytes(&payload).unwrap();
             let index = usize::from(to[0]);
-            if let Some(answer) = peers[index](&request, node.answer_sync(&payload)) {
+            if let Some(answer) = peers[index](&request, node.answer(&payload)) {
                 sync.on_response(to, id, &answer, now);
             }
         }
@@ -407,6 +424,18 @@ fn a_node_syncs_from_its_peers_and_starts() {
     assert_eq!(snapshot.header.entries, offer.entries);
     // Polling a finished sync asks nothing.
     assert!(sync.poll(1_000_000, &[peer(0)]).is_empty());
+    // Slices of one entry or none, as a server with tiny slices makes
+    // them, are summarised as leaves and empties and verified as such.
+    let tiny = ServeLimits {
+        slice_entries: 1,
+        chunk_bytes: 64,
+    };
+    let leafy = SnapshotServer::open(&source.join("snapshots"), tiny).unwrap();
+    let other = scratch("honest-leaves");
+    let (_, mut leaves) = joiner(&other, &genesis);
+    let mut peers = [honest()];
+    drive(&mut leaves, &leafy, &mut peers, 0, 5_000, &all(1));
+    assert_eq!(leaves.done().unwrap().header.state_root, offer.state_root);
     finish(&mut fresh, &snapshot).unwrap();
     assert_eq!(fresh.block_number().unwrap(), offer.height);
     assert_eq!(fresh.state_root(), offer.state_root);
@@ -646,6 +675,26 @@ fn a_peer_that_stops_serving_the_target_hands_it_to_others() {
     let later = |round: usize| if round < 300 { vec![0] } else { vec![0, 1] };
     drive(&mut sync, &node, &mut peers, 0, 3_000, &later);
     assert!(sync.done().is_some(), "{:?}", sync.failed());
+    // One that stops serving pages halfway, leaving one unanswered, strands
+    // the target with slices in flight: they are dropped, and the sync
+    // resumes once another peer turns up.
+    let target = scratch("unavailable-halfway");
+    let (_, mut sync) = joiner(&target, &genesis);
+    let mut pages = 0;
+    let halfway: Behaviour = Box::new(move |r, answer| {
+        if !matches!(r, SyncRequest::Slice { .. }) {
+            return Some(answer);
+        }
+        pages += 1;
+        match pages {
+            ..=4 => Some(answer),
+            n if n % 2 == 1 => None,
+            _ => Some(SyncResponse::Unavailable.to_bytes()),
+        }
+    });
+    let mut peers = [halfway, honest()];
+    drive(&mut sync, &node, &mut peers, 0, 3_000, &later);
+    assert!(sync.done().is_some(), "{:?}", sync.failed());
 }
 
 #[test]
@@ -796,6 +845,23 @@ fn a_sync_directory_that_cannot_be_used_is_reported() {
         drive(&mut sync, &node, &mut peers, round * 10, 1, &all(1));
     }
     std::fs::remove_dir_all(config.dir.join("parts")).unwrap();
+    drive(&mut sync, &node, &mut peers, 100_000, 2_000, &all(1));
+    assert!(sync.failed().is_some());
+    // So do verified slices that vanish before they are put together.
+    config.dir = target.join("vanished");
+    let mut sync = StateSync::new(config.clone()).unwrap();
+    for round in 0..2_000u64 {
+        if sync.progress().is_some_and(|(done, _)| done >= 1) {
+            break;
+        }
+        drive(&mut sync, &node, &mut peers, round * 10, 1, &all(1));
+    }
+    for part in std::fs::read_dir(config.dir.join("parts")).unwrap() {
+        let path = part.unwrap().path();
+        if path.extension().is_none() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
     drive(&mut sync, &node, &mut peers, 100_000, 2_000, &all(1));
     assert!(sync.failed().is_some());
     // So does a directory where the manifest cannot be written.
