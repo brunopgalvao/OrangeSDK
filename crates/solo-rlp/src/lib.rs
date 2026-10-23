@@ -29,7 +29,16 @@ pub enum Error {
     Trailing,
     /// The item was not of the expected kind, or an integer had leading zeros or was too wide.
     Shape,
+    /// Lists nested deeper than [`MAX_DEPTH`].
+    TooDeep,
 }
+
+/// The deepest nesting of lists [`decode`] accepts. Every structure Solo
+/// reads from RLP is at most four lists deep (a transaction's access list
+/// entry's storage keys, a receipt's log's topics); a limit keeps the
+/// recursive decoder's stack bounded, where a 30 KB string of nested lists
+/// would otherwise overflow a host thread's stack and abort the process.
+pub const MAX_DEPTH: usize = 16;
 
 fn be_len(bytes: &[u8]) -> Result<usize, Error> {
     if bytes.is_empty() || bytes.len() > 8 || bytes[0] == 0 {
@@ -50,6 +59,11 @@ fn be_len(bytes: &[u8]) -> Result<usize, Error> {
 /// # Errors
 /// See [`Error`].
 pub fn decode_prefix(input: &[u8]) -> Result<(Item<'_>, usize), Error> {
+    decode_nested(input, 0)
+}
+
+/// [`decode_prefix`] for an item inside `depth` lists.
+fn decode_nested(input: &[u8], depth: usize) -> Result<(Item<'_>, usize), Error> {
     let first = *input.first().ok_or(Error::Truncated)?;
     let (payload_start, payload_len, is_list) = match first {
         0x00..=0x7F => return Ok((Item::Bytes(&input[..1]), 1)),
@@ -71,10 +85,13 @@ pub fn decode_prefix(input: &[u8]) -> Result<(Item<'_>, usize), Error> {
         .ok_or(Error::Truncated)?;
     let payload = input.get(payload_start..end).ok_or(Error::Truncated)?;
     if is_list {
+        if depth == MAX_DEPTH {
+            return Err(Error::TooDeep);
+        }
         let mut items = Vec::new();
         let mut pos = 0;
         while pos < payload.len() {
-            let (item, used) = decode_prefix(&payload[pos..])?;
+            let (item, used) = decode_nested(&payload[pos..], depth + 1)?;
             items.push(item);
             pos += used;
         }
@@ -328,6 +345,25 @@ mod tests {
         assert_eq!(decode(&[0xF8]), Err(Error::Truncated));
         assert!(alloc::format!("{:?}", Error::Shape).contains("Shape"));
         assert!(alloc::format!("{:?}", Item::Bytes(&[1])).contains("Bytes"));
+    }
+
+    fn nested(depth: usize) -> Vec<u8> {
+        let mut v = Vec::new();
+        for _ in 0..depth {
+            let mut out = Vec::new();
+            encode_list(&v, &mut out);
+            v = out;
+        }
+        v
+    }
+
+    #[test]
+    fn nesting_is_bounded() {
+        assert!(decode(&nested(MAX_DEPTH)).is_ok());
+        assert_eq!(decode(&nested(MAX_DEPTH + 1)), Err(Error::TooDeep));
+        // 40 000 lists in 120 KB, under the mempool's 128 KiB transaction
+        // limit, used to overflow the stack and abort the process.
+        assert_eq!(decode(&nested(40_000)), Err(Error::TooDeep));
     }
 
     #[test]
