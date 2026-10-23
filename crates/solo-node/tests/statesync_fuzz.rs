@@ -2,8 +2,8 @@
 //! honest peer, peers that corrupt answers byte by byte, rewrite manifests
 //! and pages, answer the wrong request, stay silent or come and go. The
 //! joining node never panics, never bans the honest peer, and always ends
-//! with the snapshot the honest peer serves, verified. See `solo-fuzz` for
-//! the long mode.
+//! with the snapshot the honest peer serves, verified. And a snapshot file
+//! changed anywhere never verifies. See `solo-fuzz` for the long mode.
 
 mod support;
 
@@ -178,9 +178,34 @@ fn case(node: &Node, r: &mut Rng) {
     assert_eq!(snapshot.header.entries, offer.entries);
 }
 
+/// A snapshot file changed anywhere never opens and verifies as anything
+/// but itself (spec 22 §7.2).
+fn tampered_file(original: &[u8], dir: &Path, r: &mut Rng) {
+    let path = dir.join("tampered.snap");
+    let bytes = r.mutate(original);
+    std::fs::write(&path, &bytes).unwrap();
+    let Ok(snapshot) = solo_store::Snapshot::open(&path) else {
+        return;
+    };
+    let trust = Trust::Genesis(Sim::validator_set(&keys(1)));
+    if snapshot.verify(support::CHAIN_ID, &trust).is_ok() {
+        assert_eq!(bytes, original, "a changed snapshot file verified");
+    }
+}
+
 #[test]
 fn adversarial_peers_never_stop_a_sync_with_an_honest_one() {
     let source = Scratch::new("node-statesync-fuzz", "source");
     let node = server(&source);
     solo_fuzz::run("statesync-liars", 3, |r| case(&node, r));
+    let files = Scratch::dir("node-statesync-fuzz", "files");
+    let exported = node
+        .export_snapshot(None, &files.join("good.snap"))
+        .unwrap();
+    let trust = Trust::Genesis(Sim::validator_set(&keys(1)));
+    exported.verify(support::CHAIN_ID, &trust).unwrap();
+    let original = std::fs::read(files.join("good.snap")).unwrap();
+    solo_fuzz::run("snapshot-files", 150, |r| {
+        tampered_file(&original, &files, r)
+    });
 }
