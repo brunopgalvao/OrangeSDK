@@ -427,3 +427,24 @@ fn a_synced_observer_and_the_live_validators_commit_to_the_same_state() {
     assert_eq!(root, rebuilt(&sim.nodes[4]));
     assert_eq!(sim.nodes[4].account(&to).unwrap().balance, 2 * ETHER);
 }
+
+/// The genesis state's trie (spec 20 §3.4, spec 06 §3): the one behind the
+/// root the genesis header carries, which leaves out what the kernel wrote
+/// after it asked for that root; under a kernel that asks for none, the
+/// state's own.
+#[test]
+fn the_genesis_seals_the_trie_behind_its_header_root() {
+    use solo_host::Storage;
+    let mut bare = solo_node::ChainState::default();
+    bare.set(b"acct/a", b"1");
+    bare.seal_genesis(None).unwrap();
+    let root = bare.genesis_root().unwrap();
+    let trie = bare.trie_at(0).unwrap();
+    assert_eq!(trie.root(), root);
+    let mut headed = solo_node::ChainState::default();
+    headed.set(b"acct/a", b"1");
+    headed.set(b"block/0", b"header");
+    headed.seal_genesis(Some(trie)).unwrap();
+    assert_eq!(headed.genesis_root(), Some(root));
+    assert_eq!(headed.trie_at(0).unwrap().root(), root);
+}
