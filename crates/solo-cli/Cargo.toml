@@ -25,6 +25,7 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 getrandom = "0.3"
 
 [dev-dependencies]
+solo-scratch = { path = "../solo-scratch" }
 solo-rpc = { path = "../solo-rpc" }
 
 [lints]

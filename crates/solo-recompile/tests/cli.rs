@@ -6,10 +6,9 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_solo-recompile"))
 }
 
+/// A path for `name`, removed when the test ends.
 fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("solo-recompile-cli-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join(name)
+    solo_scratch::Scratch::new("recompile-cli", name).keep()
 }
 
 #[test]

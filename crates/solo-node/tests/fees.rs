@@ -809,10 +809,8 @@ fn a_genesis_with_unworkable_fee_parameters_never_starts() {
 
 // ---- The fee market on disk: restarts and snapshots (spec 22) ----
 
-fn store_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("solo-node-fees-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+fn store_dir(name: &str) -> solo_scratch::Scratch {
+    solo_scratch::Scratch::new("node-fees", name)
 }
 
 fn decoded<T: Decode>(r: &solo_abi::types::QueryResult) -> T {
@@ -852,7 +850,7 @@ fn the_fee_market_survives_a_restart_and_travels_in_a_snapshot() {
     let config = NodeConfig {
         now_ms: START_MS,
         key: Some(key.clone()),
-        store: StoreConfig::Disk(dir.clone()),
+        store: StoreConfig::Disk(dir.to_path_buf()),
         ..NodeConfig::default()
     };
     let mut chain = Chain::open(&genesis, config.clone(), None);
@@ -904,10 +902,8 @@ fn the_fee_market_survives_a_restart_and_travels_in_a_snapshot() {
     // A snapshot of the latest epoch carries the market as it stood there:
     // the epoch's end has just paid the pool out to the validator and its
     // delegator, so the balances it carries hold the rewards.
-    let snapshot = again
-        .node
-        .export_snapshot(None, &store_dir("market.snap"))
-        .unwrap();
+    let snap_file = store_dir("market.snap");
+    let snapshot = again.node.export_snapshot(None, &snap_file).unwrap();
     let height = snapshot.header.height;
     let expected: FeeStatus = decoded(
         &again
@@ -943,13 +939,14 @@ fn the_fee_market_survives_a_restart_and_travels_in_a_snapshot() {
         .node
         .account_at(&STAKING_ADDRESS, Some(height))
         .unwrap();
+    let fresh_dir = store_dir("snapshot");
     let mut fresh = Node::open(
         kernel_module(),
         &genesis,
         NodeConfig {
             now_ms: again.now_ms,
             key: Some(key.clone()),
-            store: StoreConfig::Disk(store_dir("snapshot")),
+            store: StoreConfig::Disk(fresh_dir.to_path_buf()),
             ..NodeConfig::default()
         },
     )
@@ -997,10 +994,11 @@ fn a_restarted_validator_signals_at_the_base_fee() {
     let mut params = GenesisParams::from_bytes(&genesis.params).unwrap();
     params.upgrades.epoch_blocks = 3;
     genesis.params = params.to_bytes();
+    let dir = store_dir("signal");
     let config = NodeConfig {
         now_ms: START_MS,
         key: Some(key.clone()),
-        store: StoreConfig::Disk(store_dir("signal")),
+        store: StoreConfig::Disk(dir.to_path_buf()),
         ..NodeConfig::default()
     };
     let signal_epoch = |node: &mut Node| {

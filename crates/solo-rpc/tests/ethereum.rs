@@ -899,14 +899,13 @@ fn answers_at_every_height(rpc: &mut Rpc, alice: &Wallet, counter: &[u8; 20]) ->
 
 #[test]
 fn a_node_restarted_over_its_chain_store_answers_every_method_as_before() {
-    let dir = std::env::temp_dir().join(format!("solo-rpc-restart-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = solo_scratch::Scratch::new("rpc-restart", "store");
     let alice = Wallet::new(1);
     let config = |persisted| solo_node::NodeConfig {
         now_ms: 1_000,
         key: Some(common::node_key()),
         persisted,
-        store: solo_node::StoreConfig::Disk(dir.clone()),
+        store: solo_node::StoreConfig::Disk(dir.to_path_buf()),
         ..solo_node::NodeConfig::default()
     };
     let genesis = common::genesis(&alice);

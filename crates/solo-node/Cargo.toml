@@ -27,6 +27,7 @@ getrandom = "0.3"
 fault-injection = ["solo-store/fault-injection"]
 
 [dev-dependencies]
+solo-scratch = { path = "../solo-scratch" }
 solo-node = { path = ".", features = ["fault-injection"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 solo-recompile = { path = "../solo-recompile" }

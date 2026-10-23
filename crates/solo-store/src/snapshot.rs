@@ -1063,10 +1063,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("solo-snapshot-unit-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+        solo_scratch::Scratch::new("snapshot-unit", name).keep()
     }
 
     /// A proposal at `height` anchoring `anchor` with `root`.

@@ -19,6 +19,7 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 serde_json = "1"
 
 [dev-dependencies]
+solo-scratch = { path = "../solo-scratch" }
 alloy-consensus = { version = "1.8.3", default-features = false, features = ["k256"] }
 alloy-eips = { version = "1.8.3", default-features = false }
 alloy-primitives = "1.7.3"

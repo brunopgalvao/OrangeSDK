@@ -251,10 +251,8 @@ pub fn prune_tables(tables: &mut Tables, cutoff: u64) -> usize {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("solo-store-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        dir
+    fn scratch(name: &str) -> solo_scratch::Scratch {
+        solo_scratch::Scratch::new("store", name)
     }
 
     fn tables(pairs: &[(&[u8], &[u8])]) -> Tables {
@@ -326,7 +324,7 @@ mod tests {
     fn a_fresh_store_is_empty_and_a_synced_one_comes_back() {
         let dir = scratch("roundtrip");
         let mut store = DriverStore::open(&dir).unwrap();
-        assert_eq!(store.dir(), dir.as_path());
+        assert_eq!(store.dir(), dir.path());
         assert_eq!(store.take_loaded(), (Tables::new(), None));
         assert_eq!(store.take_loaded(), (Tables::new(), None));
         assert!(!store.is_dirty(None));

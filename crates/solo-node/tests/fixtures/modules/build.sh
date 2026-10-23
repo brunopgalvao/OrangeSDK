@@ -8,8 +8,8 @@ cd "$(dirname "$0")"
 SOLC=${1:?usage: build.sh <path to solc 0.8.28>}
 "$SOLC" --version | grep -q "0\.8\.28" || { echo "need solc 0.8.28" >&2; exit 1; }
 OUT=$(mktemp -d)
+trap 'rm -rf "$OUT"' EXIT
 "$SOLC" --bin --bin-runtime --metadata-hash none -o "$OUT" --overwrite Caller.sol
 tr -d '\n' < "$OUT/Caller.bin" > Caller.bin
 tr -d '\n' < "$OUT/Caller.bin-runtime" > Caller.runtime
-rm -r "$OUT"
 echo "fixtures refreshed"

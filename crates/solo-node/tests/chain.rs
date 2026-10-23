@@ -663,8 +663,7 @@ fn effects_injected_by_hand() {
 
 #[test]
 fn a_store_keeps_the_driver_state_across_a_restart() {
-    let dir = std::env::temp_dir().join(format!("solo-chain-store-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = solo_scratch::Scratch::new("chain-store", "driver");
     let alice = Wallet::new(1);
     let bob = Wallet::new(2);
     let mut store = DriverStore::open(&dir).unwrap();
@@ -678,7 +677,7 @@ fn a_store_keeps_the_driver_state_across_a_restart() {
     };
     let mut node = Node::open(&kernel_module(), &genesis(&alice), config).unwrap();
     node.attach_store(store);
-    assert_eq!(node.store().map(DriverStore::dir), Some(dir.as_path()));
+    assert_eq!(node.store().map(DriverStore::dir), Some(dir.path()));
     node.start(state).unwrap();
     node.submit(&alice.transfer(0, bob.address, ETHER, 1, 21_000, Some(CHAIN_ID), &[]))
         .unwrap();

@@ -9,12 +9,13 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use solo_abi::chain::{Account, BlockHeader, UpgradeParams};
 use solo_host::Storage;
 use solo_host::hash::keccak256;
 use solo_node::{Node, NodeConfig, NodeError, Sim, StoreConfig};
+use solo_scratch::Scratch;
 use solo_store::Fault;
 use solo_upgrade::Action;
 use support::{
@@ -22,10 +23,8 @@ use support::{
     stage_actions, tiny_kernel, v1, v2,
 };
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("solo-node-store-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+fn scratch(name: &str) -> Scratch {
+    Scratch::new("node-store", name)
 }
 
 /// A single validator's configuration over `dir`, keeping four heights.
@@ -364,7 +363,7 @@ fn a_validator_restarts_from_its_store_while_the_others_keep_finalizing() {
         StoreConfig::Memory,
         StoreConfig::Memory,
         StoreConfig::Memory,
-        StoreConfig::Disk(dir),
+        StoreConfig::Disk(dir.to_path_buf()),
     ];
     let mut sim = Sim::with_stores(v1(), &genesis, &validators, 0, &template, 20, &stores).unwrap();
     let bob = Wallet::new(0x45);

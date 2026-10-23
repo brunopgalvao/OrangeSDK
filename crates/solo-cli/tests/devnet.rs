@@ -20,6 +20,7 @@ use solo_cli::devnet::{Conditions, Devnet, FUNDED, LIFELINE, MANIFEST};
 use solo_cli::upgrade::PROPOSE_GAS;
 use solo_cli::{USAGE, parse_genesis, parse_key, run};
 use solo_rpc::methods::data;
+use solo_scratch::Scratch;
 use solo_upgrade::Action;
 
 const SOLO: &str = env!("CARGO_BIN_EXE_solo");
@@ -59,10 +60,10 @@ const TOLERANT: [&str; 6] = [
     "0",
 ];
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("solo-devnet-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join(name)
+/// A path for `name`, removed when the guard drops: bound first in a test,
+/// it drops after the guards that stop the test's nodes.
+fn scratch(name: &str) -> Scratch {
+    Scratch::new("devnet", name)
 }
 
 /// A command whose nodes, however it starts them, stop when this test
@@ -963,7 +964,7 @@ fn manifest_and_argument_errors() {
 fn up_stops_only_what_it_started_and_stop_falls_back_on_the_pid_file() {
     let dir = scratch("orphans");
     init(&dir, "2", &[]);
-    let _stops = Stops(dir.clone());
+    let _stops = Stops(dir.to_path_buf());
     let d = str_of(&dir);
     let devnet = Devnet::load(&dir).unwrap();
     // Node 1 runs already: `up` refuses, kills the node 0 it had started
@@ -1012,7 +1013,7 @@ fn up_stops_only_what_it_started_and_stop_falls_back_on_the_pid_file() {
 fn nodes_stop_when_their_lifeline_goes() {
     let dir = scratch("lifeline");
     init(&dir, "1", &[]);
-    let _stops = Stops(dir.clone());
+    let _stops = Stops(dir.to_path_buf());
     let devnet = Devnet::load(&dir).unwrap();
     let rpc = devnet.nodes[0].rpc.clone();
     // `up` runs with a lifeline of its own, a process this test ends.
@@ -1119,7 +1120,7 @@ impl Drop for Up {
 fn a_single_validator_devnet_runs_restarts_and_upgrades() {
     let dir = scratch("single");
     init(&dir, "1", &["--upgrade-delay", "1"]);
-    let _stops = Stops(dir.clone());
+    let _stops = Stops(dir.to_path_buf());
     let d = str_of(&dir);
     let devnet = Devnet::load(&dir).unwrap();
     let rpc = devnet.nodes[0].rpc.clone();
@@ -1398,10 +1399,10 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
 fn the_rehearsal_passes_on_a_four_validator_devnet() {
     let dir = scratch("rehearsal");
     init(&dir, "4", &[]);
-    let _stops = Stops(dir.clone());
+    let _stops = Stops(dir.to_path_buf());
     let up = Up::start(&dir);
     let out = command(REHEARSAL)
-        .arg(&dir)
+        .arg(dir.path())
         .arg(KERNEL_V2)
         .env("SOLO", SOLO)
         .env("REHEARSE_TIMEOUT", "900")

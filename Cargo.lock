@@ -2935,6 +2935,7 @@ dependencies = [
  "solo-recompile",
  "solo-rlp",
  "solo-rpc",
+ "solo-scratch",
  "solo-store",
  "solo-upgrade",
 ]
@@ -2950,6 +2951,7 @@ dependencies = [
  "solo-host",
  "solo-recompile",
  "solo-rlp",
+ "solo-scratch",
  "solo-vm",
 ]
 
@@ -3041,6 +3043,7 @@ dependencies = [
  "solo-node",
  "solo-recompile",
  "solo-rlp",
+ "solo-scratch",
  "solo-store",
  "solo-trie",
  "solo-upgrade",
@@ -3052,6 +3055,7 @@ name = "solo-recompile"
 version = "0.0.1"
 dependencies = [
  "object",
+ "solo-scratch",
  "solo-vm",
  "tiny-keccak",
 ]
@@ -3082,9 +3086,14 @@ dependencies = [
  "solo-node",
  "solo-recompile",
  "solo-rlp",
+ "solo-scratch",
  "solo-trie",
  "tiny-keccak",
 ]
+
+[[package]]
+name = "solo-scratch"
+version = "0.0.1"
 
 [[package]]
 name = "solo-store"
@@ -3095,6 +3104,7 @@ dependencies = [
  "solo-abi",
  "solo-bls",
  "solo-host",
+ "solo-scratch",
  "solo-trie",
 ]
 

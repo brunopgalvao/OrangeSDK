@@ -37,10 +37,10 @@ const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4,
     "0x3333333333333333333333333333333333333333": {"balance": "0x10", "nonce": "0x1", "code": "0x602a60005260206000f3",
       "storage": {"0x00": "0x2a", "0x0000000000000000000000000000000000000000000000000000000000000001": "0x0102"}}}}"#;
 
+/// A path for `name`, removed when the test ends.
 fn scratch(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("solo-cli-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join(name).to_str().unwrap().to_owned()
+    let path = solo_scratch::Scratch::new("cli", name).keep();
+    path.to_str().unwrap().to_owned()
 }
 
 fn args(list: &[&str]) -> Vec<String> {

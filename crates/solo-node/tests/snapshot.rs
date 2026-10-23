@@ -8,7 +8,7 @@
 
 mod support;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use k256::ecdsa::SigningKey;
 use solo_abi::chain::consensus::{KIND_FINALIZE, signing_preimage};
@@ -24,14 +24,12 @@ use solo_node::keystore::encryption_key;
 use solo_node::{
     ARCHIVE, Node, NodeConfig, NodeError, STATE_HISTORY, Sim, StoreConfig, validator_id,
 };
+use solo_scratch::Scratch;
 use solo_store::{Entries, Snapshot, SnapshotError, Trust};
 use support::{CHAIN_ID, ETHER, SLOT_MS, Wallet, alice, genesis, include, keys, v1};
 
-fn scratch(name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("solo-node-snapshot-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+fn scratch(name: &str) -> Scratch {
+    Scratch::new("node-snapshot", name)
 }
 
 /// Feature-gate epochs of four blocks and no staking: snapshots every four
@@ -421,11 +419,12 @@ fn a_snapshot_exports_verifies_round_trips_and_refuses_forgeries() {
     // Exports need the driver's tables and the store's history: a node
     // whose window no longer reaches the height has nothing to export.
     let validators = keys(1);
+    let short = scratch("export-short");
     let config = NodeConfig {
         key: Some(validators[0].clone()),
         now_ms: 1_000,
         state_history: 1,
-        store: StoreConfig::Disk(scratch("export-short")),
+        store: StoreConfig::Disk(short.to_path_buf()),
         ..NodeConfig::default()
     };
     let mut short = Node::open(v1(), &genesis(&validators, epochs_of_four(), 10), config).unwrap();
@@ -480,7 +479,7 @@ fn driver_tables_are_pruned_below_the_retention_and_the_latest_snapshot() {
     // latest snapshot record's height, 60: the latest snapshot still exports
     // and verifies, its head and links still in the tables.
     let dir = scratch("prune");
-    let mut node = pruning(StoreConfig::Disk(dir.clone()), STATE_HISTORY, 0);
+    let mut node = pruning(StoreConfig::Disk(dir.to_path_buf()), STATE_HISTORY, 0);
     let heights = table_heights(&node);
     assert_eq!(heights.iter().min(), Some(&60), "{heights:?}");
     assert!(heights.contains(&70));
@@ -519,7 +518,7 @@ fn driver_tables_are_pruned_below_the_retention_and_the_latest_snapshot() {
             key: Some(keys(1)[0].clone()),
             persisted,
             now_ms: now,
-            store: StoreConfig::Disk(dir),
+            store: StoreConfig::Disk(dir.to_path_buf()),
             ..NodeConfig::default()
         },
     )
@@ -530,9 +529,10 @@ fn driver_tables_are_pruned_below_the_retention_and_the_latest_snapshot() {
     });
     // A node in memory, whose restart replays its finalized blocks from its
     // tables, and an archive node keep every height.
+    let archive = scratch("prune-archive");
     for node in [
         pruning(StoreConfig::Memory, STATE_HISTORY, 0),
-        pruning(StoreConfig::Disk(scratch("prune-archive")), ARCHIVE, 0),
+        pruning(StoreConfig::Disk(archive.to_path_buf()), ARCHIVE, 0),
     ] {
         assert_eq!(table_heights(&node).iter().min(), Some(&1));
     }
@@ -559,7 +559,7 @@ fn a_fresh_node_imports_a_snapshot_serves_it_and_syncs_forward() {
     let config = NodeConfig {
         key: Some(keys(1)[0].clone()),
         now_ms: now,
-        store: StoreConfig::Disk(target.clone()),
+        store: StoreConfig::Disk(target.to_path_buf()),
         ..NodeConfig::default()
     };
     let mut fresh = Node::open(v1(), &genesis, config.clone()).unwrap();
@@ -653,7 +653,9 @@ fn a_validator_joins_a_network_from_a_snapshot() {
         now_ms: 10_000,
         ..NodeConfig::default()
     };
-    let stores = [StoreConfig::Disk(scratch("join-source"))];
+    let source = scratch("join-source");
+    let join_target = scratch("join-target");
+    let stores = [StoreConfig::Disk(source.to_path_buf())];
     let mut sim = Sim::with_stores(v1(), &genesis, &validators, 0, &template, 20, &stores).unwrap();
     let bob = Wallet::new(0x52);
     sim.submit(0, &alice().tx(0, bob.address, ETHER, 21_000, &[]))
@@ -665,9 +667,8 @@ fn a_validator_joins_a_network_from_a_snapshot() {
             >= 10)
             .unwrap()
     );
-    let snapshot = sim.nodes[0]
-        .export_snapshot(None, &scratch("join.snap"))
-        .unwrap();
+    let snap_file = scratch("join.snap");
+    let snapshot = sim.nodes[0].export_snapshot(None, &snap_file).unwrap();
     snapshot
         .verify(CHAIN_ID, &Trust::Genesis(validator_set(&validators)))
         .unwrap();
@@ -675,7 +676,7 @@ fn a_validator_joins_a_network_from_a_snapshot() {
     assert!(height >= 8);
     // Reinstalled from the snapshot, it serves that state at once, then
     // syncs the rest from its peers and votes again.
-    sim.revive_from_snapshot(3, v1(), &genesis, &snapshot, scratch("join-target"))
+    sim.revive_from_snapshot(3, v1(), &genesis, &snapshot, join_target.to_path_buf())
         .unwrap();
     assert_eq!(sim.nodes[3].block_number().unwrap(), height);
     assert_eq!(sim.nodes[3].account(&bob.address).unwrap().balance, ETHER);
@@ -763,7 +764,8 @@ fn a_threshold_certificate_vouches_for_a_staking_chains_snapshot() {
         now_ms: 10_000,
         ..NodeConfig::default()
     };
-    let stores = [StoreConfig::Disk(scratch("threshold"))];
+    let dir = scratch("threshold");
+    let stores = [StoreConfig::Disk(dir.to_path_buf())];
     let mut sim = Sim::with_stores(v1(), &genesis, &validators, 0, &template, 20, &stores).unwrap();
     // Run until a block well into the threshold key's life has a threshold
     // certificate behind a snapshot record.
@@ -778,9 +780,8 @@ fn a_threshold_certificate_vouches_for_a_staking_chains_snapshot() {
         })
         .unwrap();
     assert!(certified, "{:?}", sim.finalized_heights().unwrap());
-    let snapshot = sim.nodes[0]
-        .export_snapshot(None, &scratch("threshold.snap"))
-        .unwrap();
+    let snap_file = scratch("threshold.snap");
+    let snapshot = sim.nodes[0].export_snapshot(None, &snap_file).unwrap();
     let certificate = &snapshot.header.certificate;
     assert_eq!(certificate.len(), 97);
     let key_id = u64::from_be_bytes(certificate[1..9].try_into().unwrap());
