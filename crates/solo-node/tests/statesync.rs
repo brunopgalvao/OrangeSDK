@@ -871,6 +871,22 @@ fn a_sync_directory_that_cannot_be_used_is_reported() {
     }
     drive(&mut sync, &node, &mut peers, 100_000, 2_000, &all(1));
     assert!(sync.failed().is_some());
+    // So does a slice whose part file vanishes between its pages.
+    config.dir = target.join("unlinked");
+    let mut sync = StateSync::new(config.clone()).unwrap();
+    for round in 0..2_000u64 {
+        if sync.failed().is_some() {
+            break;
+        }
+        drive(&mut sync, &node, &mut peers, round * 10, 1, &all(1));
+        for part in std::fs::read_dir(config.dir.join("parts")).unwrap() {
+            let path = part.unwrap().path();
+            if path.extension().is_some_and(|x| x == "tmp") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+    assert!(sync.failed().is_some());
     // So does a directory where the manifest cannot be written.
     config.dir = target.join("blocked");
     let mut sync = StateSync::new(config.clone()).unwrap();

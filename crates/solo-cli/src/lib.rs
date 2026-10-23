@@ -618,9 +618,7 @@ fn load_state(
                 let config = node.sync_config(snapshot::trust(args, genesis)?)?;
                 let fetched = snapshot::sync_from_peers(config, t, clock)?;
                 node.import_snapshot(&fetched)?;
-                if let Some(dir) = fetched.path().parent() {
-                    let _ = std::fs::remove_dir_all(dir);
-                }
+                let _ = fetched.path().parent().map(std::fs::remove_dir_all);
                 eprintln!(
                     "{} fetched from peers and imported",
                     snapshot::describe(&fetched)

@@ -341,7 +341,7 @@ pub fn combine(slices: &[Summary]) -> Hash {
 }
 
 /// Reads one entry in the snapshot file's encoding.
-fn read_entry(file: &mut impl Read) -> io::Result<(Vec<u8>, Vec<u8>)> {
+fn read_entry(file: &mut BufReader<File>) -> io::Result<(Vec<u8>, Vec<u8>)> {
     let mut part = || -> io::Result<Vec<u8>> {
         let mut word = [0u8; 4];
         file.read_exact(&mut word)?;
@@ -353,7 +353,7 @@ fn read_entry(file: &mut impl Read) -> io::Result<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Writes one entry in the snapshot file's encoding.
-fn write_entry(out: &mut impl Write, key: &[u8], value: &[u8]) -> io::Result<()> {
+fn write_entry(out: &mut BufWriter<Box<dyn Write>>, key: &[u8], value: &[u8]) -> io::Result<()> {
     for part in [key, value] {
         let len = u32::try_from(part.len()).map_err(io::Error::other)?;
         out.write_all(&len.to_le_bytes())?;
@@ -667,7 +667,7 @@ struct Fetch {
 
 enum Phase {
     Discover,
-    Manifest { offer: Offer, asked: bool },
+    Manifest(Offer),
     Fetch(Box<Fetch>),
     Done(Box<Snapshot>),
     Failed(String),
@@ -700,6 +700,8 @@ pub struct StateSync {
     phase: Phase,
     /// The manifest an earlier run accepted, read from the directory.
     saved: Option<Manifest>,
+    /// Whether the manifest of the target is asked for, in that phase.
+    manifest_asked: bool,
     events: Vec<SyncEvent>,
 }
 
@@ -722,6 +724,7 @@ impl StateSync {
             first_answer: None,
             phase: Phase::Discover,
             saved,
+            manifest_asked: false,
             events: Vec::new(),
         })
     }
@@ -798,9 +801,9 @@ impl StateSync {
             self.choose(now_ms, connected);
         }
         let sources = self.sources(connected);
-        let manifest = match &mut self.phase {
-            Phase::Manifest { offer, asked } if !*asked && !sources.is_empty() => {
-                *asked = true;
+        let manifest = match &self.phase {
+            Phase::Manifest(offer) if !self.manifest_asked && !sources.is_empty() => {
+                self.manifest_asked = true;
                 Some(SyncRequest::Manifest { epoch: offer.epoch })
             }
             _ => None,
@@ -881,7 +884,7 @@ impl StateSync {
     /// The offer being fetched, past discovery.
     fn target(&self) -> Option<Offer> {
         match &self.phase {
-            Phase::Manifest { offer, .. } => Some(*offer),
+            Phase::Manifest(offer) => Some(*offer),
             Phase::Fetch(f) => Some(f.offer),
             _ => None,
         }
@@ -949,18 +952,13 @@ impl StateSync {
             let header = self.verify_manifest(&offer, &m).ok()?;
             Some((header, m))
         });
-        match resumed {
-            Some((header, manifest)) => {
-                let done = self.parts_on_disk();
-                self.events.push(SyncEvent::Resumed { slices: done.len() });
-                self.enter_fetch(offer, header, manifest, done);
-            }
-            None => {
-                self.phase = Phase::Manifest {
-                    offer,
-                    asked: false,
-                };
-            }
+        if let Some((header, manifest)) = resumed {
+            let done = self.parts_on_disk();
+            self.events.push(SyncEvent::Resumed { slices: done.len() });
+            self.enter_fetch(offer, header, manifest, done);
+        } else {
+            self.manifest_asked = false;
+            self.phase = Phase::Manifest(offer);
         }
     }
 
@@ -1289,11 +1287,7 @@ impl StateSync {
     fn requeue(&mut self, peer: [u8; 32], asked: Asked) {
         match asked {
             Asked::Offers => self.peers.get_mut(&peer).expect("known").asked = false,
-            Asked::Manifest => {
-                if let Phase::Manifest { asked, .. } = &mut self.phase {
-                    *asked = false;
-                }
-            }
+            Asked::Manifest => self.manifest_asked = false,
             Asked::Slice(slice) => {
                 // Once: a banned peer's slices go back when it is banned.
                 if let Phase::Fetch(f) = &mut self.phase
@@ -1377,9 +1371,7 @@ impl StateSync {
 /// What the import or the start reports.
 pub fn finish(node: &mut crate::Node, snapshot: &Snapshot) -> Result<(), crate::NodeError> {
     node.import_snapshot(snapshot)?;
-    if let Some(dir) = snapshot.path().parent() {
-        let _ = fs::remove_dir_all(dir);
-    }
+    let _ = snapshot.path().parent().map(fs::remove_dir_all);
     node.start(None)
 }
 
