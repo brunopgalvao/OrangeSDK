@@ -952,7 +952,7 @@ fn a_restarted_validator_signals_at_the_base_fee() {
     loop {
         chain.mine();
         let head = chain.node.block_number().unwrap();
-        if head % 3 == 0 && signal_epoch(&mut chain.node).is_some() {
+        if head.is_multiple_of(3) && signal_epoch(&mut chain.node).is_some() {
             break;
         }
     }
