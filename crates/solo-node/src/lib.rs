@@ -12,6 +12,7 @@ pub mod net;
 pub mod node;
 pub mod sim;
 pub mod state;
+pub mod statesync;
 pub mod store;
 pub mod telemetry;
 pub mod upgrade;

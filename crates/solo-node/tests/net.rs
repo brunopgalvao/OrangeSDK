@@ -115,6 +115,14 @@ fn framing() {
             request_id: 3,
             payload: vec![4],
         },
+        Frame::SyncRequest {
+            request_id: 4,
+            payload: vec![5],
+        },
+        Frame::SyncResponse {
+            request_id: 4,
+            payload: vec![6],
+        },
     ];
     let mut buf = Vec::new();
     for f in &frames {
@@ -384,4 +392,126 @@ fn handshake_rules() {
     dialer.poll(&mut node, 1).unwrap();
     assert!(dialer.connected().is_empty());
     assert!(Transport::bind("nope", [0; 32], 1, vec![]).is_err());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn state_sync_frames_are_the_hosts() {
+    use solo_abi::Decode;
+    use solo_node::statesync::{StateSync, SyncConfig, SyncRequest, SyncResponse};
+    let read_frames = |s: &mut TcpStream, n: usize| {
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (mut buf, mut chunk, mut got) = (Vec::new(), [0u8; 4096], Vec::new());
+        while got.len() < n {
+            let k = std::io::Read::read(s, &mut chunk).unwrap();
+            buf.extend_from_slice(&chunk[..k]);
+            got.extend(take_frames(&mut buf).unwrap());
+        }
+        got
+    };
+    let hello = Frame::Hello {
+        id: [2; 32],
+        chain_id: CHAIN_ID,
+    };
+    let offers = SyncRequest::Offers.to_bytes();
+    let nothing = SyncResponse::Offers(vec![]).to_bytes();
+    // A running node answers a sync request from what it serves (nothing
+    // here) and ignores a sync answer.
+    let keys = keys(1);
+    let genesis = genesis(&keys);
+    let mut node = Node::open(&kernel_module(), &genesis, NodeConfig::default()).unwrap();
+    node.start(None).unwrap();
+    let mut running = Transport::bind("127.0.0.1:0", [1; 32], CHAIN_ID, vec![]).unwrap();
+    let mut peer = TcpStream::connect(running.local_addr().unwrap()).unwrap();
+    for f in [
+        hello.clone(),
+        Frame::SyncResponse {
+            request_id: 1,
+            payload: vec![],
+        },
+        Frame::SyncRequest {
+            request_id: 5,
+            payload: offers.clone(),
+        },
+    ] {
+        peer.write_all(&frame_bytes(&f)).unwrap();
+    }
+    for _ in 0..20 {
+        running.poll(&mut node, 0).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let got = read_frames(&mut peer, 2);
+    assert_eq!(
+        got[1],
+        Frame::SyncResponse {
+            request_id: 5,
+            payload: nothing.clone()
+        }
+    );
+    // A node that syncs drops what is not state sync, closes a peer of
+    // another chain or one that says hello twice, answers a sync request as
+    // a node that serves nothing, and asks its peers for their offers.
+    let dir = solo_scratch::Scratch::new("net", "syncing");
+    let mut sync = StateSync::new(SyncConfig {
+        chain_id: CHAIN_ID,
+        trust: solo_store::Trust::Genesis(Sim::validator_set(&keys)),
+        genesis_hash: None,
+        dir: dir.to_path_buf(),
+    })
+    .unwrap();
+    let mut syncing = Transport::bind("127.0.0.1:0", [1; 32], CHAIN_ID, vec![]).unwrap();
+    let addr = syncing.local_addr().unwrap();
+    let speak = |frames: &[Frame]| {
+        let mut s = TcpStream::connect(addr).unwrap();
+        for f in frames {
+            s.write_all(&frame_bytes(f)).unwrap();
+        }
+        s
+    };
+    let _other = speak(&[Frame::Hello {
+        id: [3; 32],
+        chain_id: 1,
+    }]);
+    let _twice = speak(&[hello.clone(), hello.clone()]);
+    let mut good = speak(&[
+        hello,
+        Frame::Message {
+            topic: 1,
+            payload: vec![],
+        },
+        Frame::SyncRequest {
+            request_id: 6,
+            payload: offers,
+        },
+    ]);
+    for i in 0..20 {
+        syncing.poll_sync(&mut sync, i);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(syncing.connected(), vec![[2; 32]]);
+    let got = read_frames(&mut good, 3);
+    assert!(got.contains(&Frame::SyncResponse {
+        request_id: 6,
+        payload: nothing
+    }));
+    let asked = got.iter().find_map(|f| match f {
+        Frame::SyncRequest {
+            request_id,
+            payload,
+        } => Some((*request_id, SyncRequest::from_bytes(payload).unwrap())),
+        _ => None,
+    });
+    let (id, request) = asked.unwrap();
+    assert_eq!(request, SyncRequest::Offers);
+    // Its answer reaches the sync.
+    good.write_all(&frame_bytes(&Frame::SyncResponse {
+        request_id: id,
+        payload: SyncResponse::Offers(vec![]).to_bytes(),
+    }))
+    .unwrap();
+    for i in 0..20 {
+        syncing.poll_sync(&mut sync, 100 + i);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(sync.failed().is_none());
 }

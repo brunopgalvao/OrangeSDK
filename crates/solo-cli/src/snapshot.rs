@@ -153,6 +153,57 @@ pub fn import_into(node: &mut Node, snapshot: &Snapshot) -> Result<(), String> {
     node.import_snapshot(snapshot).map_err(|e| e.to_string())
 }
 
+/// What a state-sync event says, for the operator.
+#[must_use]
+pub fn describe_event(event: &solo_node::statesync::SyncEvent) -> String {
+    use solo_node::statesync::SyncEvent;
+    match event {
+        SyncEvent::Target(offer) => format!(
+            "fetching epoch {} (block {}, {} entries)",
+            offer.epoch, offer.height, offer.entries
+        ),
+        SyncEvent::Resumed { slices } => {
+            format!("{slices} slices verified by an earlier run kept")
+        }
+        SyncEvent::Banned { peer, why } => format!(
+            "peer {} no longer asked: {why}",
+            solo_rpc::methods::data(peer)
+        ),
+    }
+}
+
+/// Fetches a snapshot from the peers `transport` connects to, before the
+/// node's driver starts (spec 22 §7.4): verified under `config`'s trust,
+/// slice by slice, resuming what an earlier run in the same directory
+/// verified. Polls until the snapshot file is assembled, saying what happens
+/// on the way; `now` is the clock. The caller imports it.
+///
+/// # Errors
+/// Why the sync stopped.
+pub fn sync_from_peers(
+    config: solo_node::statesync::SyncConfig,
+    transport: &mut solo_node::Transport,
+    now: &dyn Fn() -> u64,
+) -> Result<Snapshot, String> {
+    use solo_node::statesync::StateSync;
+    let dir = config.dir.clone();
+    let mut sync = StateSync::new(config).map_err(|e| format!("{}: {e}", dir.display()))?;
+    eprintln!("state sync: asking peers for snapshots");
+    loop {
+        transport.poll_sync(&mut sync, now());
+        for event in sync.take_events() {
+            eprintln!("state sync: {}", describe_event(&event));
+        }
+        if let Some(why) = sync.failed() {
+            return Err(format!("state sync: {why}"));
+        }
+        if let Some(snapshot) = sync.done() {
+            return Ok(snapshot.clone());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 /// Runs `solo snapshot <subcommand>` and returns what it prints.
 ///
 /// # Errors

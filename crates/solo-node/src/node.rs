@@ -243,6 +243,9 @@ pub struct Node {
     pub(crate) upgrades: Upgrades,
     /// Where the driver's node-local data goes between steps, if anywhere.
     store: Option<DriverStore>,
+    /// The snapshots this node serves to peers that sync from it (spec 22
+    /// §7.4), once [`Node::serve_snapshots`] turned it on.
+    server: Option<crate::statesync::SnapshotServer>,
 }
 
 impl Node {
@@ -313,6 +316,7 @@ impl Node {
             telemetry: solo_metrics::NodeMetrics::new(),
             upgrades: Upgrades::new(active_gates),
             store: None,
+            server: None,
         };
         if fresh {
             node.call_unit(exports::INIT, &genesis.to_bytes())?;
@@ -453,6 +457,102 @@ impl Node {
         let tables = self.persisted();
         solo_store::Snapshot::export(store, &tables, epoch, out)
             .map_err(|e| NodeError::Store(e.to_string()))
+    }
+
+    /// Serves snapshots to peers that sync from this node (spec 22 §7.4):
+    /// those already under `snapshots/` beside the chain store, and from now
+    /// on the snapshot of every newer epoch the chain records, exported
+    /// once a certificate covers it; split and paged within `limits`.
+    ///
+    /// # Errors
+    /// [`NodeError::Store`] when the chain state is not on disk or the
+    /// directory cannot be made.
+    pub fn serve_snapshots(
+        &mut self,
+        limits: crate::statesync::ServeLimits,
+    ) -> Result<(), NodeError> {
+        let store = self.chain_store().ok_or_else(|| {
+            NodeError::Store("snapshots are served from a chain store on disk".to_owned())
+        })?;
+        let dir = store.path().with_file_name("snapshots");
+        let server = crate::statesync::SnapshotServer::open(&dir, limits)
+            .map_err(|e| NodeError::Store(e.to_string()))?;
+        self.server = Some(server);
+        self.serve_latest();
+        Ok(())
+    }
+
+    /// What a state sync into this node, opened fresh over a disk store,
+    /// needs (spec 22 §7.4): the chain id, the genesis hash its own
+    /// `kernel_init` stored, `trust`, and `statesync/` beside the chain
+    /// store to work in.
+    ///
+    /// # Errors
+    /// [`NodeError::Store`] when the chain state is not on disk; what the
+    /// chain id query reports.
+    pub fn sync_config(
+        &mut self,
+        trust: solo_store::Trust,
+    ) -> Result<crate::statesync::SyncConfig, NodeError> {
+        let dir = self
+            .chain_store()
+            .ok_or_else(|| {
+                NodeError::Store("a state sync loads into a chain store on disk".to_owned())
+            })?
+            .path()
+            .with_file_name("statesync");
+        let genesis_key = [solo_abi::chain::keys::BLOCK_NUMBER, &0u64.to_be_bytes()[..]].concat();
+        Ok(crate::statesync::SyncConfig {
+            chain_id: self.chain_id()?,
+            trust,
+            genesis_hash: self.state_get(&genesis_key),
+            dir,
+        })
+    }
+
+    /// The snapshots this node serves, if it serves any.
+    #[must_use]
+    pub fn snapshot_server(&self) -> Option<&crate::statesync::SnapshotServer> {
+        self.server.as_ref()
+    }
+
+    /// The answer to a peer's state-sync request (spec 22 §7.4, the
+    /// payload of a `SyncRequest` frame, spec 09 §2).
+    #[must_use]
+    pub fn answer_sync(&self, payload: &[u8]) -> Vec<u8> {
+        match &self.server {
+            Some(server) => server.answer(payload),
+            None => crate::statesync::answer_unserved(payload),
+        }
+    }
+
+    /// Exports the latest recorded epoch's snapshot for serving, when this
+    /// node serves, finalized a block since it last looked, and serves an
+    /// older epoch or none. An export that fails, as it does until a
+    /// certificate covers the record, is tried again after the next
+    /// finalized block (spec 22 §7.4).
+    fn serve_latest(&mut self) {
+        let finalized = self.finalized.len();
+        let latest = self
+            .chain_store()
+            .and_then(|s| s.get(solo_abi::chain::keys::SNAPSHOT_LATEST))
+            .and_then(|e| u64::from_bytes(&e).ok());
+        let Some(server) = self.server.as_mut() else {
+            return;
+        };
+        if server.checked == finalized {
+            return;
+        }
+        server.checked = finalized;
+        let Some(epoch) = latest.filter(|e| server.newest().is_none_or(|n| n < *e)) else {
+            return;
+        };
+        let path = server.path_for(epoch);
+        if let Ok(snapshot) = self.export_snapshot(Some(epoch), &path) {
+            // A file just exported reads; if it did not, the next record
+            // is exported in its place.
+            let _ = self.server.as_mut().map(|s| s.add(snapshot));
+        }
     }
 
     /// The snapshot record of `epoch`, or of the latest completed epoch for
@@ -683,6 +783,7 @@ impl Node {
         }
         self.collect_persist_writes();
         self.send_gate_signal();
+        self.serve_latest();
         Ok(())
     }
 

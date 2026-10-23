@@ -442,6 +442,25 @@ fn threshold_edge_cases() {
 }
 
 #[test]
+fn public_shares_together_are_the_shares_one_by_one() {
+    let sk = SecretKey::generate(&[4; 32], b"").unwrap();
+    // Thresholds 1 and 2 have no difference above the first; 7 and 8 an
+    // odd and an even degree. Counts below half the threshold go one by
+    // one, from half up by differences; both past the threshold too.
+    for (seed, t) in [(1u8, 1u32), (2, 2), (7, 7), (8, 8)] {
+        let (keys, shares) = threshold::deal(&sk, t, 20, &[seed; 32]).unwrap();
+        for count in [0, 1, t / 2, t.div_ceil(2), t, 20] {
+            let together = keys.public_shares(count);
+            assert_eq!(together.len(), count as usize);
+            for (x, key) in (1..).zip(&together) {
+                assert_eq!(*key, keys.public_share(x), "t {t}, count {count}, x {x}");
+                assert_eq!(*key, shares[x as usize - 1].public_key());
+            }
+        }
+    }
+}
+
+#[test]
 fn batched_partial_checks_agree_with_single_ones() {
     let sk = SecretKey::generate(&[4; 32], b"batch").unwrap();
     let msg = b"batched partials";

@@ -15,6 +15,8 @@
 //! intact; `solo node` requires it for a validator. `--snapshot <file>`
 //! starts a node whose directory holds no chain yet from a verified snapshot
 //! (see [`snapshot`]), and `solo snapshot` exports, verifies and imports one.
+//! `solo node --sync-from-peers` fetches one from its `--peer`s instead
+//! (spec 22 §7.4), and `--serve-snapshots` serves them to such nodes.
 //! The genesis file is
 //! JSON: `{"chainId": 1337, "slotMs": 400, "maxTxs": 64,
 //! "alloc": {"0x<address>": "<wei>"}, "validators": ["0x<32-byte id>"]}`.
@@ -106,7 +108,7 @@ pub const DEFAULT_RPC: &str = "127.0.0.1:8545";
 /// Usage line printed on a command-line mistake.
 pub const USAGE: &str = "usage:
   solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive] [--data-dir <dir>]
-  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--snapshot <file> [--trust-key <0x 96 bytes>]] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
+  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--snapshot <file> | --sync-from-peers] [--trust-key <0x 96 bytes>] [--serve-snapshots] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
   solo key  <64 hex>
   solo snapshot export --data-dir <dir> --out <file> [--epoch <n>] | verify --snapshot <file> --genesis <genesis.json> [--trust-key <0x 96 bytes>] | import --snapshot <file> --data-dir <dir> --kernel <kernel> --genesis <genesis.json> [--trust-key <0x 96 bytes>]
   solo gov  submit <target> <0x calldata> | vote <id> yes|no | execute <id> | veto <id> | pause <target> | set-guardian <address> | set-mode stake | set-params <voting> <timelock> <quorumBps> <deposit> | set-fee-params <denominator> <elasticity> <minBaseFee> <treasury|burn>
@@ -586,8 +588,20 @@ fn chain_store_arguments(
         Some(dir) => solo_node::StoreConfig::Disk(dir.into()),
         None => solo_node::StoreConfig::Memory,
     };
+    let memory = chain_store == solo_node::StoreConfig::Memory;
+    for flag in ["--sync-from-peers", "--serve-snapshots"] {
+        if memory && args.iter().any(|a| a == flag) {
+            return Err(format!("{flag} needs --data-dir, where the snapshots are kept").into());
+        }
+    }
     let snapshot = match arg(args, "--snapshot") {
-        Some(_) if chain_store == solo_node::StoreConfig::Memory => {
+        Some(_) if args.iter().any(|a| a == "--sync-from-peers") => {
+            return Err(
+                "--snapshot and --sync-from-peers both name where the state comes from; give one"
+                    .into(),
+            );
+        }
+        Some(_) if memory => {
             return Err("--snapshot needs --data-dir, where the snapshot is loaded".into());
         }
         Some(path) => Some(
@@ -600,6 +614,57 @@ fn chain_store_arguments(
         snapshot::verify(args, snapshot, genesis)?;
     }
     Ok((chain_store, snapshot))
+}
+
+/// Loads the state before the driver starts into a data directory that
+/// holds no chain yet, from the verified `--snapshot` file or, for
+/// `--sync-from-peers`, from the peers (a directory that holds a chain keeps
+/// it, and an import that fails stops the node), and serves snapshots for
+/// `--serve-snapshots` (spec 22 §7).
+fn load_state(
+    args: &[String],
+    genesis: &Genesis,
+    node: &mut solo_node::Node,
+    (snapshot, transport): (
+        Option<&solo_store::Snapshot>,
+        Option<&mut solo_node::Transport>,
+    ),
+    clock: &dyn Fn() -> u64,
+) -> Result<(), CliError> {
+    if let Some(snapshot) = snapshot {
+        match node.chain_store().map_or(0, solo_store::DiskStore::head) {
+            0 => {
+                snapshot::import_into(node, snapshot)?;
+                eprintln!("{} imported", snapshot::describe(snapshot));
+            }
+            head => eprintln!(
+                "--snapshot ignored: the data directory already holds chain state at height {head}"
+            ),
+        }
+    }
+    if let Some(t) = transport
+        && args.iter().any(|a| a == "--sync-from-peers")
+    {
+        match node.chain_store().map_or(0, solo_store::DiskStore::head) {
+            0 => {
+                let config = node.sync_config(snapshot::trust(args, genesis)?)?;
+                let fetched = snapshot::sync_from_peers(config, t, clock)?;
+                node.import_snapshot(&fetched)?;
+                let _ = fetched.path().parent().map(std::fs::remove_dir_all);
+                eprintln!(
+                    "{} fetched from peers and imported",
+                    snapshot::describe(&fetched)
+                );
+            }
+            head => eprintln!(
+                "--sync-from-peers ignored: the data directory already holds chain state at height {head}"
+            ),
+        }
+    }
+    if args.iter().any(|a| a == "--serve-snapshots") {
+        node.serve_snapshots(solo_node::statesync::ServeLimits::default())?;
+    }
+    Ok(())
 }
 
 /// Says where the driver's state lives, which view it started in and, on a
@@ -737,31 +802,21 @@ pub(crate) fn run_inner(
             ..solo_node::NodeConfig::default()
         },
     )?;
-    if let Some(snapshot) = &snapshot {
-        // A directory that already holds a chain keeps it; the snapshot is
-        // for an empty one, and an import that fails there stops the node.
-        match node.chain_store().map_or(0, solo_store::DiskStore::head) {
-            0 => {
-                snapshot::import_into(&mut node, snapshot)?;
-                eprintln!("{} imported", snapshot::describe(snapshot));
-            }
-            head => eprintln!(
-                "--snapshot ignored: the data directory already holds chain state at height {head}"
-            ),
-        }
-    }
-    let opened_at = node.block_number().unwrap_or(0);
     let chain_id = node.chain_id().unwrap_or(0);
-    if let Some(store) = store {
-        node.attach_store(store);
-    }
-    node.start(resumed.clone())?;
-    report_driver_state(&node, resumed.as_deref(), opened_at);
     let mut transport = if command == "node" {
         Some(bind_transport(args, &node, chain_id, peers)?)
     } else {
         None
     };
+    let clock = || epoch + u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let sources = (snapshot.as_ref(), transport.as_mut());
+    load_state(args, &genesis, &mut node, sources, &clock)?;
+    let opened_at = node.block_number().unwrap_or(0);
+    if let Some(store) = store {
+        node.attach_store(store);
+    }
+    node.start(resumed.clone())?;
+    report_driver_state(&node, resumed.as_deref(), opened_at);
     let mut rpc = solo_rpc::Rpc::new(node);
     let listener = bind_rpc(rpc_addr, command, chain_id, key.as_ref())?;
     let mut last_tick = Instant::now();

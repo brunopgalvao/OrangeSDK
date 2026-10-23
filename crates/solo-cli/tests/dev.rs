@@ -938,3 +938,195 @@ fn snapshots_export_verify_import_and_start_a_node() {
     threshold.header.certificate = vec![2; 97];
     assert!(snapshot::describe(&threshold).ends_with(", threshold certificate"));
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_node_fetches_its_state_from_a_peer_that_serves_snapshots() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+
+    use solo_node::statesync::{Offer, SyncEvent};
+    let seed = "61".repeat(32);
+    let id = solo_rpc::methods::data(&solo_node::validator_id(
+        &solo_cli::parse_key(&seed).unwrap(),
+    ));
+    let text = format!(
+        r#"{{"chainId": 1337, "slotMs": 250, "maxTxs": 4, "epochBlocks": 4, "validators": ["{id}"],
+  "alloc": {{"0x1111111111111111111111111111111111111111": "1000000000000000000"}}}}"#
+    );
+    // Slots long enough that the joiner's catch-up request (spec 08 §7a)
+    // is answered within a view on a loaded machine.
+    let genesis = genesis_file("sync.json", &text);
+    // The same validator and chain id over another allocation: another
+    // genesis block, which a sync must refuse.
+    let other = genesis_file(
+        "sync-other.json",
+        &text.replace("1000000000000000000", "1000000000000000001"),
+    );
+    let staking = genesis_file(
+        "sync-staking.json",
+        &text.replace("\"epochBlocks\": 4", "\"staking\": {\"epochBlocks\": 4}"),
+    );
+    let kernel = scratch("sync-kernel.solo");
+    std::fs::write(&kernel, load_kernel(KERNEL).unwrap()).unwrap();
+    let ports = free_ports(4);
+    let node_args = |genesis: &str, listen: &str, extra: &[&str]| {
+        let mut list = vec![
+            "node",
+            "--kernel",
+            &kernel,
+            "--genesis",
+            genesis,
+            "--listen",
+            listen,
+            "--rpc",
+            "127.0.0.1:0",
+        ];
+        list.extend_from_slice(extra);
+        args(&list)
+    };
+    // Arguments that cannot work are refused before anything runs.
+    let nowhere = node_args(&genesis, &ports[3], &["--sync-from-peers"]);
+    assert_eq!(
+        run(&nowhere).unwrap_err(),
+        "--sync-from-peers needs --data-dir, where the snapshots are kept"
+    );
+    let unserved = node_args(&genesis, &ports[3], &["--serve-snapshots"]);
+    assert_eq!(
+        run(&unserved).unwrap_err(),
+        "--serve-snapshots needs --data-dir, where the snapshots are kept"
+    );
+    let both_dir = scratch("sync-both");
+    let both = node_args(
+        &genesis,
+        &ports[3],
+        &[
+            "--data-dir",
+            &both_dir,
+            "--sync-from-peers",
+            "--snapshot",
+            "x",
+        ],
+    );
+    assert!(run(&both).unwrap_err().contains("give one"));
+    let staked_dir = scratch("sync-staking");
+    let staked = node_args(
+        &staking,
+        &ports[3],
+        &["--data-dir", &staked_dir, "--sync-from-peers"],
+    );
+    assert!(run(&staked).unwrap_err().contains("needs --trust-key"));
+    let blocked = scratch("sync-blocked");
+    std::fs::create_dir_all(&blocked).unwrap();
+    std::fs::write(std::path::Path::new(&blocked).join("statesync"), b"a file").unwrap();
+    let blocked_args = node_args(
+        &genesis,
+        &ports[3],
+        &["--data-dir", &blocked, "--sync-from-peers"],
+    );
+    assert!(run(&blocked_args).unwrap_err().contains("statesync"));
+    // A validator serving snapshots, until the joiners are done.
+    let served = scratch("sync-served");
+    let finished = Arc::new(AtomicBool::new(false));
+    let serving = {
+        let argv = node_args(
+            &genesis,
+            &ports[0],
+            &["--key", &seed, "--data-dir", &served, "--serve-snapshots"],
+        );
+        let finished = Arc::clone(&finished);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_mins(3);
+            run_until(&argv, |_| {
+                !finished.load(SeqCst) && std::time::Instant::now() < deadline
+            })
+            .unwrap();
+        })
+    };
+    // An observer joins from it: it fetches the snapshot, imports it, and
+    // follows the chain from there.
+    let joined = scratch("sync-joined");
+    let oldest = Arc::new(AtomicU64::new(0));
+    let observed = Arc::clone(&oldest);
+    let joining = node_args(
+        &genesis,
+        &ports[1],
+        &[
+            "--data-dir",
+            &joined,
+            "--sync-from-peers",
+            "--peer",
+            &ports[0],
+        ],
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
+    let mut executed = 0;
+    run_until(&joining, |rpc| {
+        observed.store(rpc.node().oldest_state(), SeqCst);
+        executed = rpc.node().executed.len();
+        executed < 2 && std::time::Instant::now() < deadline
+    })
+    .unwrap();
+    let height = oldest.load(SeqCst);
+    assert!(height >= 4 && height.is_multiple_of(4), "{height}");
+    assert!(executed >= 2, "{executed}");
+    assert!(!std::path::Path::new(&joined).join("statesync").exists());
+    // Started again, the directory keeps its chain.
+    let again = node_args(
+        &genesis,
+        &ports[1],
+        &[
+            "--data-dir",
+            &joined,
+            "--sync-from-peers",
+            "--peer",
+            &ports[0],
+        ],
+    );
+    let mut resumed = 0;
+    run_until(&again, |rpc| {
+        resumed = rpc.node().chain_store().unwrap().head();
+        false
+    })
+    .unwrap();
+    assert!(resumed >= height, "{resumed}");
+    // A node of another genesis refuses what the peer serves.
+    let elsewhere = scratch("sync-elsewhere");
+    let refused = node_args(
+        &other,
+        &ports[2],
+        &[
+            "--data-dir",
+            &elsewhere,
+            "--sync-from-peers",
+            "--peer",
+            &ports[0],
+        ],
+    );
+    let err = run(&refused).unwrap_err();
+    assert!(err.contains("another genesis block"), "{err}");
+    finished.store(true, SeqCst);
+    serving.join().unwrap();
+    // What the operator reads of each event.
+    let offer = Offer {
+        epoch: 2,
+        height: 8,
+        state_root: [0; 32],
+        entries: 9,
+    };
+    assert_eq!(
+        snapshot::describe_event(&SyncEvent::Target(offer)),
+        "fetching epoch 2 (block 8, 9 entries)"
+    );
+    assert_eq!(
+        snapshot::describe_event(&SyncEvent::Resumed { slices: 3 }),
+        "3 slices verified by an earlier run kept"
+    );
+    assert!(
+        snapshot::describe_event(&SyncEvent::Banned {
+            peer: [1; 32],
+            why: "lies"
+        })
+        .ends_with("no longer asked: lies")
+    );
+}
