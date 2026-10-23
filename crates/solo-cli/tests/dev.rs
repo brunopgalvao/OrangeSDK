@@ -18,18 +18,24 @@ const HELLO: &str = concat!(
     "/../solo-recompile/tests/fixtures/hello.elf"
 );
 
-/// A kernel gas budget that lets the driver start (79 399) but not produce a block
-/// (275 029) with the pinned kernel fixture, bisected on 2026-10-23 in-process (the
-/// dev key, this genesis, 40 slots of 60 ms) on the kernel with the block log and
-/// snapshot record of spec 22, the fee market of spec 23 with its bounds and the
-/// payout that leaves jailed validators out (spec 23 §2, spec 15 §10.2), the
-/// stake-weighted threshold shares of spec 15 §6.8, the genesis block of spec 20
-/// §3.4 and delegator votes and governed calls (spec 13 §9.3, §9.5). The block
-/// figure depends on how the test host is built: the same bisection in a release
-/// build gives 275 036, and both builds give the same figures for the fixtures before
-/// the genesis block, with it alone and with governance alone, so neither change
-/// moved them (the 275 036 noted before the genesis block was a release build's).
-/// Rebuilding the fixture may move both numbers.
+/// A kernel gas budget that lets the driver start (80 224) but not produce a block
+/// (275 837) with the pinned kernel fixture, bisected on 2026-10-24 in-process (the
+/// dev key, this genesis, slots of 60 ms, in a debug host build) on the kernel with
+/// the block log and snapshot record of spec 22, the fee market of spec 23 with its
+/// bounds and the payout that leaves jailed validators out (spec 23 §2, spec 15
+/// §10.2), the stake-weighted threshold shares of spec 15 §6.8, the genesis block of
+/// spec 20 §3.4, delegator votes and governed calls (spec 13 §9.3, §9.5), and the
+/// running tallies, the system receipt and the genesis time of codex ADR 0045
+/// (spec 13 §9.3, spec 20 §3.4, §3.5). Before that last change the figures were
+/// 79 399 and 275 029, which the earlier fixture still gives by the same bisection.
+/// The new kernel takes 80 169 and 275 782 on this genesis without a genesis time
+/// (bisected with `--data-dir`, where `solo dev` takes the file as written): 770
+/// and 753 more, its rebuilt code (the parameters' decoding with their optional
+/// last field, which every step runs, and the read of the sweep list at the end of
+/// every block). The remaining 55 are the genesis time `solo dev` without a data
+/// directory now gives this genesis: eight more bytes of parameters to decode. The
+/// block figure depends on how the test host is built (a release build gave 275 036
+/// where a debug build gave 275 029). Rebuilding the fixture may move both numbers.
 const STARVED_GAS: &str = "100000";
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4,
@@ -79,6 +85,28 @@ fn genesis_parsing() {
     assert_eq!(params.allocations.0.len(), 3);
     assert_eq!(params.allocations.0[0].balance, 1_000_000_000_000_000_000);
     assert_eq!(params.allocations.0[1].balance, 5);
+    // The genesis time, in Unix seconds as geth writes it; none without one.
+    assert_eq!(params.genesis_time, 0);
+    for (text, seconds) in [
+        (r#"{"chainId": 1, "timestamp": 1792800000}"#, 1_792_800_000),
+        (r#"{"chainId": 1, "timestamp": "0x10"}"#, 16),
+        (r#"{"chainId": 1, "timestamp": "17"}"#, 17),
+    ] {
+        let p = GenesisParams::from_bytes(&parse_genesis(text).unwrap().params).unwrap();
+        assert_eq!(p.genesis_time, seconds, "{text}");
+    }
+    for text in [
+        r#"{"chainId": 1, "timestamp": -1}"#,
+        r#"{"chainId": 1, "timestamp": "soon"}"#,
+        r#"{"chainId": 1, "timestamp": "0x10000000000000000"}"#,
+        r#"{"chainId": 1, "timestamp": true}"#,
+    ] {
+        assert_eq!(
+            parse_genesis(text).unwrap_err(),
+            "genesis: timestamp must be Unix seconds, a number or a decimal or 0x hex string",
+            "{text}"
+        );
+    }
     // Without validators the dev key is the single validator; with them, the given ids.
     let set = <solo_abi::chain::ValidatorSet as Decode>::from_bytes(&g.validators).unwrap();
     assert_eq!(set.validators.0.len(), 1);

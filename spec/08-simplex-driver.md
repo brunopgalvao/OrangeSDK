@@ -14,7 +14,7 @@ A node learns whether it is a validator by signing the identity message (§4) wi
 
 ## 3. Views and the notarized tip
 
-The driver runs in views `v = 1, 2, …`. Every node keeps a *notarized tip*: the proposal with the highest view that it has seen notarized (§5), initially the empty tip at height 0 with hash zero. A proposal in view `v` extends the proposer's tip: its `parent` is the tip's hash and its `height` is the tip's height plus one. Views only increase; a node may enter a view several above its current one (§5).
+The driver runs in views `v = 1, 2, …`. Every node keeps a *notarized tip*: the proposal with the highest view that it has seen notarized (§5), initially the empty tip at height 0 with hash zero, whose timestamp is the node's clock when it starts, or the genesis time (20 §3.4) if that is later, so that the first block is proposed one slot after both. A proposal in view `v` extends the proposer's tip: its `parent` is the tip's hash and its `height` is the tip's height plus one. Views only increase; a node may enter a view several above its current one (§5).
 
 Entering view `v`, a node:
 

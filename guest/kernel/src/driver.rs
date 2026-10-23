@@ -1592,8 +1592,10 @@ pub fn step(input: &Input) -> Seq<Effect> {
             }
             c.load_set();
             if c.s.tip_height == 0 {
-                // Pace the first block one slot after start, like every later one.
-                c.s.tip_timestamp_ms = *now_ms;
+                // Pace the first block one slot after start, like every later
+                // one, and never before the genesis time, so that block
+                // timestamps rise from the genesis block's (spec 08 §2, spec 20 §3.4).
+                c.s.tip_timestamp_ms = (*now_ms).max(c.params.genesis_time_ms());
             }
             c.s.me = c.identify();
             c.catch_up_epoch();

@@ -20,7 +20,10 @@
 //! "alloc": {"0x<address>": "<wei>"}, "validators": ["0x<32-byte id>"]}`.
 //! An `alloc` entry is a balance, or a geth-style account that predeploys a
 //! contract: `{"balance": "<wei>", "nonce": "0x1", "code": "0x<bytecode>",
-//! "storage": {"0x<slot>": "0x<value>"}}`, every field optional. Without
+//! "storage": {"0x<slot>": "0x<value>"}}`, every field optional. An
+//! optional `"timestamp"`, Unix seconds as geth writes it, is the genesis
+//! time (spec 20 §3.4); `solo dev` without `--data-dir` gives a genesis
+//! without one the time it starts. Without
 //! `validators` the dev node is the only validator, signing with
 //! [`DEV_KEY_SEED`]. Governed upgrades and feature gates (spec 13) are off
 //! unless the file names a `"governance"` address (with an optional
@@ -158,6 +161,7 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
         bridge_in: bridge::parse_bridge(&v)?,
         governance: gov::parse_governance(&v)?,
         fees: fees::parse_fees(&v)?,
+        genesis_time: parse_timestamp(&v)?,
     };
     let mut validators = Vec::new();
     match v.get("validators") {
@@ -260,6 +264,34 @@ pub(crate) fn parse_balance(value: &Value) -> Result<u128, String> {
             .into(),
         _ => return Err("genesis: balance must be a string or number".to_owned()),
     })
+}
+
+/// The genesis time, `timestamp` in Unix seconds as geth writes it (a
+/// number, or a decimal or `0x` hex string); zero, no time, without one
+/// (spec 20 §3.4).
+fn parse_timestamp(v: &Value) -> Result<u64, String> {
+    let Some(value) = v.get("timestamp") else {
+        return Ok(0);
+    };
+    let seconds = match value {
+        Value::String(s) => parse_number_text(s).and_then(|n| u64::try_from(n).ok()),
+        other => other.as_u64(),
+    };
+    seconds.ok_or(
+        "genesis: timestamp must be Unix seconds, a number or a decimal or 0x hex string"
+            .to_owned(),
+    )
+}
+
+/// `genesis` with the genesis time `seconds`, for a `solo dev` chain that
+/// lives in memory and whose genesis names no time: it starts now.
+fn timed(mut genesis: Genesis, seconds: u64) -> Genesis {
+    let mut params = GenesisParams::from_bytes(&genesis.params).unwrap_or_default();
+    if params.genesis_time == 0 {
+        params.genesis_time = seconds;
+        genesis.params = params.to_bytes();
+    }
+    genesis
 }
 
 /// A number written in decimal or as `0x` hex.
@@ -641,6 +673,23 @@ fn report_switches(node: &solo_node::Node, seen: &mut usize) {
     *seen = node.upgrades().switches.len();
 }
 
+/// The genesis `--genesis` names. A `solo dev` chain in memory only, whose
+/// genesis names no time, starts now; with a data directory the genesis is
+/// the file's, so that a restart and the snapshot commands, which read the
+/// file, find the same chain (spec 20 §3.4).
+fn genesis_argument(args: &[String], command: &str) -> Result<Genesis, CliError> {
+    let genesis_path = arg(args, "--genesis").ok_or("--genesis is required")?;
+    let genesis_text = match std::fs::read_to_string(&genesis_path) {
+        Ok(text) => text,
+        Err(e) => return Err(format!("{genesis_path}: {e}").into()),
+    };
+    let genesis = parse_genesis(&genesis_text)?;
+    if command == "dev" && arg(args, "--data-dir").is_none() {
+        return Ok(timed(genesis, unix_ms() / 1000));
+    }
+    Ok(genesis)
+}
+
 pub(crate) fn run_inner(
     args: &[String],
     keep_going: &mut dyn FnMut(&solo_rpc::Rpc) -> bool,
@@ -657,12 +706,7 @@ pub(crate) fn run_inner(
         return Err(USAGE.into());
     }
     let kernel = load_kernel(&arg(args, "--kernel").ok_or("--kernel is required")?)?;
-    let genesis_path = arg(args, "--genesis").ok_or("--genesis is required")?;
-    let genesis_text = match std::fs::read_to_string(&genesis_path) {
-        Ok(text) => text,
-        Err(e) => return Err(format!("{genesis_path}: {e}").into()),
-    };
-    let genesis = parse_genesis(&genesis_text)?;
+    let genesis = genesis_argument(args, command)?;
     let rpc_arg = arg(args, "--rpc");
     let rpc_addr = rpc_arg.as_deref().unwrap_or(DEFAULT_RPC);
     let max_blocks = parse_number(args, "--blocks")?;

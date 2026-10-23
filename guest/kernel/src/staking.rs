@@ -166,7 +166,7 @@ fn put_record(id: &Hash, record: &StakeRecord) {
 }
 
 /// Registered validator ids, in registration order.
-fn ids() -> Vec<Hash> {
+pub fn ids() -> Vec<Hash> {
     state::get::<Seq<Hash>>(keys::IDS)
         .map(|s| s.0)
         .unwrap_or_default()
@@ -566,6 +566,7 @@ fn withdraw(s: &Signed, epoch: u64) -> Vec<Log> {
 fn delegate(action: &StakingAction, id: &Hash, s: &Signed, epoch: u64) -> Vec<Log> {
     let mut r = record(id).unwrap_or_default();
     let mut d = delegation(id, &s.from).unwrap_or_default();
+    let before = d.stake;
     let logs = match action {
         StakingAction::Delegate { validator } => {
             if d == Delegation::default() {
@@ -601,6 +602,9 @@ fn delegate(action: &StakingAction, id: &Hash, s: &Signed, epoch: u64) -> Vec<Lo
     };
     put_record(id, &r);
     put_delegation(id, &s.from, &d);
+    // The running tallies of the proposals the delegator voted on follow
+    // its stake (spec 13 §9.3).
+    crate::governance::delegation_changed(id, &s.from, before, d.stake);
     logs
 }
 

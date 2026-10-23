@@ -183,6 +183,12 @@ fn init_writes_a_reproducible_devnet_and_names_mistakes() {
         (params.staking.epoch_blocks, params.staking.dkg_phase_blocks),
         (12, 3)
     );
+    // The genesis time is when `init` ran, unless `--genesis-time` names one.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!((now - 600..=now).contains(&params.genesis_time));
     assert_eq!(params.staking.keys.0.len(), 2);
     assert_eq!(
         (params.upgrades.epoch_blocks, params.upgrades.min_delay),
@@ -238,9 +244,10 @@ fn init_writes_a_reproducible_devnet_and_names_mistakes() {
     }
     // The same seed gives the same validators; without one each devnet differs.
     let twin = scratch("init-twin");
-    init(&twin, "2", &["--seed", SEED]);
+    init(&twin, "2", &["--seed", SEED, "--genesis-time", "1792800000"]);
     let twin = Devnet::load(&twin).unwrap();
     assert_eq!(twin.nodes[0].validator, devnet.nodes[0].validator);
+    assert_eq!(genesis_params(&twin).genesis_time, 1_792_800_000);
     let other = scratch("init-other");
     init(&other, "2", &[]);
     assert_ne!(

@@ -388,7 +388,7 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let receipts_root = mpt::ordered_root(&envelopes, state::keccak256);
     let transactions_root = mpt::ordered_root(&listed, state::keccak256);
     crate::modules::end_block(height, template.timestamp_ms);
-    crate::governance::end_block(height, block);
+    let system_logs = crate::governance::end_block(height, block);
     // What the vault collected joins the reward pool before an epoch end
     // distributes it (spec 15 §10.2).
     fees::sweep();
@@ -410,6 +410,21 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     };
     let block_hash = header::block_hash(&header, state::keccak256);
     state::put_block(&header, &block_hash);
+    if !system_logs.is_empty() {
+        // What the end of the block logged, in a receipt of no transaction
+        // after the block's own (spec 20 §3.5).
+        let hash = state::keccak256(&solo_abi::chain::system_receipt_preimage(&block_hash));
+        let receipt = Receipt {
+            status: 1,
+            to: solo_abi::governance::GOVERNANCE_ADDRESS,
+            height,
+            index: receipts.len() as u32,
+            cumulative_gas_used: cumulative,
+            logs: Seq(system_logs),
+            ..Receipt::default()
+        };
+        state::set(&[keys::RECEIPT, &hash[..]].concat(), &receipt);
+    }
     ExecuteResult {
         state_root,
         summary: ExecuteSummary {
@@ -434,7 +449,8 @@ pub fn genesis() {
     let header = BlockHeader {
         height: 0,
         parent_hash: [0; 32],
-        timestamp_ms: 0,
+        // The genesis time the parameters set, zero without one (spec 20 §3.4).
+        timestamp_ms: state::params().genesis_time_ms(),
         state_root,
         receipts_root: mpt::EMPTY_ROOT,
         tx_hashes: Seq(Vec::new()),

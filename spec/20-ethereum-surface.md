@@ -130,7 +130,7 @@ The block's `logs_bloom` is the OR of its receipts' blooms. A transaction the bl
 |---|---|
 | `height` | 0 |
 | `parent_hash` | zero |
-| `timestamp_ms` | 0 |
+| `timestamp_ms` | the genesis time, `1 000 × GenesisParams::genesis_time` (below); 0 for a genesis without one |
 | `state_root` | the commitment `storage_commit` returns at that point: of everything `kernel_init` wrote |
 | `receipts_root`, `transactions_root` | the empty-trie root `56e81f17…b421` |
 | `tx_hashes`, `gas_used` | none, 0 |
@@ -143,9 +143,39 @@ and its Ethereum header and hash follow from it exactly as for every block (§3.
 
 The host keeps the trie behind the genesis header's root as version 0 of its state (22 §3), the trie `storage_commit` returned, not the state after the header was stored, exactly as it keeps the trie behind each block's root (§4.3); the genesis root the node and its store report is that root, and `eth_getProof` at block 0 verifies against block 0's `stateRoot`. The RPC serves block 0 from the stored record like any other block: `eth_getBlockByNumber(0)` (and `earliest`), `eth_getBlockByHash` with its hash, `eth_getBlockReceipts` and `eth_getLogs` with its hash (none), and its hash as a state method's block parameter (§5.2). The zero hash names no block.
 
-**Chain identity.** A chain is identified by its chain id together with its genesis hash. Through the state root the genesis hash commits to the chain id (`meta/chain_id`), the stored genesis parameters (`meta/params`: fees, governance, staking, upgrades), the genesis validator set (`meta/validators`), every allocated account with its code and storage, the genesis modules and the bridge's configuration: every chain parameter genesis fixes. Two chains that share a chain id but differ in any of these have different genesis hashes and are different chains; a snapshot of one does not import into the other (22 §7.3). The genesis hash does not commit to the genesis kernel's code hash: two kernels whose `kernel_init` writes the same state give the same genesis block, and a node is held to the kernel that wrote its store by the store itself (22 §5).
+**Genesis time.** `GenesisParams::genesis_time` (`u64`, Unix seconds) is the chain's genesis time: the genesis block's timestamp, so its header's `timestamp`, and through `meta/params` part of the state the genesis hash commits to. It is the last field of `GenesisParams` and encoded only when it is not zero; parameters that end before it decode with a genesis time of zero. So a genesis without a time encodes, stores and hashes exactly as before the field existed, and its genesis block keeps timestamp 0: every chain made without one is unchanged. A first block is never made before the genesis time: the driver's initial tip carries `max(now, genesis time)` as its timestamp (08 §3), so the first proposal comes one slot after the later of the two, and its timestamp, like every later one an honest leader makes, exceeds the genesis block's. The `solo` command reads it from the genesis JSON as `timestamp`, Unix seconds as geth writes it (a number, or a decimal or `0x` hex string); `solo devnet init` writes the time it ran, or `--genesis-time`; `solo dev` gives a genesis without one the time it starts when it keeps its chain in memory, and takes the file as written with `--data-dir`, so that a restart and the snapshot commands, which read the file, find the same chain. A genesis time in the future delays the first block until then, which is how a chain is launched at an announced time.
+
+**Chain identity.** A chain is identified by its chain id together with its genesis hash. Through the state root the genesis hash commits to the chain id (`meta/chain_id`), the stored genesis parameters (`meta/params`: fees, governance, staking, upgrades, the genesis time), the genesis validator set (`meta/validators`), every allocated account with its code and storage, the genesis modules and the bridge's configuration: every chain parameter genesis fixes. Two chains that share a chain id but differ in any of these have different genesis hashes and are different chains; a snapshot of one does not import into the other (22 §7.3). The genesis hash does not commit to the genesis kernel's code hash: two kernels whose `kernel_init` writes the same state give the same genesis block, and a node is held to the kernel that wrote its store by the store itself (22 §5).
 
 **Chains that predate the genesis block.** A chain's genesis block is whatever its genesis kernel's `kernel_init` stored; nothing stores it later. A reference kernel built before 2026-10-23 stored none: on a chain whose genesis kernel is such a kernel, block 1's parent hash is zero, `BLOCKHASH(0)` answers zero and the RPC answers `null` for block 0 and for its hash. A kernel upgrade cannot give such a chain a genesis block, since every block hash from block 1 on commits to a parent hash of zero; a later kernel runs on it unchanged, reading `meta/last_hash` as before, and the chain keeps its identity as its chain id and the hash of its block 1. Data directories and devnets made with an earlier kernel fixture are made again (`solo devnet init`), as after any rebuild of the genesis kernel: a node refuses a store written by a kernel that is neither the one it is given nor an upgrade in that store's chain state (22 §5).
+
+### 3.5 System receipts
+
+The end of a block can log: a fast-track proposal executed there (13 §9.2) logs `ProposalExecuted(id)` and its action's logs, and no transaction carries them. They go in the block's *system receipt*, a receipt of no transaction:
+
+| Field | Value |
+|---|---|
+| `status` | 1 |
+| `gas_used`, `value`, `effective_gas_price` | 0 |
+| `from` | the zero address |
+| `to` | the governance address `0x…5010` |
+| `height` | the block's |
+| `index` | the number of transactions the block records: it comes after them |
+| `cumulative_gas_used` | the block's gas used |
+| `contract` | none |
+| `logs` | what the end of the block logged, in order |
+| `tx_type` | 0 |
+
+It exists only for a block whose end logged something. The kernel stores it after the block's header, under `receipt/` ‖ its hash, the *system receipt hash* `keccak256("solo/system-receipt" ‖ block hash)` (`solo_abi::chain::system_receipt_preimage`), which no transaction hashes to and which names one block of one chain. It is committed by the next block's state root, as the block's header is. It is not in the header: the transactions root, the receipts root, the logs bloom and `gas_used` stay the Ethereum functions of the block's transactions of §3.1–§3.2, so a header rebuilt from `eth_getBlockByNumber` and `eth_getBlockReceipts` verifies as on any Ethereum chain, and the block hash does not depend on it.
+
+The RPC serves it the way Polygon PoS serves its state-sync receipts, which Ethereum indexers already read:
+
+- `eth_getLogs` returns its logs after the block's transactions' logs, with `transactionHash` the system receipt hash, `transactionIndex` its `index` and `logIndex` continuing the block's count; a filter by address or topic matches them as any log.
+- `eth_getTransactionReceipt(system receipt hash)` returns it, `to` the governance address, its logs as `eth_getLogs` numbers them.
+- `eth_getTransactionByHash(system receipt hash)` returns `null`: there is no transaction. `eth_getBlockByNumber` and `eth_getBlockReceipts` do not list it, and the block's `transactions` and receipts are its transactions' alone.
+- `solo_getProposal(id)` of a fast-track proposal executed at the end of a block names the system receipt hash (13 §9.8).
+
+Choosing a receipt outside the header over a system transaction inside it: a pseudo-transaction in the transactions root would need a transaction type that no Ethereum tool decodes (Optimism's deposit type `0x7E` is the precedent, and tools decode it only with chain-specific code), would put unsigned bytes where every tool expects a signed transaction, and would change what a header commits to for every block. A receipt beside the header changes no header and no transaction, and reaches tools through the one method they use to read logs.
 
 ## 4. `eth_getProof`
 
@@ -210,7 +240,8 @@ The execution-spec state tests run set-code transactions through the kernel's ow
 
 ## 7. Limits of this version
 
-- The genesis header's timestamp is 0: the genesis parameters carry no time, and block 1's is the first proposal's.
+- A genesis without a genesis time (§3.4) keeps a genesis header timestamp of 0, as every chain made before the field existed does.
+- A system receipt (§3.5) is outside the header: the logs bloom does not cover its logs, so a tool that skips blocks by their bloom misses them, and it is not in `eth_getBlockReceipts`; `eth_getLogs` and `eth_getTransactionReceipt` are the way to it.
 - `stateRoot` is not an Ethereum state root (§3.3), and `eth_getProof` answers in Solo's proof format, which Ethereum's verifiers do not read.
 - A node without a data directory keeps its history in memory and has none from before it started; while blocks write heavily a window is shorter than `state_history` (§5.1). A node started from a snapshot has no state from before the snapshot (22 §7).
 - The pool's rules for delegation are geth's, plus the take's rule for authorities ahead (§2.4); a pool of another host may differ without affecting consensus (14 §1).

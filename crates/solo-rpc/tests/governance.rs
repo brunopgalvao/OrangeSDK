@@ -272,9 +272,16 @@ fn proposals_are_read_from_submission_to_execution() {
     let receipt = ok(&mut rpc, "eth_getTransactionReceipt", json!([hash]));
     assert_eq!(receipt["status"], "0x1");
     assert_eq!(receipt["logs"].as_array().unwrap().len(), 2);
+    // Executed, the proposal names the transaction that executed it.
     assert_eq!(
         ok(&mut rpc, "solo_getProposal", json!(["0x1"])),
-        Value::Null
+        json!({
+            "id": "0x1",
+            "status": "executed",
+            "executedAt": receipt["blockNumber"],
+            "atEndOfBlock": false,
+            "transactionHash": hash,
+        })
     );
     let status = ok(&mut rpc, "solo_getGovernance", json!([]));
     assert_eq!(status["guardian"], data(&[0xAB; 20]));
@@ -295,6 +302,165 @@ fn proposals_are_read_from_submission_to_execution() {
         -32602
     );
     assert_eq!(err_code(&mut rpc, "solo_getProposal", json!([1])), -32602);
+}
+
+/// Sends `call` from `from` with `value` and returns its transaction hash.
+fn send(rpc: &mut Rpc, from: &Wallet, nonce: u64, value: u128, call: &Call) -> Value {
+    let raw = from.legacy(&Fields {
+        nonce,
+        to: Some(GOVERNANCE_ADDRESS),
+        value,
+        gas_limit: GAS,
+        data: &call.encode(),
+    });
+    ok(rpc, "eth_sendRawTransaction", json!([data(&raw)]))
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_fast_track_execution_logs_in_the_system_receipt() {
+    let alice = Wallet::new(1);
+    let mut rpc = Rpc::new(stake_node(&alice));
+    let mut now = 1_000;
+    let mut tick = |rpc: &mut Rpc| {
+        now += SLOT_MS;
+        rpc.node_mut().tick(now).unwrap();
+    };
+    tick(&mut rpc);
+    // A proposal, and the validators' `reject` of it on the fast track.
+    let guardian = Call::SetGuardian {
+        guardian: [0xAB; 20],
+    }
+    .encode();
+    send(
+        &mut rpc,
+        &alice,
+        0,
+        ETHER,
+        &Call::Submit {
+            target: GOVERNANCE_ADDRESS,
+            data: guardian,
+        },
+    );
+    tick(&mut rpc);
+    let reject = Call::Reject { id: 1 }.encode();
+    send(
+        &mut rpc,
+        &alice,
+        1,
+        ETHER,
+        &Call::Submit {
+            target: GOVERNANCE_ADDRESS,
+            data: reject,
+        },
+    );
+    tick(&mut rpc);
+    assert_eq!(
+        ok(&mut rpc, "solo_getProposal", json!(["0x2"]))["fastTrack"],
+        true
+    );
+    // The validator's vote passes it; it executes at the end of that block.
+    let voter = validator();
+    let raw = voter.legacy_on(
+        &Fields {
+            nonce: 0,
+            to: Some(GOVERNANCE_ADDRESS),
+            value: 0,
+            gas_limit: GAS,
+            data: &Call::Vote {
+                id: 2,
+                support: true,
+            }
+            .encode(),
+        },
+        0,
+        CHAIN_ID,
+    );
+    let vote = ok(&mut rpc, "eth_sendRawTransaction", json!([data(&raw)]));
+    tick(&mut rpc);
+    let receipt = ok(&mut rpc, "eth_getTransactionReceipt", json!([vote]));
+    let block = receipt["blockNumber"].clone();
+    let block_hash = receipt["blockHash"].clone();
+    assert_eq!(receipt["logs"].as_array().unwrap().len(), 1);
+    // `ProposalExecuted(2)` is in the block's system receipt, after the
+    // vote's `Voted`, where `eth_getLogs` finds it.
+    let hash = keccak256(&solo_abi::chain::system_receipt_preimage(
+        &solo_rpc::methods::parse_hex(block_hash.as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    ));
+    let executed = solo_abi::governance::executed_log(2);
+    let logs = ok(
+        &mut rpc,
+        "eth_getLogs",
+        json!([{"fromBlock": block, "toBlock": block, "address": data(&GOVERNANCE_ADDRESS)}]),
+    );
+    assert_eq!(logs.as_array().unwrap().len(), 2);
+    assert_eq!(logs[0]["transactionHash"], vote);
+    assert_eq!(
+        logs[1],
+        json!({
+            "address": data(&GOVERNANCE_ADDRESS),
+            "topics": executed.topics.0.iter().map(|t| data(t)).collect::<Vec<_>>(),
+            "data": "0x",
+            "blockHash": block_hash,
+            "blockNumber": block,
+            "transactionHash": data(&hash),
+            "transactionIndex": "0x1",
+            "logIndex": "0x1",
+            "removed": false,
+        })
+    );
+    // A filter that matches only the vote leaves it out.
+    let topic = data(&solo_abi::governance::event::VOTED);
+    let matching = ok(
+        &mut rpc,
+        "eth_getLogs",
+        json!([{"fromBlock": block, "toBlock": block, "topics": [topic]}]),
+    );
+    assert_eq!(matching.as_array().unwrap().len(), 1);
+    // Its receipt reads like a transaction's; there is no transaction, and
+    // the block lists its transactions' receipts alone.
+    let system = ok(&mut rpc, "eth_getTransactionReceipt", json!([data(&hash)]));
+    assert_eq!(
+        (
+            &system["status"],
+            &system["to"],
+            &system["from"],
+            &system["gasUsed"]
+        ),
+        (
+            &json!("0x1"),
+            &json!(data(&GOVERNANCE_ADDRESS)),
+            &json!(data(&[0; 20])),
+            &json!("0x0")
+        )
+    );
+    assert_eq!(system["cumulativeGasUsed"], receipt["cumulativeGasUsed"]);
+    assert_eq!(system["logs"][0], logs[1]);
+    assert_eq!(
+        ok(&mut rpc, "eth_getTransactionByHash", json!([data(&hash)])),
+        Value::Null
+    );
+    let receipts = ok(&mut rpc, "eth_getBlockReceipts", json!([block]));
+    assert_eq!(receipts.as_array().unwrap().len(), 1);
+    // The proposal names it; the proposal it rejected is gone.
+    assert_eq!(
+        ok(&mut rpc, "solo_getProposal", json!(["0x2"])),
+        json!({
+            "id": "0x2",
+            "status": "executed",
+            "executedAt": block,
+            "atEndOfBlock": true,
+            "transactionHash": data(&hash),
+        })
+    );
+    assert_eq!(
+        ok(&mut rpc, "solo_getProposal", json!(["0x1"])),
+        Value::Null
+    );
+    assert_eq!(ok(&mut rpc, "solo_getProposals", json!([])), json!([]));
 }
 
 #[test]

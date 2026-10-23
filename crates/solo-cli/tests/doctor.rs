@@ -19,8 +19,10 @@ const KERNEL: &str = concat!(
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4, "alloc": {}}"#;
 
-/// Gas that lets the driver start but not produce a block; see `dev.rs`.
-const STARVED_GAS: i64 = 80_000;
+/// Gas that lets the driver start (80 224) but not produce a block (275 837); see
+/// `dev.rs`, whose budget this is. It was 80 000 until the driver start passed it
+/// on 2026-10-24.
+const STARVED_GAS: i64 = 100_000;
 
 /// Limits a healthy node meets even on an instrumented build under heavy load.
 const TOLERANT: [&str; 4] = ["--max-call-ms", "600000", "--max-head-age", "600"];

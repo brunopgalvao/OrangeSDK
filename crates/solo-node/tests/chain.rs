@@ -3,7 +3,7 @@
 //! receipts, queries, rejection reasons, and restart from persisted state.
 
 use k256::ecdsa::SigningKey;
-use solo_abi::Encode;
+use solo_abi::{Decode, Encode};
 use solo_abi::chain::consensus::{propose_timer, timeout_timer};
 use solo_abi::chain::{Allocation, GenesisParams, reason};
 use solo_abi::codec::Seq;
@@ -166,6 +166,58 @@ fn genesis_state_and_queries() {
         Some(solo_node::validator_id(&node_key()))
     );
     assert_eq!(node.now_ms(), 1_000);
+    // No genesis time: the genesis block's timestamp is 0, as before there was one.
+    assert_eq!(node.block_by_number(0).unwrap().unwrap().timestamp_ms, 0);
+}
+
+#[test]
+fn a_genesis_time_dates_block_zero_and_holds_the_first_block_back() {
+    let alice = Wallet::new(1);
+    let mut g = genesis(&alice);
+    let mut params = GenesisParams::from_bytes(&g.params).unwrap();
+    params.genesis_time = 5;
+    g.params = params.to_bytes();
+    let config = NodeConfig {
+        now_ms: 1_000,
+        key: Some(node_key()),
+        ..NodeConfig::default()
+    };
+    let mut node = Node::open(&kernel_module(), &g, config).unwrap();
+    node.start(None).unwrap();
+    let zero = node.block_by_number(0).unwrap().unwrap();
+    assert_eq!(zero.timestamp_ms, 5_000);
+    // A node started before the genesis time proposes one slot after it.
+    assert_eq!(
+        node.timers(),
+        vec![
+            (timeout_timer(1), 1_000 + 3 * SLOT_MS),
+            (propose_timer(1), 5_000 + SLOT_MS)
+        ]
+    );
+    let mut now = 1_000;
+    while node.block_number().unwrap() == 0 {
+        now += SLOT_MS;
+        node.tick(now).unwrap();
+    }
+    let first = node.block_by_number(1).unwrap().unwrap();
+    assert!(first.timestamp_ms >= 5_000 + SLOT_MS, "{}", first.timestamp_ms);
+    // The genesis hash commits to the time: another time, another chain.
+    let mut other = genesis(&alice);
+    other.params = GenesisParams {
+        genesis_time: 6,
+        ..params
+    }
+    .to_bytes();
+    let config = NodeConfig {
+        now_ms: 1_000,
+        key: Some(node_key()),
+        ..NodeConfig::default()
+    };
+    let mut twin = Node::open(&kernel_module(), &other, config).unwrap();
+    assert_ne!(
+        twin.block_by_number(0).unwrap().unwrap().state_root,
+        zero.state_root
+    );
 }
 
 #[test]

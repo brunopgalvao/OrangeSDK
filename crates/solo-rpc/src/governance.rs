@@ -4,7 +4,11 @@
 
 use serde_json::{Value, json};
 use solo_abi::Decode;
-use solo_abi::governance::{GovernanceStatus, ProposalView, mode, query, status};
+use solo_abi::chain::system_receipt_preimage;
+use solo_abi::governance::{
+    Call, Execution, GOVERNANCE_ADDRESS, GovernanceStatus, ProposalView, mode, query, status,
+};
+use solo_host::hash::keccak256;
 use solo_node::Node;
 
 use crate::hex::{data, parse_quantity, quantity};
@@ -126,8 +130,37 @@ pub fn proposals(node: &mut Node) -> Result<Value, RpcError> {
     ))
 }
 
-/// `solo_getProposal(id)`: one open proposal, or `null` once it is executed,
-/// vetoed, failed or expired.
+/// The hash whose receipt carries what executing proposal `id` in block
+/// `height` logged: the block's system receipt for an execution at its end,
+/// else the first `execute(id)` of the block that ran (spec 13 §9.7).
+fn execution_receipt(node: &mut Node, id: u64, e: &Execution) -> Result<Value, RpcError> {
+    let header = node.block_by_number(e.height)?.unwrap_or_default();
+    if e.system {
+        let block_hash = solo_eth::header::block_hash(&header, keccak256);
+        return Ok(json!(data(&keccak256(&system_receipt_preimage(
+            &block_hash
+        )))));
+    }
+    let execute = Some(Call::Execute { id });
+    let found = header.tx_hashes.0.iter().find(|hash| {
+        let ran = node
+            .receipt(hash)
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.gas_used > 0);
+        let raw = node.transaction(hash).ok().flatten().unwrap_or_default();
+        ran && solo_eth::decode(&raw)
+            .is_ok_and(|tx| tx.to == Some(GOVERNANCE_ADDRESS) && Call::decode(&tx.input) == execute)
+    });
+    // A block a node no longer keeps has no transactions to show.
+    Ok(found.map_or(Value::Null, |hash| json!(data(hash))))
+}
+
+/// `solo_getProposal(id)`: one open proposal; once executed, where it ran
+/// (`status` `executed`, `executedAt`, and `transactionHash`, whose receipt
+/// carries what it logged: the `execute` transaction, or the block's system
+/// receipt for a fast-track proposal executed at the end of a block);
+/// `null` once vetoed, failed or expired.
 ///
 /// # Errors
 /// Invalid params, or a server error if the node fails.
@@ -135,7 +168,21 @@ pub fn proposal(node: &mut Node, params: &[Value]) -> Result<Value, RpcError> {
     let id = parse_quantity(param_str(params, 0)?)?;
     let r = node.query(query::PROPOSAL, &solo_abi::Encode::to_bytes(&id))?;
     if r.status != 0 {
-        return Ok(Value::Null);
+        let r = node.query(query::EXECUTED, &solo_abi::Encode::to_bytes(&id))?;
+        if r.status != 0 {
+            return Ok(Value::Null);
+        }
+        let e = Execution::from_bytes(&r.body)
+            .ok()
+            .ok_or(RpcError::server("the kernel's execution does not decode"))?;
+        let hash = execution_receipt(node, id, &e)?;
+        return Ok(json!({
+            "id": quantity(u128::from(id)),
+            "status": "executed",
+            "executedAt": quantity(u128::from(e.height)),
+            "atEndOfBlock": e.system,
+            "transactionHash": hash,
+        }));
     }
     let view = ProposalView::from_bytes(&r.body)
         .ok()

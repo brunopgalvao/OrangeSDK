@@ -8,7 +8,7 @@
 //! solo devnet init --dir <dir> --kernel <kernel.elf|kernel.solo> [--validators 4] [--chain-id 1337]
 //!                  [--slot-ms 400] [--epoch-blocks 20] [--dkg-phase-blocks 5] [--upgrade-delay 2]
 //!                  [--host 127.0.0.1] [--p2p-port 30301] [--rpc-port 8545] [--seed <64 hex>]
-//!                  [--governance-key <64 hex>] [--force]
+//!                  [--governance-key <64 hex>] [--genesis-time <unix seconds>] [--force]
 //! solo devnet up --dir <dir> [--blocks <n>]
 //! solo devnet down --dir <dir>
 //! solo devnet stop|start --dir <dir> --node <i>
@@ -23,7 +23,10 @@
 //! `<dir>/genesis.json`, `<dir>/governance.key`, one `<dir>/node-<i>/key`
 //! per validator and the manifest `<dir>/devnet.json`: each node's
 //! peer-to-peer and JSON-RPC addresses (port 0 picks free ports) and its
-//! peers, every node dialling the ones before it. The genesis runs the fee
+//! peers, every node dialling the ones before it. The genesis carries the
+//! time of the `init` as its `timestamp`, or `--genesis-time` (spec 20
+//! §3.4): the genesis block's timestamp, before which nobody makes a
+//! block, so a devnet started late begins at once. The genesis runs the fee
 //! market at the production defaults (spec 23 §2.1) and funds the account
 //! of the README's key `0x01…01`, every validator's account and the
 //! governance account, so that validators pay for their gate signals and
@@ -337,6 +340,10 @@ fn init(args: &[String]) -> Result<String, String> {
     let epoch_blocks = number(args, "--epoch-blocks", 20)?;
     let dkg_phase_blocks = number(args, "--dkg-phase-blocks", 5)?;
     let upgrade_delay = number(args, "--upgrade-delay", 2)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let genesis_time = number(args, "--genesis-time", now)?;
     let host = arg(args, "--host").unwrap_or_else(|| "127.0.0.1".to_owned());
     let seed: [u8; 32] = if let Some(hex) = arg(args, "--seed") {
         parse_key(&hex)?.to_bytes().into()
@@ -367,6 +374,7 @@ fn init(args: &[String]) -> Result<String, String> {
     }
     let mut genesis = json!({
         "chainId": chain_id,
+        "timestamp": genesis_time,
         "slotMs": slot_ms,
         "maxTxs": 64,
         "alloc": alloc,

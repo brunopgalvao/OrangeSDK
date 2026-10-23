@@ -18,9 +18,10 @@ use solo_abi::bridge_in::{LIGHT_CLIENT_ADDRESS, VERIFIER_ADDRESS};
 use solo_abi::chain::{Account, Log, UpgradeParams, ValidatorSet, call_status, reason};
 use solo_abi::codec::Seq;
 use solo_abi::governance::{
-    self as gov, ACTION_GAS, Ballot, BallotEntry, Call, DelegatorBallot, GOVERNANCE_ADDRESS,
-    GOVERNANCE_GAS, GovernanceParams, GovernanceStatus, MAX_BALLOTS, MAX_CALL_GAS,
-    MAX_OPEN_PROPOSALS, Member, OpenProposal, Proposal, ProposalView, mode, status,
+    self as gov, ACTION_GAS, Ballot, BallotEntry, Call, DelegatorBallot, Execution,
+    GOVERNANCE_ADDRESS, GOVERNANCE_GAS, GovernanceParams, GovernanceStatus, MAX_CALL_GAS,
+    MAX_OPEN_PROPOSALS, Member, Moved, OpenProposal, Proposal, ProposalView, SWEEP_BALLOTS, Sweep,
+    mode, status,
 };
 use solo_abi::modules::{Install, MODULE_ADDRESS};
 use solo_abi::staking::GWEI;
@@ -180,12 +181,17 @@ fn open() -> Vec<OpenProposal> {
         .unwrap_or_default()
 }
 
-fn set_open(list: &[OpenProposal]) {
+/// Stores `list` under `key`, or deletes the key when it is empty.
+fn put_list<T: Encode + Clone>(key: &[u8], list: &[T]) {
     if list.is_empty() {
-        state::delete(gov::keys::OPEN);
+        state::delete(key);
     } else {
-        state::set(gov::keys::OPEN, &Seq(list.to_vec()));
+        state::set(key, &Seq(list.to_vec()));
     }
+}
+
+fn set_open(list: &[OpenProposal]) {
+    put_list(gov::keys::OPEN, list);
 }
 
 /// An open proposal by id.
@@ -307,10 +313,63 @@ fn count(id: u64) -> Count {
     }
 }
 
-/// The stake voting yes and no on `id`, and the stake of the members that count.
-fn tally(id: u64) -> (u64, u64, u64) {
-    let t = count(id).tally;
-    (t.yes, t.no, t.total)
+/// The running sums of proposal `id` behind `validator` (spec 13 §9.3).
+fn moved(id: u64, validator: &Hash) -> Moved {
+    state::get(&gov::keys::moved(id, validator)).unwrap_or_default()
+}
+
+/// Replaces `old` gwei with `new` in the sums of proposal `id` behind
+/// `validator` on the side `support` names.
+fn shift(id: u64, validator: &Hash, support: bool, old: u64, new: u64) {
+    let mut m = moved(id, validator);
+    m.shift(support, old, new);
+    let key = gov::keys::moved(id, validator);
+    if m == Moved::default() {
+        state::delete(&key);
+    } else {
+        state::set(&key, &m);
+    }
+}
+
+/// The staking hook of spec 13 §9.3: `delegator`'s bonded stake behind
+/// `validator` changed from `old` to `new` wei (a `delegate` or an
+/// `undelegate`), so the running sums of every open proposal it voted on
+/// move with it. At most `MAX_OPEN_PROPOSALS` proposals, each one read of
+/// where the vote is, and for a vote its entry and its sums.
+pub fn delegation_changed(validator: &Hash, delegator: &Address, old: u128, new: u128) {
+    let (old, new) = (gwei(old), gwei(new));
+    for o in open() {
+        if let Some(i) = ballot_index(o.id, delegator)
+            && let Some(b) = state::get::<BallotEntry>(&gov::keys::ballot_at(o.id, i))
+        {
+            shift(o.id, validator, b.support, old, new);
+        }
+    }
+}
+
+/// The tally of `id` from its running sums (spec 13 §9.3): one vote and one
+/// sum per member of `members`, whatever the number of delegators' votes.
+/// Equal to [`count`]'s from scratch.
+fn tally_with(id: u64, members: &[(Hash, u64)]) -> (u64, u64, u64) {
+    let staking = crate::staking::enabled();
+    let list: Vec<(Member, Moved)> = members
+        .iter()
+        .map(|(v, weight)| {
+            let m = Member {
+                weight: *weight,
+                vote: vote_of(id, v),
+            };
+            (
+                m,
+                if staking {
+                    moved(id, v)
+                } else {
+                    Moved::default()
+                },
+            )
+        })
+        .collect();
+    gov::running_tally(&list)
 }
 
 /// Moves `id`'s entry in the open list to `due`.
@@ -328,19 +387,31 @@ fn set_due(id: u64, due: u64) {
     set_open(&list);
 }
 
-/// Removes proposal `p` from state with its votes, and settles its deposit:
-/// back to the proposer when `refund`, else to the zero address, where fees
-/// go and nobody can spend it.
+/// Removes proposal `p` from state with its validators' votes and its
+/// running sums, hands its delegators' votes to the sweep (spec 13 §9.3),
+/// and settles its deposit: back to the proposer when `refund`, else to the
+/// zero address, where fees go and nobody can spend it.
 fn prune(p: &Proposal, refund: bool) {
     for validator in voters(p.id) {
         state::delete(&gov::keys::vote(p.id, &validator));
     }
     state::delete(&gov::keys::voters(p.id));
-    for (i, (a, _)) in (0u32..).zip(ballots(p.id)) {
-        state::delete(&gov::keys::ballot(p.id, &a));
-        state::delete(&gov::keys::ballot_at(p.id, i));
+    // Sums are kept only behind registered validators: a delegation needs
+    // one, and a record with delegations behind it, or jailed, stays.
+    for validator in crate::staking::ids() {
+        state::delete(&gov::keys::moved(p.id, &validator));
     }
-    state::delete(&gov::keys::ballots(p.id));
+    let end = ballot_count(p.id);
+    if end != 0 {
+        let mut list = sweeps();
+        list.push(Sweep {
+            id: p.id,
+            next: 0,
+            end,
+        });
+        put_list(gov::keys::SWEEP, &list);
+        state::delete(&gov::keys::ballots(p.id));
+    }
     state::delete(&gov::keys::proposal(p.id));
     let rest: Vec<OpenProposal> = open().into_iter().filter(|o| o.id != p.id).collect();
     set_open(&rest);
@@ -350,11 +421,52 @@ fn prune(p: &Proposal, refund: bool) {
     }
 }
 
+fn sweeps() -> Vec<Sweep> {
+    state::get::<Seq<Sweep>>(gov::keys::SWEEP)
+        .map(|s| s.0)
+        .unwrap_or_default()
+}
+
+/// Deletes up to [`SWEEP_BALLOTS`] delegators' votes of pruned proposals,
+/// oldest first (spec 13 §9.3): a pruned proposal's votes are no longer
+/// read, and leave state at this pace, which outruns what a block can cast.
+fn sweep() {
+    let mut list = sweeps();
+    if list.is_empty() {
+        return;
+    }
+    let mut budget = SWEEP_BALLOTS;
+    while budget != 0
+        && let Some(s) = list.first_mut()
+    {
+        let upto = s.end.min(s.next.saturating_add(budget));
+        for i in s.next..upto {
+            let key = gov::keys::ballot_at(s.id, i);
+            if let Some(b) = state::get::<BallotEntry>(&key) {
+                state::delete(&gov::keys::ballot(s.id, &b.delegator));
+            }
+            state::delete(&key);
+        }
+        budget -= upto - s.next;
+        s.next = upto;
+        if s.next == s.end {
+            list.remove(0);
+        }
+    }
+    put_list(gov::keys::SWEEP, &list);
+}
+
+/// Records where proposal `id` was executed, in block `height`, at its end
+/// (`system`) or by an `execute` transaction (spec 13 §9.7).
+fn record_execution(id: u64, height: u64, system: bool) {
+    state::set(&gov::keys::executed(id), &Execution { height, system });
+}
+
 /// Records the tally of a proposal whose voting ended: passed, it waits for
 /// its timelock; otherwise it is pruned, its deposit returned only if the
 /// vote reached quorum.
-fn close_voting(mut p: Proposal) {
-    let (yes, no, total) = tally(p.id);
+fn close_voting(mut p: Proposal, members: &[(Hash, u64)]) {
+    let (yes, no, total) = tally_with(p.id, members);
     let rules = rules();
     if !p.fast_track && gov::passes(yes, no, total, rules.quorum_bps) {
         p.status = status::PASSED;
@@ -586,7 +698,7 @@ fn call_allowed(call: &Call, s: &Signed, height: u64) -> bool {
             value == 0
                 && proposal(*id)
                     .is_some_and(|p| p.status == status::VOTING && height <= p.voting_end)
-                && (validator_of(from).is_some() || may_ballot(*id, from))
+                && (validator_of(from).is_some() || may_ballot(from))
         }
         Call::Execute { id } => {
             value == 0
@@ -618,24 +730,12 @@ fn callable(target: &Address, gas: u64) -> bool {
     !gov::is_system(target) && gas <= MAX_CALL_GAS
 }
 
-/// Whether `from`, which is no validator's account, may vote on `id` as a
-/// delegator (spec 13 §9.3): staking is on and it has bonded stake behind a
-/// member of the current set that counts; and it voted on `id` before, or
-/// the proposal has room for another delegator's vote and that stake is at
-/// least `1 / MAX_BALLOTS` of the members' stake.
-fn may_ballot(id: u64, from: &Address) -> bool {
-    if !crate::staking::enabled() {
-        return false;
-    }
-    let members = members();
-    let weight: u128 = behind(from, &positions(&members))
-        .iter()
-        .map(|(_, w)| u128::from(*w))
-        .sum();
-    let total: u128 = members.iter().map(|(_, w)| u128::from(*w)).sum();
-    weight != 0
-        && (ballot_index(id, from).is_some()
-            || (ballot_count(id) < MAX_BALLOTS && weight * u128::from(MAX_BALLOTS) >= total))
+/// Whether `from`, which is no validator's account, may vote as a delegator
+/// (spec 13 §9.3): staking is on and it has bonded stake behind a member of
+/// the current set that counts. Any such stake, however small: the tally
+/// reads running sums, not the votes, so their number bounds nothing.
+fn may_ballot(from: &Address) -> bool {
+    crate::staking::enabled() && !behind(from, &positions(&members())).is_empty()
 }
 
 fn guardian_acts(from: &Address) -> bool {
@@ -1027,12 +1127,32 @@ fn apply_call(call: Call, s: &Signed, block: BlockFields, called: &mut u64) -> O
                         .map_or(0, |(_, w)| w)
                 }
                 None => {
-                    let at = ballot_index(id, &s.from).unwrap_or_else(|| {
-                        let n = ballot_count(id);
-                        state::set(&gov::keys::ballot(id, &s.from), &n);
-                        state::set(&gov::keys::ballots(id), &(n + 1));
-                        n
-                    });
+                    let (at, before) = match ballot_index(id, &s.from) {
+                        Some(at) => {
+                            let entry = state::get::<BallotEntry>(&gov::keys::ballot_at(id, at));
+                            (at, entry.map(|b| b.support))
+                        }
+                        None => {
+                            let n = ballot_count(id);
+                            state::set(&gov::keys::ballot(id, &s.from), &n);
+                            state::set(&gov::keys::ballots(id), &(n + 1));
+                            (n, None)
+                        }
+                    };
+                    if before != Some(support) {
+                        // The delegator's stake joins its side's running
+                        // sums, or moves there from the other side, behind
+                        // every validator it delegates to.
+                        for v in crate::staking::delegated_to(&s.from) {
+                            let w = gwei(
+                                crate::staking::delegation(&v, &s.from).map_or(0, |d| d.stake),
+                            );
+                            if let Some(old) = before {
+                                shift(id, &v, old, w, 0);
+                            }
+                            shift(id, &v, support, 0, w);
+                        }
+                    }
                     let entry = BallotEntry {
                         delegator: s.from,
                         support,
@@ -1052,6 +1172,7 @@ fn apply_call(call: Call, s: &Signed, block: BlockFields, called: &mut u64) -> O
         Call::Execute { id } => {
             let p = proposal(id)?;
             prune(&p, true);
+            record_execution(id, height, false);
             let mut logs = vec![gov::executed_log(id)];
             if p.is_call() {
                 logs.extend(governed_call(id, &p, s, block, called));
@@ -1096,13 +1217,20 @@ fn assemble(code_hash: &Hash) -> Option<(Vec<u8>, u32)> {
     (chunks > 0).then_some((code, chunks))
 }
 
-/// Bookkeeping at the end of `block`, before the state commitment.
-pub fn end_block(height: u64, block: BlockFields) {
+/// Bookkeeping at the end of `block`, before the state commitment. Returns
+/// what the fast-track proposals executed here logged, in order: the
+/// block's system logs (spec 20 §3.5).
+pub fn end_block(height: u64, block: BlockFields) -> Vec<Log> {
     if pending().is_some_and(|up| height > up.activation_height) {
         // This kernel was superseded at the activation height. A host still
         // running it past there must halt rather than fork the chain.
         solo_guest::trap();
     }
+    // What pruning left of delegators' votes leaves state at a bounded pace.
+    sweep();
+    let mut logs = Vec::new();
+    // The members that count, read once for every tally of the block.
+    let mut counted: Option<Vec<(Hash, u64)>> = None;
     // Proposals whose voting ends here are tallied, and fast-track ones that
     // took a vote in this block; passed ones left unexecuted through their
     // window expire (spec 13 §9.3).
@@ -1115,15 +1243,20 @@ pub fn end_block(height: u64, block: BlockFields) {
         };
         if p.status != status::VOTING {
             prune(&p, true);
-        } else if !p.fast_track {
-            close_voting(p);
+            continue;
+        }
+        let members = counted.get_or_insert_with(members);
+        if !p.fast_track {
+            close_voting(p, members);
         } else {
-            let (yes, no, total) = tally(p.id);
+            let (yes, no, total) = tally_with(p.id, members);
             if gov::fast_passes(yes, total) {
-                // A safety action executes at once; what it logs has no
-                // receipt to go to.
+                // A safety action executes at once; what it logs goes to the
+                // block's system receipt, after `ProposalExecuted`.
                 prune(&p, true);
-                let _ = apply_action(&p.target, &p.data, block);
+                record_execution(p.id, height, true);
+                logs.push(gov::executed_log(p.id));
+                logs.extend(apply_action(&p.target, &p.data, block).unwrap_or_default());
             } else if height >= p.voting_end {
                 prune(&p, gov::quorum(yes, no, total, rules().quorum_bps));
             } else {
@@ -1155,6 +1288,7 @@ pub fn end_block(height: u64, block: BlockFields) {
         // The new kernel needs host features that will not be active: it lapses.
         state::delete(keys::PENDING);
     }
+    logs
 }
 
 // ---- Queries ----
@@ -1250,6 +1384,19 @@ pub fn query(method: &str, params: &[u8]) -> QueryResult {
             },
         },
         gov::query::GOVERNANCE => ok(governance_status().to_bytes()),
+        gov::query::EXECUTED => match u64::from_bytes(params) {
+            Ok(id) => state::get::<Execution>(&gov::keys::executed(id)).map_or(
+                QueryResult {
+                    status: 1,
+                    body: Vec::new(),
+                },
+                |e| ok(e.to_bytes()),
+            ),
+            Err(_) => QueryResult {
+                status: 2,
+                body: Vec::new(),
+            },
+        },
         gov::query::PROPOSAL => match u64::from_bytes(params) {
             Ok(id) => proposal(id).map_or(
                 QueryResult {

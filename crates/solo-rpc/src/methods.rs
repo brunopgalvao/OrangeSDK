@@ -718,6 +718,16 @@ impl Rpc {
         })
     }
 
+    /// The system receipt of the block whose hash is `block_hash`, with its
+    /// hash, if the end of that block logged anything (spec 20 §3.5).
+    pub(crate) fn system_receipt(
+        &mut self,
+        block_hash: &[u8; 32],
+    ) -> Result<Option<([u8; 32], Receipt)>, RpcError> {
+        let hash = keccak256(&solo_abi::chain::system_receipt_preimage(block_hash));
+        Ok(self.node.receipt(&hash)?.map(|r| (hash, r)))
+    }
+
     fn receipt_json(&mut self, hash: &[u8; 32], receipt: &Receipt) -> Result<Value, RpcError> {
         let (header, block_hash) = self.header_at(receipt.height)?.unwrap_or_default();
         let earlier = header.tx_hashes.0.iter().take(receipt.index as usize);
@@ -726,7 +736,16 @@ impl Rpc {
             let logs = self.node.receipt(tx_hash)?.unwrap_or_default().logs;
             first_log += logs.0.len() as u64;
         }
-        let destination = self.destination(hash)?;
+        let destination = if self.node.transaction(hash)?.is_none() {
+            // A system receipt, of no transaction: its logs are the
+            // governance address's end of the block.
+            Destination {
+                to: Some(receipt.to),
+                contract: None,
+            }
+        } else {
+            self.destination(hash)?
+        };
         Ok(views::receipt(
             hash,
             receipt,
@@ -760,7 +779,10 @@ impl Rpc {
 
     fn transaction_by_hash(&mut self, hash: &[u8; 32]) -> Result<Value, RpcError> {
         if let Some(receipt) = self.node.receipt(hash)? {
-            let raw = self.node.transaction(hash)?.unwrap_or_default();
+            // A system receipt has no transaction.
+            let Some(raw) = self.node.transaction(hash)? else {
+                return Ok(Value::Null);
+            };
             let (_, block_hash) = self.header_at(receipt.height)?.unwrap_or_default();
             let position = Position {
                 block_hash,
@@ -856,6 +878,21 @@ impl Rpc {
                 for log in &receipt.logs.0 {
                     if filter.matches(log) {
                         out.push(views::log(log, tx_hash, &position, log_index));
+                    }
+                    log_index += 1;
+                }
+            }
+            // What the end of the block logged comes after its transactions'
+            // logs, under the system receipt's hash (spec 20 §3.5).
+            if let Some((hash, receipt)) = self.system_receipt(&block_hash)? {
+                let position = Position {
+                    block_hash,
+                    height,
+                    index: receipt.index,
+                };
+                for log in &receipt.logs.0 {
+                    if filter.matches(log) {
+                        out.push(views::log(log, &hash, &position, log_index));
                     }
                     log_index += 1;
                 }

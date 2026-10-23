@@ -67,25 +67,74 @@ record! {
     }
 }
 
-record! {
-    /// Kernel parameters carried in `Genesis::params`.
-    GenesisParams {
-        /// Slot length of the dev driver in milliseconds.
-        slot_ms: u64,
-        /// Maximum transactions per block.
-        max_txs: u32,
-        /// Initial accounts: balances and predeployed contracts.
-        allocations: Seq<Allocation>,
-        /// Governed kernel upgrades and host feature gates (spec 13).
-        upgrades: UpgradeParams,
-        /// Staking, epochs, slashing and threshold keys (spec 15).
-        staking: crate::staking::StakingParams,
-        /// The Ethereum-to-Solo bridge (spec 18); disabled by default.
-        bridge_in: crate::bridge_in::BridgeInParams,
-        /// Two-track governance (spec 13 §9): the mode and the proposal rules.
-        governance: crate::governance::GovernanceParams,
-        /// The fee market (spec 23): off, with a zero base fee, by default.
-        fees: crate::fees::FeeParams,
+/// Kernel parameters carried in `Genesis::params`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GenesisParams {
+    /// Slot length of the dev driver in milliseconds.
+    pub slot_ms: u64,
+    /// Maximum transactions per block.
+    pub max_txs: u32,
+    /// Initial accounts: balances and predeployed contracts.
+    pub allocations: Seq<Allocation>,
+    /// Governed kernel upgrades and host feature gates (spec 13).
+    pub upgrades: UpgradeParams,
+    /// Staking, epochs, slashing and threshold keys (spec 15).
+    pub staking: crate::staking::StakingParams,
+    /// The Ethereum-to-Solo bridge (spec 18); disabled by default.
+    pub bridge_in: crate::bridge_in::BridgeInParams,
+    /// Two-track governance (spec 13 §9): the mode and the proposal rules.
+    pub governance: crate::governance::GovernanceParams,
+    /// The fee market (spec 23): off, with a zero base fee, by default.
+    pub fees: crate::fees::FeeParams,
+    /// The genesis time, Unix seconds: the genesis block's timestamp, and
+    /// the earliest a first block is made (spec 20 §3.4, spec 08 §2).
+    /// Encoded only when it is not zero, so parameters without a time
+    /// encode, and hash, exactly as before it existed.
+    pub genesis_time: u64,
+}
+
+impl Encode for GenesisParams {
+    fn encode(&self, e: &mut Encoder) {
+        self.slot_ms.encode(e);
+        self.max_txs.encode(e);
+        self.allocations.encode(e);
+        self.upgrades.encode(e);
+        self.staking.encode(e);
+        self.bridge_in.encode(e);
+        self.governance.encode(e);
+        self.fees.encode(e);
+        if self.genesis_time != 0 {
+            self.genesis_time.encode(e);
+        }
+    }
+}
+
+impl Decode for GenesisParams {
+    /// Parameters that end after `fees` have no genesis time: zero.
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let mut p = GenesisParams {
+            slot_ms: d.get()?,
+            max_txs: d.get()?,
+            allocations: d.get()?,
+            upgrades: d.get()?,
+            staking: d.get()?,
+            bridge_in: d.get()?,
+            governance: d.get()?,
+            fees: d.get()?,
+            genesis_time: 0,
+        };
+        if d.remaining() != 0 {
+            p.genesis_time = d.get()?;
+        }
+        Ok(p)
+    }
+}
+
+impl GenesisParams {
+    /// The genesis time in milliseconds, the unit of block timestamps.
+    #[must_use]
+    pub fn genesis_time_ms(&self) -> u64 {
+        self.genesis_time.saturating_mul(1_000)
     }
 }
 
@@ -173,6 +222,18 @@ record! {
         /// Price paid per gas.
         effective_gas_price: u128,
     }
+}
+
+/// What a block's system receipt hash is the `keccak256` of, after the
+/// block hash (spec 20 §3.5).
+pub const SYSTEM_RECEIPT_TAG: &[u8] = b"solo/system-receipt";
+
+/// The preimage of the hash of the system receipt of the block whose hash
+/// is `block_hash`: [`SYSTEM_RECEIPT_TAG`] ‖ the block hash. No
+/// transaction hashes to it, and it names one block of one chain.
+#[must_use]
+pub fn system_receipt_preimage(block_hash: &Hash) -> Vec<u8> {
+    [SYSTEM_RECEIPT_TAG, &block_hash[..]].concat()
 }
 
 record! {
@@ -965,7 +1026,35 @@ mod tests {
                 ..crate::governance::GovernanceParams::default()
             },
             fees: crate::fees::FeeParams::production(),
+            genesis_time: 1_792_800_000,
         });
+        // Without a time the parameters encode as before the field existed,
+        // and such an encoding reads as no time.
+        let timed = GenesisParams {
+            slot_ms: 400,
+            genesis_time: 7,
+            ..GenesisParams::default()
+        };
+        let untimed = GenesisParams {
+            genesis_time: 0,
+            ..timed.clone()
+        };
+        assert_eq!(timed.to_bytes().len(), untimed.to_bytes().len() + 8);
+        assert_eq!(
+            GenesisParams::from_bytes(&untimed.to_bytes()),
+            Ok(untimed.clone())
+        );
+        assert_eq!(timed.genesis_time_ms(), 7_000);
+        assert_eq!(
+            GenesisParams {
+                genesis_time: u64::MAX,
+                ..untimed
+            }
+            .genesis_time_ms(),
+            u64::MAX
+        );
+        let bytes = timed.to_bytes();
+        assert!(GenesisParams::from_bytes(&bytes[..bytes.len() - 1]).is_err());
         roundtrip(&BlockHeader {
             height: 1,
             parent_hash: [2; 32],

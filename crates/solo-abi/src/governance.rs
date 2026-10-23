@@ -61,12 +61,11 @@ pub const MAX_OPEN_PROPOSALS: usize = 16;
 /// light-client checkpoint (spec 18 §3.4) within one storage value.
 pub const MAX_PROPOSAL_DATA: usize = 32_768;
 
-/// Most delegator votes on one proposal (spec 13 §9.3). A delegator's first
-/// vote on a proposal also needs at least `1 / MAX_BALLOTS` of the stake of
-/// the members that count, so stake that is bonded cannot make more; the
-/// bound keeps the tallies and the pruning at the end of a block within the
-/// kernel gas of a block (spec 19 §5.1).
-pub const MAX_BALLOTS: u32 = 4_096;
+/// Most delegators' votes of pruned proposals the end of a block deletes
+/// (spec 13 §9.3): more than a block's governance calls can cast, so what
+/// pruning leaves never piles up, and no number of votes on one proposal
+/// makes a block's bookkeeping unbounded.
+pub const SWEEP_BALLOTS: u32 = 1_024;
 
 /// Most gas a governed call (`submitCall`, spec 13 §9.2) may carry.
 pub const MAX_CALL_GAS: u64 = 10_000_000;
@@ -236,6 +235,13 @@ pub mod keys {
     /// `gov/ballot_at/` + id ‖ index (big-endian u32) → `BallotEntry`, the
     /// delegators' votes, in the order they first voted.
     pub const BALLOT_AT: &[u8] = b"gov/ballot_at/";
+    /// `gov/moved/` + id ‖ validator id → `Moved`, the running sums of the
+    /// stake that delegators who voted hold behind the validator.
+    pub const MOVED: &[u8] = b"gov/moved/";
+    /// `gov/sweep` → `vec<Sweep>`, the votes of pruned proposals still to delete.
+    pub const SWEEP: &[u8] = b"gov/sweep";
+    /// `gov/executed/` + id → `Execution`, where an executed proposal ran.
+    pub const EXECUTED: &[u8] = b"gov/executed/";
 
     fn keyed(prefix: &[u8], id: u64) -> Vec<u8> {
         let mut k = prefix.to_vec();
@@ -284,6 +290,20 @@ pub mod keys {
         k.extend_from_slice(&index.to_be_bytes());
         k
     }
+
+    /// The key of the running sums of proposal `id` behind `validator`.
+    #[must_use]
+    pub fn moved(id: u64, validator: &Hash) -> Vec<u8> {
+        let mut k = keyed(MOVED, id);
+        k.extend_from_slice(validator);
+        k
+    }
+
+    /// The key of where proposal `id` was executed.
+    #[must_use]
+    pub fn executed(id: u64) -> Vec<u8> {
+        keyed(EXECUTED, id)
+    }
 }
 
 /// Query methods (spec 13 §9.8).
@@ -293,6 +313,9 @@ pub mod query {
     /// `(u64 id) -> ProposalView` of an open proposal; status 1 if it is
     /// not open, 2 for malformed parameters.
     pub const PROPOSAL: &str = "governance_proposal";
+    /// `(u64 id) -> Execution` of an executed proposal; status 1 if it was
+    /// not executed (or is still open), 2 for malformed parameters.
+    pub const EXECUTED: &str = "governance_executed";
 }
 
 /// A proposal's status while it is open.
@@ -453,6 +476,56 @@ record! {
         delegator: Address,
         /// Yes or no.
         support: bool,
+    }
+}
+
+record! {
+    /// What the delegators who voted on a proposal hold behind one
+    /// validator (spec 13 §9.3): the sums, in gwei, of the bonded stake of
+    /// their delegations to it, by the side they voted for. Kept up to date
+    /// by every vote and every change of a delegation, so that a tally reads
+    /// one of these per member instead of every delegator's vote.
+    Moved {
+        /// Behind the validator, voting yes.
+        yes: u128,
+        /// Behind the validator, voting no.
+        no: u128,
+    }
+}
+
+impl Moved {
+    /// Replaces `old` gwei with `new` on the side `support` names: a
+    /// delegation of a delegator who voted that way changed, or the vote
+    /// came in (`old` 0) or moved to the other side (`new` 0).
+    pub fn shift(&mut self, support: bool, old: u64, new: u64) {
+        let side = if support { &mut self.yes } else { &mut self.no };
+        *side = side.saturating_sub(u128::from(old)) + u128::from(new);
+    }
+}
+
+record! {
+    /// Votes of a pruned proposal still to delete: indices `next` up to
+    /// `end` under `gov/ballot_at/` (spec 13 §9.3).
+    Sweep {
+        /// The proposal.
+        id: u64,
+        /// The next index to delete.
+        next: u32,
+        /// One past the last index.
+        end: u32,
+    }
+}
+
+record! {
+    /// Where a proposal was executed (spec 13 §9.7): the block, and whether
+    /// at its end, the logs then being in the block's system receipt (spec
+    /// 20 §3.5), or by an `execute` transaction of the block, whose receipt
+    /// carries them.
+    Execution {
+        /// The block's height.
+        height: u64,
+        /// Executed at the end of the block, not by a transaction.
+        system: bool,
     }
 }
 
@@ -898,6 +971,30 @@ pub fn tally(members: &[Member], delegators: &[Delegator]) -> Tally {
     }
 }
 
+/// The tally of spec 13 §9.3 from running sums: each member that counts
+/// with its validator's vote and what the delegators who voted hold behind
+/// it ([`Moved`]). It gives the `yes`, `no` and `total` of [`tally`] over
+/// the same votes, where each [`Delegator::behind`] lists the delegator's
+/// stake behind the members, in time linear in the members alone.
+#[must_use]
+pub fn running_tally(members: &[(Member, Moved)]) -> (u64, u64, u64) {
+    let cap = |x: u128| u64::try_from(x).unwrap_or(u64::MAX);
+    let (mut yes, mut no, mut total) = (0u128, 0u128, 0u128);
+    for (m, moved) in members {
+        let weight = u128::from(m.weight);
+        total += weight;
+        yes = yes.saturating_add(moved.yes);
+        no = no.saturating_add(moved.no);
+        let rest = weight.saturating_sub(moved.yes.saturating_add(moved.no));
+        match m.vote {
+            Some(true) => yes = yes.saturating_add(rest),
+            Some(false) => no = no.saturating_add(rest),
+            None => {}
+        }
+    }
+    (cap(yes), cap(no), cap(total))
+}
+
 fn log(topics: Vec<Hash>, data: Vec<u8>) -> Log {
     Log {
         address: GOVERNANCE_ADDRESS,
@@ -1018,6 +1115,7 @@ pub fn fee_params_log(p: &FeeParams) -> Log {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn roundtrip<T: Encode + Decode + PartialEq + core::fmt::Debug>(v: &T) {
         assert_eq!(&T::from_bytes(&v.to_bytes()).unwrap(), v);
@@ -1103,9 +1201,19 @@ mod tests {
         near[1] = 1;
         assert!(!is_system(&near));
         assert_eq!(
-            (MAX_BALLOTS, MAX_CALL_GAS, MAX_CALL_OUTPUT),
-            (4_096, 10_000_000, 1_024)
+            (SWEEP_BALLOTS, MAX_CALL_GAS, MAX_CALL_OUTPUT),
+            (1_024, 10_000_000, 1_024)
         );
+        roundtrip(&Moved { yes: 1, no: 2 });
+        roundtrip(&Sweep {
+            id: 1,
+            next: 2,
+            end: 3,
+        });
+        roundtrip(&Execution {
+            height: 4,
+            system: true,
+        });
         assert_eq!(GOVERNANCE_ADDRESS[18..], [0x50, 0x10]);
         assert!(GOVERNANCE_ADDRESS[..18].iter().all(|b| *b == 0));
         assert_eq!((mode::KEY, mode::STAKE), (0, 1));
@@ -1120,8 +1228,8 @@ mod tests {
             (16, 32_768, 50_000, 1 << 26)
         );
         assert_eq!(
-            (query::GOVERNANCE, query::PROPOSAL),
-            ("governance", "governance_proposal")
+            (query::GOVERNANCE, query::PROPOSAL, query::EXECUTED),
+            ("governance", "governance_proposal", "governance_executed")
         );
         for key in [
             keys::MODE,
@@ -1135,6 +1243,9 @@ mod tests {
             keys::BALLOT,
             keys::BALLOTS,
             keys::BALLOT_AT,
+            keys::MOVED,
+            keys::SWEEP,
+            keys::EXECUTED,
         ] {
             assert!(key.starts_with(b"gov/"));
         }
@@ -1149,6 +1260,9 @@ mod tests {
         assert_eq!(keys::ballots(1).len(), 20);
         let k = keys::ballot_at(1, 0x0102);
         assert_eq!((k.len(), &k[22..]), (26, &[0, 0, 1, 2][..]));
+        let k = keys::moved(1, &[7; 32]);
+        assert_eq!((k.len(), &k[18..]), (50, &[7u8; 32][..]));
+        assert_eq!(keys::executed(1).len(), 21);
     }
 
     #[test]
@@ -1479,6 +1593,195 @@ mod tests {
         assert_eq!((t.yes, t.no), (0, u64::MAX));
         assert_eq!(Tally::default().effective, Vec::<u64>::new());
         assert!(!alloc::format!("{:?}", (members[0], &delegators[0], &t)).is_empty());
+    }
+
+    /// A chain's staking and one proposal's votes, as the kernel keeps them:
+    /// stakes in gwei, and the running sums the kernel updates on every vote
+    /// and every delegation change, but not on a slash, which jails for good.
+    #[derive(Default)]
+    struct World {
+        /// Each validator's own stake, whether it is jailed, whether it is in
+        /// the current set, and its vote.
+        validators: Vec<(u128, bool, bool, Option<bool>)>,
+        /// Each delegation's bonded stake, by validator and delegator.
+        delegations: alloc::collections::BTreeMap<(usize, usize), u128>,
+        /// The delegators' votes, in the order they first voted.
+        ballots: Vec<(usize, bool)>,
+        /// The running sums, by validator.
+        moved: alloc::collections::BTreeMap<usize, Moved>,
+    }
+
+    fn capped(x: u128) -> u64 {
+        u64::try_from(x).unwrap_or(u64::MAX)
+    }
+
+    impl World {
+        fn support(&self, d: usize) -> Option<bool> {
+            self.ballots.iter().find(|b| b.0 == d).map(|b| b.1)
+        }
+
+        /// A delegation's stake changes to `stake`: the staking hook.
+        fn set_delegation(&mut self, v: usize, d: usize, stake: u128) {
+            let old = self.delegations.insert((v, d), stake).unwrap_or(0);
+            if let Some(support) = self.support(d) {
+                let m = self.moved.entry(v).or_default();
+                m.shift(support, capped(old), capped(stake));
+            }
+        }
+
+        /// A delegator votes, or votes again.
+        fn ballot(&mut self, d: usize, support: bool) {
+            let before = self.support(d);
+            if before == Some(support) {
+                return;
+            }
+            match before {
+                Some(_) => self.ballots.iter_mut().find(|b| b.0 == d).unwrap().1 = support,
+                None => self.ballots.push((d, support)),
+            }
+            let mine: Vec<(usize, u128)> = self
+                .delegations
+                .iter()
+                .filter(|((_, x), _)| *x == d)
+                .map(|((v, _), s)| (*v, *s))
+                .collect();
+            for (v, stake) in mine {
+                let m = self.moved.entry(v).or_default();
+                if let Some(old) = before {
+                    m.shift(old, capped(stake), 0);
+                }
+                m.shift(support, 0, capped(stake));
+            }
+        }
+
+        /// The members that count, by validator index, with their weights.
+        fn members(&self) -> Vec<(usize, Member)> {
+            self.validators
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.2 && !v.1)
+                .map(|(i, v)| {
+                    let delegated: u128 = self
+                        .delegations
+                        .iter()
+                        .filter(|((x, _), _)| *x == i)
+                        .map(|(_, s)| *s)
+                        .sum();
+                    let weight = capped(v.0 + delegated);
+                    (i, Member { weight, vote: v.3 })
+                })
+                .collect()
+        }
+
+        fn check(&self) -> Result<(), TestCaseError> {
+            let members = self.members();
+            let list: Vec<Member> = members.iter().map(|(_, m)| *m).collect();
+            let delegators: Vec<Delegator> = self
+                .ballots
+                .iter()
+                .map(|(d, support)| Delegator {
+                    support: *support,
+                    behind: members
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(at, (v, _))| {
+                            let s = self.delegations.get(&(*v, *d))?;
+                            Some((at, capped(*s)))
+                        })
+                        .collect(),
+                })
+                .collect();
+            let t = tally(&list, &delegators);
+            let running: Vec<(Member, Moved)> = members
+                .iter()
+                .map(|(v, m)| (*m, self.moved.get(v).cloned().unwrap_or_default()))
+                .collect();
+            prop_assert_eq!(running_tally(&running), (t.yes, t.no, t.total));
+            Ok(())
+        }
+    }
+
+    /// An amount of gwei: mostly small, sometimes near the top of `u64`,
+    /// where the sums saturate.
+    fn amount(seed: u64) -> u128 {
+        if seed.is_multiple_of(8) {
+            u128::from(u64::MAX - seed % 1_000)
+        } else {
+            u128::from(seed % 1_000)
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// The running tally the kernel keeps equals [`tally`] from scratch
+        /// after every step of a random history of bonds, delegations,
+        /// undelegations, slashes, set changes and votes.
+        #[test]
+        fn running_tallies_equal_the_tally_from_scratch(
+            n in 1usize..6,
+            steps in proptest::collection::vec((0u8..9, any::<u8>(), any::<u8>(), any::<u64>()), 1..80),
+        ) {
+            let mut w = World::default();
+            for i in 0..n {
+                w.validators.push((amount(i as u64 + 1), false, true, None));
+            }
+            for (kind, a, b, seed) in steps {
+                let v = usize::from(a) % n;
+                let d = usize::from(b) % 6;
+                let stake = w.delegations.get(&(v, d)).copied().unwrap_or(0);
+                match kind {
+                    // Delegate, only behind a validator that is not jailed.
+                    0 | 1 if !w.validators[v].1 => w.set_delegation(v, d, stake + amount(seed)),
+                    // Undelegate part or all of it.
+                    2 => w.set_delegation(v, d, stake - stake * u128::from(seed % 3) / 2),
+                    3 | 4 => w.ballot(d, seed % 2 == 0),
+                    5 => w.validators[v].3 = Some(seed % 2 == 0),
+                    // A slash: the validator is jailed, its stake and every
+                    // delegation behind it cut, with no hook.
+                    6 => {
+                        w.validators[v].1 = true;
+                        w.validators[v].0 -= w.validators[v].0 / 10;
+                        for ((x, _), s) in &mut w.delegations {
+                            if *x == v {
+                                *s -= *s / 10;
+                            }
+                        }
+                    }
+                    7 => w.validators[v].2 = !w.validators[v].2,
+                    8 => w.validators[v].0 += amount(seed),
+                    _ => {}
+                }
+                w.check()?;
+            }
+        }
+    }
+
+    #[test]
+    fn running_sums_shift_between_sides() {
+        let mut m = Moved::default();
+        m.shift(true, 0, 5);
+        m.shift(false, 0, 3);
+        m.shift(true, 5, 2);
+        assert_eq!((m.yes, m.no), (2, 3));
+        // Stale sums behind a jailed validator only saturate.
+        m.shift(false, 7, 0);
+        assert_eq!((m.yes, m.no), (2, 0));
+        let member = |weight, vote| Member { weight, vote };
+        let r = running_tally(&[
+            (member(10, Some(true)), Moved { yes: 0, no: 4 }),
+            (member(6, None), Moved { yes: 1, no: 0 }),
+            (member(3, Some(false)), Moved { yes: 9, no: 0 }),
+        ]);
+        assert_eq!(r, (6 + 1 + 9, 4, 19));
+        let r = running_tally(&[(
+            member(u64::MAX, Some(false)),
+            Moved {
+                yes: u128::MAX,
+                no: 1,
+            },
+        )]);
+        assert_eq!(r, (u64::MAX, 1, u64::MAX));
     }
 
     #[test]

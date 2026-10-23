@@ -2094,41 +2094,88 @@ fn delegators_vote_and_proposals_call_any_account() {
 }
 
 #[test]
-fn a_delegator_needs_a_share_of_the_stake_to_vote() {
+#[allow(clippy::too_many_lines)]
+fn any_delegator_votes_and_the_tally_follows_its_stake() {
     let validators = keys(1);
     let mut dave = Sender::new(Wallet::new(0x64));
     let mut erin = Sender::new(Wallet::new(0x65));
+    let mut frank = Sender::new(Wallet::new(0x66));
     let mut node = start(&staked_with(
         5_000,
-        single(20),
-        &[dave.address(), erin.address()],
+        single(30),
+        &[dave.address(), erin.address(), frank.address()],
         true,
     ));
     let mut v0 = Sender::new(Wallet::from_key(validators[0].clone()));
     let validator = v0.address();
-    for (who, gwei) in [(&mut dave, 1u128), (&mut erin, 2)] {
-        let raw = who.tx(
+    let delegate = |who: &mut Sender, gwei: u128| {
+        who.tx(
             STAKING_ADDRESS,
             gwei * GWEI,
             200_000,
             &StakingAction::Delegate { validator }.encode(),
-        );
-        assert_eq!(include(&mut node, &raw).status, 1);
+        )
+    };
+    for (who, gwei) in [(&mut dave, 1u128), (&mut erin, 2)] {
+        assert_eq!(include(&mut node, &delegate(who, gwei)).status, 1);
     }
     let guardian = Call::SetGuardian {
         guardian: [0xAB; 20],
     }
     .encode();
-    include(
+    let submitted = include(
         &mut node,
         &v0.call(&submit(GOVERNANCE_ADDRESS, &guardian), 0),
     );
-    // 1 gwei of 5 003 is less than a 4 096th: Dave's validator speaks for him.
-    assert_eq!(node.submit(&dave.peek(&vote(1, false), 0)), refused());
+    // 1 gwei of 5 003 votes: no share of the stake is needed.
+    let r = include(&mut node, &dave.call(&vote(1, false), 0));
+    assert_eq!(r.logs.0, vec![gov::voted_log(1, &dave.address(), false, 1)]);
     let r = include(&mut node, &erin.call(&vote(1, false), 0));
     assert_eq!(r.logs.0, vec![gov::voted_log(1, &erin.address(), false, 2)]);
+    include(&mut node, &v0.call(&vote(1, true), 0));
     let p = view(&mut node, 1).unwrap();
-    assert_eq!((p.yes, p.no, p.total), (0, 2, 5_003));
+    assert_eq!((p.yes, p.no, p.total), (5_000, 3, 5_003));
+    // Stake that changes after the votes moves the running tally with it:
+    // Erin adds 3 gwei, Dave leaves, Frank delegates and votes yes, then no.
+    assert_eq!(include(&mut node, &delegate(&mut erin, 3)).status, 1);
+    let leave = dave.tx(
+        STAKING_ADDRESS,
+        0,
+        200_000,
+        &StakingAction::Undelegate {
+            validator,
+            amount: GWEI,
+        }
+        .encode(),
+    );
+    assert_eq!(include(&mut node, &leave).status, 1);
+    assert_eq!(include(&mut node, &delegate(&mut frank, 7)).status, 1);
+    include(&mut node, &frank.call(&vote(1, true), 0));
+    let p = view(&mut node, 1).unwrap();
+    assert_eq!((p.yes, p.no, p.total), (5_007, 5, 5_012));
+    include(&mut node, &frank.call(&vote(1, false), 0));
+    let p = view(&mut node, 1).unwrap();
+    assert_eq!((p.yes, p.no, p.total), (5_000, 12, 5_012));
+    assert_eq!(
+        p.delegators
+            .0
+            .iter()
+            .map(|b| (b.support, b.weight))
+            .collect::<Vec<_>>(),
+        [(false, 0), (false, 5), (false, 7)]
+    );
+    // Dave, with nothing left behind a member, may not vote again.
+    assert_eq!(node.submit(&dave.peek(&vote(1, true), 0)), refused());
+    // The tally recorded at the end of voting, from the running sums, is the
+    // view's from the votes.
+    reach(&mut node, submitted.height + 30);
+    let p = view(&mut node, 1).unwrap();
+    assert_eq!(p.proposal.status, status::PASSED);
+    assert_eq!(
+        (p.proposal.yes, p.proposal.no, p.proposal.total),
+        (5_000, 12, 5_012)
+    );
+    assert_eq!((p.yes, p.no, p.total), (5_000, 12, 5_012));
 }
 
 #[test]
@@ -2217,14 +2264,34 @@ fn include_all(node: &mut Node, raws: &[Vec<u8>]) {
     }
 }
 
-/// What the tally and the pruning of delegators' votes cost the kernel
-/// (spec 19 §5.1): 64 delegators, one delegation each, vote on one
-/// proposal; another proposal takes no vote. The block where each one's
-/// voting ends, and the block that executes each, are measured.
+/// Runs blocks until `hash` has a receipt, and returns the kernel gas of
+/// executing the block that carried it.
+fn gas_of_inclusion(node: &mut Node, hash: &[u8; 32]) -> u64 {
+    let mut gas = 0;
+    while node.receipt(hash).unwrap().is_none() {
+        let (height, before) = (node.block_number().unwrap(), execute_gas(node));
+        let t = node.now_ms() + SLOT_MS;
+        node.tick(t).unwrap();
+        if node.block_number().unwrap() == height + 1 {
+            gas = execute_gas(node) - before;
+        }
+    }
+    gas
+}
+
+/// What delegators' votes cost the kernel with running tallies (spec 13
+/// §9.3, spec 19 §5.1): 62 delegators, one delegation each, vote on one
+/// proposal; another proposal takes no vote. Measured: the block where each
+/// one's voting ends (the tally reads no vote), the block that executes
+/// each (pruning hands the votes to the sweep) and the block after (the
+/// sweep deletes them), against a block with none of it; then a `delegate`
+/// by a delegator that voted on 16 open proposals (the staking hook at its
+/// bound) against one by a delegator that voted on none.
 ///
 /// `cargo test -p solo-node --test governance -- --ignored --nocapture ballots`
 #[test]
 #[ignore = "measurement; run explicitly"]
+#[allow(clippy::too_many_lines)]
 fn the_kernel_gas_of_delegators_ballots() {
     let validators = keys(1);
     let delegators: Vec<Sender> = (0..64u8)
@@ -2258,6 +2325,8 @@ fn the_kernel_gas_of_delegators_ballots() {
         })
         .collect();
     include_all(&mut node, &delegations);
+    let mut hooked = delegators.pop().unwrap();
+    let mut plain = delegators.pop().unwrap();
     let guardian = |b: u8| Call::SetGuardian { guardian: [b; 20] }.encode();
     let quiet = include(
         &mut node,
@@ -2274,35 +2343,65 @@ fn the_kernel_gas_of_delegators_ballots() {
         .map(|d| d.call(&vote(2, true), 0))
         .collect();
     include_all(&mut node, &votes);
-    assert_eq!(view(&mut node, 2).unwrap().delegators.0.len(), 64);
+    assert_eq!(view(&mut node, 2).unwrap().delegators.0.len(), 62);
     let quiet_end = gas_of_block(&mut node, quiet.height + 12);
     let busy_end = gas_of_block(&mut node, busy.height + 12);
-    let plain = gas_of_block(&mut node, busy.height + 13);
+    let plain_block = gas_of_block(&mut node, busy.height + 13);
     eprintln!(
-        "end of voting: no ballots {quiet_end}, 64 ballots {busy_end}, a block with neither {plain}; per ballot {}",
-        (busy_end - quiet_end) / 64
+        "end of voting: no ballots {quiet_end}, 62 ballots {busy_end}, a block with neither {plain_block}"
     );
     assert_eq!(view(&mut node, 2).unwrap().proposal.status, status::PASSED);
     let mut executor = Sender::new(alice());
-    let mut execute = |node: &mut Node, id: u64| {
-        let hash = node
-            .submit(&executor.call(&Call::Execute { id }, 0))
-            .unwrap();
-        let mut gas = 0;
-        while node.receipt(&hash).unwrap().is_none() {
-            let (height, before) = (node.block_number().unwrap(), execute_gas(node));
-            let t = node.now_ms() + SLOT_MS;
-            node.tick(t).unwrap();
-            if node.block_number().unwrap() == height + 1 {
-                gas = execute_gas(node) - before;
-            }
-        }
-        gas
-    };
-    let quiet_execute = execute(&mut node, 1);
-    let busy_execute = execute(&mut node, 2);
+    let hash = node
+        .submit(&executor.call(&Call::Execute { id: 1 }, 0))
+        .unwrap();
+    let quiet_execute = gas_of_inclusion(&mut node, &hash);
+    let next = node.block_number().unwrap() + 1;
+    let after_quiet = gas_of_block(&mut node, next);
+    let hash = node
+        .submit(&executor.call(&Call::Execute { id: 2 }, 0))
+        .unwrap();
+    let busy_execute = gas_of_inclusion(&mut node, &hash);
+    let next = node.block_number().unwrap() + 1;
+    let sweep = gas_of_block(&mut node, next);
     eprintln!(
-        "execute: no ballots {quiet_execute}, 64 ballots {busy_execute}; per ballot {}",
-        (busy_execute - quiet_execute) / 64
+        "execute (pruning, and the sweep at the end of the same block): no ballots {quiet_execute}, 62 ballots {busy_execute}, {} per ballot; the block after: {after_quiet} and {sweep}",
+        (busy_execute - quiet_execute) / 62
     );
+    // Sixteen open proposals, each voted on by one delegator; a `delegate`
+    // by it moves sixteen running sums.
+    let submits: Vec<Vec<u8>> = (0..16u8)
+        .map(|b| v0.call(&submit(GOVERNANCE_ADDRESS, &guardian(10 + b)), 0))
+        .collect();
+    include_all(&mut node, &submits);
+    let open: Vec<u64> = gov_status(&mut node)
+        .proposals
+        .0
+        .iter()
+        .map(|p| p.proposal.id)
+        .collect();
+    assert_eq!(open.len(), 16);
+    let ballots: Vec<Vec<u8>> = open
+        .iter()
+        .map(|id| hooked.call(&vote(*id, false), 0))
+        .collect();
+    include_all(&mut node, &ballots);
+    let more = |s: &mut Sender| {
+        s.tx(
+            STAKING_ADDRESS,
+            GWEI,
+            200_000,
+            &StakingAction::Delegate { validator }.encode(),
+        )
+    };
+    let hash = node.submit(&more(&mut plain)).unwrap();
+    let unhooked = gas_of_inclusion(&mut node, &hash);
+    let hash = node.submit(&more(&mut hooked)).unwrap();
+    let with_hook = gas_of_inclusion(&mut node, &hash);
+    eprintln!(
+        "delegate: no votes {unhooked}, votes on 16 open proposals {with_hook}; the hook {}",
+        with_hook - unhooked
+    );
+    let p = view(&mut node, open[0]).unwrap();
+    assert_eq!(p.no, 2);
 }
