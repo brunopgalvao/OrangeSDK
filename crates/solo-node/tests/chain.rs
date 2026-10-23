@@ -3,11 +3,11 @@
 //! receipts, queries, rejection reasons, and restart from persisted state.
 
 use k256::ecdsa::SigningKey;
-use solo_abi::{Decode, Encode};
 use solo_abi::chain::consensus::{propose_timer, timeout_timer};
 use solo_abi::chain::{Allocation, GenesisParams, reason};
 use solo_abi::codec::Seq;
 use solo_abi::types::Genesis;
+use solo_abi::{Decode, Encode};
 use solo_host::hash::keccak256;
 use solo_node::{DriverStore, Node, NodeConfig, NodeError, Sim, SubmitError};
 use solo_recompile::{Input, Options, recompile};
@@ -200,7 +200,11 @@ fn a_genesis_time_dates_block_zero_and_holds_the_first_block_back() {
         node.tick(now).unwrap();
     }
     let first = node.block_by_number(1).unwrap().unwrap();
-    assert!(first.timestamp_ms >= 5_000 + SLOT_MS, "{}", first.timestamp_ms);
+    assert!(
+        first.timestamp_ms >= 5_000 + SLOT_MS,
+        "{}",
+        first.timestamp_ms
+    );
     // The genesis hash commits to the time: another time, another chain.
     let mut other = genesis(&alice);
     other.params = GenesisParams {

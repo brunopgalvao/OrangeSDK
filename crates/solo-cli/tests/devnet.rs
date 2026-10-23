@@ -244,7 +244,11 @@ fn init_writes_a_reproducible_devnet_and_names_mistakes() {
     }
     // The same seed gives the same validators; without one each devnet differs.
     let twin = scratch("init-twin");
-    init(&twin, "2", &["--seed", SEED, "--genesis-time", "1792800000"]);
+    init(
+        &twin,
+        "2",
+        &["--seed", SEED, "--genesis-time", "1792800000"],
+    );
     let twin = Devnet::load(&twin).unwrap();
     assert_eq!(twin.nodes[0].validator, devnet.nodes[0].validator);
     assert_eq!(genesis_params(&twin).genesis_time, 1_792_800_000);
