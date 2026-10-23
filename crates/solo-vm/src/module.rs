@@ -305,7 +305,9 @@ fn parse_jump_table(payload: &[u8]) -> Result<Vec<Option<u32>>, ValidationError>
     if count == 0 || count > MAX_SLOTS {
         return Err(ValidationError::JumpTable);
     }
-    let mut table = Vec::with_capacity(count as usize);
+    // Every slot takes at least one byte, so the bytes left bound the count
+    // worth reserving: a count prefix alone must not reserve memory.
+    let mut table = Vec::with_capacity((count as usize).min(payload.len() - r.pos));
     for _ in 0..count {
         let v = r.uleb()?;
         table.push(if v == 0 { None } else { Some(v - 1) });
@@ -330,7 +332,10 @@ fn parse_code(payload: &[u8]) -> Result<Vec<Vec<Instruction>>, ValidationError> 
     if count == 0 || count > MAX_BLOCKS {
         return Err(ValidationError::BlockCount);
     }
-    let mut blocks = Vec::with_capacity(count as usize);
+    // Every block takes at least two bytes (a length and an instruction), so
+    // the bytes left bound the count worth reserving: a count prefix alone,
+    // up to 2^24 blocks of 24 bytes each, must not reserve 384 MiB.
+    let mut blocks = Vec::with_capacity((count as usize).min((payload.len() - r.pos) / 2));
     for index in 0..count {
         let len = r.uleb()?;
         if len == 0 {

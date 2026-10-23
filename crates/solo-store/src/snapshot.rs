@@ -387,8 +387,18 @@ pub struct Snapshot {
 fn read_part(file: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut word = [0u8; 4];
     file.read_exact(&mut word)?;
-    let mut part = vec![0u8; u32::from_le_bytes(word) as usize];
-    file.read_exact(&mut part)?;
+    read_len(file, u32::from_le_bytes(word))
+}
+
+/// Reads exactly `len` bytes. The buffer grows only as bytes arrive: a file
+/// from a peer may claim a part of 4 GiB in a length word alone, and that
+/// must not reserve 4 GiB before the read finds the file ends early.
+fn read_len(file: &mut impl Read, len: u32) -> io::Result<Vec<u8>> {
+    let mut part = Vec::new();
+    file.take(u64::from(len)).read_to_end(&mut part)?;
+    if part.len() != len as usize {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
     Ok(part)
 }
 
@@ -440,8 +450,7 @@ impl Iterator for EntryReader {
                 ));
             }
             self.file.read_exact(&mut word[1..]).map_err(io_error)?;
-            let mut key = vec![0u8; u32::from_le_bytes(word) as usize];
-            self.file.read_exact(&mut key).map_err(io_error)?;
+            let key = read_len(&mut self.file, u32::from_le_bytes(word)).map_err(io_error)?;
             let value = read_part(&mut self.file).map_err(io_error)?;
             Ok((key, value))
         })();
