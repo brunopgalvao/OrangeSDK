@@ -4,7 +4,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use solo_abi::chain::consensus::{MAX_EVIDENCE, signing_preimage};
-use solo_abi::chain::{Account, BLOCK_GAS_LIMIT, BlockHeader, CallRequest, CallResult, Evidence, Participation, Receipt, StorageQuery, call_status, query, reason};
+use solo_abi::chain::{Account, BLOCK_GAS_LIMIT, BlockHeader, CallRequest, CallResult, Evidence, Participation, Receipt, SNAPSHOT_INTERVAL, SnapshotRecord, StorageQuery, call_status, keys, query, reason};
 use solo_abi::codec::Seq;
 use solo_abi::types::{Address, Ahead, Block, BuildArgs, ExecuteArgs, ExecuteResult, ExecuteSummary, FinalizeArgs, Hash, QueryArgs, QueryResult, ValidateArgs, ValidateResult};
 use solo_abi::{Decode, Encode};
@@ -200,6 +200,44 @@ fn run_tx(raw: &[u8], chain_id: u64, block: BlockFields, index: u32, cumulative:
     })
 }
 
+/// Blocks between snapshot records (spec 22 §6): the staking epoch, else the
+/// feature-gate epoch, else [`SNAPSHOT_INTERVAL`].
+fn snapshot_interval() -> u64 {
+    let p = state::params();
+    [p.staking.epoch_blocks, p.upgrades.epoch_blocks, SNAPSHOT_INTERVAL].into_iter().find(|n| *n != 0).unwrap_or(SNAPSHOT_INTERVAL)
+}
+
+/// Writes the snapshot record of the epoch that ended with the block before
+/// `height`, when `height` opens an epoch (spec 22 §6): the state commitment
+/// of the state as it stands now, which is the whole state after that block,
+/// its bookkeeping included, under `snap/` + epoch.
+fn record_snapshot(height: u64) {
+    let interval = snapshot_interval();
+    if height < 2 || (height - 1) % interval != 0 {
+        return;
+    }
+    let epoch = (height - 1) / interval - 1;
+    let record = SnapshotRecord { height: height - 1, state_root: state::commit() };
+    state::set(&[keys::SNAPSHOT, &epoch.to_be_bytes()[..]].concat(), &record);
+    state::set(keys::SNAPSHOT_LATEST, &epoch);
+}
+
+/// The snapshot record of `epoch`, or of the latest completed one.
+fn snapshot(params: &[u8]) -> QueryResult {
+    let epoch = if params.is_empty() {
+        match state::get::<u64>(keys::SNAPSHOT_LATEST) {
+            Some(epoch) => epoch,
+            None => return found::<SnapshotRecord>(None),
+        }
+    } else {
+        match u64::from_bytes(params) {
+            Ok(epoch) => epoch,
+            Err(_) => return bad_params(),
+        }
+    };
+    found(state::get::<SnapshotRecord>(&[keys::SNAPSHOT, &epoch.to_be_bytes()[..]].concat()))
+}
+
 /// `kernel_stf_execute_block`: runs every transaction in order through the
 /// EVM, writing a receipt for each, then the header with the state commitment.
 ///
@@ -213,6 +251,7 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let template = BlockHeader::from_bytes(&args.block.header).unwrap_or_else(|_| solo_guest::trap());
     let height = template.height;
     let block = BlockFields { number: height, timestamp: template.timestamp_ms / 1000 };
+    record_snapshot(height);
     crate::precompiles::begin(crate::governance::gate_active(solo_upgrade::gate::PRECOMPILES, height));
     record_participation(&args.block.participation, height);
     crate::modules::begin_block(height, template.timestamp_ms);
@@ -371,6 +410,7 @@ pub fn query(args: &QueryArgs) -> QueryResult {
             Ok(first) => found(Some(Seq(state::evidence_from(first)))),
             Err(_) => bad_params(),
         },
+        query::SNAPSHOT => snapshot(&args.params),
         solo_abi::bridge::query::FINALITY_PROOF => match u64::from_bytes(&args.params) {
             Ok(height) => found(crate::driver::finality_proof(height)),
             Err(_) => bad_params(),

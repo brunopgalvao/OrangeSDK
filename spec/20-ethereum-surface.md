@@ -161,7 +161,9 @@ The reference node keeps the state of its latest `state_history` executed blocks
 
 History is also bounded in key writes, so that blocks that write heavily cannot make it outgrow the node's memory: the node keeps at most `512 × state_history` of them (`HISTORY_KEYS_PER_BLOCK`), a key counting once for each block that wrote it. When the blocks of the window wrote more, it drops the oldest of them until the rest fit, and the window holds fewer blocks; the head's state is always kept. Each key write kept costs its old value and the trie nodes on its path, about 1 to 1.5 KB (measured 2026-10-21 over 200 000 entries: 1.4 KB per write at 1 500 writes per block, 1.0 KB at 6 000), so the default window holds at most about 0.5 to 0.75 GB of history whatever its blocks write, while blocks that write 512 keys or fewer each on average keep all 1 024. An archive node has no bound.
 
-The oldest height whose state the node keeps is therefore the head less `state_history − 1`, later when the bound in key writes holds fewer blocks, or 0 while the chain is shorter; the genesis state, height 0, is kept until then.
+The oldest height whose state the node keeps is therefore the head less `state_history − 1`, later when the bound in key writes holds fewer blocks, or 0 while the chain is shorter; the genesis state, height 0, is kept until then. A node started from a snapshot (22 §7) keeps from the snapshot's height on.
+
+A node with a data directory keeps the history and the tries on disk, in the chain store of spec 22, and keeps them across restarts: a restarted node answers at every height it kept before, and an archive node's history is bounded by its disk, not its memory. Without a data directory both stay in memory and end with the process.
 
 ### 5.2 Queries at a height
 
@@ -187,6 +189,6 @@ The execution-spec state tests run set-code transactions through the kernel's ow
 
 - The genesis block's hash is zero, not the hash of a header: a tool that hashes block 0 finds a mismatch, and a header chain verifies from block 1.
 - `stateRoot` is not an Ethereum state root (§3.3), and `eth_getProof` answers in Solo's proof format, which Ethereum's verifiers do not read.
-- History is kept in memory beside the state; a node has no history from before it started, and while blocks write heavily its window is shorter than `state_history` (§5.1).
+- A node without a data directory keeps its history in memory and has none from before it started; while blocks write heavily a window is shorter than `state_history` (§5.1). A node started from a snapshot has no state from before the snapshot (22 §7).
 - The pool's rules for delegation are geth's, plus the take's rule for authorities ahead (§2.4); a pool of another host may differ without affecting consensus (14 §1).
 - Proposals are not run before they are made: a delegated account's code can spend the account's balance, or move its nonce by creating a contract, during another sender's transaction, and a later transaction of that account in the same block is then recorded as failed (06 §5.1) where a geth builder would have left it out.

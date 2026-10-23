@@ -15,14 +15,13 @@ use solo_abi::types::{
 };
 use solo_abi::{Decode, Encode};
 use solo_host::hash::keccak256;
-use solo_host::{
-    Backend, CallResult, Executor, Flags, LoadError, MemStorage, ModuleCache, Overlay, Storage,
-};
+use solo_host::{Backend, CallResult, Executor, Flags, LoadError, ModuleCache, Overlay, Storage};
 use solo_vm::host::Capability;
 use solo_vm::status::Termination;
 
 use crate::extension::{NodeExtension, NodeServices, Outbound, validator_id};
 use crate::mempool::{Mempool, PoolError, PoolLimits, PoolTx, rejection};
+use crate::state::{ChainState, StoreConfig};
 use crate::store::DriverStore;
 use crate::upgrade::{GatedExtension, Upgrades};
 
@@ -46,6 +45,9 @@ pub struct NodeConfig {
     /// Key writes of history the node keeps per block of `state_history`;
     /// see [`HISTORY_KEYS_PER_BLOCK`].
     pub history_keys_per_block: usize,
+    /// Where the chain state lives (spec 22): in memory, or on disk in a
+    /// directory a later node resumes from.
+    pub store: StoreConfig,
 }
 
 impl Default for NodeConfig {
@@ -58,6 +60,7 @@ impl Default for NodeConfig {
             query_gas: QUERY_GAS,
             state_history: STATE_HISTORY,
             history_keys_per_block: HISTORY_KEYS_PER_BLOCK,
+            store: StoreConfig::Memory,
         }
     }
 }
@@ -132,8 +135,9 @@ pub enum NodeError {
     /// A query named a height whose state the node does not keep: pruned,
     /// below `oldest`, or not executed yet (spec 20 §5).
     StateUnavailable { height: u64, oldest: u64 },
-    /// The node-local store refused a write (spec 06 §4.2); nothing the
-    /// driver did since the last successful write has been sent.
+    /// The node-local store refused a write (spec 06 §4.2), nothing the
+    /// driver did since the last successful write having been sent; or the
+    /// chain store refused one (spec 22), nothing of the block being on disk.
     Store(String),
 }
 
@@ -148,7 +152,7 @@ impl fmt::Display for NodeError {
                 f,
                 "state of block {height} is not available: the node keeps the state from block {oldest}"
             ),
-            NodeError::Store(why) => write!(f, "driver store: {why}"),
+            NodeError::Store(why) => write!(f, "{why}"),
         }
     }
 }
@@ -182,7 +186,7 @@ pub enum SubmitError {
 
 /// A running node.
 pub struct Node {
-    pub(crate) exec: Executor<MemStorage>,
+    pub(crate) exec: Executor<ChainState>,
     pub(crate) kernel: [u8; 32],
     services: Rc<RefCell<NodeServices>>,
     pool: Mempool,
@@ -201,9 +205,6 @@ pub struct Node {
     /// Raw transactions admitted since the last [`Node::take_tx_gossip`],
     /// for the transport to forward to peers.
     tx_gossip: Vec<Vec<u8>>,
-    /// The state trie behind the root each recent executed block returned,
-    /// by height, from [`Node::oldest_state`] on.
-    committed: BTreeMap<u64, solo_trie::Trie>,
     /// How many executed blocks' states to keep; see [`STATE_HISTORY`]. A
     /// change applies from the next executed block.
     pub state_history: usize,
@@ -211,8 +212,9 @@ pub struct Node {
     /// [`HISTORY_KEYS_PER_BLOCK`]. A change applies from the next executed
     /// block.
     pub history_keys_per_block: usize,
-    /// The state commitment of the genesis state, as `kernel_init` left it.
-    genesis_root: [u8; 32],
+    /// The executed height the node opened at: 0 from genesis, the store's
+    /// head on a resume (spec 22 §5). Finalized at least that far.
+    pub(crate) opened_at: u64,
     /// Telemetry (spec 11); consensus-ignored.
     pub(crate) telemetry: solo_metrics::NodeMetrics,
     /// Kernel switchover and feature-gate state (`crate::upgrade`).
@@ -237,22 +239,30 @@ impl Node {
         )
     }
 
-    /// Loads a kernel with a key and persisted data, then runs `kernel_init`.
+    /// Loads a kernel with a key and persisted data, then runs `kernel_init`,
+    /// or, over a disk store a previous run sealed, resumes from its head
+    /// with the kernel that wrote it (spec 22 §5): no block is executed
+    /// again, and the store's history serves queries and proofs as before.
     ///
     /// # Errors
-    /// As [`Node::new`].
+    /// As [`Node::new`]; [`NodeError::Store`] when the store cannot be
+    /// opened; [`NodeError::Upgrade`] when the store was last written by a
+    /// kernel that is neither `kernel_module` nor an upgrade in chain state.
     pub fn open(
         kernel_module: &[u8],
         genesis: &Genesis,
         config: NodeConfig,
     ) -> Result<Node, NodeError> {
+        let opening = std::time::Instant::now();
         let services = Rc::new(RefCell::new(NodeServices {
             now_ms: config.now_ms,
             key: config.key,
             persisted: config.persisted,
             ..NodeServices::default()
         }));
-        let mut exec = Executor::new(ModuleCache::default(), MemStorage::default());
+        let state = ChainState::open(&config.store)?;
+        let fresh = state.is_fresh();
+        let mut exec = Executor::new(ModuleCache::default(), state);
         let active_gates = Rc::new(Cell::new(0));
         exec.set_extension(Box::new(GatedExtension::new(
             NodeExtension::new(Rc::clone(&services)),
@@ -273,28 +283,126 @@ impl Node {
             kernel_gas: KERNEL_GAS,
             query_gas: config.query_gas,
             tx_gossip: Vec::new(),
-            committed: BTreeMap::new(),
             state_history: config.state_history.max(1),
             history_keys_per_block: config.history_keys_per_block,
-            genesis_root: [0; 32],
+            opened_at: 0,
             telemetry: solo_metrics::NodeMetrics::new(),
             upgrades: Upgrades::new(active_gates),
             store: None,
         };
-        node.call_unit(exports::INIT, &genesis.to_bytes())?;
-        // The kernel's version and gates are known before the first block:
-        // the query spec 13 §7.1 makes after every block, once at open and
-        // under the kernel budget like every host read of it. A kernel that
-        // does not serve it reads as the default (spec 06 §7.2), so the node
-        // opens and its telemetry reports version 0 (spec 11 §4).
-        node.upgrades.status = Some(node.upgrade_status().unwrap_or_default());
+        if fresh {
+            node.call_unit(exports::INIT, &genesis.to_bytes())?;
+            // The kernel's version and gates are known before the first block:
+            // the query spec 13 §7.1 makes after every block, once at open and
+            // under the kernel budget like every host read of it. A kernel that
+            // does not serve it reads as the default (spec 06 §7.2), so the node
+            // opens and its telemetry reports version 0 (spec 11 §4).
+            node.upgrades.status = Some(node.upgrade_status().unwrap_or_default());
+            // The genesis state is version 0; each executed block seals its height.
+            node.exec.state_mut().base_mut().set_kernel(kernel);
+            node.exec.state_mut().base_mut().seal_genesis()?;
+        } else {
+            node.resume()?;
+        }
         node.kernel_gas = config.kernel_gas;
-        // The genesis state is version 0; each executed block seals its height.
-        node.exec.state_mut().base_mut().keep_history(0);
-        let genesis = node.exec.state().base().state_trie();
-        node.genesis_root = genesis.root();
-        node.committed.insert(0, genesis);
+        node.telemetry.opened_in(opening.elapsed().as_secs_f64());
         Ok(node)
+    }
+
+    /// Takes the node up where its store left it: the kernel that last wrote
+    /// the store (the genesis kernel, or an upgrade whose code chain state
+    /// holds, spec 13 §6), the gates active for the next block, a pending
+    /// upgrade prepared again, and the head as finalized.
+    fn resume(&mut self) -> Result<(), NodeError> {
+        let stored = self.exec.state().base().kernel();
+        self.take_up(stored)
+    }
+
+    /// Takes the node up at the store's head with `kernel`, the kernel that
+    /// wrote it, if the store names one other than the module loaded.
+    fn take_up(&mut self, kernel: Option<[u8; 32]>) -> Result<(), NodeError> {
+        let head = self.exec.state().base().head();
+        self.opened_at = head;
+        // The loaded kernel's view of the upgrade state serves to find the
+        // gates the kernel that wrote the store imports.
+        let status = self.upgrade_status().unwrap_or_default();
+        let gates = status.gates.active_at(head + 1) & self.upgrades.features;
+        self.upgrades.active.set(gates);
+        if let Some(stored) = kernel.filter(|k| *k != self.kernel) {
+            // A kernel that cannot serve the query, like code that does not
+            // hash to the stored kernel, leaves nothing to compile.
+            let code = self
+                .query(solo_upgrade::query::CODE, &stored)
+                .ok()
+                .and_then(|r| Vec::<u8>::from_bytes(&r.body).ok())
+                .unwrap_or_default();
+            self.compile(&code, &stored, gates).map_err(|why| {
+                NodeError::Upgrade(format!(
+                    "the store was last written by a kernel that is neither the one given nor an upgrade in chain state: {why}"
+                ))
+            })?;
+            self.kernel = stored;
+            self.exec.state_mut().base_mut().set_kernel(stored);
+        }
+        self.after_executed(head)?;
+        Ok(())
+    }
+
+    /// Loads a verified snapshot (spec 22 §7) into a node opened fresh over
+    /// a disk store, before it starts: the state becomes the snapshot's, the
+    /// kernel the one the chain had enacted by then, and the driver finds
+    /// the finalized head in the block log when it starts and syncs forward
+    /// from there. The caller verifies the snapshot first.
+    ///
+    /// # Errors
+    /// [`NodeError::Store`] unless the node holds the genesis alone on disk;
+    /// [`NodeError::Upgrade`] when the enacted kernel's code is not in the
+    /// snapshot's state.
+    pub fn import_snapshot(&mut self, snapshot: &solo_store::Snapshot) -> Result<(), NodeError> {
+        let state = self.exec.state_mut().base_mut();
+        let ChainState::Disk(store) = state else {
+            return Err(NodeError::Store(
+                "a snapshot loads into a chain store on disk".to_owned(),
+            ));
+        };
+        snapshot
+            .import(store)
+            .map_err(|e| NodeError::Store(e.to_string()))?;
+        // The kernel the chain ran at the snapshot: the latest enacted
+        // upgrade's, if any, whose code is in the state just loaded.
+        let status = self.upgrade_status().unwrap_or_default();
+        let enacted = status.enacted.map(|e| e.code_hash);
+        self.take_up(enacted)?;
+        self.exec.state_mut().base_mut().flush()?;
+        Ok(())
+    }
+
+    /// Exports the snapshot of `epoch` (the latest, for `None`) from this
+    /// node's chain store and driver tables (spec 22 §6).
+    ///
+    /// # Errors
+    /// [`NodeError::Store`] when the state is not on disk, and
+    /// [`solo_store::SnapshotError`]'s reasons as a store error otherwise.
+    pub fn export_snapshot(&self, epoch: Option<u64>) -> Result<solo_store::Snapshot, NodeError> {
+        let store = self.chain_store().ok_or_else(|| {
+            NodeError::Store("a snapshot exports from a chain store on disk".to_owned())
+        })?;
+        let tables = self.persisted();
+        solo_store::Snapshot::export(store, &tables, epoch)
+            .map_err(|e| NodeError::Store(e.to_string()))
+    }
+
+    /// The snapshot record of `epoch`, or of the latest completed epoch for
+    /// `None` (spec 22 §6); `None` before the chain recorded one.
+    ///
+    /// # Errors
+    /// See [`NodeError`].
+    pub fn snapshot_record(
+        &mut self,
+        epoch: Option<u64>,
+    ) -> Result<Option<solo_abi::chain::SnapshotRecord>, NodeError> {
+        let params = epoch.map(|e| e.to_bytes()).unwrap_or_default();
+        self.query_decoded(solo_abi::chain::query::SNAPSHOT, &params)
     }
 
     /// Runs the kernel, and every module it invokes, on `backend` from the
@@ -464,6 +572,15 @@ impl Node {
         let cap = std::mem::replace(&mut self.query_gas, i64::MAX);
         let stepped = self.step_capless(input);
         self.query_gas = cap;
+        // A block the store refused is a block the driver believes executed:
+        // the node stops here, to be restarted over the store, which holds
+        // the block before (spec 22 §4). What the step queued for peers goes
+        // too: its driver state never reached the driver store, so a
+        // restarted node could sign otherwise in a view it signed in here.
+        if let Err(e @ NodeError::Store(_)) = &stepped {
+            self.upgrades.halt(e.clone());
+            self.take_outbound();
+        }
         stepped
     }
 
@@ -522,7 +639,7 @@ impl Node {
         let services = self.services.borrow();
         store
             .sync(self.persisted_driver_state.as_deref(), &services.persisted)
-            .map_err(|e| NodeError::Store(e.to_string()))
+            .map_err(|e| NodeError::Store(format!("driver store: {e}")))
     }
 
     /// Applies one driver effect as the host would, returning any follow-up
@@ -558,6 +675,7 @@ impl Node {
                 }
                 .to_bytes();
                 self.call_unit(exports::FINALIZE_BLOCK, &args)?;
+                self.exec.state_mut().base_mut().flush()?;
                 self.finalized.push(height);
                 self.telemetry.block_finalized(height);
                 None
@@ -659,20 +777,18 @@ impl Node {
             .into_iter()
             .rev()
             .find(|trie| trie.root() == result.state_root);
-        self.committed.extend(kept.map(|trie| (height, trie)));
-        // The window: the last `state_history` blocks, fewer when they wrote
-        // more keys than its budget (spec 20 §5.1). A height's trie goes
-        // with its values.
+        // The block, its history and its trie reach the store together
+        // (spec 22 §4); then the window: the last `state_history` blocks,
+        // fewer when they wrote more keys than its budget (spec 20 §5.1). A
+        // height's trie goes with its values.
         let history = self.state_history.max(1);
         let base = self.exec.state_mut().base_mut();
-        base.seal(height);
+        base.seal(height, kept)?;
         if history != ARCHIVE {
             let by_blocks = (height + 1).saturating_sub(history as u64);
             let budget = history.saturating_mul(self.history_keys_per_block);
-            base.prune(by_blocks.max(base.oldest_within(budget)));
+            base.prune(by_blocks.max(base.oldest_within(budget)))?;
         }
-        let oldest = self.oldest_state();
-        self.committed = self.committed.split_off(&oldest);
         let stored = self
             .block_by_number(height)?
             .ok_or(NodeError::Decode("stored header"))?;
@@ -843,7 +959,7 @@ impl Node {
     /// synthetic header of block 0 carries (spec 20 §3.1).
     #[must_use]
     pub fn genesis_state_root(&self) -> [u8; 32] {
-        self.genesis_root
+        self.exec.state().base().genesis_root().unwrap_or_default()
     }
 
     /// The oldest height whose state the node keeps (spec 20 §5): queries
@@ -1078,8 +1194,26 @@ impl Node {
 
     /// The chain state as the kernel left it after its last call.
     #[must_use]
-    pub fn state(&self) -> &Overlay<MemStorage> {
+    pub fn state(&self) -> &Overlay<ChainState> {
         self.exec.state()
+    }
+
+    /// The chain store on disk, if the node keeps its state there.
+    #[must_use]
+    pub fn chain_store(&self) -> Option<&solo_store::DiskStore> {
+        self.exec.state().base().disk()
+    }
+
+    /// Injects `fault` into the chain store's next write (tests of crash
+    /// recovery, spec 22 §4); nothing happens to a node in memory.
+    pub fn inject_store_fault(&mut self, fault: solo_store::Fault) {
+        self.exec.state_mut().base_mut().inject(fault);
+    }
+
+    /// Lets go of the chain store, keeping an empty state in memory: for a
+    /// simulator that reopens the same store in another node.
+    pub(crate) fn release_store(&mut self) {
+        *self.exec.state_mut().base_mut() = ChainState::Memory(Box::default());
     }
 
     /// The state commitment (spec 10) of the current chain state: what
@@ -1107,7 +1241,11 @@ impl Node {
     /// from genesis, and keeps its state (from [`Node::oldest_state`] on).
     #[must_use]
     pub fn state_proof_at(&self, height: u64, key: &[u8]) -> Option<solo_trie::Proof> {
-        self.committed.get(&height).map(|trie| trie.prove(key))
+        self.exec
+            .state()
+            .base()
+            .trie_at(height)
+            .map(|trie| trie.prove(key))
     }
 
     /// Log lines emitted by the kernel.

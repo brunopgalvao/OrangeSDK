@@ -123,7 +123,7 @@ pub fn gated(name: &str, capability: Capability, active: u64) -> Option<u32> {
 /// gated name resolves only while its gate is in the shared active set.
 pub struct GatedExtension {
     inner: NodeExtension,
-    active: Rc<Cell<u64>>,
+    pub(crate) active: Rc<Cell<u64>>,
 }
 
 impl GatedExtension {
@@ -227,7 +227,7 @@ pub struct Upgrades {
     /// Why the node halted; every later step reports it.
     halted: Option<NodeError>,
     /// Gates active for the next block, shared with [`GatedExtension`].
-    active: Rc<Cell<u64>>,
+    pub(crate) active: Rc<Cell<u64>>,
     /// A signal transaction to submit once the current step is done.
     signal: Option<Vec<u8>>,
 }
@@ -276,6 +276,11 @@ impl Upgrades {
     #[must_use]
     pub fn halted(&self) -> Option<&NodeError> {
         self.halted.as_ref()
+    }
+
+    /// Halts the node with `why`: every later step reports it.
+    pub(crate) fn halt(&mut self, why: NodeError) {
+        self.halted = Some(why);
     }
 }
 
@@ -436,7 +441,7 @@ impl Node {
         Ok(Some(executed))
     }
 
-    fn after_executed(&mut self, height: u64) -> Result<(), NodeError> {
+    pub(crate) fn after_executed(&mut self, height: u64) -> Result<(), NodeError> {
         let status = self.upgrade_status()?;
         self.upgrades
             .active
@@ -489,7 +494,12 @@ impl Node {
         Ok(())
     }
 
-    fn compile(&mut self, code: &[u8], code_hash: &[u8; 32], gates: u64) -> Result<(), String> {
+    pub(crate) fn compile(
+        &mut self,
+        code: &[u8],
+        code_hash: &[u8; 32],
+        gates: u64,
+    ) -> Result<(), String> {
         // Code that does not hash to its code hash counts as no code at all.
         let code = &code[..code.len() * usize::from(keccak256(code) == *code_hash)];
         let module = {
@@ -533,7 +543,9 @@ impl Node {
         &mut self,
         queue: &mut VecDeque<Input>,
     ) -> Result<(), NodeError> {
-        let finalized = self.finalized.last().copied().unwrap_or(0);
+        // Executed is finalized: a node resumed from its store at `H` has
+        // finalized `H`, whether or not this run saw the effect.
+        let finalized = self.finalized.last().copied().unwrap_or(self.opened_at);
         let Some((height, code_hash)) = self.upgrades.switch_at.filter(|(h, _)| finalized >= *h)
         else {
             return Ok(());
@@ -569,6 +581,10 @@ impl Node {
             .to_bytes(),
         )?;
         self.kernel = code_hash;
+        // What `kernel_migrate` wrote and who wrote it reach the store before
+        // the new kernel executes anything (spec 22 §5).
+        self.exec.state_mut().base_mut().set_kernel(code_hash);
+        self.exec.state_mut().base_mut().flush()?;
         self.upgrades.prepared = None;
         let held = std::mem::take(&mut self.upgrades.held);
         self.upgrades.switches.push(Switch {

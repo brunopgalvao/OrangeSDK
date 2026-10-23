@@ -22,7 +22,7 @@ mod proof;
 mod trie;
 
 pub use proof::{Proof, ProofError, TERMINAL_EMPTY, TERMINAL_LEAF, Terminal};
-pub use trie::Trie;
+pub use trie::{NodeSource, PathNode, Trie};
 
 /// A 32-byte digest: a path, a value hash or a node hash.
 pub type Hash = [u8; 32];
@@ -43,6 +43,23 @@ pub const BRANCH_TAG: u8 = 0x01;
 /// Most siblings a proof can carry: a path has 256 bits, so no leaf sits
 /// deeper than 256 (spec 10 §5).
 pub const MAX_DEPTH: usize = 256;
+
+/// Length of a node's preimage (spec 10 §4): a tag byte and two hashes.
+pub const NODE_LEN: usize = 65;
+
+/// The two hashes of a node's preimage: a leaf's path and value hash, or a
+/// branch's left and right child hashes.
+///
+/// # Panics
+/// If `preimage` is shorter than [`NODE_LEN`].
+#[must_use]
+pub fn node_halves(preimage: &[u8]) -> (Hash, Hash) {
+    let mut a = EMPTY;
+    let mut b = EMPTY;
+    a.copy_from_slice(&preimage[1..33]);
+    b.copy_from_slice(&preimage[33..NODE_LEN]);
+    (a, b)
+}
 
 /// `keccak256` of `data`.
 #[cfg(feature = "keccak")]
@@ -101,6 +118,14 @@ mod tests {
         assert!(!bit(&path, 8));
         assert!(bit(&path, 255));
         assert!(!bit(&path, 254));
+    }
+
+    #[test]
+    fn node_halves_split_a_preimage() {
+        let mut preimage = [0u8; NODE_LEN];
+        preimage[1..33].copy_from_slice(&[3; 32]);
+        preimage[33..].copy_from_slice(&[4; 32]);
+        assert_eq!(node_halves(&preimage), ([3; 32], [4; 32]));
     }
 
     #[test]

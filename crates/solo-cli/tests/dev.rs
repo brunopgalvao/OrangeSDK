@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 
 use solo_abi::Decode;
 use solo_abi::chain::GenesisParams;
-use solo_cli::{USAGE, arg, load_kernel, parse_genesis, run, run_until};
+use solo_cli::{USAGE, arg, load_kernel, parse_genesis, run, run_until, snapshot};
 
 const KERNEL: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -18,10 +18,11 @@ const HELLO: &str = concat!(
     "/../solo-recompile/tests/fixtures/hello.elf"
 );
 
-/// A kernel gas budget that lets the driver start (78 170) but not produce a block
-/// (260 880) with the pinned kernel fixture, bisected on 2026-10-22 after governance's
-/// staker, veto and quorum rules and the driver's replay of its own finalized blocks
-/// landed; rebuilding the fixture may move both numbers.
+/// A kernel gas budget that lets the driver start (78 190) but not produce a block
+/// (273 830) with the pinned kernel fixture, bisected on 2026-10-22 in-process (the
+/// dev key, this genesis, 40 slots of 60 ms) after the block log and the snapshot
+/// record of spec 22 landed in the kernel; rebuilding the fixture may move both
+/// numbers.
 const STARVED_GAS: &str = "80000";
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4,
@@ -685,4 +686,220 @@ fn node_command_errors() {
     })
     .unwrap();
     assert!(std::path::Path::new(&data).join("driver.state").exists());
+}
+
+/// A dev chain whose feature-gate epochs of four blocks are its snapshot
+/// epochs (spec 22 §6).
+const EPOCHS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4, "epochBlocks": 4,
+  "alloc": {"0x1111111111111111111111111111111111111111": "1000000000000000000"}}"#;
+
+/// The height a node's chain store holds and the snapshot record's, read
+/// once the node in the data directory `dir` has started.
+fn opened(genesis: &str, dir: &str, extra: &[&str]) -> u64 {
+    let mut height = 0;
+    let mut list = vec!["--data-dir", dir];
+    list.extend_from_slice(extra);
+    run_until(&dev_args(genesis, &list), |rpc| {
+        height = rpc.node().chain_store().unwrap().head();
+        false
+    })
+    .unwrap();
+    height
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn snapshots_export_verify_import_and_start_a_node() {
+    let genesis = genesis_file("snap.json", EPOCHS);
+    let staking = genesis_file(
+        "snap-staking.json",
+        &EPOCHS.replace("\"epochBlocks\": 4", "\"staking\": {\"epochBlocks\": 4}"),
+    );
+    let source = scratch("snap-source");
+    // A dev chain on disk, long enough for several epochs' records.
+    run(&dev_args(
+        &genesis,
+        &["--blocks", "16", "--data-dir", &source],
+    ))
+    .unwrap();
+    let file = scratch("snap.snap");
+    let snap = |list: &[&str]| {
+        let mut full = vec!["snapshot"];
+        full.extend_from_slice(list);
+        snapshot::run(&args(&full))
+    };
+    let out = snap(&["export", "--data-dir", &source, "--out", &file]).unwrap();
+    assert!(out.starts_with("snapshot of chain 1337 at epoch "), "{out}");
+    assert!(
+        out.ends_with(&format!("vote certificate written to {file}")),
+        "{out}"
+    );
+    let first = scratch("snap-0.snap");
+    let out = snap(&[
+        "export",
+        "--data-dir",
+        &source,
+        "--out",
+        &first,
+        "--epoch",
+        "0",
+    ])
+    .unwrap();
+    assert!(out.contains("at epoch 0: block 4,"), "{out}");
+    // It verifies against the genesis set of a chain without staking.
+    let out = snap(&["verify", "--snapshot", &file, "--genesis", &genesis]).unwrap();
+    assert!(out.ends_with(" verifies"), "{out}");
+    // Under a trusted group key a vote certificate is not enough; a chain
+    // with staking needs one; a key must be one.
+    let key = format!("0x{}", "00".repeat(96));
+    let err = snap(&[
+        "verify",
+        "--snapshot",
+        &file,
+        "--genesis",
+        &genesis,
+        "--trust-key",
+        &key,
+    ])
+    .unwrap_err();
+    assert!(
+        err.contains("a vote certificate needs the genesis validator set"),
+        "{err}"
+    );
+    let err = snap(&["verify", "--snapshot", &file, "--genesis", &staking]).unwrap_err();
+    assert_eq!(
+        err,
+        "a chain with staking needs --trust-key: its genesis set is not its set for good"
+    );
+    let err = snap(&[
+        "verify",
+        "--snapshot",
+        &file,
+        "--genesis",
+        &genesis,
+        "--trust-key",
+        "0x12",
+    ])
+    .unwrap_err();
+    assert_eq!(err, "--trust-key must be 96 bytes of 0x hex");
+    // Arguments and files that are missing or wrong.
+    assert_eq!(snap(&[]).unwrap_err(), USAGE);
+    assert_eq!(
+        snap(&["export", "--out", &file]).unwrap_err(),
+        "--data-dir is required"
+    );
+    assert_eq!(
+        snap(&["export", "--data-dir", &source]).unwrap_err(),
+        "--out is required"
+    );
+    let not_dir = genesis_file("snap-not-a-dir", "x");
+    let err = snap(&["export", "--data-dir", &not_dir, "--out", &file]).unwrap_err();
+    assert!(err.ends_with("(is the node still running?)"), "{err}");
+    let locked = scratch("snap-driver-refuses");
+    std::fs::create_dir_all(std::path::Path::new(&locked).join("persist.log")).unwrap();
+    let err = snap(&["export", "--data-dir", &locked, "--out", &file]).unwrap_err();
+    assert!(err.starts_with(&format!("{locked}: ")), "{err}");
+    let empty = scratch("snap-empty");
+    let err = snap(&["export", "--data-dir", &empty, "--out", &file]).unwrap_err();
+    assert!(err.contains("the store holds no chain"), "{err}");
+    let err = snap(&["export", "--data-dir", &source, "--out", &empty]).unwrap_err();
+    assert!(
+        err.starts_with(&format!("{empty}: snapshot file: ")),
+        "{err}"
+    );
+    assert_eq!(
+        snap(&["verify", "--snapshot", &file]).unwrap_err(),
+        "--genesis is required"
+    );
+    assert_eq!(
+        snap(&["verify", "--genesis", &genesis]).unwrap_err(),
+        "--snapshot is required"
+    );
+    let missing = scratch("snap-missing");
+    let err = snap(&["verify", "--snapshot", &file, "--genesis", &missing]).unwrap_err();
+    assert!(err.starts_with(&format!("{missing}: ")), "{err}");
+    let err = snap(&["verify", "--snapshot", &missing, "--genesis", &genesis]).unwrap_err();
+    assert!(
+        err.starts_with(&format!("{missing}: snapshot file: ")),
+        "{err}"
+    );
+    // Imported into an empty directory, once.
+    let target = scratch("snap-target");
+    let import = |dir: &str, extra: &[&str]| {
+        let mut list = vec!["import", "--snapshot", &file, "--genesis", &genesis];
+        list.extend_from_slice(extra);
+        if !dir.is_empty() {
+            list.extend(["--data-dir", dir]);
+        }
+        snap(&list)
+    };
+    assert_eq!(import(&target, &[]).unwrap_err(), "--kernel is required");
+    assert_eq!(
+        import("", &["--kernel", KERNEL]).unwrap_err(),
+        "--data-dir is required"
+    );
+    assert!(import(&not_dir, &["--kernel", KERNEL]).is_err());
+    let out = import(&target, &["--kernel", KERNEL]).unwrap();
+    assert!(out.ends_with(&format!("imported into {target}")), "{out}");
+    let err = import(&target, &["--kernel", KERNEL]).unwrap_err();
+    assert!(err.contains("already holds chain state at height"), "{err}");
+    // A node started over it resumes at the snapshot's height (a validator
+    // alone proposes and executes the next block in the step that starts
+    // it) and goes on.
+    let height = solo_store::Snapshot::read(std::path::Path::new(&file))
+        .unwrap()
+        .header
+        .height;
+    assert!(height >= 8 && height.is_multiple_of(4), "{height}");
+    let resumed = opened(&genesis, &target, &[]);
+    assert!((height..=height + 1).contains(&resumed), "{resumed}");
+    run(&dev_args(
+        &genesis,
+        &["--data-dir", &target, "--blocks", "2"],
+    ))
+    .unwrap();
+    assert!(opened(&genesis, &target, &[]) >= resumed + 2);
+    // `--snapshot` does both in one go, wants a data directory, verifies
+    // first, and leaves a directory that holds a chain as it is.
+    let joined = scratch("snap-joined");
+    let started = opened(&genesis, &joined, &["--snapshot", &file]);
+    assert!((height..=height + 1).contains(&started), "{started}");
+    let err = run(&dev_args(&genesis, &["--snapshot", &file])).unwrap_err();
+    assert_eq!(
+        err,
+        "--snapshot needs --data-dir, where the snapshot is loaded"
+    );
+    let err = run(&dev_args(
+        &genesis,
+        &["--data-dir", &empty, "--snapshot", &missing],
+    ))
+    .unwrap_err();
+    assert!(
+        err.starts_with(&format!("{missing}: snapshot file: ")),
+        "{err}"
+    );
+    let err = run(&dev_args(
+        &staking,
+        &["--data-dir", &empty, "--snapshot", &file],
+    ))
+    .unwrap_err();
+    assert!(err.contains("needs --trust-key"), "{err}");
+    let kept = opened(&genesis, &source, &["--snapshot", &first]);
+    assert!(kept >= 16, "{kept}");
+    // A node that keeps its state in memory has nowhere to load it.
+    let mut memory = solo_node::Node::open(
+        &load_kernel(KERNEL).unwrap(),
+        &parse_genesis(EPOCHS).unwrap(),
+        solo_node::NodeConfig::default(),
+    )
+    .unwrap();
+    let loaded = solo_store::Snapshot::read(std::path::Path::new(&file)).unwrap();
+    assert_eq!(
+        snapshot::import_into(&mut memory, &loaded).unwrap_err(),
+        "a snapshot loads into a chain store on disk"
+    );
+    // A threshold certificate is named as one.
+    let mut threshold = solo_store::Snapshot::read(std::path::Path::new(&file)).unwrap();
+    threshold.header.certificate = vec![2; 97];
+    assert!(snapshot::describe(&threshold).ends_with(", threshold certificate"));
 }

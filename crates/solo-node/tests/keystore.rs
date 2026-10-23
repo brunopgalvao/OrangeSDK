@@ -13,7 +13,8 @@ use solo_abi::staking::{
     certificate_message,
 };
 use solo_abi::{Decode, Encode};
-use solo_host::{Executor, Flags, MemStorage, ModuleCache};
+use solo_host::{Executor, Flags, ModuleCache};
+use solo_node::ChainState;
 use solo_node::keystore::{Keystore, encryption_key};
 use solo_node::{NodeExtension, NodeServices};
 use solo_vm::builder::ModuleBuilder;
@@ -404,10 +405,10 @@ fn sign_with_role_2_reaches_the_keystore() {
         key: Some(key.clone()),
         ..NodeServices::default()
     }));
-    let mut exec = Executor::new(ModuleCache::default(), MemStorage::default());
+    let mut exec = Executor::new(ModuleCache::default(), ChainState::default());
     exec.set_extension(Box::new(NodeExtension::new(Rc::clone(&services))));
     let request = KeystoreRequest::EncryptionKey.to_bytes();
-    let call = |exec: &mut Executor<MemStorage>, rodata: &[u8], cap: i64| {
+    let call = |exec: &mut Executor<ChainState>, rodata: &[u8], cap: i64| {
         let hash = exec
             .load(&module(rodata, cap), Capability::Privileged)
             .unwrap();

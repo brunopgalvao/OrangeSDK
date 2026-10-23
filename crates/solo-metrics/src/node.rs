@@ -275,6 +275,41 @@ pub const START_TIME: Desc = desc(
     &[],
     "Unix time at which the node opened, in seconds.",
 );
+/// `solo_node_open_seconds`.
+pub const OPEN_SECONDS: Desc = desc(
+    "solo_node_open_seconds",
+    Kind::Gauge,
+    &[],
+    "Seconds from opening the chain store to the node being ready to serve: the restart time (spec 22 section 5).",
+);
+/// `solo_store_size_bytes`.
+pub const STORE_SIZE: Desc = desc(
+    "solo_store_size_bytes",
+    Kind::Gauge,
+    &[],
+    "Size of the chain store file on disk (spec 22 section 4); absent on a node that keeps its state in memory.",
+);
+/// `solo_store_write_bytes_total`.
+pub const STORE_WRITE_BYTES: Desc = desc(
+    "solo_store_write_bytes_total",
+    Kind::Counter,
+    &[],
+    "Bytes of keys, values and trie nodes the chain store wrote since the node opened; per block, its write amplification.",
+);
+/// `solo_store_versions`.
+pub const STORE_VERSIONS: Desc = desc(
+    "solo_store_versions",
+    Kind::Gauge,
+    &[],
+    "Block versions the chain store keeps the state of (spec 20 section 5.1).",
+);
+/// `solo_store_nodes`.
+pub const STORE_NODES: Desc = desc(
+    "solo_store_nodes",
+    Kind::Gauge,
+    &[],
+    "Trie nodes the chain store holds over every kept root.",
+);
 
 /// Every family the node exports, in the order spec 11 §4 lists them.
 pub const ALL: &[Desc] = &[
@@ -307,6 +342,11 @@ pub const ALL: &[Desc] = &[
     GATE_ACTIVE,
     BUILD_INFO,
     START_TIME,
+    OPEN_SECONDS,
+    STORE_SIZE,
+    STORE_WRITE_BYTES,
+    STORE_VERSIONS,
+    STORE_NODES,
 ];
 
 /// Every sample name the node exports: what alert rules and dashboards may
@@ -445,6 +485,9 @@ pub struct NodeMetrics {
     /// Series of each emitted family (by name) per origin, for the
     /// per-origin cardinality limit.
     emitted_series: BTreeMap<(&'static str, Origin), usize>,
+    /// The store's write total as last reported, to raise the counter by
+    /// what grew.
+    store_write_bytes: u64,
 }
 
 impl Default for NodeMetrics {
@@ -524,6 +567,7 @@ impl NodeMetrics {
             logs_seen: 0,
             chain_id: None,
             emitted_series: BTreeMap::new(),
+            store_write_bytes: 0,
         }
     }
 
@@ -677,6 +721,24 @@ impl NodeMetrics {
             &[],
             f64::from(missing_gates.count_ones()),
         );
+    }
+
+    /// Sets the chain store's families (spec 22 §8) from what the store
+    /// reports: its size, the bytes written since the node opened (the
+    /// counter is raised by what grew since the last call), the versions it
+    /// keeps and the trie nodes it holds. A node in memory records nothing.
+    pub fn store(&mut self, size_bytes: u64, write_bytes: u64, versions: u64, nodes: u64) {
+        self.registry.set(&STORE_SIZE, &[], float(size_bytes));
+        let grew = write_bytes.saturating_sub(self.store_write_bytes);
+        self.store_write_bytes = write_bytes;
+        self.registry.inc(&STORE_WRITE_BYTES, &[], float(grew));
+        self.registry.set(&STORE_VERSIONS, &[], float(versions));
+        self.registry.set(&STORE_NODES, &[], float(nodes));
+    }
+
+    /// Records how long the node took from opening its store to being ready.
+    pub fn opened_in(&mut self, seconds: f64) {
+        self.registry.set(&OPEN_SECONDS, &[], seconds);
     }
 
     /// Sets the gauges of the kernel and its gates: the running kernel's

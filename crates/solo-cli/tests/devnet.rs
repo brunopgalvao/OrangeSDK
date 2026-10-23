@@ -988,14 +988,15 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
     assert!(ran >= 2, "{log}");
     assert!(ok(&["devnet", "status", "--dir", d]).contains("node 0  down"));
     assert!(devnet.node_dir(0).join("driver.state").exists());
-    // Started again, alone, it resumes the view its driver state records,
-    // re-executes every block it had from its tables and runs on; a second
-    // start is refused.
+    // Started again, alone, it resumes the view its driver state records
+    // and the chain state its store holds, executes nothing again and runs
+    // on; a second start is refused.
     assert!(ok(&["devnet", "start", "--dir", d, "--node", "0"]).contains("node 0 started"));
     assert!(err(&["devnet", "start", "--dir", d, "--node", "0"]).contains("already running"));
     let log = std::fs::read_to_string(devnet.node_dir(0).join("log")).unwrap();
     assert!(log.contains("resumed in view "), "{log}");
-    assert_eq!(replayed(&log), ran, "{log}");
+    assert_eq!(replayed(&log), 0, "{log}");
+    assert!(opened_at(&log) >= ran, "{log}");
     // Conditions not met yet: no peers, no gate, no certificate, not that high.
     let text = err(&[
         "devnet",
@@ -1250,9 +1251,9 @@ fn the_rehearsal_passes_on_a_four_validator_devnet() {
     }
     assert!(up.finish());
     // Every node's log shows the kernel switch and no error; the two that
-    // restarted resumed the driver state they had left on disk and
-    // re-executed, before asking any peer, every block they had executed
-    // before they stopped (the log holds both runs).
+    // restarted resumed the driver state and the chain state they had left
+    // on disk, at or past the last block they had logged before they
+    // stopped, and executed nothing again (the log holds both runs).
     for i in 0..4 {
         let log = std::fs::read_to_string(dir.join(format!("node-{i}/log"))).unwrap();
         assert!(!log.contains("node error"), "node {i}: {log}");
@@ -1265,7 +1266,8 @@ fn the_rehearsal_passes_on_a_four_validator_devnet() {
             let (before, _) = log.split_once("resumed in view ").unwrap();
             let ran = last_block(before);
             assert!(ran > 0, "node {i}: {log}");
-            assert_eq!(replayed(&log), ran, "node {i}: {log}");
+            assert_eq!(replayed(&log), 0, "node {i}: {log}");
+            assert!(opened_at(&log) >= ran, "node {i}: {log}");
         }
     }
 }
@@ -1284,6 +1286,13 @@ fn replayed(log: &str) -> u64 {
     let (_, rest) = log.split_once("resumed in view ").unwrap();
     let (_, count) = rest.split_once(", ").unwrap();
     count.split(' ').next().unwrap().parse().unwrap()
+}
+
+/// The height the node says its chain store held when it last opened.
+fn opened_at(log: &str) -> u64 {
+    let (_, rest) = log.rsplit_once("chain state in ").unwrap();
+    let (_, height) = rest.split_once(": height ").unwrap();
+    height.split(',').next().unwrap().parse().unwrap()
 }
 
 #[test]

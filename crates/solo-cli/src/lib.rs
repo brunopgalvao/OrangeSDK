@@ -6,13 +6,15 @@
 //! runs a single-node development chain with Ethereum JSON-RPC. The node keeps
 //! the state of its latest 1 024 blocks for historical queries and proofs, or
 //! `--state-history` of them, or every block's with `--archive` (spec 20 §5).
-//! `--data-dir` keeps the driver's node-local data on disk
-//! ([`solo_node::DriverStore`]): a node started again over the same
-//! directory resumes the view it left with the votes it cast there, so it
-//! never votes twice in one view (spec 08 §3 and §7); `solo node` requires
-//! it for a validator. Chain state is not kept: a restarted node re-executes
-//! the chain it had finalized from its tables and syncs the rest from its
-//! peers.
+//! `--data-dir` keeps the node's data on disk: the driver's node-local data
+//! ([`solo_node::DriverStore`]), so that a node started again over the same
+//! directory resumes the view it left with the votes it cast there and never
+//! votes twice in one view (spec 08 §3 and §7), and the chain state
+//! ([`solo_store::DiskStore`], spec 22), so that it resumes from the block it
+//! had executed without executing anything again, its history and proofs
+//! intact; `solo node` requires it for a validator. `--snapshot <file>`
+//! starts a node whose directory holds no chain yet from a verified snapshot
+//! (see [`snapshot`]), and `solo snapshot` exports, verifies and imports one.
 //! The genesis file is
 //! JSON: `{"chainId": 1337, "slotMs": 400, "maxTxs": 64,
 //! "alloc": {"0x<address>": "<wei>"}, "validators": ["0x<32-byte id>"]}`.
@@ -42,6 +44,7 @@ pub mod devnet;
 pub mod doctor;
 pub mod gov;
 pub mod modules;
+pub mod snapshot;
 pub mod staking;
 pub mod upgrade;
 
@@ -50,12 +53,12 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use solo_abi::Encode;
 use solo_abi::chain::{
     Allocation, GenesisParams, StorageSlot, UpgradeParams, Validator, ValidatorSet,
 };
 use solo_abi::codec::Seq;
 use solo_abi::types::Genesis;
+use solo_abi::{Decode, Encode};
 
 /// A message for the user.
 #[derive(Debug)]
@@ -97,8 +100,9 @@ pub const DEFAULT_RPC: &str = "127.0.0.1:8545";
 /// Usage line printed on a command-line mistake.
 pub const USAGE: &str = "usage:
   solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive] [--data-dir <dir>]
-  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
+  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--snapshot <file> [--trust-key <0x 96 bytes>]] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
   solo key  <64 hex>
+  solo snapshot export --data-dir <dir> --out <file> [--epoch <n>] | verify --snapshot <file> --genesis <genesis.json> [--trust-key <0x 96 bytes>] | import --snapshot <file> --data-dir <dir> --kernel <kernel> --genesis <genesis.json> [--trust-key <0x 96 bytes>]
   solo gov  submit <target> <0x calldata> | vote <id> yes|no | execute <id> | veto <id> | pause <target> | set-guardian <address> | set-mode stake | set-params <voting> <timelock> <quorumBps> <deposit>
   solo doctor [--rpc 127.0.0.1:8545] [--max-head-age <s>] [--max-finality-lag <blocks>] [--min-peers <n>] [--max-mempool <txs>] [--max-call-ms <ms>]
   solo upgrade --kernel <kernel.elf|kernel.solo> (--key <64 hex> | --key-file <path>) [--rpc 127.0.0.1:8545] [--delay <blocks>] [--required-gates <g,g,...>] [--timeout <s>]
@@ -480,6 +484,7 @@ fn tool_output(command: &str, args: &[String]) -> Option<Result<String, CliError
             "doctor" => doctor::run(args),
             "gov" => gov::parse(args.get(2..).unwrap_or(&[])).map(|call| gov::describe(&call)),
             "upgrade" => upgrade::run(args),
+            "snapshot" => snapshot::run(args),
             _ => return None,
         }
         .map_err(CliError::from),
@@ -534,21 +539,65 @@ fn open_store(args: &[String], validator: bool) -> Result<Opened, CliError> {
     Ok((Some(store), persisted, resumed))
 }
 
+/// Where `--data-dir` keeps the chain state, and the snapshot `--snapshot`
+/// names, read and verified under the trust the arguments give (spec 22
+/// §7); a snapshot without a data directory has nowhere to go.
+fn chain_store_arguments(
+    args: &[String],
+    genesis: &Genesis,
+) -> Result<(solo_node::StoreConfig, Option<solo_store::Snapshot>), CliError> {
+    let chain_store = match arg(args, "--data-dir") {
+        Some(dir) => solo_node::StoreConfig::Disk(dir.into()),
+        None => solo_node::StoreConfig::Memory,
+    };
+    let snapshot = match arg(args, "--snapshot") {
+        Some(_) if chain_store == solo_node::StoreConfig::Memory => {
+            return Err("--snapshot needs --data-dir, where the snapshot is loaded".into());
+        }
+        Some(path) => Some(
+            solo_store::Snapshot::read(std::path::Path::new(&path))
+                .map_err(|e| format!("{path}: {e}"))?,
+        ),
+        None => None,
+    };
+    if let Some(snapshot) = &snapshot {
+        snapshot::verify(args, snapshot, genesis)?;
+    }
+    Ok((chain_store, snapshot))
+}
+
 /// Says where the driver's state lives, which view it started in and, on a
 /// resume, how many of its own finalized blocks it re-executed from its
-/// tables before anything else happened (spec 08 §7).
-fn report_driver_state(node: &solo_node::Node, resuming: bool) {
+/// tables before anything else happened (spec 08 §7), and where the chain
+/// state lives and at which height it was opened (spec 22 §5).
+fn report_driver_state(node: &solo_node::Node, resumed: Option<&[u8]>, opened_at: u64) {
     if let Some(store) = node.store() {
         let view = node.simplex_state().map_or(0, |s| s.view);
-        let how = if resuming {
-            format!(
-                "resumed in view {view}, {} blocks re-executed from its tables",
-                node.executed.len()
-            )
+        let how = if let Some(resumed) = resumed {
+            // Re-executed blocks are at or below the height the driver had
+            // finalized when it stopped; blocks it proposed on starting are
+            // above it.
+            let remembered = solo_abi::chain::SimplexState::from_bytes(resumed)
+                .map_or(0, |s| s.finalized_height);
+            let replayed = node
+                .executed
+                .iter()
+                .filter(|(height, _)| *height <= remembered)
+                .count();
+            format!("resumed in view {view}, {replayed} blocks re-executed from its tables")
         } else {
             format!("new, from view {view}")
         };
         eprintln!("driver state in {}: {how}", store.dir().display());
+    }
+    if let Some(chain) = node.chain_store() {
+        let stats = chain.stats();
+        eprintln!(
+            "chain state in {}: height {opened_at}, {} versions kept, {} bytes",
+            chain.path().display(),
+            stats.versions,
+            stats.size_bytes
+        );
     }
 }
 
@@ -623,6 +672,7 @@ pub(crate) fn run_inner(
     };
     let peers = parse_peers(args)?;
     let (store, persisted, resumed) = open_store(args, command == "node" && key.is_some())?;
+    let (chain_store, snapshot) = chain_store_arguments(args, &genesis)?;
     let start = Instant::now();
     let epoch = unix_ms();
     let mut node = solo_node::Node::open(
@@ -635,16 +685,30 @@ pub(crate) fn run_inner(
             kernel_gas,
             query_gas,
             state_history,
+            store: chain_store,
             ..solo_node::NodeConfig::default()
         },
     )?;
+    if let Some(snapshot) = &snapshot {
+        // A directory that already holds a chain keeps it; the snapshot is
+        // for an empty one, and an import that fails there stops the node.
+        match node.chain_store().map_or(0, solo_store::DiskStore::head) {
+            0 => {
+                snapshot::import_into(&mut node, snapshot)?;
+                eprintln!("{} imported", snapshot::describe(snapshot));
+            }
+            head => eprintln!(
+                "--snapshot ignored: the data directory already holds chain state at height {head}"
+            ),
+        }
+    }
+    let opened_at = node.block_number().unwrap_or(0);
     let chain_id = node.chain_id().unwrap_or(0);
     if let Some(store) = store {
         node.attach_store(store);
     }
-    let resuming = resumed.is_some();
-    node.start(resumed)?;
-    report_driver_state(&node, resuming);
+    node.start(resumed.clone())?;
+    report_driver_state(&node, resumed.as_deref(), opened_at);
     let mut transport = if command == "node" {
         Some(bind_transport(args, &node, chain_id, peers)?)
     } else {

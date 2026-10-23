@@ -11,6 +11,7 @@ solo-abi = { path = "../solo-abi" }
 solo-eth = { path = "../solo-eth" }
 solo-host = { path = "../solo-host" }
 solo-trie = { path = "../solo-trie" }
+solo-store = { path = "../solo-store" }
 solo-metrics = { path = "../solo-metrics" }
 solo-vm = { path = "../solo-vm" }
 solo-upgrade = { path = "../solo-upgrade" }

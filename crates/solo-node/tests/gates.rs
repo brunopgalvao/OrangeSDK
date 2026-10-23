@@ -12,7 +12,8 @@ use std::rc::Rc;
 use k256::ecdsa::SigningKey;
 use solo_abi::types::Genesis;
 use solo_host::hash::keccak256;
-use solo_host::{Executor, Flags, MemStorage, ModuleCache};
+use solo_host::{Executor, Flags, ModuleCache};
+use solo_node::ChainState;
 use solo_node::upgrade::{
     BLS12381_FAST_AGGREGATE_VERIFY, GATED, PRECOMPILE_HANDLE, SECP256K1_VERIFY, SUPPORTED, gated,
     precompile, signal_tx,
@@ -59,13 +60,13 @@ fn caller(name: &str, args: &[i64], rodata: &[u8]) -> Vec<u8> {
     b.export("main", 0).build()
 }
 
-fn executor(active: u64) -> (Executor<MemStorage>, Rc<Cell<u64>>) {
+fn executor(active: u64) -> (Executor<ChainState>, Rc<Cell<u64>>) {
     let services = Rc::new(RefCell::new(NodeServices {
         now_ms: 77,
         ..NodeServices::default()
     }));
     let gates = Rc::new(Cell::new(active));
-    let mut exec = Executor::new(ModuleCache::default(), MemStorage::default());
+    let mut exec = Executor::new(ModuleCache::default(), ChainState::default());
     exec.set_extension(Box::new(GatedExtension::new(
         NodeExtension::new(services),
         Rc::clone(&gates),
@@ -74,7 +75,7 @@ fn executor(active: u64) -> (Executor<MemStorage>, Rc<Cell<u64>>) {
 }
 
 fn run(
-    exec: &mut Executor<MemStorage>,
+    exec: &mut Executor<ChainState>,
     module: &[u8],
     capability: Capability,
 ) -> (Termination, u64) {
@@ -270,7 +271,7 @@ fn secp256k1_verify_checks_low_s_signatures_against_a_public_key() {
     let pubkey = key.verifying_key().to_encoded_point(false).as_bytes()[1..].to_vec();
     let (mut exec, _) = executor(1);
     let base = 0x1_0000;
-    let check = |exec: &mut Executor<MemStorage>, msg: &[u8], sig: &[u8], pubkey: &[u8]| {
+    let check = |exec: &mut Executor<ChainState>, msg: &[u8], sig: &[u8], pubkey: &[u8]| {
         let rodata = [msg, sig, pubkey].concat();
         run(
             exec,
