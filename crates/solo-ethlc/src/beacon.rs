@@ -513,8 +513,16 @@ impl Update {
         let sync_aggregate = SyncAggregate::read(&mut r, size)?;
         let signature_slot = r.u64()?;
         let headers = parts(bytes, r.pos, &[attested, finalized])?;
-        let next_sync_committee =
-            (committee_branch != [ZERO; COMMITTEE_BRANCH]).then_some((committee, committee_branch));
+        // An update without a next committee carries a zero branch and a
+        // zero committee; a committee beside a zero branch would be dropped
+        // unread, so two encodings would decode to one update.
+        let next_sync_committee = if committee_branch == [ZERO; COMMITTEE_BRANCH] {
+            let zero =
+                committee.pubkeys.iter().all(|b| *b == 0) && committee.aggregate_pubkey == [0; 48];
+            zero.then_some(None).ok_or(Malformed)?
+        } else {
+            Some((committee, committee_branch))
+        };
         Ok(Update {
             attested: LightClientHeader::decode(headers[0])?,
             next_sync_committee,
@@ -766,6 +774,14 @@ mod tests {
             Update::decode_update(&finality.encode_update(8), 8),
             Ok(finality.clone())
         );
+        // A committee beside a zero branch is refused rather than dropped:
+        // it would be a second encoding of the same update. Its keys start
+        // after the 4-byte offset; its aggregate follows the keys.
+        for at in [4 + 48 * 3, 4 + 48 * 8 + 7] {
+            let mut stray = finality.encode_update(8);
+            stray[at] = 1;
+            assert_eq!(Update::decode_update(&stray, 8), Err(Malformed));
+        }
         let mut swapped = finality.encode_finality_update();
         swapped[4..8].copy_from_slice(&1u32.to_le_bytes());
         assert_eq!(Update::decode_finality_update(&swapped, 8), Err(Malformed));
