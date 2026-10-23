@@ -265,7 +265,6 @@ mod tests {
         assert_eq!(streamed(&by_path).0, trie.root());
         // Subtrees at a depth their paths all share: the slices of a
         // snapshot's manifest (spec 22 §7.4).
-        let mut none = |_: &Hash, _: &[u8; NODE_LEN]| {};
         let pair = crate::branch_hash(
             keccak256,
             &crate::leaf_hash(keccak256, &b, &[1; 32]),
@@ -292,7 +291,7 @@ mod tests {
             subtree(&by_path[2..3], 200),
             crate::leaf_hash(keccak256, &c, &[3; 32])
         );
-        assert_eq!(SortedRoot::new(keccak256).finish_at(9, &mut none), EMPTY);
+        assert_eq!(subtree(&[], 9), EMPTY);
         assert_eq!(common_bits(&a, &a), 256);
         assert_eq!(common_bits(&a, &b), 255);
     }

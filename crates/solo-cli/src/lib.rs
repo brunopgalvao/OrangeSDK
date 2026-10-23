@@ -614,7 +614,18 @@ fn load_state(
         && args.iter().any(|a| a == "--sync-from-peers")
     {
         match node.chain_store().map_or(0, solo_store::DiskStore::head) {
-            0 => snapshot::sync_from_peers(args, genesis, node, t, clock)?,
+            0 => {
+                let config = node.sync_config(snapshot::trust(args, genesis)?)?;
+                let fetched = snapshot::sync_from_peers(config, t, clock)?;
+                node.import_snapshot(&fetched)?;
+                if let Some(dir) = fetched.path().parent() {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                eprintln!(
+                    "{} fetched from peers and imported",
+                    snapshot::describe(&fetched)
+                );
+            }
             head => eprintln!(
                 "--sync-from-peers ignored: the data directory already holds chain state at height {head}"
             ),

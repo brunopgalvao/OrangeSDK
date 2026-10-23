@@ -172,29 +172,24 @@ pub fn describe_event(event: &solo_node::statesync::SyncEvent) -> String {
     }
 }
 
-/// Fetches a snapshot from the peers `transport` connects to and loads it
-/// into `node`, opened fresh over a data directory, before its driver starts
-/// (spec 22 §7.4): verified under the trust `args` name, slice by slice,
-/// resuming what an earlier run in the same directory verified. Polls until
-/// the snapshot is in, saying what happens on the way; `now` is the clock.
+/// Fetches a snapshot from the peers `transport` connects to, before the
+/// node's driver starts (spec 22 §7.4): verified under `config`'s trust,
+/// slice by slice, resuming what an earlier run in the same directory
+/// verified. Polls until the snapshot file is assembled, saying what happens
+/// on the way; `now` is the clock. The caller imports it.
 ///
 /// # Errors
-/// Why the sync stopped or the import failed.
+/// Why the sync stopped.
 pub fn sync_from_peers(
-    args: &[String],
-    genesis: &Genesis,
-    node: &mut Node,
+    config: solo_node::statesync::SyncConfig,
     transport: &mut solo_node::Transport,
     now: &dyn Fn() -> u64,
-) -> Result<(), String> {
+) -> Result<Snapshot, String> {
     use solo_node::statesync::StateSync;
-    let config = node
-        .sync_config(trust(args, genesis)?)
-        .map_err(|e| e.to_string())?;
     let dir = config.dir.clone();
     let mut sync = StateSync::new(config).map_err(|e| format!("{}: {e}", dir.display()))?;
     eprintln!("state sync: asking peers for snapshots");
-    let snapshot = loop {
+    loop {
         transport.poll_sync(&mut sync, now());
         for event in sync.take_events() {
             eprintln!("state sync: {}", describe_event(&event));
@@ -203,14 +198,10 @@ pub fn sync_from_peers(
             return Err(format!("state sync: {why}"));
         }
         if let Some(snapshot) = sync.done() {
-            break snapshot.clone();
+            return Ok(snapshot.clone());
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
-    };
-    node.import_snapshot(&snapshot).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_dir_all(&dir);
-    eprintln!("{} fetched from peers and imported", describe(&snapshot));
-    Ok(())
+    }
 }
 
 /// Runs `solo snapshot <subcommand>` and returns what it prints.

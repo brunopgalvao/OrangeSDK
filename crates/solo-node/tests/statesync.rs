@@ -265,7 +265,7 @@ fn messages_round_trip_and_bad_ones_are_refused() {
 fn a_server_serves_the_latest_epochs_and_answers_every_request() {
     let dir = scratch("server");
     let genesis = chain();
-    let node = server(&dir, &genesis, SMALL);
+    let mut node = server(&dir, &genesis, SMALL);
     let served = node.snapshot_server().unwrap();
     let offers = served.offers();
     // It exported the latest record once a certificate covered it, and
@@ -391,6 +391,13 @@ fn a_server_serves_the_latest_epochs_and_answers_every_request() {
     let file = scratch("server-file");
     std::fs::write(&file, b"x").unwrap();
     assert!(SnapshotServer::open(&file.join("sub"), SMALL).is_err());
+    // A snapshot directory that cannot be made is named.
+    std::fs::remove_dir_all(&snaps).unwrap();
+    std::fs::write(&snaps, b"a file").unwrap();
+    assert!(matches!(
+        node.serve_snapshots(SMALL),
+        Err(NodeError::Store(_))
+    ));
     let mut memory = Node::new(v1(), &genesis, 0).unwrap();
     assert!(matches!(
         memory.serve_snapshots(SMALL),
