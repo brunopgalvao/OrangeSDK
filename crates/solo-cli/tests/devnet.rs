@@ -7,7 +7,7 @@
 //! against four validators. The compose stack's rehearsal runs only with
 //! `SOLO_DOCKER` set (`tools/compose-rehearsal.sh` says so otherwise).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -450,8 +450,21 @@ fn fake_node(replies: Vec<&'static str>, status: Option<&'static str>) -> String
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
+            // Read the whole request before answering: closing a socket
+            // with unread input sends a reset, which can reach the client
+            // before the reply does.
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
-            let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+            let _ = reader.read_line(&mut line);
+            let mut length = 0;
+            let mut header = String::new();
+            while reader.read_line(&mut header).is_ok_and(|n| n > 2) {
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap_or(0);
+                }
+                header.clear();
+            }
+            let _ = reader.take(length).read_to_end(&mut Vec::new());
             let reply = match status {
                 Some(status) if line.starts_with("GET /status") => status,
                 _ => match replies.next() {
