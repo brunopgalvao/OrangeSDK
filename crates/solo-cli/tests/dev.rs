@@ -19,12 +19,13 @@ const HELLO: &str = concat!(
 );
 
 /// A kernel gas budget that lets the driver start (79 399) but not produce a block
-/// (275 039) with the pinned kernel fixture, bisected on 2026-10-23 in-process (the
+/// (275 036) with the pinned kernel fixture, bisected on 2026-10-23 in-process (the
 /// dev key, this genesis, 40 slots of 60 ms) after the block log and snapshot record
-/// of spec 22 and the fee market of spec 23 both landed in the kernel, and again
-/// after the fee market's bounds and the payout that leaves jailed validators out
-/// (spec 23 §2, spec 15 §10.2) rebuilt it: the same two numbers from the fixture
-/// before and after that rebuild. Rebuilding the fixture may move both.
+/// of spec 22, the fee market of spec 23 with its bounds and the payout that leaves
+/// jailed validators out (spec 23 §2, spec 15 §10.2), and the stake-weighted
+/// threshold shares of spec 15 §6.8 landed in the kernel. The same bisection gave
+/// 79 399 and 275 039 for the fixture before the shares, which took 3 off the block;
+/// rebuilding the fixture may move both numbers.
 const STARVED_GAS: &str = "100000";
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4,
