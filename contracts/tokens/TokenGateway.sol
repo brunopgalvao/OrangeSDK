@@ -78,10 +78,12 @@ abstract contract TokenGateway {
     }
 
     /// @notice A mint or release over its limit, waiting until `readyAt` for anyone to execute it.
-    /// `token` is the origin of a mint, the native token of a release.
+    /// `token` is the origin of a mint, the native token of a release. A frozen one waits until the
+    /// owner unfreezes or cancels it.
     struct Transfer {
         address token;
         uint8 kind;
+        bool frozen;
         uint64 nonce;
         uint64 readyAt;
         address from;
@@ -122,6 +124,11 @@ abstract contract TokenGateway {
         uint256 indexed id, uint64 indexed nonce, uint8 kind, address token, address to, uint256 amount, uint64 readyAt
     );
     event QueueExecuted(uint256 indexed id);
+    event QueueFrozen(uint256 indexed id, address indexed by);
+    event QueueUnfrozen(uint256 indexed id);
+    event QueueCancelled(
+        uint256 indexed id, uint64 indexed nonce, uint8 kind, address token, address from, address to, uint256 amount
+    );
     event PeerConfirmed();
     event Paused(address indexed by);
     event Unpaused();
@@ -146,6 +153,7 @@ abstract contract TokenGateway {
     error BadWindow();
     error NothingQueued();
     error NotReady(uint64 readyAt);
+    error Frozen();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -235,6 +243,7 @@ abstract contract TokenGateway {
     function executeQueued(uint256 id) external whenNotPaused nonReentrant {
         Transfer memory t = queued[id];
         if (t.amount == 0) revert NothingQueued();
+        if (t.frozen) revert Frozen();
         if (block.timestamp < t.readyAt) revert NotReady(t.readyAt);
         delete queued[id];
         emit QueueExecuted(id);
@@ -247,6 +256,42 @@ abstract contract TokenGateway {
             releasesQueued[t.token] -= t.amount;
             _release(t.nonce, t.token, t.from, t.to, t.amount);
         }
+    }
+
+    /// @notice Stops queued transfer `id` alone, leaving the gateway and every other transfer running:
+    /// `executeQueued` refuses it until the owner unfreezes or cancels it. The guardian or the owner.
+    function freezeQueued(uint256 id) external {
+        if (msg.sender != guardian && msg.sender != owner) revert NotGuardian();
+        if (queued[id].amount == 0) revert NothingQueued();
+        queued[id].frozen = true;
+        emit QueueFrozen(id, msg.sender);
+    }
+
+    /// @notice Lets frozen transfer `id` be executed again, at its time. The owner.
+    function unfreezeQueued(uint256 id) external onlyOwner {
+        if (queued[id].amount == 0) revert NothingQueued();
+        queued[id].frozen = false;
+        emit QueueUnfrozen(id);
+    }
+
+    /// @notice Retires queued transfer `id` by undoing what its delivery did here: a mint is dropped,
+    /// freeing its room under the mint cap, a release goes back into `locked`, and the limit gets back
+    /// what the transfer took of it. Nothing is sent to anyone. For a forged message this restores the
+    /// gateway as it was before, so honest transfers are not held behind it; for an honest one the
+    /// value stays held where it was locked, as for a vetoed message. The owner.
+    function cancelQueued(uint256 id) external onlyOwner {
+        Transfer memory t = queued[id];
+        if (t.amount == 0) revert NothingQueued();
+        delete queued[id];
+        if (t.kind == MINT) {
+            mintsQueued[t.token] -= t.amount;
+            _unschedule(mintLimit[t.token], t.amount);
+        } else {
+            releasesQueued[t.token] -= t.amount;
+            locked[t.token] += t.amount;
+            _unschedule(releaseLimit[t.token], t.amount);
+        }
+        emit QueueCancelled(id, t.nonce, t.kind, t.token, t.from, t.to, t.amount);
     }
 
     /// @notice Sends the paired gateway a `HELLO` again, while none of its messages has arrived: for a
@@ -334,7 +379,7 @@ abstract contract TokenGateway {
             uint64 readyAt = _schedule(releaseLimit[token], amount);
             if (readyAt > block.timestamp) {
                 releasesQueued[token] += amount;
-                _queue(Transfer(token, RELEASE, nonce, readyAt, from, to, amount));
+                _queue(Transfer(token, RELEASE, false, nonce, readyAt, from, to, amount));
             } else {
                 _release(nonce, token, from, to, amount);
             }
@@ -354,7 +399,7 @@ abstract contract TokenGateway {
         uint64 readyAt = _schedule(mintLimit[origin], amount);
         if (readyAt > block.timestamp) {
             mintsQueued[origin] = queuedAmount + amount;
-            _queue(Transfer(origin, MINT, nonce, readyAt, from, to, amount));
+            _queue(Transfer(origin, MINT, false, nonce, readyAt, from, to, amount));
         } else {
             BridgedToken(token).mint(to, amount);
             emit Minted(nonce, origin, token, from, to, amount);
@@ -383,6 +428,15 @@ abstract contract TokenGateway {
         if (used <= cap) return uint64(block.timestamp);
         // Rounded up, so that nothing is paid out before it has refilled.
         return uint64(block.timestamp + ((used - cap) * limit.window + cap - 1) / cap);
+    }
+
+    /// @dev Gives `amount` back to `limit`: what it has used, refilled up to now, less `amount`, never
+    /// below zero. Transfers already queued keep their times. Without a limit, nothing.
+    function _unschedule(RateLimit storage limit, uint256 amount) private {
+        if (limit.amount == 0) return;
+        uint256 used = _used(limit);
+        limit.used = used > amount ? used - amount : 0;
+        limit.updated = uint64(block.timestamp);
     }
 
     /// @dev What `limit` has used, less what has refilled since it was last brought up to date.

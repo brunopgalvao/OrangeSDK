@@ -267,6 +267,26 @@ pub fn execute_queued_calldata(id: u64) -> Vec<u8> {
     abi::call("executeQueued(uint256)", &[Value::uint(u128::from(id))])
 }
 
+/// `freezeQueued(id)`: stops queued transfer `id` alone until the owner
+/// unfreezes or cancels it; the guardian or the owner sends it (spec 21 §5.5a).
+#[must_use]
+pub fn freeze_queued_calldata(id: u64) -> Vec<u8> {
+    abi::call("freezeQueued(uint256)", &[Value::uint(u128::from(id))])
+}
+
+/// `unfreezeQueued(id)`: lets a frozen transfer be executed again; the owner.
+#[must_use]
+pub fn unfreeze_queued_calldata(id: u64) -> Vec<u8> {
+    abi::call("unfreezeQueued(uint256)", &[Value::uint(u128::from(id))])
+}
+
+/// `cancelQueued(id)`: retires queued transfer `id` by undoing its
+/// delivery on this side; the owner (spec 21 §5.5a).
+#[must_use]
+pub fn cancel_queued_calldata(id: u64) -> Vec<u8> {
+    abi::call("cancelQueued(uint256)", &[Value::uint(u128::from(id))])
+}
+
 /// The calldata of a gateway view that takes one address, such as
 /// `locked(address)`, `lockCap(address)`, `wrappedToken(address)` or a
 /// token's `balanceOf(address)`.
@@ -459,6 +479,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn calls_and_constructor_arguments() {
         assert_eq!(
             &deposit_calldata(&NATIVE, &[1; 20], 5)[..4],
@@ -504,6 +525,21 @@ mod tests {
             (
                 execute_queued_calldata(9),
                 execute_queued,
+                &word(&[9]).to_vec(),
+            ),
+            (
+                freeze_queued_calldata(9),
+                [0x58, 0x88, 0xdc, 0x7b],
+                &word(&[9]).to_vec(),
+            ),
+            (
+                unfreeze_queued_calldata(9),
+                [0x7a, 0xed, 0x6b, 0x98],
+                &word(&[9]).to_vec(),
+            ),
+            (
+                cancel_queued_calldata(9),
+                [0xb1, 0xfd, 0x65, 0x3e],
                 &word(&[9]).to_vec(),
             ),
         ] {
