@@ -1175,7 +1175,10 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
         let text = err(&args);
         assert!(text.contains(message), "{args:?}: {text}");
     }
-    // The upgrade itself, then a second proposal while it is pending.
+    // The upgrade itself, then a second proposal while it is pending: 30
+    // blocks of delay leave the second command, a process of its own, the
+    // time to ask before the switch, however loaded the machine (with 3 it
+    // sometimes asked after it, and staged into the new kernel).
     let upgrade = [
         "upgrade",
         "--rpc",
@@ -1185,7 +1188,7 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
         "--key-file",
         governance,
         "--delay",
-        "3",
+        "30",
         "--required-gates",
         "",
     ];
@@ -1198,7 +1201,8 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
         .unwrap()
         .parse()
         .unwrap();
-    assert!(err(&upgrade).contains("already pending"));
+    let again = err(&upgrade);
+    assert!(again.contains("already pending"), "{again}");
     let text = ok(&["devnet", "status", "--dir", d, "--json"]);
     assert!(
         text.contains(&format!("\"pendingUpgrade\": {activation}")),
