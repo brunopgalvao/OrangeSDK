@@ -16,6 +16,7 @@ solo-abi = { path = "../solo-abi", default-features = false }
 [dev-dependencies]
 tiny-keccak = { version = "2", features = ["keccak"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
+solo-fuzz = { path = "../solo-fuzz" }
 
 [lints]
 workspace = true

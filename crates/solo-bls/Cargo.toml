@@ -19,6 +19,7 @@ zeroize = { version = "1", default-features = false }
 
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
+solo-fuzz = { path = "../solo-fuzz" }
 # An independent BLS12-381 implementation, called the way revm's EIP-2537
 # precompiles call it: the oracle for the procedure an Ethereum contract
 # follows to verify a certificate (spec 12 §8).

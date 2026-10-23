@@ -2903,6 +2903,7 @@ dependencies = [
  "proptest",
  "sha2 0.10.9",
  "solo-abi",
+ "solo-fuzz",
  "zeroize",
 ]
 
@@ -2983,6 +2984,7 @@ dependencies = [
  "solo-abi",
  "solo-bls",
  "solo-ethlc",
+ "solo-fuzz",
  "solo-rlp",
  "tiny-keccak",
 ]
@@ -3047,6 +3049,7 @@ dependencies = [
  "solo-bls",
  "solo-eth",
  "solo-ethlc",
+ "solo-fuzz",
  "solo-host",
  "solo-metrics",
  "solo-node",
@@ -3124,6 +3127,7 @@ name = "solo-trie"
 version = "0.0.1"
 dependencies = [
  "proptest",
+ "solo-fuzz",
  "tiny-keccak",
 ]
 
@@ -3133,6 +3137,7 @@ version = "0.0.1"
 dependencies = [
  "proptest",
  "solo-abi",
+ "solo-fuzz",
  "tiny-keccak",
 ]
 
