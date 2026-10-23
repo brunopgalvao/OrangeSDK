@@ -2986,6 +2986,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "solo-fuzz"
+version = "0.0.1"
+
+[[package]]
 name = "solo-host"
 version = "0.0.1"
 dependencies = [
@@ -3011,10 +3015,13 @@ dependencies = [
  "libc",
  "proptest",
  "solo-abi",
+ "solo-fuzz",
  "solo-host",
  "solo-node",
  "solo-recompile",
  "solo-rlp",
+ "solo-scratch",
+ "solo-store",
  "solo-vm",
 ]
 
@@ -3055,6 +3062,7 @@ name = "solo-recompile"
 version = "0.0.1"
 dependencies = [
  "object",
+ "solo-fuzz",
  "solo-scratch",
  "solo-vm",
  "tiny-keccak",

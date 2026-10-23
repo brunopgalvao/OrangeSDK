@@ -15,6 +15,9 @@ libc = "0.2"
 [dev-dependencies]
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
+solo-fuzz = { path = "../solo-fuzz" }
+solo-scratch = { path = "../solo-scratch" }
+solo-store = { path = "../solo-store" }
 solo-abi = { path = "../solo-abi" }
 solo-host = { path = "../solo-host" }
 solo-node = { path = "../solo-node" }
