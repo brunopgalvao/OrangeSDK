@@ -177,8 +177,10 @@ impl Keystore {
 }
 
 /// Combines partial signatures and verifies the result under the group key;
-/// when it fails, verifies each partial, drops the invalid ones and combines
-/// again (spec 12 §7).
+/// when it fails, finds the invalid partials with one batched check and its
+/// halves (spec 12 §4.1), drops them and combines again (spec 12 §7). The
+/// batch's coefficients come from fresh randomness of this host, which no
+/// signer can know.
 fn combine(key_set: &[u8], message: &[u8], partials: &[PartialShare]) -> Option<Vec<u8>> {
     let set = PublicKeySet::from_bytes(key_set).ok()?;
     let mut parsed: Vec<PartialSignature> = Vec::new();
@@ -201,7 +203,11 @@ fn combine(key_set: &[u8], message: &[u8], partials: &[PartialShare]) -> Option<
     {
         return Some(signature.to_bytes().to_vec());
     }
-    parsed.retain(|p| set.verify_partial(message, p));
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).ok()?;
+    let valid = set.verify_partials(message, &parsed, &seed);
+    let mut flags = valid.into_iter();
+    parsed.retain(|_| flags.next().unwrap_or(false));
     let signature = set.combine(&parsed).ok()?;
     Some(signature.to_bytes().to_vec())
 }

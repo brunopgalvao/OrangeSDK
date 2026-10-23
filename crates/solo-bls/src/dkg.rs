@@ -20,7 +20,7 @@ use zeroize::Zeroize;
 use crate::poly::{self, Polynomial};
 use crate::sig::SecretKey;
 use crate::threshold::{PublicKeySet, SecretShare};
-use crate::{Error, hash, point};
+use crate::{Error, batch, hash, point};
 
 /// Domain separation tag of a dealer's ephemeral encryption scalar.
 pub const DST_EPHEMERAL: &[u8] = b"SOLO-V01-DKG-EPHEMERAL_XMD:SHA-256";
@@ -489,28 +489,53 @@ impl Dkg {
         };
         let me = recipient.index;
         let mine = range_of(&self.shares, me);
-        let mut accused = Vec::new();
-        for (&dealer, received) in &self.dealings {
-            let shared: G1Affine = (received.ephemeral * recipient.key.0).into();
-            let mut verified = Vec::new();
-            for x in mine.clone() {
-                let pad = pad(
-                    &self.config.session,
-                    dealer,
-                    x,
-                    &received.ephemeral,
-                    &shared,
+        let mut secret = point::scalar_bytes(&recipient.key.0);
+        let decrypted: Vec<(u32, Vec<Scalar>, u64)> = self
+            .dealings
+            .iter()
+            .map(|(&dealer, received)| {
+                let shared: G1Affine = (received.ephemeral * recipient.key.0).into();
+                let decrypted = mine
+                    .clone()
+                    .map(|x| {
+                        let pad = pad(
+                            &self.config.session,
+                            dealer,
+                            x,
+                            &received.ephemeral,
+                            &shared,
+                        );
+                        received.shares[x as usize - 1] - pad
+                    })
+                    .collect();
+                // The coefficient of the batched check (spec 12 §5.1): keyed
+                // by this recipient's secret, so the dealer cannot predict it.
+                let rho = batch::coefficient(
+                    &[
+                        &secret,
+                        &self.config.session,
+                        &dealer.to_be_bytes(),
+                        &received.ephemeral.to_compressed(),
+                    ],
+                    batch::DST_SHARE_BATCH,
                 );
-                let share = received.shares[x as usize - 1] - pad;
-                if !poly::share_matches(&received.commitment, x, &share) {
-                    break;
-                }
-                verified.push(share);
-            }
-            if verified.len() == mine.len() {
-                self.mine.insert(dealer, verified);
-            } else {
-                accused.push(dealer);
+                (dealer, decrypted, rho)
+            })
+            .collect();
+        secret.zeroize();
+        let items: Vec<batch::DealerShares<'_>> = decrypted
+            .iter()
+            .map(|(dealer, shares, rho)| batch::DealerShares {
+                commitment: &self.dealings[dealer].commitment,
+                shares,
+                rho: *rho,
+            })
+            .collect();
+        let failing = batch::failing_dealers(&items, mine.start);
+        let accused: Vec<u32> = failing.iter().map(|&i| decrypted[i].0).collect();
+        for (dealer, shares, _) in decrypted {
+            if !accused.contains(&dealer) {
+                self.mine.insert(dealer, shares);
             }
         }
         if accused.is_empty() {

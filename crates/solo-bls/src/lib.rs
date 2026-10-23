@@ -8,6 +8,8 @@
 //!   signatures and their Lagrange combination into the group signature.
 //! - [`dkg`]: the dealerless key generation and the resharing that keeps the
 //!   group key across validator-set changes, as a pure state machine.
+//! - [`batch`]: share checks and partial-signature checks batched into
+//!   random linear combinations.
 //! - [`certificate`]: the versioned finality certificate and the bytes it signs.
 //! - [`evm`]: the inputs an Ethereum contract passes to the EIP-2537 precompiles.
 //! - [`host`]: the byte-level semantics of the `bls12381_*` host functions.
@@ -21,6 +23,7 @@
 
 extern crate alloc;
 
+pub mod batch;
 pub mod certificate;
 pub mod dkg;
 pub mod eth;
