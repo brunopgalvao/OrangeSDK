@@ -166,16 +166,23 @@ fn computing_every_public_key_share() {
         let start = Instant::now();
         let one_by_one: Vec<_> = (1..=n).map(|x| set.public_share(x)).collect();
         let before = start.elapsed();
-        let mut after = Duration::MAX;
+        // By differences on one thread, and on every core.
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        let mut after = [Duration::MAX; 2];
         for _ in 0..3 {
-            let start = Instant::now();
-            let together = set.public_shares(n);
-            after = after.min(start.elapsed());
-            assert_eq!(together, one_by_one);
+            for (i, threads) in [1, cores].into_iter().enumerate() {
+                let start = Instant::now();
+                let together = set.public_shares_on(n, threads);
+                after[i] = after[i].min(start.elapsed());
+                assert_eq!(together, one_by_one);
+            }
         }
         eprintln!(
-            "{members} members, {n} shares, threshold {t}: one by one {before:?}, together {after:?} ({:.1}x)",
-            before.as_secs_f64() / after.as_secs_f64()
+            "{members} members, {n} shares, threshold {t}: one by one {before:?}, by differences {:?} ({:.1}x), on {cores} cores {:?} ({:.1}x)",
+            after[0],
+            before.as_secs_f64() / after[0].as_secs_f64(),
+            after[1],
+            before.as_secs_f64() / after[1].as_secs_f64()
         );
     }
 }

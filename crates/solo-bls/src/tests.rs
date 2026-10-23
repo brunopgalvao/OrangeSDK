@@ -451,6 +451,9 @@ fn public_shares_together_are_the_shares_one_by_one() {
         let (keys, shares) = threshold::deal(&sk, t, 20, &[seed; 32]).unwrap();
         for count in [0, 1, t / 2, t.div_ceil(2), t, 20] {
             let together = keys.public_shares(count);
+            // By differences on one thread, one by one on several: the same.
+            assert_eq!(keys.public_shares_on(count, 1), together);
+            assert_eq!(keys.public_shares_on(count, 5), together);
             assert_eq!(together.len(), count as usize);
             for (x, key) in (1..).zip(&together) {
                 assert_eq!(*key, keys.public_share(x), "t {t}, count {count}, x {x}");
