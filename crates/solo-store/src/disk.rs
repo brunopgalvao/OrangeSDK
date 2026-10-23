@@ -1195,31 +1195,49 @@ impl DiskStore {
             .map_err(redb::Error::from)
             .map_err(db)?;
         let (count, bytes, nodes_written, node_count) = {
-            let open = |e: redb::TableError| db(redb::Error::from(e));
-            let mut state = txn.open_table(STATE).map_err(open)?;
-            let mut nodes = txn.open_table(NODES).map_err(open)?;
-            let mut versions = txn.open_table(VERSIONS).map_err(open)?;
-            let gone = |e: redb::StorageError| db(redb::Error::from(e));
+            let mut state = txn
+                .open_table(STATE)
+                .map_err(redb::Error::from)
+                .map_err(db)?;
+            let mut nodes = txn
+                .open_table(NODES)
+                .map_err(redb::Error::from)
+                .map_err(db)?;
+            let mut versions = txn
+                .open_table(VERSIONS)
+                .map_err(redb::Error::from)
+                .map_err(db)?;
             // The genesis goes: its rows, its history and its trie, which
             // its version row and the current root hold.
-            state.retain(|_, _| false).map_err(gone)?;
-            txn.open_table(HISTORY)
-                .map_err(open)?
+            state
                 .retain(|_, _| false)
-                .map_err(gone)?;
+                .map_err(redb::Error::from)
+                .map_err(db)?;
+            txn.open_table(HISTORY)
+                .map_err(redb::Error::from)
+                .map_err(db)?
+                .retain(|_, _| false)
+                .map_err(redb::Error::from)
+                .map_err(db)?;
             txn.open_table(WRITTEN)
-                .map_err(open)?
+                .map_err(redb::Error::from)
+                .map_err(db)?
                 .retain(|_, ()| false)
-                .map_err(gone)?;
+                .map_err(redb::Error::from)
+                .map_err(db)?;
             let roots: Vec<Hash> = versions
                 .iter()
-                .map_err(gone)?
+                .map_err(redb::Error::from)
+                .map_err(db)?
                 .filter_map(|row| VersionRow::decode(read(row).1.value()).and_then(|r| r.root))
                 .collect();
             for root in roots.iter().chain([&self.current]) {
                 release(&mut nodes, root)?;
             }
-            versions.retain(|_, _| false).map_err(gone)?;
+            versions
+                .retain(|_, _| false)
+                .map_err(redb::Error::from)
+                .map_err(db)?;
             let mut builder = SortedRoot::new(solo_trie::keccak256);
             // The nodes one entry completes, at most one per bit of a path
             // and its leaf, written before the next entry.
@@ -1236,7 +1254,8 @@ impl DiskStore {
                 bytes += (key.len() + value.len()) as u64;
                 state
                     .insert(key.as_slice(), value.as_slice())
-                    .map_err(gone)?;
+                    .map_err(redb::Error::from)
+                    .map_err(db)?;
                 builder
                     .push(
                         solo_trie::keccak256(&key),
@@ -1265,7 +1284,8 @@ impl DiskStore {
             for (key, value) in local {
                 state
                     .insert(key.as_slice(), value.as_slice())
-                    .map_err(gone)?;
+                    .map_err(redb::Error::from)
+                    .map_err(db)?;
             }
             let row = VersionRow {
                 root: None,
@@ -1274,21 +1294,27 @@ impl DiskStore {
             };
             versions
                 .insert(version, row.encode().as_slice())
-                .map_err(gone)?;
-            let mut meta = txn.open_table(META).map_err(open)?;
+                .map_err(redb::Error::from)
+                .map_err(db)?;
+            let mut meta = txn
+                .open_table(META)
+                .map_err(redb::Error::from)
+                .map_err(db)?;
             for (name, value) in [
                 ("latest", version.to_le_bytes().as_slice()),
                 ("oldest", version.to_le_bytes().as_slice()),
                 ("current", root.as_slice()),
                 ("entries", count.to_le_bytes().as_slice()),
             ] {
-                meta.insert(name, value).map_err(gone)?;
+                meta.insert(name, value)
+                    .map_err(redb::Error::from)
+                    .map_err(db)?;
             }
             (
                 count,
                 bytes + nodes_written * (32 + 4 + NODE_LEN as u64),
                 nodes_written,
-                nodes.len().map_err(gone)?,
+                nodes.len().map_err(redb::Error::from).map_err(db)?,
             )
         };
         txn.commit().map_err(redb::Error::from).map_err(db)?;
@@ -1316,20 +1342,17 @@ impl DiskStore {
     }
 }
 
-/// One more parent or root names the node `hash` with `preimage`: its row
-/// is written with one reference, or its count goes up when it is there.
+/// The node `hash` with `preimage`, named by one parent or, for the root,
+/// by the current state: its row with one reference. A loaded trie's nodes
+/// are each named once, and the genesis trie is released before they are
+/// written, so no row is there already.
 fn adopt(
     table: &mut NodesTable<'_>,
     hash: &Hash,
     preimage: &[u8; NODE_LEN],
 ) -> Result<(), StoreError> {
-    let refs = table
-        .get(hash)
-        .map_err(redb::Error::from)
-        .map_err(db)?
-        .map_or(0, |row| node_refs(row.value()));
     table
-        .insert(hash, node_row(refs + 1, preimage).as_slice())
+        .insert(hash, node_row(1, preimage).as_slice())
         .map_err(redb::Error::from)
         .map_err(db)?;
     Ok(())

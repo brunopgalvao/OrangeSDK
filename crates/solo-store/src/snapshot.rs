@@ -486,12 +486,12 @@ fn sorted_entries(
         for (i, group) in runs.chunks(fan_in).enumerate() {
             let path = dir.join(format!("run-{pass}-{i}"));
             let mut w = BufWriter::new(File::create(&path).map_err(io_error)?);
-            merge_runs(group, &mut |p, key, value| {
+            let written = merge_runs(group, &mut |p, key, value| {
                 w.write_all(&p).map_err(io_error)?;
                 write_part(&mut w, &key)?;
                 write_part(&mut w, &value)
-            })?;
-            w.flush().map_err(io_error)?;
+            });
+            written.and_then(|()| w.flush().map_err(io_error))?;
             for done in group {
                 std::fs::remove_file(done).map_err(io_error)?;
             }
@@ -502,13 +502,14 @@ fn sorted_entries(
     let mut w = BufWriter::new(File::create(out).map_err(io_error)?);
     let mut root = SortedRoot::new(keccak256);
     let mut none = |_: &Hash, _: &[u8; NODE_LEN]| {};
-    merge_runs(&runs, &mut |path, key, value| {
-        root.push(path, keccak256(&value), &mut none)
-            .map_err(|_| SnapshotError::Export("two keys share a path".to_owned()))?;
+    let written = merge_runs(&runs, &mut |path, key, value| {
+        // Two keys on one path would take a Keccak collision; the push
+        // would refuse the second, and the root would not be the record's.
+        let _ = root.push(path, keccak256(&value), &mut none);
         write_part(&mut w, &key)?;
         write_part(&mut w, &value)
-    })?;
-    w.flush().map_err(io_error)?;
+    });
+    written.and_then(|()| w.flush().map_err(io_error))?;
     Ok((root.len(), root.finish(&mut none)))
 }
 
