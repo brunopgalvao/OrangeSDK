@@ -171,6 +171,11 @@ fn proposals_are_read_from_submission_to_execution() {
         json!({"yes": "0x0", "no": "0x0", "total": "0x7"})
     );
     assert_eq!(p["votes"], json!([]));
+    assert_eq!(p["delegators"], json!([]));
+    assert_eq!(
+        (&p["call"], &p["value"], &p["gas"]),
+        (&json!(false), &json!("0x0"), &json!("0x0"))
+    );
     assert_eq!(
         ok(&mut rpc, "solo_getGovernance", json!([]))["nextId"],
         "0x2"

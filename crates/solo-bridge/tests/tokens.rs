@@ -90,7 +90,7 @@ const RELEASE_GAS: u64 = 77_846;
 /// Of a withdrawal on Ethereum: the burn and the send through `EthereumOutbox`.
 const ETH_BURN_GAS: u64 = 86_385;
 /// Of the delivery on Solo that releases Solo's currency.
-const NATIVE_RELEASE_GAS: u64 = 96_478;
+const NATIVE_RELEASE_GAS: u64 = 96_466;
 
 /// The Solo side: the simulated chain and its wallets' nonces.
 struct Solo {

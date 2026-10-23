@@ -61,6 +61,28 @@ pub const MAX_OPEN_PROPOSALS: usize = 16;
 /// light-client checkpoint (spec 18 §3.4) within one storage value.
 pub const MAX_PROPOSAL_DATA: usize = 32_768;
 
+/// Most delegator votes on one proposal (spec 13 §9.3). A delegator's first
+/// vote on a proposal also needs at least `1 / MAX_BALLOTS` of the stake of
+/// the members that count, so stake that is bonded cannot make more; the
+/// bound keeps the tallies and the pruning at the end of a block within the
+/// kernel gas of a block (spec 19 §5.1).
+pub const MAX_BALLOTS: u32 = 4_096;
+
+/// Most gas a governed call (`submitCall`, spec 13 §9.2) may carry.
+pub const MAX_CALL_GAS: u64 = 10_000_000;
+
+/// Most bytes of a governed call's return data its `CallExecuted` log keeps.
+pub const MAX_CALL_OUTPUT: usize = 1_024;
+
+/// Whether `address` is a system address: its first 18 bytes are zero, as
+/// for the governance, module, staking and bridge addresses and the
+/// precompiles. A governed call never targets one; the actions of spec 13
+/// §9.2 reach them.
+#[must_use]
+pub fn is_system(address: &Address) -> bool {
+    address[..18].iter().all(|b| *b == 0)
+}
+
 /// Gas every governance call (`submit`, `vote`, `execute`, `veto`, `pause`)
 /// costs on top of the plain call, paid at the transaction's gas price to
 /// the zero address like every fee; the gas limit must cover it.
@@ -71,14 +93,20 @@ pub const GOVERNANCE_GAS: u64 = 50_000;
 pub const ACTION_GAS: u64 = 1 << 26;
 
 /// The gas a message to `to` with calldata `data` pays beyond the plain
-/// call: [`GOVERNANCE_GAS`] for a governance call, nothing for anything
-/// else, upgrade actions included. Admission requires a gas limit that
-/// covers it, and the kernel's `call` query reports it, so that an
-/// `eth_estimateGas` is a gas limit the chain accepts (spec 13 §9.9).
+/// call: [`GOVERNANCE_GAS`] for a governance call, plus the gas of the call
+/// a `submitCall` carries, nothing for anything else, upgrade actions
+/// included. Admission requires a gas limit that covers it, and the
+/// kernel's `call` query reports it, so that an `eth_estimateGas` is a gas
+/// limit the chain accepts (spec 13 §9.9). The kernel adds the call's gas
+/// to an `execute` of a call proposal, which this function cannot see.
 #[must_use]
 pub fn surcharge(to: Option<&Address>, data: &[u8]) -> u64 {
     match to {
-        Some(to) if *to == GOVERNANCE_ADDRESS && Call::decode(data).is_some() => GOVERNANCE_GAS,
+        Some(to) if *to == GOVERNANCE_ADDRESS => match Call::decode(data) {
+            Some(Call::SubmitCall { gas, .. }) => GOVERNANCE_GAS + gas,
+            Some(_) => GOVERNANCE_GAS,
+            None => 0,
+        },
         _ => 0,
     }
 }
@@ -104,6 +132,10 @@ pub mod selector {
     pub const SET_PARAMS: [u8; 4] = [0x94, 0xbc, 0x43, 0xb4];
     /// `setFeeParams(uint64,uint64,uint64,address)`.
     pub const SET_FEE_PARAMS: [u8; 4] = [0x92, 0x10, 0x6b, 0x6c];
+    /// `submitCall(address,uint256,uint64,bytes)`.
+    pub const SUBMIT_CALL: [u8; 4] = [0x0d, 0xfe, 0x20, 0x64];
+    /// `reject(uint64)`.
+    pub const REJECT: [u8; 4] = [0x50, 0x44, 0xa7, 0x60];
 }
 
 /// Event topics: `keccak256` of each event signature.
@@ -166,6 +198,12 @@ pub mod event {
         0x16, 0x6f, 0x73, 0x41, 0x3d, 0xfa, 0x1e, 0x90, 0xdb, 0xee, 0x1a, 0x24, 0xff, 0x2e, 0xfe,
         0xb4, 0xd8,
     ];
+    /// `CallExecuted(uint64 indexed id, address indexed target, bool success, uint64 gasUsed, bytes output)`.
+    pub const CALL_EXECUTED: Hash = [
+        0xe0, 0x3e, 0xc1, 0x32, 0x00, 0x48, 0x97, 0x3d, 0x79, 0xe1, 0x12, 0x8f, 0x8b, 0xe1, 0x49,
+        0x00, 0x18, 0xbc, 0xca, 0xd3, 0x9d, 0xe5, 0x96, 0x72, 0x91, 0xa0, 0xb7, 0xd1, 0x68, 0x42,
+        0xde, 0x45,
+    ];
 }
 
 /// Storage keys of governance (spec 13 §9.7).
@@ -190,6 +228,14 @@ pub mod keys {
     pub const VOTE: &[u8] = b"gov/vote/";
     /// `gov/voters/` + id → `vec<[32]>`, the validators that voted.
     pub const VOTERS: &[u8] = b"gov/voters/";
+    /// `gov/ballot/` + id ‖ address → `u32`, the position of a delegator's
+    /// vote under `gov/ballot_at/`.
+    pub const BALLOT: &[u8] = b"gov/ballot/";
+    /// `gov/ballots/` + id → `u32`, how many delegators voted.
+    pub const BALLOTS: &[u8] = b"gov/ballots/";
+    /// `gov/ballot_at/` + id ‖ index (big-endian u32) → `BallotEntry`, the
+    /// delegators' votes, in the order they first voted.
+    pub const BALLOT_AT: &[u8] = b"gov/ballot_at/";
 
     fn keyed(prefix: &[u8], id: u64) -> Vec<u8> {
         let mut k = prefix.to_vec();
@@ -215,6 +261,28 @@ pub mod keys {
     #[must_use]
     pub fn voters(id: u64) -> Vec<u8> {
         keyed(VOTERS, id)
+    }
+
+    /// The key of `delegator`'s vote on proposal `id`.
+    #[must_use]
+    pub fn ballot(id: u64, delegator: &crate::types::Address) -> Vec<u8> {
+        let mut k = keyed(BALLOT, id);
+        k.extend_from_slice(delegator);
+        k
+    }
+
+    /// The key of the number of delegators that voted on proposal `id`.
+    #[must_use]
+    pub fn ballots(id: u64) -> Vec<u8> {
+        keyed(BALLOTS, id)
+    }
+
+    /// The key of the `index`th delegator to vote on proposal `id`.
+    #[must_use]
+    pub fn ballot_at(id: u64, index: u32) -> Vec<u8> {
+        let mut k = keyed(BALLOT_AT, id);
+        k.extend_from_slice(&index.to_be_bytes());
+        k
     }
 }
 
@@ -254,39 +322,103 @@ record! {
     }
 }
 
-record! {
-    /// An open proposal (spec 13 §9.3).
-    Proposal {
-        /// Its id; ids start at 1 and never repeat.
-        id: u64,
-        /// The account that submitted it.
-        proposer: Address,
-        /// Wei it locked; zero for a validator's proposal.
-        deposit: u128,
-        /// The system address the action is for.
-        target: Address,
-        /// The action: calldata to `target`.
-        data: Vec<u8>,
-        /// Height of the block that submitted it.
-        submitted_at: u64,
-        /// The last block that takes votes.
-        voting_end: u64,
-        /// The first block that may execute it, once passed; zero on the fast track.
-        executable_at: u64,
-        /// The last block that may execute it; a passed proposal still open
-        /// after it has expired.
-        expires_at: u64,
-        /// Whether it is a safety action: no timelock, passed by a majority
-        /// of all stake and executed in the vote that reaches it.
-        fast_track: bool,
-        /// [`status`].
-        status: u8,
-        /// Stake that voted yes, as tallied at the end of voting.
-        yes: u64,
-        /// Stake that voted no, as tallied at the end of voting.
-        no: u64,
-        /// Stake of the whole validator set at the tally.
-        total: u64,
+/// An open proposal (spec 13 §9.3).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Proposal {
+    /// Its id; ids start at 1 and never repeat.
+    pub id: u64,
+    /// The account that submitted it.
+    pub proposer: Address,
+    /// Wei it locked; zero for a validator's proposal.
+    pub deposit: u128,
+    /// The system address the action is for, or, for a governed call, the
+    /// account called.
+    pub target: Address,
+    /// The action, or the governed call's calldata.
+    pub data: Vec<u8>,
+    /// Height of the block that submitted it.
+    pub submitted_at: u64,
+    /// The last block that takes votes.
+    pub voting_end: u64,
+    /// The first block that may execute it, once passed; zero on the fast track.
+    pub executable_at: u64,
+    /// The last block that may execute it; a passed proposal still open
+    /// after it has expired.
+    pub expires_at: u64,
+    /// Whether it is a safety action: no timelock, passed by a majority of
+    /// all stake at the end of a block in which it took a vote.
+    pub fast_track: bool,
+    /// [`status`].
+    pub status: u8,
+    /// Stake that voted yes, as tallied at the end of voting.
+    pub yes: u64,
+    /// Stake that voted no, as tallied at the end of voting.
+    pub no: u64,
+    /// Stake of the whole validator set at the tally.
+    pub total: u64,
+    /// For a governed call, the wei the governance address sends with it.
+    pub value: u128,
+    /// For a governed call, its gas limit; zero for an action.
+    pub gas: u64,
+}
+
+impl Proposal {
+    /// Whether it carries a governed call rather than an action: its target
+    /// is not a system address.
+    #[must_use]
+    pub fn is_call(&self) -> bool {
+        !is_system(&self.target)
+    }
+}
+
+impl Encode for Proposal {
+    fn encode(&self, e: &mut Encoder) {
+        e.put(&self.id)
+            .put(&self.proposer)
+            .put(&self.deposit)
+            .put(&self.target)
+            .put(&self.data)
+            .put(&self.submitted_at)
+            .put(&self.voting_end)
+            .put(&self.executable_at)
+            .put(&self.expires_at)
+            .put(&self.fast_track)
+            .put(&self.status)
+            .put(&self.yes)
+            .put(&self.no)
+            .put(&self.total)
+            .put(&self.value)
+            .put(&self.gas);
+    }
+}
+
+impl Decode for Proposal {
+    /// A record a kernel before governed calls stored ends after `total`;
+    /// it reads as an action, with no value and no gas.
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let mut p = Proposal {
+            id: d.get()?,
+            proposer: d.get()?,
+            deposit: d.get()?,
+            target: d.get()?,
+            data: d.get()?,
+            submitted_at: d.get()?,
+            voting_end: d.get()?,
+            executable_at: d.get()?,
+            expires_at: d.get()?,
+            fast_track: d.get()?,
+            status: d.get()?,
+            yes: d.get()?,
+            no: d.get()?,
+            total: d.get()?,
+            value: 0,
+            gas: 0,
+        };
+        if d.remaining() != 0 {
+            p.value = d.get()?;
+            p.gas = d.get()?;
+        }
+        Ok(p)
     }
 }
 
@@ -308,7 +440,31 @@ record! {
         validator: Hash,
         /// Yes or no.
         support: bool,
-        /// Its weight in the current validator set.
+        /// The stake it carries now: its own and that of every delegation
+        /// behind it whose delegator did not vote (spec 13 §9.3).
+        weight: u64,
+    }
+}
+
+record! {
+    /// A delegator's vote as state keeps it (spec 13 §9.7).
+    BallotEntry {
+        /// The delegator.
+        delegator: Address,
+        /// Yes or no.
+        support: bool,
+    }
+}
+
+record! {
+    /// A delegator's vote as the queries list it.
+    DelegatorBallot {
+        /// The delegator.
+        delegator: Address,
+        /// Yes or no.
+        support: bool,
+        /// The bonded stake of its delegations behind members of the
+        /// current set that count, in gwei, now.
         weight: u64,
     }
 }
@@ -324,8 +480,10 @@ record! {
         no: u64,
         /// Stake of the current validator set.
         total: u64,
-        /// Every vote, in validator-set order.
+        /// Every vote of a validator that counts, in validator-set order.
         votes: Seq<Ballot>,
+        /// Every delegator's vote, in the order they first voted.
+        delegators: Seq<DelegatorBallot>,
     }
 }
 
@@ -371,6 +529,24 @@ pub enum Call {
     },
     /// The guardian withdraws an open proposal.
     Veto {
+        /// The proposal.
+        id: u64,
+    },
+    /// Proposes a governed call: the governance address calls `target`
+    /// with `value` and `data` and at most `gas`; under the key track,
+    /// executes it at once.
+    SubmitCall {
+        /// The account called; never a system address.
+        target: Address,
+        /// Wei the governance address sends.
+        value: u128,
+        /// The call's gas limit, intrinsic gas included.
+        gas: u64,
+        /// The calldata.
+        data: Vec<u8>,
+    },
+    /// Withdraws open proposal `id` (an action, on the fast track).
+    Reject {
         /// The proposal.
         id: u64,
     },
@@ -445,6 +621,22 @@ fn address_of(w: &[u8]) -> Option<Address> {
         .then(|| w[12..].try_into().expect("20 bytes"))
 }
 
+/// The `bytes` argument whose offset word is word `head` of `body`, the
+/// last argument: its offset must point right after the head, its length be
+/// at most [`MAX_PROPOSAL_DATA`], its padding zeros to a whole word, and
+/// nothing follow it. `body` holds at least `head + 2` words.
+fn bytes_at(body: &[u8], head: usize) -> Option<Vec<u8>> {
+    let offset = 32 * (head + 1);
+    let len = usize::try_from(uint(&body[offset..offset + 32], 8)?)
+        .ok()
+        .filter(|n| *n <= MAX_PROPOSAL_DATA)?;
+    let (data, padding) = body[offset + 32..].split_at_checked(len)?;
+    let canonical = uint(&body[32 * head..32 * head + 32], 8) == Some(offset as u128)
+        && padding.len() == len.next_multiple_of(32) - len
+        && padding.iter().all(|b| *b == 0);
+    canonical.then(|| data.to_vec())
+}
+
 /// The tail encoding of `bytes`: its length word and the data padded to whole words.
 fn bytes_tail(data: &[u8]) -> Vec<u8> {
     let mut out = word(data.len() as u128).to_vec();
@@ -464,6 +656,23 @@ impl Call {
                 out.extend_from_slice(&address_word(target));
                 out.extend_from_slice(&word(64));
                 out.extend_from_slice(&bytes_tail(data));
+            }
+            Call::SubmitCall {
+                target,
+                value,
+                gas,
+                data,
+            } => {
+                out.extend_from_slice(&selector::SUBMIT_CALL);
+                out.extend_from_slice(&address_word(target));
+                out.extend_from_slice(&word(*value));
+                out.extend_from_slice(&word(u128::from(*gas)));
+                out.extend_from_slice(&word(128));
+                out.extend_from_slice(&bytes_tail(data));
+            }
+            Call::Reject { id } => {
+                out.extend_from_slice(&selector::REJECT);
+                out.extend_from_slice(&word(u128::from(*id)));
             }
             Call::Vote { id, support } => {
                 out.extend_from_slice(&selector::VOTE);
@@ -527,18 +736,22 @@ impl Call {
         match <[u8; 4]>::try_from(sel).ok()? {
             selector::SUBMIT if body.len() >= 96 => {
                 let target = address_of(w(0))?;
-                let len = usize::try_from(uint(w(2), 8)?)
-                    .ok()
-                    .filter(|n| *n <= MAX_PROPOSAL_DATA)?;
-                let (data, padding) = body[96..].split_at_checked(len)?;
-                let canonical = uint(w(1), 8) == Some(64)
-                    && padding.len() == len.next_multiple_of(32) - len
-                    && padding.iter().all(|b| *b == 0);
-                canonical.then(|| Call::Submit {
+                let data = bytes_at(body, 1)?;
+                Some(Call::Submit { target, data })
+            }
+            selector::SUBMIT_CALL if body.len() >= 160 => {
+                let target = address_of(w(0))?;
+                let value = uint(w(1), 16)?;
+                let gas = u64_of(w(2))?;
+                let data = bytes_at(body, 3)?;
+                Some(Call::SubmitCall {
                     target,
-                    data: data.to_vec(),
+                    value,
+                    gas,
+                    data,
                 })
             }
+            selector::REJECT if body.len() == 32 => Some(Call::Reject { id: u64_of(w(0))? }),
             selector::VOTE if body.len() == 64 => {
                 let support = match uint(w(1), 1)? {
                     0 => false,
@@ -602,6 +815,89 @@ pub fn fast_passes(yes: u64, total: u64) -> bool {
     u128::from(yes) * 2 > u128::from(total)
 }
 
+/// A member of the current validator set whose stake counts, for [`tally`]
+/// (spec 13 §9.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Member {
+    /// Its weight: its own and its delegators' bonded stake, in gwei.
+    pub weight: u64,
+    /// Its validator's vote, if any.
+    pub vote: Option<bool>,
+}
+
+/// A delegator's vote for [`tally`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delegator {
+    /// Yes or no.
+    pub support: bool,
+    /// Its bonded stake behind each member, in gwei, by the member's
+    /// position: part of that member's weight.
+    pub behind: Vec<(usize, u64)>,
+}
+
+/// What a [`tally`] gives.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Tally {
+    /// Stake voting yes.
+    pub yes: u64,
+    /// Stake voting no.
+    pub no: u64,
+    /// The members' whole stake.
+    pub total: u64,
+    /// Each member's weight less what its voting delegators took with them:
+    /// what its validator's vote carries.
+    pub effective: Vec<u64>,
+    /// Each delegator's weight, in order.
+    pub delegators: Vec<u64>,
+}
+
+/// The stake-weighted tally of spec 13 §9.3: a delegator's vote carries its
+/// delegations, and takes them out of the weight its validators' votes
+/// carry; a validator's vote carries the rest of its member's weight, its
+/// own stake and every delegation whose delegator did not vote. Sums
+/// saturate at `2^64 − 1` gwei.
+///
+/// # Panics
+/// If a delegator names a member position out of range.
+#[must_use]
+pub fn tally(members: &[Member], delegators: &[Delegator]) -> Tally {
+    let mut moved = vec![0u64; members.len()];
+    let (mut yes, mut no) = (0u64, 0u64);
+    let mut weights = Vec::with_capacity(delegators.len());
+    for d in delegators {
+        let mut weight = 0u64;
+        for &(m, w) in &d.behind {
+            moved[m] = moved[m].saturating_add(w);
+            weight = weight.saturating_add(w);
+        }
+        if d.support {
+            yes = yes.saturating_add(weight);
+        } else {
+            no = no.saturating_add(weight);
+        }
+        weights.push(weight);
+    }
+    let mut total = 0u64;
+    let mut effective = Vec::with_capacity(members.len());
+    for (m, taken) in members.iter().zip(moved) {
+        total = total.saturating_add(m.weight);
+        let w = m.weight.saturating_sub(taken);
+        match m.vote {
+            Some(true) => yes = yes.saturating_add(w),
+            Some(false) => no = no.saturating_add(w),
+            None => {}
+        }
+        effective.push(w);
+    }
+    Tally {
+        yes,
+        no,
+        total,
+        effective,
+        delegators: weights,
+    }
+}
+
 fn log(topics: Vec<Hash>, data: Vec<u8>) -> Log {
     Log {
         address: GOVERNANCE_ADDRESS,
@@ -642,6 +938,31 @@ pub fn voted_log(id: u64, voter: &Address, support: bool, weight: u64) -> Log {
 #[must_use]
 pub fn executed_log(id: u64) -> Log {
     log(vec![event::EXECUTED, word(u128::from(id))], Vec::new())
+}
+
+/// The log of a governed call's execution (spec 13 §9.5): `id` 0 for one
+/// the key executed at once; at most [`MAX_CALL_OUTPUT`] bytes of output.
+#[must_use]
+pub fn call_executed_log(
+    id: u64,
+    target: &Address,
+    success: bool,
+    gas_used: u64,
+    output: &[u8],
+) -> Log {
+    let output = &output[..output.len().min(MAX_CALL_OUTPUT)];
+    let mut data = word(u128::from(success)).to_vec();
+    data.extend_from_slice(&word(u128::from(gas_used)));
+    data.extend_from_slice(&word(96));
+    data.extend_from_slice(&bytes_tail(output));
+    log(
+        vec![
+            event::CALL_EXECUTED,
+            word(u128::from(id)),
+            address_word(target),
+        ],
+        data,
+    )
 }
 
 /// The log `veto` emits.
@@ -718,10 +1039,13 @@ mod tests {
             yes: 8,
             no: 1,
             total: 10,
+            value: 11,
+            gas: 12,
         }
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn records_roundtrip() {
         let params = GovernanceParams {
             mode: mode::STAKE,
@@ -739,6 +1063,10 @@ mod tests {
             weight: 4,
         };
         roundtrip(&ballot);
+        roundtrip(&BallotEntry {
+            delegator: [4; 20],
+            support: true,
+        });
         roundtrip(&GovernanceStatus {
             mode: mode::KEY,
             key: [1; 20],
@@ -751,9 +1079,33 @@ mod tests {
                 no: 2,
                 total: 3,
                 votes: Seq(vec![ballot]),
+                delegators: Seq(vec![DelegatorBallot {
+                    delegator: [3; 20],
+                    support: false,
+                    weight: 5,
+                }]),
             }]),
         });
         assert!(alloc::format!("{:?}", GovernanceStatus::default()).contains("GovernanceStatus"));
+        // A record from a kernel before governed calls reads as an action.
+        let mut legacy = proposal();
+        let full = legacy.to_bytes();
+        let old = &full[..full.len() - 24];
+        (legacy.value, legacy.gas) = (0, 0);
+        assert_eq!(Proposal::from_bytes(old), Ok(legacy.clone()));
+        assert!(Proposal::from_bytes(&full[..full.len() - 1]).is_err());
+        legacy.target = GOVERNANCE_ADDRESS;
+        assert!(!legacy.is_call());
+        legacy.target[0] = 1;
+        assert!(legacy.is_call());
+        assert!(is_system(&GOVERNANCE_ADDRESS) && is_system(&[0; 20]));
+        let mut near = [0u8; 20];
+        near[1] = 1;
+        assert!(!is_system(&near));
+        assert_eq!(
+            (MAX_BALLOTS, MAX_CALL_GAS, MAX_CALL_OUTPUT),
+            (4_096, 10_000_000, 1_024)
+        );
         assert_eq!(GOVERNANCE_ADDRESS[18..], [0x50, 0x10]);
         assert!(GOVERNANCE_ADDRESS[..18].iter().all(|b| *b == 0));
         assert_eq!((mode::KEY, mode::STAKE), (0, 1));
@@ -780,6 +1132,9 @@ mod tests {
             keys::PROPOSAL,
             keys::VOTE,
             keys::VOTERS,
+            keys::BALLOT,
+            keys::BALLOTS,
+            keys::BALLOT_AT,
         ] {
             assert!(key.starts_with(b"gov/"));
         }
@@ -789,6 +1144,11 @@ mod tests {
         assert_eq!((k.len(), &k[17..]), (49, &[7u8; 32][..]));
         assert!(k.len() <= 64);
         assert_eq!(keys::voters(1).len(), 19);
+        let k = keys::ballot(1, &[7; 20]);
+        assert_eq!((k.len(), &k[19..]), (39, &[7u8; 20][..]));
+        assert_eq!(keys::ballots(1).len(), 20);
+        let k = keys::ballot_at(1, 0x0102);
+        assert_eq!((k.len(), &k[22..]), (26, &[0, 0, 1, 2][..]));
     }
 
     #[test]
@@ -822,6 +1182,19 @@ mod tests {
             Call::Veto { id: 5 },
             Call::Pause { target: [0x45; 20] },
             Call::SetGuardian { guardian: [0; 20] },
+            Call::SubmitCall {
+                target: [0x51; 20],
+                value: u128::MAX,
+                gas: 21_000,
+                data: vec![1, 2, 3],
+            },
+            Call::SubmitCall {
+                target: [0x51; 20],
+                value: 0,
+                gas: u64::MAX,
+                data: vec![],
+            },
+            Call::Reject { id: 9 },
             Call::SetMode { mode: 1 },
             Call::SetParams {
                 voting_blocks: 1,
@@ -858,8 +1231,18 @@ mod tests {
         assert_eq!(vote.len(), 68);
         assert_eq!((vote[4 + 31], vote[4 + 63]), (3, 1));
         assert_eq!(calls[6].encode().len(), 36);
-        assert_eq!(calls[11].encode().len(), 4 + 128);
-        let fees = calls[12].encode();
+        let submit_call = calls[10].encode();
+        assert_eq!(submit_call.len(), 4 + 32 * 6);
+        assert_eq!(&submit_call[..4], &selector::SUBMIT_CALL);
+        assert_eq!(&submit_call[4 + 12..4 + 32], &[0x51; 20]);
+        assert_eq!(&submit_call[4 + 48..4 + 64], &[0xFF; 16]);
+        assert_eq!((submit_call[4 + 94], submit_call[4 + 95]), (0x52, 0x08));
+        assert_eq!((submit_call[4 + 127], submit_call[4 + 159]), (128, 3));
+        assert_eq!(calls[11].encode().len(), 4 + 32 * 5);
+        assert_eq!(calls[12].encode().len(), 36);
+        assert_eq!(&calls[12].encode()[..4], &selector::REJECT);
+        assert_eq!(calls[14].encode().len(), 4 + 128);
+        let fees = calls[15].encode();
         assert_eq!(fees.len(), 4 + 128);
         assert_eq!(&fees[..4], &selector::SET_FEE_PARAMS);
         assert_eq!((fees[4 + 31], fees[4 + 63], fees[4 + 108]), (125, 2, 7));
@@ -966,6 +1349,30 @@ mod tests {
             v[at] = byte;
             bad.push(v);
         }
+        let call = Call::SubmitCall {
+            target: [0x51; 20],
+            value: 5,
+            gas: 6,
+            data: vec![1, 2, 3],
+        }
+        .encode();
+        bad.push(call[..4 + 128].to_vec());
+        bad.push(call[..call.len() - 1].to_vec());
+        for (at, byte) in [
+            (4, 1),
+            (4 + 32, 1),
+            (4 + 64 + 23, 1),
+            (4 + 127, 96),
+            (4 + 159, 33),
+            (call.len() - 1, 1),
+        ] {
+            let mut v = call.clone();
+            v[at] = byte;
+            bad.push(v);
+        }
+        let mut reject = Call::Reject { id: 1 }.encode();
+        reject.push(0);
+        bad.push(reject);
         for (i, data) in bad.iter().enumerate() {
             assert_eq!(Call::decode(data), None, "case {i}");
         }
@@ -986,6 +1393,92 @@ mod tests {
         assert_eq!(surcharge(Some(&GOVERNANCE_ADDRESS), &cancel), 0);
         assert_eq!(surcharge(Some(&GOVERNANCE_ADDRESS), &vote[..67]), 0);
         assert_eq!(surcharge(Some(&GOVERNANCE_ADDRESS), &[]), 0);
+        // A governed call carries its own gas.
+        let call = Call::SubmitCall {
+            target: [0x51; 20],
+            value: 0,
+            gas: 70_000,
+            data: vec![],
+        }
+        .encode();
+        assert_eq!(
+            surcharge(Some(&GOVERNANCE_ADDRESS), &call),
+            GOVERNANCE_GAS + 70_000
+        );
+    }
+
+    #[test]
+    fn delegators_take_their_stake_out_of_their_validators_votes() {
+        let members = [
+            Member {
+                weight: 10,
+                vote: Some(true),
+            },
+            Member {
+                weight: 6,
+                vote: None,
+            },
+            Member {
+                weight: 4,
+                vote: Some(false),
+            },
+        ];
+        // Nobody else: validators carry their whole weight.
+        let t = tally(&members, &[]);
+        assert_eq!((t.yes, t.no, t.total), (10, 4, 20));
+        assert_eq!(t.effective, vec![10, 6, 4]);
+        // A delegator behind members 0 and 1 votes no, one behind member 2 yes.
+        let delegators = [
+            Delegator {
+                support: false,
+                behind: vec![(0, 3), (1, 2)],
+            },
+            Delegator {
+                support: true,
+                behind: vec![(2, 1)],
+            },
+            Delegator {
+                support: true,
+                behind: vec![],
+            },
+        ];
+        let t = tally(&members, &delegators);
+        assert_eq!((t.yes, t.no, t.total), (7 + 1, 5 + 3, 20));
+        assert_eq!(t.effective, vec![7, 4, 3]);
+        assert_eq!(t.delegators, vec![5, 1, 0]);
+        assert!(t.yes + t.no <= t.total);
+        // Sums saturate.
+        let big = [
+            Member {
+                weight: u64::MAX,
+                vote: Some(true),
+            },
+            Member {
+                weight: u64::MAX,
+                vote: Some(false),
+            },
+        ];
+        let heavy = [Delegator {
+            support: true,
+            behind: vec![(0, u64::MAX), (1, 5)],
+        }];
+        let t = tally(&big, &heavy);
+        assert_eq!((t.yes, t.no, t.total), (u64::MAX, u64::MAX - 5, u64::MAX));
+        assert_eq!(t.effective, vec![0, u64::MAX - 5]);
+        let lopsided = [
+            Delegator {
+                support: false,
+                behind: vec![(0, u64::MAX)],
+            },
+            Delegator {
+                support: false,
+                behind: vec![(0, 1)],
+            },
+        ];
+        let t = tally(&big, &lopsided);
+        assert_eq!((t.yes, t.no), (0, u64::MAX));
+        assert_eq!(Tally::default().effective, Vec::<u64>::new());
+        assert!(!alloc::format!("{:?}", (members[0], &delegators[0], &t)).is_empty());
     }
 
     #[test]
@@ -1069,5 +1562,18 @@ mod tests {
             [word(5), word(6), word(7), address_word(&[8; 20])].concat()
         );
         assert_eq!(l.topics.0, vec![event::FEE_PARAMS_SET]);
+        let l = call_executed_log(3, &[4; 20], true, 21_000, &[5; 40]);
+        assert_eq!(
+            l.topics.0,
+            vec![event::CALL_EXECUTED, word(3), address_word(&[4; 20])]
+        );
+        assert_eq!(l.data.len(), 32 * 4 + 64);
+        assert_eq!(
+            (l.data[31], l.data[62], l.data[95], l.data[127]),
+            (1, 0x52, 96, 40)
+        );
+        let l = call_executed_log(0, &[4; 20], false, 0, &[5; MAX_CALL_OUTPUT + 1]);
+        assert_eq!(l.data.len(), 32 * 4 + MAX_CALL_OUTPUT);
+        assert_eq!(l.data[31], 0);
     }
 }

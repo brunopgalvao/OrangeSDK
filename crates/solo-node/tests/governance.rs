@@ -21,17 +21,19 @@ use solo_abi::chain::{
 };
 use solo_abi::codec::Seq;
 use solo_abi::governance::{
-    self as gov, Call, GOVERNANCE_ADDRESS, GOVERNANCE_GAS, GovernanceParams, GovernanceStatus,
-    MAX_OPEN_PROPOSALS, MAX_PROPOSAL_DATA, Proposal, ProposalView, event, mode, selector, status,
+    self as gov, Ballot, Call, DelegatorBallot, GOVERNANCE_ADDRESS, GOVERNANCE_GAS,
+    GovernanceParams, GovernanceStatus, MAX_CALL_GAS, MAX_OPEN_PROPOSALS, MAX_PROPOSAL_DATA,
+    Proposal, ProposalView, event, mode, selector, status,
 };
 use solo_abi::modules::{self, INSTALLED_TOPIC, Install, MODULE_ADDRESS, capability};
+use solo_abi::staking::{GWEI, STAKING_ADDRESS, StakingAction, StakingParams};
 use solo_abi::types::Genesis;
 use solo_abi::{Decode, Encode};
 use solo_ethlc::abi;
 use solo_ethlc::testing::Chain;
 use solo_host::hash::keccak256;
 use solo_node::{Node, NodeConfig, NodeError, Sim, SubmitError, Switch};
-use solo_upgrade::action::{cancelled_log, proposed_log};
+use solo_upgrade::action::proposed_log;
 use solo_upgrade::{Action, query};
 use solo_vm::status::Termination;
 use support::{
@@ -290,6 +292,8 @@ fn expected(
         yes: 0,
         no: 0,
         total: 0,
+        value: 0,
+        gas: 0,
     }
 }
 
@@ -739,8 +743,9 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
         refused()
     );
 
-    // Proposal 5 pauses the inbox on the fast track: it executes in the
-    // vote that takes yes past half of all stake, half itself not enough.
+    // Proposal 5 pauses the inbox on the fast track: it executes at the end
+    // of the block whose votes take yes past half of all stake, half itself
+    // not enough.
     let r = sim_include(
         &mut sim,
         &val[1].call(&submit(VERIFIER_ADDRESS, &abi::PAUSE), 0),
@@ -773,10 +778,7 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
     assert_eq!(r.status, 1);
     assert_eq!(
         r.logs.0,
-        vec![
-            gov::voted_log(5, &val[0].address(), true, 5),
-            gov::executed_log(5)
-        ]
+        vec![gov::voted_log(5, &val[0].address(), true, 5)]
     );
     assert!(paused(&mut sim.nodes[0]));
     assert_eq!(view(&mut sim.nodes[0], 5), None);
@@ -1486,7 +1488,7 @@ fn one_validator_meets_the_edge_cases() {
     }
 
     // A pending upgrade proposed by proposal, then cancelled on the fast
-    // track by the vote that reaches a majority.
+    // track at the end of the block whose vote reaches a majority.
     let h = node.block_number().unwrap() + 40;
     let propose = Action::Propose {
         code_hash: tiny_hash,
@@ -1523,14 +1525,7 @@ fn one_validator_meets_the_edge_cases() {
     let r2 = include(&mut node, &v0.call(&vote(id, true), 0));
     assert_eq!(
         (r2.status, r2.logs.0),
-        (
-            1,
-            vec![
-                gov::voted_log(id, &v0.address(), true, 1),
-                gov::executed_log(id),
-                cancelled_log(&tiny_hash)
-            ]
-        )
+        (1, vec![gov::voted_log(id, &v0.address(), true, 1)])
     );
     assert!(r2.height > r.height);
     assert_eq!(node.upgrade_status().unwrap().pending, None);
@@ -1733,6 +1728,15 @@ fn selectors_and_topics_are_the_solidity_ones() {
         selector::SET_PARAMS
     );
     assert_eq!(
+        sel("submitCall(address,uint256,uint64,bytes)"),
+        selector::SUBMIT_CALL
+    );
+    assert_eq!(sel("reject(uint64)"), selector::REJECT);
+    assert_eq!(
+        keccak256(b"CallExecuted(uint64,address,bool,uint64,bytes)"),
+        event::CALL_EXECUTED
+    );
+    assert_eq!(
         keccak256(b"ProposalSubmitted(uint64,address,address,bytes,uint64)"),
         event::SUBMITTED
     );
@@ -1760,6 +1764,8 @@ fn selectors_and_topics_are_the_solidity_ones() {
         selector::SET_GUARDIAN,
         selector::SET_MODE,
         selector::SET_PARAMS,
+        selector::SUBMIT_CALL,
+        selector::REJECT,
     ] {
         for old in [
             solo_upgrade::action::selector::STAGE,
@@ -1770,4 +1776,533 @@ fn selectors_and_topics_are_the_solidity_ones() {
             assert_ne!(new, old);
         }
     }
+}
+
+/// An account with code at a plain address: stores its first calldata word
+/// in slot 0 and the value it received in slot 1, emits an empty log, and
+/// reverts when the calldata is empty.
+const TARGET: [u8; 20] = [0x77; 20];
+const TARGET_CODE: [u8; 26] = [
+    0x36, 0x15, 0x60, 0x15, 0x57, 0x60, 0x00, 0x35, 0x60, 0x00, 0x55, 0x34, 0x60, 0x01, 0x55, 0x60,
+    0x00, 0x60, 0x00, 0xa0, 0x00, 0x5b, 0x60, 0x00, 0x80, 0xfd,
+];
+
+/// The intrinsic gas of `execute(id)` for an id of one non-zero byte, at
+/// the EIP-7623 floor.
+const EXECUTE_INTRINSIC: u64 = 21_510;
+
+/// A chain of one validator of weight 100 (100 gwei of stake), with staking
+/// on if `staking`, `funded` accounts with 100 ether each, the target, and
+/// 5 ether at the governance address.
+fn staked(rules: GovernanceParams, funded: &[[u8; 20]], staking: bool) -> Genesis {
+    staked_with(100, rules, funded, staking)
+}
+
+/// [`staked`] with a validator of `weight`.
+fn staked_with(
+    weight: u64,
+    rules: GovernanceParams,
+    funded: &[[u8; 20]],
+    staking: bool,
+) -> Genesis {
+    let mut g = genesis(&keys(1), &[weight], rules, None);
+    let mut params = GenesisParams::from_bytes(&g.params).unwrap();
+    if staking {
+        params.staking = StakingParams {
+            epoch_blocks: 10_000,
+            unbonding_epochs: 0,
+            min_stake: 0,
+            max_validators: 0,
+            dkg_phase_blocks: 0,
+            max_key_age: 0,
+            keys: Seq(vec![]),
+        };
+    }
+    for address in funded {
+        params.allocations.0.push(Allocation {
+            address: *address,
+            balance: 100 * ETHER,
+            ..Allocation::default()
+        });
+    }
+    params.allocations.0.push(Allocation {
+        address: GOVERNANCE_ADDRESS,
+        balance: 5 * ETHER,
+        ..Allocation::default()
+    });
+    params.allocations.0.push(Allocation {
+        address: TARGET,
+        code: TARGET_CODE.to_vec(),
+        ..Allocation::default()
+    });
+    g.params = params.to_bytes();
+    g
+}
+
+fn slot(node: &mut Node, address: [u8; 20], index: u8) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    key[31] = index;
+    node.storage(&address, &key).unwrap()
+}
+
+/// The gas a governed call used, from its `CallExecuted` log.
+fn call_gas(log: &solo_abi::chain::Log) -> u64 {
+    u64::from_be_bytes(log.data[56..64].try_into().unwrap())
+}
+
+/// The target's empty log.
+fn target_log() -> solo_abi::chain::Log {
+    solo_abi::chain::Log {
+        address: TARGET,
+        topics: Seq(vec![]),
+        data: vec![],
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn delegators_vote_and_proposals_call_any_account() {
+    let validators = keys(1);
+    let mut alice = Sender::new(alice());
+    let mut bob = Sender::new(Wallet::new(0x62));
+    let mut carol = Sender::new(Wallet::new(0x63));
+    let rules = GovernanceParams {
+        mode: mode::STAKE,
+        voting_blocks: VOTING,
+        timelock_blocks: 1,
+        quorum_bps: QUORUM,
+        deposit: DEPOSIT,
+    };
+    let mut node = start(&staked(rules, &[bob.address(), carol.address()], true));
+    let mut v0 = Sender::new(Wallet::from_key(validators[0].clone()));
+    let validator = v0.address();
+    let delegate = |s: &mut Sender, gwei: u128| {
+        s.tx(
+            STAKING_ADDRESS,
+            gwei * GWEI,
+            200_000,
+            &StakingAction::Delegate { validator }.encode(),
+        )
+    };
+    assert_eq!(include(&mut node, &delegate(&mut alice, 60)).status, 1);
+    assert_eq!(include(&mut node, &delegate(&mut bob, 40)).status, 1);
+
+    // Proposal 1: the governance address calls the target with an ether.
+    let forty_two = gov::word(42).to_vec();
+    let call1 = Call::SubmitCall {
+        target: TARGET,
+        value: ETHER,
+        gas: 100_000,
+        data: forty_two.clone(),
+    };
+    assert_eq!(include(&mut node, &v0.call(&call1, 0)).status, 1);
+    let p = view(&mut node, 1).unwrap();
+    assert!(p.proposal.is_call() && !p.proposal.fast_track);
+    assert_eq!(
+        (p.proposal.target, p.proposal.value, p.proposal.gas),
+        (TARGET, ETHER, 100_000)
+    );
+    assert_eq!(p.proposal.data, forty_two);
+    assert_eq!((p.yes, p.no, p.total), (0, 0, 200));
+    // Carol has no stake behind anyone, so no vote.
+    assert_eq!(node.submit(&carol.peek(&vote(1, true), 0)), refused());
+    // The validator's vote carries its own stake and its delegators'; a
+    // delegator who votes takes its own with it (spec 13 §9.3).
+    let r = include(&mut node, &v0.call(&vote(1, true), 0));
+    assert_eq!(r.logs.0, vec![gov::voted_log(1, &validator, true, 200)]);
+    let r = include(&mut node, &alice.call(&vote(1, false), 0));
+    assert_eq!(
+        r.logs.0,
+        vec![gov::voted_log(1, &alice.address(), false, 60)]
+    );
+    let p = view(&mut node, 1).unwrap();
+    assert_eq!((p.yes, p.no, p.total), (140, 60, 200));
+    assert_eq!(
+        p.votes.0,
+        vec![Ballot {
+            validator: solo_node::validator_id(&validators[0]),
+            support: true,
+            weight: 140,
+        }]
+    );
+    assert_eq!(
+        p.delegators.0,
+        vec![DelegatorBallot {
+            delegator: alice.address(),
+            support: false,
+            weight: 60,
+        }]
+    );
+    // Bob votes no, then yes: one ballot, his latest vote.
+    include(&mut node, &bob.call(&vote(1, false), 0));
+    let p = view(&mut node, 1).unwrap();
+    assert_eq!((p.yes, p.no), (100, 100));
+    include(&mut node, &bob.call(&vote(1, true), 0));
+    let p = view(&mut node, 1).unwrap();
+    assert_eq!((p.yes, p.no), (140, 60));
+    assert_eq!(p.delegators.0.len(), 2);
+    // Alice undelegates half: stake that is unbonding votes for nobody, and
+    // the whole stake shrinks with it.
+    let undelegate = StakingAction::Undelegate {
+        validator,
+        amount: 30 * GWEI,
+    }
+    .encode();
+    assert_eq!(
+        include(
+            &mut node,
+            &alice.tx(STAKING_ADDRESS, 0, 200_000, &undelegate)
+        )
+        .status,
+        1
+    );
+    let p = view(&mut node, 1).unwrap();
+    assert_eq!((p.yes, p.no, p.total), (140, 30, 170));
+    // Voting ends: passed, the tally recorded.
+    reach(&mut node, p.proposal.voting_end);
+    let p = view(&mut node, 1).unwrap();
+    assert_eq!(
+        (
+            p.proposal.status,
+            p.proposal.yes,
+            p.proposal.no,
+            p.proposal.total
+        ),
+        (status::PASSED, 140, 30, 170)
+    );
+    // `execute` needs the call's gas beside the surcharge: an estimate says
+    // so, and a limit one short is refused as the shortfall it is.
+    let execute = Call::Execute { id: 1 }.encode();
+    let needed = EXECUTE_INTRINSIC + GOVERNANCE_GAS + 100_000;
+    reach(&mut node, p.proposal.executable_at - 1);
+    assert_eq!(
+        call(&mut node, carol.address(), GOVERNANCE_ADDRESS, &execute).gas_used,
+        needed
+    );
+    let short = carol
+        .wallet
+        .tx(carol.nonce, GOVERNANCE_ADDRESS, 0, needed - 1, &execute);
+    assert_eq!(
+        node.submit(&short),
+        Err(SubmitError::Rejected(reason::GAS_TOO_LOW))
+    );
+    // Anyone executes it; the executor pays the call's gas, and the receipt
+    // records what the call did.
+    let r = include(&mut node, &carol.call(&Call::Execute { id: 1 }, 0));
+    let used = call_gas(&r.logs.0[2]);
+    // Intrinsic gas, two storage slots set from zero, and the log (spec 13 §9.9).
+    assert_eq!(used, 65_753);
+    assert_eq!(
+        (r.status, r.gas_used),
+        (1, EXECUTE_INTRINSIC + GOVERNANCE_GAS + used)
+    );
+    assert_eq!(
+        r.logs.0,
+        vec![
+            gov::executed_log(1),
+            target_log(),
+            gov::call_executed_log(1, &TARGET, true, used, &[]),
+        ]
+    );
+    assert_eq!(slot(&mut node, TARGET, 0), gov::word(42));
+    assert_eq!(slot(&mut node, TARGET, 1), gov::word(ETHER));
+    assert_eq!(balance(&mut node, TARGET), ETHER);
+    assert_eq!(balance(&mut node, GOVERNANCE_ADDRESS), 4 * ETHER);
+    assert_eq!(view(&mut node, 1), None);
+
+    // Proposal 2 calls the target with no calldata, which reverts; proposal
+    // 3 asks for more than the governance address holds beyond the deposits
+    // of open proposals; proposal 4 is Alice's, with a deposit.
+    let revert = Call::SubmitCall {
+        target: TARGET,
+        value: 0,
+        gas: 100_000,
+        data: vec![],
+    };
+    let greedy = Call::SubmitCall {
+        target: TARGET,
+        value: 4 * ETHER + 1,
+        gas: 100_000,
+        data: forty_two,
+    };
+    let r2 = include(&mut node, &v0.call(&revert, 0));
+    include(&mut node, &v0.call(&vote(2, true), 0));
+    let r3 = include(&mut node, &v0.call(&greedy, 0));
+    include(&mut node, &v0.call(&vote(3, true), 0));
+    let alice_before = balance(&mut node, alice.address());
+    let guardian = Call::SetGuardian {
+        guardian: [0xAB; 20],
+    }
+    .encode();
+    assert_eq!(
+        include(
+            &mut node,
+            &alice.call(&submit(GOVERNANCE_ADDRESS, &guardian), DEPOSIT)
+        )
+        .status,
+        1
+    );
+    assert_eq!(balance(&mut node, GOVERNANCE_ADDRESS), 4 * ETHER + DEPOSIT);
+    // Proposal 5 withdraws proposal 4 on the fast track: Alice's vote
+    // against it is not enough to hold it, the validator's yes passes it at
+    // the end of its block, and her deposit comes back.
+    let reject = Call::Reject { id: 4 }.encode();
+    include(&mut node, &v0.call(&submit(GOVERNANCE_ADDRESS, &reject), 0));
+    assert!(view(&mut node, 5).unwrap().proposal.fast_track);
+    include(&mut node, &alice.call(&vote(5, false), 0));
+    assert!(view(&mut node, 5).is_some());
+    let r = include(&mut node, &v0.call(&vote(5, true), 0));
+    assert_eq!(r.logs.0, vec![gov::voted_log(5, &validator, true, 170)]);
+    assert_eq!((view(&mut node, 4), view(&mut node, 5)), (None, None));
+    assert_eq!(balance(&mut node, alice.address()), alice_before);
+    assert_eq!(balance(&mut node, GOVERNANCE_ADDRESS), 4 * ETHER);
+    // A call that reverts leaves nothing behind but its gas and the record
+    // of its failure; the proposal is executed all the same.
+    reach(&mut node, r2.height + VOTING + 1);
+    let r = include(&mut node, &carol.call(&Call::Execute { id: 2 }, 0));
+    let used = call_gas(&r.logs.0[1]);
+    assert!(used > 21_000, "{used}");
+    assert_eq!(
+        (r.status, r.logs.0.clone()),
+        (
+            1,
+            vec![
+                gov::executed_log(2),
+                gov::call_executed_log(2, &TARGET, false, used, &[])
+            ]
+        )
+    );
+    assert_eq!(slot(&mut node, TARGET, 0), gov::word(42));
+    assert_eq!(view(&mut node, 2), None);
+    // Neither can a call spend what the governance address does not hold:
+    // it does not run, and uses no gas.
+    reach(&mut node, r3.height + VOTING + 1);
+    let r = include(&mut node, &carol.call(&Call::Execute { id: 3 }, 0));
+    assert_eq!(
+        (r.status, r.gas_used, r.logs.0),
+        (
+            1,
+            EXECUTE_INTRINSIC + GOVERNANCE_GAS,
+            vec![
+                gov::executed_log(3),
+                gov::call_executed_log(3, &TARGET, false, 0, &[])
+            ]
+        )
+    );
+    assert_eq!(balance(&mut node, GOVERNANCE_ADDRESS), 4 * ETHER);
+    assert_eq!(gov_status(&mut node).proposals.0, vec![]);
+}
+
+#[test]
+fn a_delegator_needs_a_share_of_the_stake_to_vote() {
+    let validators = keys(1);
+    let mut dave = Sender::new(Wallet::new(0x64));
+    let mut erin = Sender::new(Wallet::new(0x65));
+    let mut node = start(&staked_with(
+        5_000,
+        single(20),
+        &[dave.address(), erin.address()],
+        true,
+    ));
+    let mut v0 = Sender::new(Wallet::from_key(validators[0].clone()));
+    let validator = v0.address();
+    for (who, gwei) in [(&mut dave, 1u128), (&mut erin, 2)] {
+        let raw = who.tx(
+            STAKING_ADDRESS,
+            gwei * GWEI,
+            200_000,
+            &StakingAction::Delegate { validator }.encode(),
+        );
+        assert_eq!(include(&mut node, &raw).status, 1);
+    }
+    let guardian = Call::SetGuardian {
+        guardian: [0xAB; 20],
+    }
+    .encode();
+    include(
+        &mut node,
+        &v0.call(&submit(GOVERNANCE_ADDRESS, &guardian), 0),
+    );
+    // 1 gwei of 5 003 is less than a 4 096th: Dave's validator speaks for him.
+    assert_eq!(node.submit(&dave.peek(&vote(1, false), 0)), refused());
+    let r = include(&mut node, &erin.call(&vote(1, false), 0));
+    assert_eq!(r.logs.0, vec![gov::voted_log(1, &erin.address(), false, 2)]);
+    let p = view(&mut node, 1).unwrap();
+    assert_eq!((p.yes, p.no, p.total), (0, 2, 5_003));
+}
+
+#[test]
+fn the_key_calls_any_account_at_once() {
+    let mut node = start(&staked(rules(mode::KEY), &[], false));
+    let mut key = Sender::new(governance());
+    let seven = gov::word(7).to_vec();
+    let call7 = Call::SubmitCall {
+        target: TARGET,
+        value: 3,
+        gas: 100_000,
+        data: seven.clone(),
+    };
+    let r = include(&mut node, &key.call(&call7, 0));
+    let used = call_gas(&r.logs.0[2]);
+    assert_eq!(
+        r.logs.0,
+        vec![
+            gov::enacted_log(&key.address(), &TARGET, &seven),
+            target_log(),
+            gov::call_executed_log(0, &TARGET, true, used, &[]),
+        ]
+    );
+    assert_eq!(slot(&mut node, TARGET, 0), gov::word(7));
+    assert_eq!(balance(&mut node, TARGET), 3);
+    // Not to a system address, not with more than the most gas a call
+    // carries, and no `reject` without proposals.
+    let staking = Call::SubmitCall {
+        target: STAKING_ADDRESS,
+        value: 0,
+        gas: 100_000,
+        data: vec![],
+    };
+    assert_eq!(node.submit(&key.peek(&staking, 0)), refused());
+    let heavy = Call::SubmitCall {
+        target: TARGET,
+        value: 0,
+        gas: MAX_CALL_GAS + 1,
+        data: vec![],
+    };
+    let raw = key.wallet.tx(
+        key.nonce,
+        GOVERNANCE_ADDRESS,
+        0,
+        11_000_000,
+        &heavy.encode(),
+    );
+    assert_eq!(node.submit(&raw), refused());
+    let reject = submit(GOVERNANCE_ADDRESS, &Call::Reject { id: 1 }.encode());
+    assert_eq!(node.submit(&key.peek(&reject, 0)), refused());
+    // Only the key: a call from anyone else cannot run.
+    assert_eq!(
+        node.submit(&Sender::new(alice()).peek(&call7, 0)),
+        refused()
+    );
+}
+
+/// The kernel gas `kernel_stf_execute_block` has used so far.
+fn execute_gas(node: &mut Node) -> u64 {
+    node.metrics_text()
+        .lines()
+        .find(|l| {
+            l.starts_with("solo_kernel_gas_used_total") && l.contains("kernel_stf_execute_block")
+        })
+        .and_then(|l| l.rsplit(' ').next())
+        .map_or(0, |n| n.parse().unwrap())
+}
+
+/// Runs `node` to block `height` and returns the kernel gas of executing it.
+fn gas_of_block(node: &mut Node, height: u64) -> u64 {
+    reach(node, height - 1);
+    let before = execute_gas(node);
+    reach(node, height);
+    assert_eq!(node.block_number().unwrap(), height);
+    execute_gas(node) - before
+}
+
+/// Submits every transaction and runs until each has a receipt.
+fn include_all(node: &mut Node, raws: &[Vec<u8>]) {
+    let hashes: Vec<_> = raws.iter().map(|r| node.submit(r).unwrap()).collect();
+    run_until(node, 60, &mut |n| {
+        hashes.iter().all(|h| n.receipt(h).unwrap().is_some())
+    });
+    for h in hashes {
+        assert_eq!(node.receipt(&h).unwrap().unwrap().status, 1);
+    }
+}
+
+/// What the tally and the pruning of delegators' votes cost the kernel
+/// (spec 19 §5.1): 64 delegators, one delegation each, vote on one
+/// proposal; another proposal takes no vote. The block where each one's
+/// voting ends, and the block that executes each, are measured.
+///
+/// `cargo test -p solo-node --test governance -- --ignored --nocapture ballots`
+#[test]
+#[ignore = "measurement; run explicitly"]
+fn the_kernel_gas_of_delegators_ballots() {
+    let validators = keys(1);
+    let delegators: Vec<Sender> = (0..64u8)
+        .map(|i| Sender::new(Wallet::new(0x80 + i)))
+        .collect();
+    let funded: Vec<[u8; 20]> = delegators.iter().map(Sender::address).collect();
+    let rules = GovernanceParams {
+        mode: mode::STAKE,
+        voting_blocks: 12,
+        timelock_blocks: 1,
+        quorum_bps: QUORUM,
+        deposit: DEPOSIT,
+    };
+    let mut genesis = staked(rules, &funded, true);
+    let mut params = GenesisParams::from_bytes(&genesis.params).unwrap();
+    params.max_txs = 64;
+    genesis.params = params.to_bytes();
+    let mut node = start(&genesis);
+    let mut v0 = Sender::new(Wallet::from_key(validators[0].clone()));
+    let validator = v0.address();
+    let mut delegators = delegators;
+    let delegations: Vec<Vec<u8>> = delegators
+        .iter_mut()
+        .map(|d| {
+            d.tx(
+                STAKING_ADDRESS,
+                GWEI,
+                200_000,
+                &StakingAction::Delegate { validator }.encode(),
+            )
+        })
+        .collect();
+    include_all(&mut node, &delegations);
+    let guardian = |b: u8| Call::SetGuardian { guardian: [b; 20] }.encode();
+    let quiet = include(
+        &mut node,
+        &v0.call(&submit(GOVERNANCE_ADDRESS, &guardian(1)), 0),
+    );
+    let busy = include(
+        &mut node,
+        &v0.call(&submit(GOVERNANCE_ADDRESS, &guardian(2)), 0),
+    );
+    include(&mut node, &v0.call(&vote(1, true), 0));
+    include(&mut node, &v0.call(&vote(2, true), 0));
+    let votes: Vec<Vec<u8>> = delegators
+        .iter_mut()
+        .map(|d| d.call(&vote(2, true), 0))
+        .collect();
+    include_all(&mut node, &votes);
+    assert_eq!(view(&mut node, 2).unwrap().delegators.0.len(), 64);
+    let quiet_end = gas_of_block(&mut node, quiet.height + 12);
+    let busy_end = gas_of_block(&mut node, busy.height + 12);
+    let plain = gas_of_block(&mut node, busy.height + 13);
+    eprintln!(
+        "end of voting: no ballots {quiet_end}, 64 ballots {busy_end}, a block with neither {plain}; per ballot {}",
+        (busy_end - quiet_end) / 64
+    );
+    assert_eq!(view(&mut node, 2).unwrap().proposal.status, status::PASSED);
+    let mut executor = Sender::new(alice());
+    let mut execute = |node: &mut Node, id: u64| {
+        let hash = node
+            .submit(&executor.call(&Call::Execute { id }, 0))
+            .unwrap();
+        let mut gas = 0;
+        while node.receipt(&hash).unwrap().is_none() {
+            let (height, before) = (node.block_number().unwrap(), execute_gas(node));
+            let t = node.now_ms() + SLOT_MS;
+            node.tick(t).unwrap();
+            if node.block_number().unwrap() == height + 1 {
+                gas = execute_gas(node) - before;
+            }
+        }
+        gas
+    };
+    let quiet_execute = execute(&mut node, 1);
+    let busy_execute = execute(&mut node, 2);
+    eprintln!(
+        "execute: no ballots {quiet_execute}, 64 ballots {busy_execute}; per ballot {}",
+        (busy_execute - quiet_execute) / 64
+    );
 }

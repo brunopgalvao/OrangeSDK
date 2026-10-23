@@ -24,8 +24,11 @@ const HELLO: &str = concat!(
 /// of spec 22, the fee market of spec 23 with its bounds and the payout that leaves
 /// jailed validators out (spec 23 §2, spec 15 §10.2), and the stake-weighted
 /// threshold shares of spec 15 §6.8 landed in the kernel. The same bisection gave
-/// 79 399 and 275 039 for the fixture before the shares, which took 3 off the block;
-/// rebuilding the fixture may move both numbers.
+/// 79 399 and 275 039 for the fixture before the shares, which took 3 off the block.
+/// Bisected again on 2026-10-23 after delegator votes and governed calls (spec 13
+/// §9.3, §9.5) landed: 79 399 and 275 029, the same as that bisection gives for the
+/// fixture before them, so they cost a block of this genesis nothing; rebuilding the
+/// fixture may move both numbers.
 const STARVED_GAS: &str = "100000";
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4,

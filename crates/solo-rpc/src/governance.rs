@@ -40,12 +40,27 @@ fn proposal_json(v: &ProposalView) -> Value {
             })
         })
         .collect();
+    let delegators: Vec<Value> = v
+        .delegators
+        .0
+        .iter()
+        .map(|b| {
+            json!({
+                "delegator": data(&b.delegator),
+                "support": b.support,
+                "weight": quantity(u128::from(b.weight)),
+            })
+        })
+        .collect();
     json!({
         "id": quantity(u128::from(p.id)),
         "proposer": data(&p.proposer),
         "deposit": quantity(p.deposit),
         "target": data(&p.target),
         "data": data(&p.data),
+        "call": p.is_call(),
+        "value": quantity(p.value),
+        "gas": quantity(u128::from(p.gas)),
         "submittedAt": quantity(u128::from(p.submitted_at)),
         "votingEnd": quantity(u128::from(p.voting_end)),
         "executableAt": quantity(u128::from(p.executable_at)),
@@ -58,6 +73,7 @@ fn proposal_json(v: &ProposalView) -> Value {
             "total": quantity(u128::from(v.total)),
         },
         "votes": votes,
+        "delegators": delegators,
     })
 }
 
@@ -125,4 +141,39 @@ pub fn proposal(node: &mut Node, params: &[Value]) -> Result<Value, RpcError> {
         .ok()
         .ok_or(RpcError::server("the kernel's proposal does not decode"))?;
     Ok(proposal_json(&view))
+}
+
+#[cfg(test)]
+mod tests {
+    use solo_abi::codec::Seq;
+    use solo_abi::governance::{DelegatorBallot, Proposal};
+
+    use super::*;
+
+    #[test]
+    fn a_view_shows_delegators_and_governed_calls() {
+        let view = ProposalView {
+            proposal: Proposal {
+                target: [7; 20],
+                value: 5,
+                gas: 21_000,
+                ..Proposal::default()
+            },
+            delegators: Seq(vec![DelegatorBallot {
+                delegator: [9; 20],
+                support: false,
+                weight: 3,
+            }]),
+            ..ProposalView::default()
+        };
+        let json = proposal_json(&view);
+        assert_eq!(
+            (&json["call"], &json["value"], &json["gas"]),
+            (&json!(true), &json!("0x5"), &json!("0x5208"))
+        );
+        assert_eq!(
+            json["delegators"],
+            json!([{"delegator": data(&[9; 20]), "support": false, "weight": "0x3"}])
+        );
+    }
 }

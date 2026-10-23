@@ -169,9 +169,9 @@ Measured by `crates/solo-bridge/tests/tokens.rs`, which pins each number: on Eth
 | `deposit` of Solo's currency | Solo | 117 482 |
 | `SoloInbox.execute` of a `RELEASE` of ETH | Ethereum | 77 846 |
 | `deposit` of a wrapped token (burn and `EthereumOutbox` send) | Ethereum | 86 385 |
-| `EthereumInbox.deliver` of a `RELEASE` of Solo's currency | Solo | 96 478 |
+| `EthereumInbox.deliver` of a `RELEASE` of Solo's currency | Solo | 96 466 |
 
-Creating a wrapped token costs about 720 000 gas, mostly the code deposit of its 2 779-byte runtime at 200 gas a byte and the initialization's storage writes; the deliveries include the inbox's proof verification (spec 18 §8), which grows with the depth of the Ethereum state. The `MINT` payload is 384 bytes for a name and symbol of up to 32 bytes each, and `send_gas` (spec 17 §2.4) charges for it on Solo.
+The last moved from 96 478 on 2026-10-23, when the bridge modules were rebuilt against a changed `solo-abi` (codex ADR 0042): the delivery runs them as native contracts, charged by their VM gas (16 §6), and the rest of the table stayed as it was. Creating a wrapped token costs about 720 000 gas, mostly the code deposit of its 2 779-byte runtime at 200 gas a byte and the initialization's storage writes; the deliveries include the inbox's proof verification (spec 18 §8), which grows with the depth of the Ethereum state. The `MINT` payload is 384 bytes for a name and symbol of up to 32 bytes each, and `send_gas` (spec 17 §2.4) charges for it on Solo.
 
 ## 9. Contracts and fixtures
 

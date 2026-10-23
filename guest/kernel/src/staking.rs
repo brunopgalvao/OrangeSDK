@@ -110,7 +110,7 @@ pub fn add_to_pool(amount: u128) {
 }
 
 /// `delegator`'s delegation behind validator `id`, if any.
-fn delegation(id: &Hash, delegator: &Address) -> Option<Delegation> {
+pub fn delegation(id: &Hash, delegator: &Address) -> Option<Delegation> {
     state::get(&delegation_key(id, delegator))
 }
 
@@ -122,7 +122,7 @@ fn delegators(id: &Hash) -> Vec<Address> {
 }
 
 /// The validators an account delegates to, in the order it first did.
-fn delegated_to(delegator: &Address) -> Vec<Hash> {
+pub fn delegated_to(delegator: &Address) -> Vec<Hash> {
     state::get::<Seq<Hash>>(&delegated_to_key(delegator))
         .map(|s| s.0)
         .unwrap_or_default()

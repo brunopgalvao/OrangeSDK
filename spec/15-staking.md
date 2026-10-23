@@ -341,7 +341,7 @@ All of it is committed (10 §2).
 
 Any account puts stake behind a registered validator with `delegate(validator)` (§3.3, §3.4) and takes it back with `undelegate(validator, amount)` and, once released, `withdraw()`. A *delegation* is the record `Delegation { stake, unbonding, release_epoch }` under `stake/d/` ‖ id ‖ delegator (§7), one per delegator and validator, deleted once both its stake and its unbonding stake are zero, when it also leaves both lists. A validator's `delegated` is the sum of the bonded stake of the delegations behind it; its *total stake* is `stake + delegated`.
 
-Delegated stake counts: it orders the candidates of an epoch's set and weighs the validator's votes (§4), and it is slashed with the validator's own (§5). It does not meet the minimum stake, which is the validator's own bond, and it earns nothing while unbonding. A validator with a delegation behind it keeps its registration slot (§3.5) until the last delegation is withdrawn, so a delegator can always undelegate and withdraw, from a jailed validator too.
+Delegated stake counts: it orders the candidates of an epoch's set and weighs the validator's votes (§4), and it is slashed with the validator's own (§5). In governance (13 §9.3) a validator's vote carries the bonded stake of its delegations as they stand at the tally, and a delegator may vote itself, taking its delegations' bonded stake out of its validators' votes. It does not meet the minimum stake, which is the validator's own bond, and it earns nothing while unbonding. A validator with a delegation behind it keeps its registration slot (§3.5) until the last delegation is withdrawn, so a delegator can always undelegate and withdraw, from a jailed validator too.
 
 ### 10.2 The reward pool
 
