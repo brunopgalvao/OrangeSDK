@@ -124,7 +124,8 @@ fn envelope(receipt: &Value) -> ReceiptEnvelope {
 }
 
 /// Checks block `n` against alloy: its hash, its tries, its bloom and its
-/// parent link; returns how many transactions it has.
+/// parent link, zero for the genesis block; returns how many transactions
+/// it has.
 fn verify_block(rpc: &mut Rpc, n: u64) -> usize {
     let block = ok(
         rpc,
@@ -167,7 +168,7 @@ fn verify_block(rpc: &mut Rpc, n: u64) -> usize {
         bloom.accrue_bloom(r.logs_bloom());
     }
     assert_eq!(bloom, h.logs_bloom);
-    let parent = if n == 1 {
+    let parent = if n == 0 {
         [0; 32]
     } else {
         fixed(
@@ -247,7 +248,8 @@ fn blocks_carry_ethereum_headers_and_patricia_roots() {
     );
     let head = rpc.node_mut().block_number().unwrap();
     let mut total = 0;
-    for n in 1..=head {
+    // The genesis block verifies as every other does (spec 20 §3.1).
+    for n in 0..=head {
         total += verify_block(&mut rpc, n);
     }
     assert_eq!(total, 5);
@@ -274,9 +276,15 @@ fn blocks_carry_ethereum_headers_and_patricia_roots() {
     // The counter's code now runs at Bob's address too, over Bob's storage.
     let count = json!({ "to": data(&bob.address), "input": data(&calldata("count()", &[])) });
     assert_eq!(ok(&mut rpc, "eth_call", json!([count])), data(&word(0)));
-    // The genesis block is synthetic, with hash zero.
+    // The genesis block has a header, whose hash is its hash (spec 20 §3.1),
+    // committing to the genesis state.
     let genesis = ok(&mut rpc, "eth_getBlockByNumber", json!(["0x0", false]));
-    assert_eq!(genesis["hash"], data(&[0; 32]));
+    assert_eq!(
+        header(&genesis).hash_slow().0,
+        fixed::<32>(&genesis["hash"])
+    );
+    assert_ne!(genesis["hash"], data(&[0; 32]));
+    assert_eq!(genesis["parentHash"], data(&[0; 32]));
     assert_eq!(
         genesis["transactionsRoot"],
         data(&solo_eth::mpt::EMPTY_ROOT)
@@ -286,9 +294,18 @@ fn blocks_carry_ethereum_headers_and_patricia_roots() {
     // Block 1's parent hash names it as any block's hash names its block:
     // by hash, for receipts and logs, and as a state method's block
     // parameter, directly or as an EIP-1898 object (spec 20 §5.2).
-    let zero = data(&[0; 32]);
+    let zero = genesis["hash"].clone();
     let first = ok(&mut rpc, "eth_getBlockByNumber", json!(["0x1", false]));
     assert_eq!(first["parentHash"], zero);
+    // The zero hash names no block.
+    assert_eq!(
+        ok(
+            &mut rpc,
+            "eth_getBlockByHash",
+            json!([data(&[0; 32]), false])
+        ),
+        Value::Null
+    );
     assert_eq!(
         ok(&mut rpc, "eth_getBlockByHash", json!([zero, false])),
         genesis

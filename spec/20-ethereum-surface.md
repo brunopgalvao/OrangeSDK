@@ -5,7 +5,7 @@
 Codex ADR 0003 makes Solo a Type 2 Ethereum chain: standard EVM bytecode at exact gas, every transaction type a wallet sends, the full RPC, and Solo's own state tree, consensus and block format underneath. This document specifies where the reference kernel and host meet Ethereum tooling beyond the EVM itself (codex ADR 0033):
 
 - the transaction types the kernel accepts, including EIP-7702 set-code transactions, and the one it refuses, EIP-4844 blob transactions (§2);
-- the block header: every block has an Ethereum header whose `keccak256` of the RLP is the block hash, with Merkle-Patricia transactions and receipts roots and a logs bloom, while the state root stays Solo's binary trie (§3);
+- the block header: every block, the genesis block included, has an Ethereum header whose `keccak256` of the RLP is the block hash, with Merkle-Patricia transactions and receipts roots and a logs bloom, while the state root stays Solo's binary trie (§3); the genesis block's hash and the chain id identify the chain (§3.4);
 - `eth_getProof`, which answers with spec 10 proofs in EIP-1186's response shape (§4);
 - historical state: the state methods answer at any block within a retention window, or at every block on an archive node (§5).
 
@@ -67,7 +67,7 @@ The kernel stores, for each block, the record `solo_abi::chain::BlockHeader`:
 | Field | Content |
 |---|---|
 | `height` | block number |
-| `parent_hash` | the previous block's hash; zero for block 1 |
+| `parent_hash` | the previous block's hash: the genesis block's for block 1, zero for the genesis block (§3.4) |
 | `timestamp_ms` | the proposal's timestamp, milliseconds |
 | `state_root` | the state commitment (spec 10) the block returned (06 §5) |
 | `receipts_root` | §3.2 |
@@ -105,9 +105,7 @@ The block's **Ethereum header** is the Prague/Osaka header with these values, in
 | `parentBeaconBlockRoot` | zero (no beacon chain) |
 | `requestsHash` | `sha256("")` = `e3b0c442…b855` (no EIP-7685 requests) |
 
-The **block hash** is `keccak256` of the header's RLP. The kernel computes it after storing the block's receipts, stores it beside the record (the `bnum/` and `bhash/` indexes) and as the next block's `parent_hash`; `BLOCKHASH` returns it (19 §4); the host reports it in `BlockExecuted` (06 §4.1) and the RPC serves it as `hash`. The RPC's block view is exactly the header's fields with that hash, plus `size` (the length of `rlp([header, transactions, [], []])`, a typed transaction as the string of its bytes), `totalDifficulty` 0, empty `uncles` and `withdrawals`, and the transactions. So `keccak256(rlp(header))`, rebuilt from the view by any Ethereum library, is the view's `hash`, and the parent link holds from block 1 on.
-
-**Genesis.** The kernel stores no record for height 0. The RPC serves a synthetic block 0: the genesis state root (the commitment of the state `kernel_init` left, which the node records when it starts), empty transactions and receipts roots, the chain's gas limit, the base fee the chain started at (its floor at genesis, 23 §3), a zero bloom, a zero beneficiary, and hash zero, which is block 1's `parentHash`. Its hash is not the hash of its header. The zero hash names it wherever the RPC takes a block hash, as any block's hash names its block: `eth_getBlockByHash`, `eth_getBlockReceipts`, `eth_getLogs` with `blockHash`, and a state method's block parameter (§5.2).
+The **block hash** is `keccak256` of the header's RLP. The kernel computes it after storing the block's receipts, stores it beside the record (the `bnum/` and `bhash/` indexes) and as the next block's `parent_hash`; `BLOCKHASH` returns it (19 §4); the host reports it in `BlockExecuted` (06 §4.1) and the RPC serves it as `hash`. The RPC's block view is exactly the header's fields with that hash, plus `size` (the length of `rlp([header, transactions, [], []])`, a typed transaction as the string of its bytes), `totalDifficulty` 0, empty `uncles` and `withdrawals`, and the transactions. So `keccak256(rlp(header))`, rebuilt from the view by any Ethereum library, is the view's `hash`, and the parent link holds from the genesis block on (§3.4).
 
 ### 3.2 Transactions and receipts roots
 
@@ -123,6 +121,31 @@ The block's `logs_bloom` is the OR of its receipts' blooms. A transaction the bl
 ### 3.3 State root
 
 `stateRoot` is Solo's state commitment (spec 10), a binary Merkle trie over the store's entries. It is not, and cannot be checked as, an Ethereum state root: a tool that verifies Ethereum state proofs against it fails, and Solo's state proofs follow spec 10 (§4). What an Ethereum state root would commit to (accounts, storage) is in Solo's store under the keys of §4.1, alongside the kernel's other state.
+
+### 3.4 The genesis block
+
+`kernel_init` (06 §2) ends by storing block 0, after everything else it writes (`stf::genesis` in the reference kernel). Its record is
+
+| Field | Value |
+|---|---|
+| `height` | 0 |
+| `parent_hash` | zero |
+| `timestamp_ms` | 0 |
+| `state_root` | the commitment `storage_commit` returns at that point: of everything `kernel_init` wrote |
+| `receipts_root`, `transactions_root` | the empty-trie root `56e81f17…b421` |
+| `tx_hashes`, `gas_used` | none, 0 |
+| `logs_bloom` | 256 zero bytes |
+| `gas_limit` | the block gas limit, 30 000 000 |
+| `base_fee` | the floor the genesis parameters set, `min_base_fee` (23 §2): the parent at the floor that used nothing from which 23 §3 derives block 1's base fee |
+| `beneficiary` | the zero address: no fee is paid at genesis |
+
+and its Ethereum header and hash follow from it exactly as for every block (§3.1): the hash is `keccak256(rlp(header))`, with parent hash zero, so a header chain verifies from block 0. The kernel stores it as it stores every block, under `block/`, `bnum/` and `bhash/` (so `BLOCKHASH(0)` returns it, 19 §4), and its hash as `meta/last_hash`, which becomes block 1's `parent_hash`; `meta/height` stays unset until block 1 executes, so everything that reads the executed height reads none before the first block, as before. The header is a function of the genesis (`Genesis` of 06 §5: the chain id, the parameters, the validators and the allocations) and of the genesis kernel's `kernel_init`, so every node of the chain computes the same one.
+
+The host keeps the trie behind the genesis header's root as version 0 of its state (22 §3), the trie `storage_commit` returned, not the state after the header was stored, exactly as it keeps the trie behind each block's root (§4.3); the genesis root the node and its store report is that root, and `eth_getProof` at block 0 verifies against block 0's `stateRoot`. The RPC serves block 0 from the stored record like any other block: `eth_getBlockByNumber(0)` (and `earliest`), `eth_getBlockByHash` with its hash, `eth_getBlockReceipts` and `eth_getLogs` with its hash (none), and its hash as a state method's block parameter (§5.2). The zero hash names no block.
+
+**Chain identity.** A chain is identified by its chain id together with its genesis hash. Through the state root the genesis hash commits to the chain id (`meta/chain_id`), the stored genesis parameters (`meta/params`: fees, governance, staking, upgrades), the genesis validator set (`meta/validators`), every allocated account with its code and storage, the genesis modules and the bridge's configuration: every chain parameter genesis fixes. Two chains that share a chain id but differ in any of these have different genesis hashes and are different chains; a snapshot of one does not import into the other (22 §7.3). The genesis hash does not commit to the genesis kernel's code hash: two kernels whose `kernel_init` writes the same state give the same genesis block, and a node is held to the kernel that wrote its store by the store itself (22 §5).
+
+**Chains that predate the genesis block.** A chain's genesis block is whatever its genesis kernel's `kernel_init` stored; nothing stores it later. A reference kernel built before 2026-10-23 stored none: on a chain whose genesis kernel is such a kernel, block 1's parent hash is zero, `BLOCKHASH(0)` answers zero and the RPC answers `null` for block 0 and for its hash. A kernel upgrade cannot give such a chain a genesis block, since every block hash from block 1 on commits to a parent hash of zero; a later kernel runs on it unchanged, reading `meta/last_hash` as before, and the chain keeps its identity as its chain id and the hash of its block 1. Data directories and devnets made with an earlier kernel fixture are made again (`solo devnet init`), as after any rebuild of the genesis kernel: a node refuses a store written by a kernel that is neither the one it is given nor an upgrade in that store's chain state (22 §5).
 
 ## 4. `eth_getProof`
 
@@ -187,7 +210,7 @@ The execution-spec state tests run set-code transactions through the kernel's ow
 
 ## 7. Limits of this version
 
-- The genesis block's hash is zero, not the hash of a header: a tool that hashes block 0 finds a mismatch, and a header chain verifies from block 1.
+- The genesis header's timestamp is 0: the genesis parameters carry no time, and block 1's is the first proposal's.
 - `stateRoot` is not an Ethereum state root (§3.3), and `eth_getProof` answers in Solo's proof format, which Ethereum's verifiers do not read.
 - A node without a data directory keeps its history in memory and has none from before it started; while blocks write heavily a window is shorter than `state_history` (§5.1). A node started from a snapshot has no state from before the snapshot (22 §7).
 - The pool's rules for delegation are geth's, plus the take's rule for authorities ahead (§2.4); a pool of another host may differ without affecting consensus (14 §1).

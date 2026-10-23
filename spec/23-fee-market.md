@@ -46,7 +46,7 @@ next_base_fee(b, g) =
   max(min_base_fee, b − b · (T − g) / T / denominator)      if g < T
 ```
 
-Divisions round down, as in EIP-1559, whose formula this is with the floor applied last; the result saturates at `2^64 − 1`. The genesis counts as a parent at the floor that used nothing, so block 1's base fee is `min_base_fee`. `solo_abi::fees::FeeParams::next_base_fee` is the one implementation, shared by the kernel, the node and the RPC.
+Divisions round down, as in EIP-1559, whose formula this is with the floor applied last; the result saturates at `2^64 − 1`. The genesis counts as a parent at the floor that used nothing, so block 1's base fee is `min_base_fee`; the genesis block's header carries exactly that parent, base fee `min_base_fee` and no gas used (20 §3.4). `solo_abi::fees::FeeParams::next_base_fee` is the one implementation, shared by the kernel, the node and the RPC.
 
 The base fee of block `h` applies to:
 
@@ -103,7 +103,7 @@ The JSON-RPC follows geth:
 - `eth_gasPrice` is the head block's base fee plus the suggested tip; `eth_maxPriorityFeePerGas` the suggested tip (§7.1);
 - `eth_feeHistory(blockCount, newestBlock, rewardPercentiles)` reports, per block, `baseFeePerGas` from its header and, after the newest, the base fee of the block after it (its header's, or the kernel's next base fee when the newest is the head), `gasUsedRatio`, and `reward`: at each percentile, the tip paid by the transaction at that share of the block's gas, the receipts sorted by the tip they paid over the block's base fee; `blockCount` is at most 1 024, as in geth;
 - `eth_sendRawTransaction` refuses reason 8 with `max fee per gas less than block base fee: address …, maxFeePerGas: …, baseFee: …` and reason 24 with `max priority fee per gas higher than max fee per gas: address …, maxPriorityFeePerGas: …, maxFeePerGas: …`, geth's texts with its details;
-- the synthetic genesis block (20 §3.1) reports the base fee the chain started with, its floor at genesis, and block views report each header's `baseFeePerGas` and `miner`.
+- the genesis block (20 §3.4) carries the base fee the chain started with, its floor at genesis, in its header, and block views report each header's `baseFeePerGas` and `miner`.
 
 ### 7.1 The tip oracle
 
@@ -127,4 +127,3 @@ The reference host's take orders senders by the tip their next pending transacti
 - `min_base_fee` is bounded (§2), but not by what the governance account holds: a floor at the bound still leaves governance without the transaction that would lower it if its accounts hold less than the transaction's gas at that floor. Governance checks a new floor against its own balance before it sets one.
 - A proposal is not run before it is made (20 §7): a transaction priced exactly at the base fee of the block the take was made for can land in a later block whose base fee rose past it, and is then recorded as failed instead of left out as a geth builder would.
 - The tip oracle reads receipts block by block on the thread that drives consensus; a node with many transactions per block pays for the first `eth_gasPrice` after each head.
-- The genesis block has no header (20 §7), so its base fee is the floor the RPC fills in, not a value any hash commits to.

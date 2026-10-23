@@ -796,8 +796,9 @@ impl DiskStore {
     /// Seals `version`: writes the pending state, its history as
     /// `version`'s, the trie nodes the span created, and the version row
     /// with `committed`, the trie behind the block's header root, when the
-    /// block has one. The genesis state is sealed as version 0 with no
-    /// committed trie: its root is the state's.
+    /// block has one. The genesis state is sealed as version 0 with the
+    /// trie behind the genesis header's root, the genesis root, or without
+    /// one, its root then being the state's.
     ///
     /// # Errors
     /// When the database refuses or a fault was injected; nothing of the
@@ -900,9 +901,11 @@ impl DiskStore {
             }
             // The version's root and the current root each hold a reference;
             // the previous current root gives its own back.
+            // The genesis's root is the state's own unless the genesis
+            // header carries an earlier one.
             let version_root = match version {
                 Some(_) if self.sealed => committed_root,
-                Some(_) => Some(self.trie.root()),
+                Some(_) => committed_root.or(Some(self.trie.root())),
                 None => None,
             };
             if let Some(root) = &version_root {
@@ -940,7 +943,7 @@ impl DiskStore {
                     meta.insert("oldest", v.to_le_bytes().as_slice())
                         .map_err(redb::Error::from)
                         .map_err(db)?;
-                    meta.insert("genesis", self.trie.root().as_slice())
+                    meta.insert("genesis", version_root.unwrap_or(EMPTY).as_slice())
                         .map_err(redb::Error::from)
                         .map_err(db)?;
                 }
@@ -976,7 +979,7 @@ impl DiskStore {
         if let Some(v) = version {
             if !self.sealed {
                 self.oldest = v;
-                self.genesis = Some(self.trie.root());
+                self.genesis = committed_root.or(Some(self.trie.root()));
             }
             self.sealed = true;
             self.latest = v;

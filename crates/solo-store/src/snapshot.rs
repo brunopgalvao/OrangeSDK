@@ -995,17 +995,63 @@ impl Snapshot {
     /// Loads the snapshot into `store`, which holds the genesis alone, after
     /// [`Snapshot::verify`] passed: the entries stream from the file into
     /// the store's one transaction ([`DiskStore::load`]), which checks
-    /// their order and root again before it commits.
+    /// their order and root again before it commits. The snapshot must be
+    /// of the chain whose genesis the store holds: its state names the
+    /// genesis block's hash at `bnum/` ‖ 0, and that must be the hash of the
+    /// genesis block the store's own `kernel_init` stored (spec 22 §7.3,
+    /// spec 20 §3.1), whatever its chain id and certificates say.
     ///
     /// # Errors
-    /// What reading the file or the store reports.
+    /// [`SnapshotError::Verify`] for the state of another genesis; what
+    /// reading the file or the store reports.
     pub fn import(&self, store: &mut DiskStore) -> Result<(), SnapshotError> {
+        let key = [keys::BLOCK_NUMBER, &0u64.to_be_bytes()[..]].concat();
+        let expected = store.get(&key);
+        let entries = GenesisCheck {
+            entries: self.entries()?,
+            seen: expected.is_none(),
+            key,
+            expected,
+        };
         store.load(
             self.header.height,
             &self.header.state_root,
-            self.entries()?,
+            entries,
             &self.local_keys(),
         )
+    }
+}
+
+/// The entries of a snapshot, refused unless they name the genesis hash
+/// `expected` at `key` (`bnum/` ‖ 0), or name none when there is none to
+/// expect.
+struct GenesisCheck {
+    entries: EntryReader,
+    key: Vec<u8>,
+    expected: Option<Vec<u8>>,
+    seen: bool,
+}
+
+impl Iterator for GenesisCheck {
+    type Item = Result<(Vec<u8>, Vec<u8>), SnapshotError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        const OTHER: SnapshotError =
+            SnapshotError::Verify("the snapshot is of a chain with another genesis block");
+        match self.entries.next() {
+            Some(Ok((key, value))) if key == self.key => {
+                if self.expected.as_ref() != Some(&value) {
+                    return Some(Err(OTHER));
+                }
+                self.seen = true;
+                Some(Ok((key, value)))
+            }
+            None if !self.seen => {
+                self.seen = true;
+                Some(Err(OTHER))
+            }
+            other => other,
+        }
     }
 }
 
@@ -1299,6 +1345,65 @@ mod tests {
             Err(SnapshotError::Io(_))
         ));
         assert_eq!(left(), 2);
+    }
+
+    #[test]
+    fn an_import_needs_the_genesis_block_the_store_holds() {
+        let key = [keys::BLOCK_NUMBER, &0u64.to_be_bytes()[..]].concat();
+        // A snapshot of version 1 holding `entries`, in path order.
+        let file = |name: &str, mut entries: Vec<(Vec<u8>, Vec<u8>)>| {
+            entries.sort_by_key(|(k, _)| keccak256(k));
+            let mut root = SortedRoot::new(keccak256);
+            for (k, v) in &entries {
+                root.push(keccak256(k), keccak256(v), &mut |_, _| {})
+                    .unwrap();
+            }
+            let header = SnapshotHeader {
+                height: 1,
+                state_root: root.finish(&mut |_, _| {}),
+                entries: entries.len() as u64,
+                ..SnapshotHeader::default()
+            };
+            let dir = scratch(&format!("genesis-out-{name}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            Snapshot::write(&dir.join("x.snap"), &header, entries).unwrap()
+        };
+        // A store holding a genesis whose block hash is `hash`, if any.
+        let genesis = |name: &str, hash: Option<&[u8]>| {
+            let mut s = DiskStore::open(&scratch(&format!("genesis-{name}"))).unwrap();
+            s.set(keys::CHAIN_ID, &7u64.to_bytes());
+            if let Some(hash) = hash {
+                s.set(&key, hash);
+            }
+            s.seal(0, None).unwrap();
+            s
+        };
+        let other = |r: Result<(), SnapshotError>| {
+            r.unwrap_err().to_string().contains("another genesis block")
+        };
+        let acct = (b"acct/a".to_vec(), b"1".to_vec());
+        let ours = (key.clone(), [1u8; 32].to_vec());
+        let theirs = (key.clone(), [2u8; 32].to_vec());
+        // Another genesis hash, or none, is another chain, and the store
+        // keeps its genesis.
+        let mut s = genesis("other", Some(&[1; 32]));
+        assert!(other(
+            file("other", vec![acct.clone(), theirs.clone()]).import(&mut s)
+        ));
+        assert!(other(file("none", vec![acct.clone()]).import(&mut s)));
+        assert_eq!(s.get(&key), Some([1u8; 32].to_vec()));
+        // A store whose kernel stored no genesis block takes only a chain
+        // without one.
+        let mut bare = genesis("bare", None);
+        assert!(other(
+            file("bare-other", vec![acct.clone(), theirs]).import(&mut bare)
+        ));
+        file("bare", vec![acct.clone()]).import(&mut bare).unwrap();
+        assert_eq!(bare.get(b"acct/a"), Some(b"1".to_vec()));
+        // The same genesis loads.
+        file("same", vec![acct, ours]).import(&mut s).unwrap();
+        assert_eq!(s.get(b"acct/a"), Some(b"1".to_vec()));
+        assert_eq!(s.head(), 1);
     }
 
     #[test]

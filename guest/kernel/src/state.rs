@@ -106,20 +106,28 @@ pub fn height() -> Option<u64> {
     get(keys::HEIGHT)
 }
 
-/// Hash of the last executed block, zero before the first.
+/// Hash of the last block: the genesis block's before the first executes
+/// (zero on a chain whose genesis kernel stored no genesis block).
 pub fn last_hash() -> Hash {
     get(keys::LAST_HASH).unwrap_or([0; 32])
 }
 
-/// Stores a block and its index entries.
+/// Stores an executed block and its index entries, and makes it the head.
 pub fn put_block(header: &BlockHeader, hash: &Hash) {
+    put_header(header, hash);
+    set(keys::HEIGHT, &header.height);
+}
+
+/// Stores a block's header and its index entries, and makes its hash the
+/// next block's parent. The genesis block's alone leaves the executed
+/// height unset: no block has executed yet (spec 20 §3.1).
+pub fn put_header(header: &BlockHeader, hash: &Hash) {
     set(&block_key(header.height), header);
     set_raw(
         &concat(keys::BLOCK_NUMBER, &header.height.to_be_bytes()),
         hash,
     );
     set(&concat(keys::BLOCK_HASH, hash), &header.height);
-    set(keys::HEIGHT, &header.height);
     set(keys::LAST_HASH, hash);
 }
 

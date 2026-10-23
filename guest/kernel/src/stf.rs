@@ -422,6 +422,33 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     }
 }
 
+/// The end of `kernel_init`: the genesis block (spec 20 §3.1). Its header
+/// commits to the state everything before it in `kernel_init` wrote, the
+/// chain id, the parameters, the validators and the allocations, through
+/// the state root; it records no transactions, uses no gas, starts the base
+/// fee at the floor the genesis parameters set (spec 23 §3) and names the
+/// zero address as beneficiary, as no fee is paid at genesis. Its hash is
+/// block 1's parent and, with the chain id, the chain's identity.
+pub fn genesis() {
+    let state_root = state::commit();
+    let header = BlockHeader {
+        height: 0,
+        parent_hash: [0; 32],
+        timestamp_ms: 0,
+        state_root,
+        receipts_root: mpt::EMPTY_ROOT,
+        tx_hashes: Seq(Vec::new()),
+        gas_used: 0,
+        transactions_root: mpt::EMPTY_ROOT,
+        logs_bloom: alloc::vec![0; 256],
+        gas_limit: BLOCK_GAS_LIMIT,
+        base_fee: fees::params().min_base_fee,
+        beneficiary: [0; 20],
+    };
+    let hash = header::block_hash(&header, state::keccak256);
+    state::put_header(&header, &hash);
+}
+
 /// `kernel_stf_finalize_block`.
 pub fn finalize(args: &FinalizeArgs) {
     state::set(solo_abi::chain::keys::FINALIZED, &args.height);

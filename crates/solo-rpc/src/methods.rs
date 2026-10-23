@@ -335,13 +335,10 @@ impl Rpc {
         }
     }
 
-    /// The header of the block whose hash is `hash`. The zero hash names
-    /// the synthetic genesis, whose hash it is (spec 20 §3.1); the kernel
-    /// indexes every other block by its hash.
+    /// The header of the block whose hash is `hash`, the genesis block's
+    /// included: the kernel indexes every block it stores by its hash
+    /// (spec 20 §3.1).
     fn header_by_hash(&mut self, hash: &[u8; 32]) -> Result<Option<BlockHeader>, RpcError> {
-        if *hash == [0; 32] {
-            return Ok(self.header_at(0)?.map(|(header, _)| header));
-        }
         Ok(self.node.block_by_hash(hash)?)
     }
 
@@ -683,26 +680,12 @@ impl Rpc {
         Ok(hi)
     }
 
-    /// The header at `height` with its hash. Height 0 is the genesis, which
-    /// the kernel does not store: a header of the genesis state root, empty
-    /// tries, the chain's gas limit and the base fee it started at, whose
-    /// hash is zero, the parent hash of block 1 (spec 20 §3.1).
+    /// The header at `height` with its hash; height 0 is the genesis block,
+    /// which the kernel stores at `kernel_init` (spec 20 §3.1).
     pub(crate) fn header_at(
         &mut self,
         height: u64,
     ) -> Result<Option<(BlockHeader, [u8; 32])>, RpcError> {
-        if height == 0 {
-            let genesis = BlockHeader {
-                state_root: self.node.genesis_state_root(),
-                transactions_root: solo_eth::mpt::EMPTY_ROOT,
-                receipts_root: solo_eth::mpt::EMPTY_ROOT,
-                logs_bloom: vec![0; 256],
-                gas_limit: BLOCK_GAS_LIMIT,
-                base_fee: self.node.genesis_base_fee(),
-                ..BlockHeader::default()
-            };
-            return Ok(Some((genesis, [0; 32])));
-        }
         Ok(self.node.block_by_number(height)?.map(|header| {
             let hash = solo_eth::header::block_hash(&header, keccak256);
             (header, hash)

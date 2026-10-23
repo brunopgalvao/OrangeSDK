@@ -114,7 +114,8 @@ record! {
     BlockHeader {
         /// Height.
         height: u64,
-        /// Parent block hash; zero for the first block.
+        /// Parent block hash: block 1's is the genesis block's hash; the
+        /// genesis block's is zero (spec 20 §3.1).
         parent_hash: Hash,
         /// Timestamp in milliseconds.
         timestamp_ms: u64,

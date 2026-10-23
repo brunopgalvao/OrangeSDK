@@ -237,9 +237,6 @@ pub struct Node {
     /// parameters in force, the next block's base fee and the reward pool,
     /// read at open and after every executed block.
     fees: FeeStatus,
-    /// The base fee of the synthetic genesis block (spec 20 §3.1): the floor
-    /// the chain started with.
-    genesis_base_fee: u64,
     /// Telemetry (spec 11); consensus-ignored.
     pub(crate) telemetry: solo_metrics::NodeMetrics,
     /// Kernel switchover and feature-gate state (`crate::upgrade`).
@@ -313,13 +310,15 @@ impl Node {
             driver_retention: DRIVER_RETENTION,
             opened_at: 0,
             fees: FeeStatus::default(),
-            genesis_base_fee: 0,
             telemetry: solo_metrics::NodeMetrics::new(),
             upgrades: Upgrades::new(active_gates),
             store: None,
         };
         if fresh {
             node.call_unit(exports::INIT, &genesis.to_bytes())?;
+            // The trie behind the root the genesis header carries: the kernel
+            // asks for it last, before it stores the header (spec 20 §3.1).
+            let committed = node.services.borrow_mut().commitments.pop();
             // The kernel's version and gates are known before the first block:
             // the query spec 13 §7.1 makes after every block, once at open and
             // under the kernel budget like every host read of it. A kernel that
@@ -328,12 +327,11 @@ impl Node {
             node.upgrades.status = Some(node.upgrade_status().unwrap_or_default());
             // The genesis state is version 0; each executed block seals its height.
             node.exec.state_mut().base_mut().set_kernel(kernel);
-            node.exec.state_mut().base_mut().seal_genesis()?;
+            node.exec.state_mut().base_mut().seal_genesis(committed)?;
             node.refresh_fees()?;
         } else {
             node.resume()?;
         }
-        node.genesis_base_fee = node.genesis_floor()?;
         node.kernel_gas = config.kernel_gas;
         node.telemetry.opened_in(opening.elapsed().as_secs_f64());
         Ok(node)
@@ -561,29 +559,6 @@ impl Node {
     #[must_use]
     pub fn fee_status(&self) -> &FeeStatus {
         &self.fees
-    }
-
-    /// The base fee of the synthetic genesis block: the floor the chain
-    /// started with (spec 20 §3.1).
-    #[must_use]
-    pub fn genesis_base_fee(&self) -> u64 {
-        self.genesis_base_fee
-    }
-
-    /// The base fee of the synthetic genesis block (spec 20 §3.1). From
-    /// genesis, the next block's, as the kernel reports it; on a node
-    /// resumed past genesis (spec 22 §5), block 1's, which nothing but the
-    /// genesis parameters could set: a parent at the floor that used no gas
-    /// leaves the floor, and no governance action takes effect before
-    /// block 2.
-    fn genesis_floor(&mut self) -> Result<u64, NodeError> {
-        if self.opened_at == 0 {
-            return Ok(self.fees.base_fee);
-        }
-        let cap = std::mem::replace(&mut self.query_gas, i64::MAX);
-        let first = self.block_by_number(1);
-        self.query_gas = cap;
-        Ok(first?.map_or(self.fees.base_fee, |header| header.base_fee))
     }
 
     /// Reads the fee market from the kernel; see [`Node::fee_status`]. A
@@ -1073,7 +1048,7 @@ impl Node {
     }
 
     /// The state commitment (spec 10) of the genesis state, which the
-    /// synthetic header of block 0 carries (spec 20 §3.1).
+    /// genesis header carries (spec 20 §3.1).
     #[must_use]
     pub fn genesis_state_root(&self) -> [u8; 32] {
         self.exec.state().base().genesis_root().unwrap_or_default()

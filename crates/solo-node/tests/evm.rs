@@ -1167,9 +1167,13 @@ fn block_opcodes_agree_with_headers() {
     // block's own hash is out of reach, as in a transaction it would be.
     assert_eq!(hash_of(&mut chain, 2), [0; 32]);
     assert_ne!(block2, [0; 32]);
-    // The genesis block has no header, so its hash is zero, as block 1's parent hash
-    // and the RPC's block 0 say; later blocks have none yet either.
-    assert_eq!(hash_of(&mut chain, 0), [0; 32]);
+    // The genesis block's hash is that of its header, block 1's parent hash
+    // (spec 20 §3.1); later blocks have none yet.
+    let genesis = chain.node.block_by_number(0).unwrap().unwrap();
+    assert_eq!(
+        hash_of(&mut chain, 0),
+        solo_eth::header::block_hash(&genesis, keccak256)
+    );
     assert_eq!(hash_of(&mut chain, 3), [0; 32]);
 }
 

@@ -273,10 +273,11 @@ fn transactions_blocks_and_receipts() {
         ok(&mut rpc, "eth_getBlockByHash", json!([data(&[7; 32])])),
         Value::Null
     );
-    // The genesis block is synthetic: an empty header whose hash is zero.
+    // The genesis block: an empty header whose hash is block 1's parent hash.
     let genesis = ok(&mut rpc, "eth_getBlockByNumber", json!(["earliest", true]));
     assert_eq!(genesis["number"], "0x0");
-    assert_eq!(genesis["hash"], data(&[0; 32]));
+    assert_eq!(genesis["parentHash"], data(&[0; 32]));
+    assert_eq!(genesis["miner"], data(&[0; 20]));
     assert_eq!(genesis["transactions"], json!([]));
     assert_eq!(genesis["baseFeePerGas"], "0x0");
     assert_eq!(genesis["gasLimit"], quantity(30_000_000));
@@ -336,7 +337,8 @@ fn transactions_blocks_and_receipts() {
     let by_number = ok(&mut rpc, "eth_getBlockByNumber", json!(["0x1", false]));
     assert_eq!(by_number["hash"], block_hash);
     assert_eq!(by_number["number"], "0x1");
-    assert_eq!(by_number["parentHash"], data(&[0; 32]));
+    assert_eq!(by_number["parentHash"], genesis["hash"]);
+    assert_ne!(genesis["hash"], data(&[0; 32]));
     assert_eq!(by_number["transactions"], json!([hash_hex]));
     // The Merkle-Patricia root of the one raw transaction (spec 20 §3.2).
     let root = alloy_trie::root::ordered_trie_root_encoded(std::slice::from_ref(&raw));

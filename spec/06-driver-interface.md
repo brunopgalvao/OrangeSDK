@@ -36,7 +36,7 @@ Each entrypoint is an export (03 §5.2). The host places the encoded argument in
 | `kernel_stf_finalize_block` | stf | `FinalizeArgs { height: u64, certificate: bytes }` | `()` |
 | `kernel_query` | stf | `QueryArgs { method: bytes, params: bytes, at: option<u64> }` | `QueryResult { status: u32, body: bytes }` |
 
-Driver entrypoints may import the time and network functions of 05; state-transition entrypoints may not (05 §4.6). A kernel exports all of the above; a module that exports only `main` is a contract or kernel module, not a kernel.
+Driver entrypoints may import the time and network functions of 05; state-transition entrypoints may not (05 §4.6). `kernel_init` may call `storage_commit` once, last before it stores the genesis block: the host keeps the trie behind the root it returned as the genesis state's (spec 20 §3.4, spec 22 §2), as it keeps the trie behind the root a block returns (§5); without the call the genesis state's trie is the state's own. A kernel exports all of the above; a module that exports only `main` is a contract or kernel module, not a kernel.
 
 ## 4. Driver inputs and effects
 

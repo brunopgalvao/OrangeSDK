@@ -46,6 +46,8 @@ solo_guest::solo_export!(kernel_init, |input: &[u8]| -> Vec<u8> {
     staking::init(&genesis);
     modules::init(&genesis);
     bridge::init(&genesis);
+    // Last: the genesis header commits to everything above.
+    stf::genesis();
     Vec::new()
 });
 

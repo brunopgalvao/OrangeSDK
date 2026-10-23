@@ -133,20 +133,23 @@ impl ChainState {
         }
     }
 
-    /// Seals the genesis state as version 0, whose trie is the state's own.
+    /// Seals the genesis state as version 0. Its trie is `committed`, the
+    /// trie behind the root the genesis header carries (spec 20 §3.1),
+    /// which the kernel took before it stored that header; the state's own
+    /// without one, under a kernel that stores no genesis header.
     ///
     /// # Errors
     /// What the disk store reports.
-    pub fn seal_genesis(&mut self) -> Result<(), crate::NodeError> {
+    pub fn seal_genesis(&mut self, committed: Option<Trie>) -> Result<(), crate::NodeError> {
         match self {
             ChainState::Memory(m) => {
                 m.storage.keep_history(0);
-                let genesis = m.storage.state_trie();
+                let genesis = committed.unwrap_or_else(|| m.storage.state_trie());
                 m.genesis = Some(genesis.root());
                 m.committed.insert(0, genesis);
                 Ok(())
             }
-            ChainState::Disk(d) => d.seal(0, None).map_err(store_error),
+            ChainState::Disk(d) => d.seal(0, committed.as_ref()).map_err(store_error),
         }
     }
 

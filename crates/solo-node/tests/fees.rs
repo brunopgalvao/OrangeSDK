@@ -371,6 +371,14 @@ impl Chain {
     }
 }
 
+/// The base fee the genesis header carries (spec 20 §3.1, 23 §3).
+fn genesis_base_fee(node: &mut Node) -> u64 {
+    node.block_by_number(0)
+        .unwrap()
+        .expect("the genesis block")
+        .base_fee
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn the_base_fee_follows_eip_1559_above_the_floor() {
@@ -393,7 +401,7 @@ fn the_base_fee_follows_eip_1559_above_the_floor() {
     let price = 2 * u128::from(FLOOR);
     // Before any block the next base fee is the floor, and so is block 1's.
     assert_eq!(chain.fees().base_fee, FLOOR);
-    assert_eq!(chain.node.genesis_base_fee(), FLOOR);
+    assert_eq!(genesis_base_fee(&mut chain.node), FLOOR);
     let empty = chain.mine();
     assert_eq!((empty.base_fee, empty.gas_used), (FLOOR, 0));
     // Two full blocks: each raises the next base fee by the largest step,
@@ -868,7 +876,7 @@ fn the_fee_market_survives_a_restart_and_travels_in_a_snapshot() {
     assert!(fees.base_fee > FLOOR && fees.pool > 0, "{fees:?}");
     let delegated = delegations(&mut chain.node, d1.address);
     assert_eq!(delegated.len(), 1);
-    assert_eq!(chain.node.genesis_base_fee(), FLOOR);
+    assert_eq!(genesis_base_fee(&mut chain.node), FLOOR);
     let (persisted, resumed, now_ms) = (
         chain.node.persisted(),
         chain.node.persisted_driver_state.clone(),
@@ -882,9 +890,9 @@ fn the_fee_market_survives_a_restart_and_travels_in_a_snapshot() {
         now_ms,
         ..config
     };
-    let reopened = Node::open(kernel_module(), &genesis, config.clone()).unwrap();
+    let mut reopened = Node::open(kernel_module(), &genesis, config.clone()).unwrap();
     assert_eq!(reopened.fee_status(), &fees);
-    assert_eq!(reopened.genesis_base_fee(), FLOOR);
+    assert_eq!(genesis_base_fee(&mut reopened), FLOOR);
     drop(reopened);
     let mut again = Chain::open(&genesis, config, resumed);
     assert!(again.node.executed.is_empty());
@@ -951,7 +959,7 @@ fn the_fee_market_survives_a_restart_and_travels_in_a_snapshot() {
     // Before any block: the market the snapshot holds, not genesis's.
     assert_eq!(fresh.fee_status(), &expected);
     assert_eq!(fee_status(&mut fresh), expected);
-    assert_eq!(fresh.genesis_base_fee(), FLOOR);
+    assert_eq!(genesis_base_fee(&mut fresh), FLOOR);
     assert_eq!(delegations(&mut fresh, d1.address), expected_delegations.0);
     assert_eq!(status(&mut fresh), expected_staking);
     assert_eq!(fresh.account(&STAKING_ADDRESS).unwrap(), staked);

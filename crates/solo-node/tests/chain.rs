@@ -169,6 +169,7 @@ fn genesis_state_and_queries() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn transfers_make_blocks() {
     let alice = Wallet::new(1);
     let bob = Wallet::new(2);
@@ -218,9 +219,21 @@ fn transfers_make_blocks() {
     let a = node.account(&alice.address).unwrap();
     assert_eq!(a.balance, 100 * ETHER - 5 * ETHER - fee);
     assert_eq!(a.nonce, 1);
+    // The genesis block (spec 20 §3.1): a header of the genesis state, and
+    // block 1's parent.
+    let genesis = node.block_by_number(0).unwrap().expect("block 0");
+    assert_eq!(
+        (genesis.height, genesis.parent_hash, genesis.timestamp_ms),
+        (0, [0; 32], 0)
+    );
+    assert_eq!(genesis.state_root, node.genesis_state_root());
+    assert_eq!(genesis.gas_used, 0);
+    assert!(genesis.tx_hashes.0.is_empty());
+    let genesis_hash = solo_eth::header::block_hash(&genesis, keccak256);
+    assert_eq!(node.block_by_hash(&genesis_hash).unwrap(), Some(genesis));
     let header = node.block_by_number(1).unwrap().expect("block 1");
     assert_eq!(header.height, 1);
-    assert_eq!(header.parent_hash, [0; 32]);
+    assert_eq!(header.parent_hash, genesis_hash);
     assert_eq!(header.timestamp_ms, 1_000 + SLOT_MS);
     assert_eq!(header.tx_hashes.0, vec![hash]);
     assert_eq!(header.gas_used, 21_000);
