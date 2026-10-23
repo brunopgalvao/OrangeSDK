@@ -78,7 +78,12 @@ const INVOKE_RESERVE: u64 = 100_000;
 
 static ACCELERATED: AtomicBool = AtomicBool::new(false);
 static START: AtomicU64 = AtomicU64::new(0);
-static HASH: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HASH: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 static HASHED: AtomicBool = AtomicBool::new(false);
 
 /// The `keccak256` that `alloy-primitives` calls with its `native-keccak`
@@ -132,7 +137,10 @@ pub fn code_hash() -> Hash {
     if !HASHED.load(Ordering::Relaxed) {
         let hash = state::keccak256(MODULE);
         for (i, word) in hash.chunks_exact(8).enumerate() {
-            HASH[i].store(u64::from_le_bytes(word.try_into().unwrap_or_default()), Ordering::Relaxed);
+            HASH[i].store(
+                u64::from_le_bytes(word.try_into().unwrap_or_default()),
+                Ordering::Relaxed,
+            );
         }
         HASHED.store(true, Ordering::Relaxed);
     }
@@ -147,7 +155,9 @@ pub fn code_hash() -> Hash {
 /// budget.
 fn guard(op: u8, gas: u64) -> Result<(), PrecompileHalt> {
     let ratio = GUEST_RATIO[op as usize];
-    let used = START.load(Ordering::Relaxed).saturating_sub(gas_remaining());
+    let used = START
+        .load(Ordering::Relaxed)
+        .saturating_sub(gas_remaining());
     match used.checked_add(gas.saturating_mul(ratio)) {
         Some(total) if total <= PRECOMPILE_BUDGET => Ok(()),
         _ => Err(PrecompileHalt::OutOfGas),
@@ -165,7 +175,16 @@ fn accelerate(op: u8, operands: &[u8]) -> (u8, Vec<u8>) {
     input.extend_from_slice(operands);
     let limit = gas_remaining().saturating_sub(INVOKE_RESERVE);
     // SAFETY: valid pointers into our own buffers of the stated sizes; flag 2 is `static`.
-    let result = unsafe { host::__solo_import_invoke(hash.as_ptr(), [0u8; 32].as_ptr(), input.as_ptr(), input.len() as u32, limit, 2) };
+    let result = unsafe {
+        host::__solo_import_invoke(
+            hash.as_ptr(),
+            [0u8; 32].as_ptr(),
+            input.as_ptr(),
+            input.len() as u32,
+            limit,
+            2,
+        )
+    };
     if result.a0 != 0 {
         solo_guest::trap();
     }
@@ -183,7 +202,11 @@ fn accelerate(op: u8, operands: &[u8]) -> (u8, Vec<u8>) {
 }
 
 /// A result the host wrote, or `halt` for status 1.
-fn output<const N: usize>(op: u8, operands: &[u8], halt: PrecompileHalt) -> Result<[u8; N], PrecompileHalt> {
+fn output<const N: usize>(
+    op: u8,
+    operands: &[u8],
+    halt: PrecompileHalt,
+) -> Result<[u8; N], PrecompileHalt> {
     let (status, out) = accelerate(op, operands);
     match <[u8; N]>::try_from(out.as_slice()) {
         Ok(out) if status == 0 => Ok(out),
@@ -235,7 +258,11 @@ pub fn bn254_add(p1: &[u8], p2: &[u8]) -> Result<[u8; 64], PrecompileHalt> {
     if !accelerated() {
         return Guest.bn254_g1_add(p1, p2);
     }
-    output(op::BN254_ADD, &[p1, p2].concat(), PrecompileHalt::Bn254AffineGFailedToCreate)
+    output(
+        op::BN254_ADD,
+        &[p1, p2].concat(),
+        PrecompileHalt::Bn254AffineGFailedToCreate,
+    )
 }
 
 /// bn254 scalar multiplication (EIP-196).
@@ -244,7 +271,11 @@ pub fn bn254_mul(point: &[u8], scalar: &[u8]) -> Result<[u8; 64], PrecompileHalt
         guard(op::BN254_MUL, 6_000)?;
         return Guest.bn254_g1_mul(point, scalar);
     }
-    output(op::BN254_MUL, &[point, scalar].concat(), PrecompileHalt::Bn254AffineGFailedToCreate)
+    output(
+        op::BN254_MUL,
+        &[point, scalar].concat(),
+        PrecompileHalt::Bn254AffineGFailedToCreate,
+    )
 }
 
 /// bn254 pairing check (EIP-197).
@@ -253,8 +284,15 @@ pub fn bn254_pairing(pairs: &[(&[u8], &[u8])]) -> Result<bool, PrecompileHalt> {
         guard(op::BN254_PAIRING, 45_000 + 34_000 * pairs.len() as u64)?;
         return Guest.bn254_pairing_check(pairs);
     }
-    let operands: Vec<u8> = pairs.iter().flat_map(|(a, b)| a.iter().chain(b.iter()).copied()).collect();
-    check(op::BN254_PAIRING, &operands, PrecompileHalt::Bn254PairLength)
+    let operands: Vec<u8> = pairs
+        .iter()
+        .flat_map(|(a, b)| a.iter().chain(b.iter()).copied())
+        .collect();
+    check(
+        op::BN254_PAIRING,
+        &operands,
+        PrecompileHalt::Bn254PairLength,
+    )
 }
 
 /// BLAKE2 compression (EIP-152): within the bound in the guest, and cheaper
@@ -276,7 +314,12 @@ pub fn blake2f(rounds: u32, h: &mut [u64; 8], m: &[u64; 16], t: &[u64; 2], f: bo
 }
 
 /// KZG point evaluation (EIP-4844), after the versioned-hash check.
-pub fn kzg(z: &[u8; 32], y: &[u8; 32], commitment: &[u8; 48], proof: &[u8; 48]) -> Result<(), PrecompileHalt> {
+pub fn kzg(
+    z: &[u8; 32],
+    y: &[u8; 32],
+    commitment: &[u8; 48],
+    proof: &[u8; 48],
+) -> Result<(), PrecompileHalt> {
     if !accelerated() {
         guard(op::KZG, 50_000)?;
         return Guest.verify_kzg_proof(z, y, commitment, proof);
@@ -305,10 +348,19 @@ fn msm_gas(k: usize, table: &[u16], per_pair: u64) -> u64 {
 }
 
 /// BLS12-381 G1 multi-scalar multiplication (EIP-2537).
-pub fn g1_msm(pairs: &mut dyn Iterator<Item = Result<G1PointScalar, PrecompileHalt>>) -> Result<[u8; 96], PrecompileHalt> {
+pub fn g1_msm(
+    pairs: &mut dyn Iterator<Item = Result<G1PointScalar, PrecompileHalt>>,
+) -> Result<[u8; 96], PrecompileHalt> {
     let items: Vec<Result<G1PointScalar, PrecompileHalt>> = pairs.collect();
     if !accelerated() {
-        guard(op::G1_MSM, msm_gas(items.len(), &revm::precompile::bls12_381_const::DISCOUNT_TABLE_G1_MSM, 12_000))?;
+        guard(
+            op::G1_MSM,
+            msm_gas(
+                items.len(),
+                &revm::precompile::bls12_381_const::DISCOUNT_TABLE_G1_MSM,
+                12_000,
+            ),
+        )?;
         return Guest.bls12_381_g1_msm(&mut items.into_iter());
     }
     let mut operands = Vec::with_capacity(items.len() * 128);
@@ -317,7 +369,11 @@ pub fn g1_msm(pairs: &mut dyn Iterator<Item = Result<G1PointScalar, PrecompileHa
         g1(&point, &mut operands);
         operands.extend_from_slice(&scalar);
     }
-    output(op::G1_MSM, &operands, PrecompileHalt::Bls12381G1NotInSubgroup)
+    output(
+        op::G1_MSM,
+        &operands,
+        PrecompileHalt::Bls12381G1NotInSubgroup,
+    )
 }
 
 /// BLS12-381 G2 addition (EIP-2537).
@@ -333,10 +389,19 @@ pub fn g2_add(a: G2Point, b: G2Point) -> Result<[u8; 192], PrecompileHalt> {
 }
 
 /// BLS12-381 G2 multi-scalar multiplication (EIP-2537).
-pub fn g2_msm(pairs: &mut dyn Iterator<Item = Result<G2PointScalar, PrecompileHalt>>) -> Result<[u8; 192], PrecompileHalt> {
+pub fn g2_msm(
+    pairs: &mut dyn Iterator<Item = Result<G2PointScalar, PrecompileHalt>>,
+) -> Result<[u8; 192], PrecompileHalt> {
     let items: Vec<Result<G2PointScalar, PrecompileHalt>> = pairs.collect();
     if !accelerated() {
-        guard(op::G2_MSM, msm_gas(items.len(), &revm::precompile::bls12_381_const::DISCOUNT_TABLE_G2_MSM, 22_500))?;
+        guard(
+            op::G2_MSM,
+            msm_gas(
+                items.len(),
+                &revm::precompile::bls12_381_const::DISCOUNT_TABLE_G2_MSM,
+                22_500,
+            ),
+        )?;
         return Guest.bls12_381_g2_msm(&mut items.into_iter());
     }
     let mut operands = Vec::with_capacity(items.len() * 224);
@@ -345,7 +410,11 @@ pub fn g2_msm(pairs: &mut dyn Iterator<Item = Result<G2PointScalar, PrecompileHa
         g2(&point, &mut operands);
         operands.extend_from_slice(&scalar);
     }
-    output(op::G2_MSM, &operands, PrecompileHalt::Bls12381G2NotInSubgroup)
+    output(
+        op::G2_MSM,
+        &operands,
+        PrecompileHalt::Bls12381G2NotInSubgroup,
+    )
 }
 
 /// BLS12-381 pairing check (EIP-2537).
@@ -359,7 +428,11 @@ pub fn pairing(pairs: &[(G1Point, G2Point)]) -> Result<bool, PrecompileHalt> {
         g1(a, &mut operands);
         g2(b, &mut operands);
     }
-    check(op::PAIRING, &operands, PrecompileHalt::Bls12381G1NotInSubgroup)
+    check(
+        op::PAIRING,
+        &operands,
+        PrecompileHalt::Bls12381G1NotInSubgroup,
+    )
 }
 
 /// Mapping a base-field element to G1 (EIP-2537).
@@ -377,5 +450,9 @@ pub fn map_fp2(fp2: ([u8; 48], [u8; 48])) -> Result<[u8; 192], PrecompileHalt> {
         guard(op::MAP_FP2, 23_800)?;
         return Guest.bls12_381_fp2_to_g2(fp2);
     }
-    output(op::MAP_FP2, &[fp2.0, fp2.1].concat(), PrecompileHalt::NonCanonicalFp)
+    output(
+        op::MAP_FP2,
+        &[fp2.0, fp2.1].concat(),
+        PrecompileHalt::NonCanonicalFp,
+    )
 }

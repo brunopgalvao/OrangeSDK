@@ -54,14 +54,29 @@ use crate::evm::{Env, Message};
 
 fn run(case: Case, accelerated: bool) -> Outcome {
     let env = case.env;
-    let params = GenesisParams { allocations: case.allocations, ..GenesisParams::default() };
-    state::init(&Genesis { chain_id: env.chain_id, params: params.to_bytes(), ..Genesis::default() });
+    let params = GenesisParams {
+        allocations: case.allocations,
+        ..GenesisParams::default()
+    };
+    state::init(&Genesis {
+        chain_id: env.chain_id,
+        params: params.to_bytes(),
+        ..Genesis::default()
+    });
     precompiles::begin(accelerated);
     let Ok(signed) = tx::decode_signed(&case.tx, env.chain_id) else {
-        return Outcome { status: call_status::INVALID, gas_used: 0, logs: Seq(Vec::new()) };
+        return Outcome {
+            status: call_status::INVALID,
+            gas_used: 0,
+            logs: Seq(Vec::new()),
+        };
     };
     let tx = signed.tx;
-    let authorization_list = tx.authorization_list.into_iter().zip(signed.authorities).collect();
+    let authorization_list = tx
+        .authorization_list
+        .into_iter()
+        .zip(signed.authorities)
+        .collect();
     let message = Message {
         tx_type: tx.tx_type,
         caller: signed.from,
@@ -87,7 +102,11 @@ fn run(case: Case, accelerated: bool) -> Outcome {
         excess_blob_gas: env.excess_blob_gas,
     };
     let outcome = native::run_in(message, &env, true);
-    Outcome { status: outcome.status, gas_used: outcome.gas_used, logs: Seq(outcome.logs) }
+    Outcome {
+        status: outcome.status,
+        gas_used: outcome.gas_used,
+        logs: Seq(outcome.logs),
+    }
 }
 
 solo_guest::solo_export!(conformance_run, |input: &[u8]| -> Vec<u8> {
@@ -160,7 +179,10 @@ fn heap_check() -> Vec<u8> {
     let aligned = aligned && address(&*three) % 8192 == 0 && two.0[0] == 1 && three.0[0] == 2;
     drop((two, three));
 
-    [reuse, reuse_large, in_place, moved, aligned].into_iter().map(u8::from).collect()
+    [reuse, reuse_large, in_place, moved, aligned]
+        .into_iter()
+        .map(u8::from)
+        .collect()
 }
 
 solo_guest::solo_export!(heap_check, |_input: &[u8]| -> Vec<u8> { heap_check() });

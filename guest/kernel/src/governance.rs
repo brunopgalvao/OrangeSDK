@@ -14,8 +14,8 @@ use solo_abi::bridge_in::{LIGHT_CLIENT_ADDRESS, VERIFIER_ADDRESS};
 use solo_abi::chain::{Account, Log, UpgradeParams, ValidatorSet, call_status, reason};
 use solo_abi::codec::Seq;
 use solo_abi::governance::{
-    self as gov, ACTION_GAS, Ballot, Call, GOVERNANCE_ADDRESS, GOVERNANCE_GAS, GovernanceParams, GovernanceStatus, MAX_OPEN_PROPOSALS, OpenProposal,
-    Proposal, ProposalView, mode, status,
+    self as gov, ACTION_GAS, Ballot, Call, GOVERNANCE_ADDRESS, GOVERNANCE_GAS, GovernanceParams,
+    GovernanceStatus, MAX_OPEN_PROPOSALS, OpenProposal, Proposal, ProposalView, mode, status,
 };
 use solo_abi::modules::{Install, MODULE_ADDRESS};
 use solo_abi::types::{Address, Genesis, Hash, MigrateArgs, QueryResult};
@@ -23,7 +23,10 @@ use solo_abi::{Decode, Encode};
 use solo_ethlc::abi as lcabi;
 use solo_upgrade::action::{cancelled_log, proposed_log};
 use solo_upgrade::gates::{ended_epoch, epoch_of};
-use solo_upgrade::{Action, EnactedUpgrade, GateBook, MAX_CHUNKS, PendingUpgrade, Signal, UpgradeStatus, ValidatorSignal, keys, query};
+use solo_upgrade::{
+    Action, EnactedUpgrade, GateBook, MAX_CHUNKS, PendingUpgrade, Signal, UpgradeStatus,
+    ValidatorSignal, keys, query,
+};
 
 use crate::evm::{BlockFields, Message, Outcome};
 use crate::state;
@@ -55,7 +58,10 @@ pub fn mode() -> u8 {
 /// The proposal rules in force, as a `setParams` left them, else genesis's,
 /// under the mode in force.
 fn rules() -> GovernanceParams {
-    GovernanceParams { mode: mode(), ..state::get(gov::keys::PARAMS).unwrap_or_else(|| state::params().governance) }
+    GovernanceParams {
+        mode: mode(),
+        ..state::get(gov::keys::PARAMS).unwrap_or_else(|| state::params().governance)
+    }
 }
 
 /// The guardian under the stake track: the account a `setGuardian` named,
@@ -71,7 +77,11 @@ fn guardian() -> Address {
 /// (spec 18 §5): the key under the key track, the governance address under
 /// the stake track. It is what the modules' configuration names.
 pub fn authority() -> Address {
-    if mode() == mode::STAKE { GOVERNANCE_ADDRESS } else { key() }
+    if mode() == mode::STAKE {
+        GOVERNANCE_ADDRESS
+    } else {
+        key()
+    }
 }
 
 /// Whether `from` is the key acting under the key track.
@@ -91,9 +101,14 @@ fn workable(voting_blocks: u64, quorum_bps: u64) -> bool {
 /// chain never starts with them: an unknown mode, a quorum above the whole,
 /// or the stake track with rules that are not workable.
 pub fn init(genesis: &Genesis) {
-    let Ok(params) = solo_abi::chain::GenesisParams::from_bytes(&genesis.params) else { solo_guest::trap() };
+    let Ok(params) = solo_abi::chain::GenesisParams::from_bytes(&genesis.params) else {
+        solo_guest::trap()
+    };
     let g = &params.governance;
-    if g.mode > mode::STAKE || g.quorum_bps > 10_000 || (g.mode == mode::STAKE && !workable(g.voting_blocks, g.quorum_bps)) {
+    if g.mode > mode::STAKE
+        || g.quorum_bps > 10_000
+        || (g.mode == mode::STAKE && !workable(g.voting_blocks, g.quorum_bps))
+    {
         solo_guest::trap();
     }
 }
@@ -102,14 +117,22 @@ pub fn init(genesis: &Genesis) {
 fn validators() -> Vec<(Hash, u64)> {
     state::get_raw(b"meta/validators")
         .and_then(|b| ValidatorSet::from_bytes(&b).ok())
-        .map(|set| set.validators.0.into_iter().map(|v| (v.id, v.weight)).collect())
+        .map(|set| {
+            set.validators
+                .0
+                .into_iter()
+                .map(|v| (v.id, v.weight))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 /// The validator whose consensus key controls `address`, with its weight: a
 /// validator id is the hash an Ethereum address is the last 20 bytes of.
 fn validator_of(address: &Address) -> Option<(Hash, u64)> {
-    validators().into_iter().find(|(id, _)| id[12..] == address[..])
+    validators()
+        .into_iter()
+        .find(|(id, _)| id[12..] == address[..])
 }
 
 fn pending() -> Option<PendingUpgrade> {
@@ -146,7 +169,9 @@ fn debit(address: &Address, amount: u128) {
 // ---- Proposals in state ----
 
 fn open() -> Vec<OpenProposal> {
-    state::get::<Seq<OpenProposal>>(gov::keys::OPEN).map(|s| s.0).unwrap_or_default()
+    state::get::<Seq<OpenProposal>>(gov::keys::OPEN)
+        .map(|s| s.0)
+        .unwrap_or_default()
 }
 
 fn set_open(list: &[OpenProposal]) {
@@ -171,7 +196,9 @@ fn vote_of(id: u64, validator: &Hash) -> Option<bool> {
 }
 
 fn voters(id: u64) -> Vec<Hash> {
-    state::get::<Seq<Hash>>(&gov::keys::voters(id)).map(|s| s.0).unwrap_or_default()
+    state::get::<Seq<Hash>>(&gov::keys::voters(id))
+        .map(|s| s.0)
+        .unwrap_or_default()
 }
 
 /// The stake voting yes and no on `id`, and the stake of the whole current
@@ -217,7 +244,19 @@ fn close_voting(mut p: Proposal) {
         p.status = status::PASSED;
         (p.yes, p.no, p.total) = (yes, no, total);
         put_proposal(&p);
-        let list: Vec<OpenProposal> = open().into_iter().map(|o| if o.id == p.id { OpenProposal { id: o.id, due: p.expires_at } } else { o }).collect();
+        let list: Vec<OpenProposal> = open()
+            .into_iter()
+            .map(|o| {
+                if o.id == p.id {
+                    OpenProposal {
+                        id: o.id,
+                        due: p.expires_at,
+                    }
+                } else {
+                    o
+                }
+            })
+            .collect();
         set_open(&list);
     } else {
         prune(&p, gov::quorum(yes, no, total, rules.quorum_bps));
@@ -246,15 +285,23 @@ fn track_of(target: &Address, data: &[u8], switch: bool) -> Option<Track> {
             Some(Action::Cancel { .. }) => Some(Track::Fast),
             Some(_) => None,
             None => match Call::decode(data)? {
-                Call::SetGuardian { .. } | Call::SetParams { .. } | Call::SetFeeParams { .. } => Some(Track::Normal),
+                Call::SetGuardian { .. } | Call::SetParams { .. } | Call::SetFeeParams { .. } => {
+                    Some(Track::Normal)
+                }
                 Call::SetMode { .. } if switch => Some(Track::Normal),
                 _ => None,
             },
         },
         MODULE_ADDRESS => Install::decode(data).map(|_| Track::Normal),
-        LIGHT_CLIENT_ADDRESS if selector == lcabi::SET_CHECKPOINT || selector == lcabi::SET_DELAY => Some(Track::Normal),
+        LIGHT_CLIENT_ADDRESS
+            if selector == lcabi::SET_CHECKPOINT || selector == lcabi::SET_DELAY =>
+        {
+            Some(Track::Normal)
+        }
         VERIFIER_ADDRESS if selector == lcabi::PAUSE => Some(Track::Fast),
-        VERIFIER_ADDRESS if selector == lcabi::UNPAUSE || selector == lcabi::SET_RATE_LIMIT => Some(Track::Normal),
+        VERIFIER_ADDRESS if selector == lcabi::UNPAUSE || selector == lcabi::SET_RATE_LIMIT => {
+            Some(Track::Normal)
+        }
         _ => None,
     }
 }
@@ -266,7 +313,9 @@ fn apply_action(target: &Address, data: &[u8], block: BlockFields) -> Option<Vec
     let height = block.number;
     match *target {
         GOVERNANCE_ADDRESS => match Action::decode(data) {
-            Some(action @ (Action::Propose { .. } | Action::Cancel { .. })) => apply_upgrade(action, &[0; 20], height),
+            Some(action @ (Action::Propose { .. } | Action::Cancel { .. })) => {
+                apply_upgrade(action, &[0; 20], height)
+            }
             Some(_) => None,
             None => match Call::decode(data)? {
                 Call::SetGuardian { guardian } => {
@@ -274,21 +323,38 @@ fn apply_action(target: &Address, data: &[u8], block: BlockFields) -> Option<Vec
                     Some(vec![gov::guardian_log(&guardian)])
                 }
                 Call::SetMode { mode: m } => switch_to_stake(m),
-                Call::SetParams { voting_blocks, timelock_blocks, quorum_bps, deposit } => {
+                Call::SetParams {
+                    voting_blocks,
+                    timelock_blocks,
+                    quorum_bps,
+                    deposit,
+                } => {
                     if !workable(voting_blocks, quorum_bps) {
                         return None;
                     }
-                    let rules = GovernanceParams { mode: mode(), voting_blocks, timelock_blocks, quorum_bps, deposit };
+                    let rules = GovernanceParams {
+                        mode: mode(),
+                        voting_blocks,
+                        timelock_blocks,
+                        quorum_bps,
+                        deposit,
+                    };
                     state::set(gov::keys::PARAMS, &rules);
                     Some(vec![gov::params_log(&rules)])
                 }
                 // The fee market's parameters, from the next block on (spec 23 §5).
-                Call::SetFeeParams { params } => crate::fees::set_params(&params).then(|| vec![gov::fee_params_log(&params)]),
+                Call::SetFeeParams { params } => {
+                    crate::fees::set_params(&params).then(|| vec![gov::fee_params_log(&params)])
+                }
                 _ => None,
             },
         },
-        MODULE_ADDRESS => Install::decode(data).and_then(|install| crate::modules::install_action(&install, height)).map(|log| vec![log]),
-        LIGHT_CLIENT_ADDRESS | VERIFIER_ADDRESS => crate::bridge::govern(target, data, block, ACTION_GAS).map(|()| Vec::new()),
+        MODULE_ADDRESS => Install::decode(data)
+            .and_then(|install| crate::modules::install_action(&install, height))
+            .map(|log| vec![log]),
+        LIGHT_CLIENT_ADDRESS | VERIFIER_ADDRESS => {
+            crate::bridge::govern(target, data, block, ACTION_GAS).map(|()| Vec::new())
+        }
         _ => None,
     }
 }
@@ -298,13 +364,20 @@ fn apply_action(target: &Address, data: &[u8], block: BlockFields) -> Option<Vec
 /// their governance, and nothing but a kernel upgrade changes the mode again.
 fn switch_to_stake(to: u8) -> Option<Vec<Log>> {
     let rules = rules();
-    if to != mode::STAKE || mode() != mode::KEY || !workable(rules.voting_blocks, rules.quorum_bps) {
+    if to != mode::STAKE || mode() != mode::KEY || !workable(rules.voting_blocks, rules.quorum_bps)
+    {
         return None;
     }
     state::set(gov::keys::MODE, &mode::STAKE);
     if state::get_raw(gov::keys::PARAMS).is_some() {
         // Rules a `setParams` recorded under the key now read as the stake track's.
-        state::set(gov::keys::PARAMS, &GovernanceParams { mode: mode::STAKE, ..rules });
+        state::set(
+            gov::keys::PARAMS,
+            &GovernanceParams {
+                mode: mode::STAKE,
+                ..rules
+            },
+        );
     }
     if state::get_raw(gov::keys::GUARDIAN).is_none() {
         state::set(gov::keys::GUARDIAN, &key());
@@ -336,9 +409,12 @@ fn request_of(s: &Signed, height: u64) -> Option<Request> {
         return None;
     }
     match s.tx.to? {
-        MODULE_ADDRESS if s.tx.value == 0 && key_acts(&s.from) => Install::decode(&s.tx.input).map(Request::Install),
+        MODULE_ADDRESS if s.tx.value == 0 && key_acts(&s.from) => {
+            Install::decode(&s.tx.input).map(Request::Install)
+        }
         GOVERNANCE_ADDRESS => match Action::decode(&s.tx.input) {
-            Some(action) => (s.tx.value == 0 && upgrade_allowed(&action, &s.from)).then_some(Request::Upgrade(action)),
+            Some(action) => (s.tx.value == 0 && upgrade_allowed(&action, &s.from))
+                .then_some(Request::Upgrade(action)),
             None => {
                 let call = Call::decode(&s.tx.input)?;
                 if s.tx.gas_limit < s.tx.min_gas_limit().saturating_add(GOVERNANCE_GAS) {
@@ -357,7 +433,9 @@ fn request_of(s: &Signed, height: u64) -> Option<Request> {
 /// proposals); `signal` any validator while gate epochs exist.
 fn upgrade_allowed(action: &Action, from: &Address) -> bool {
     match action {
-        Action::Stage { .. } => key_acts(from) || (mode() == mode::STAKE && validator_of(from).is_some()),
+        Action::Stage { .. } => {
+            key_acts(from) || (mode() == mode::STAKE && validator_of(from).is_some())
+        }
         Action::Propose { .. } | Action::Cancel { .. } => key_acts(from),
         Action::Signal { .. } => params().epoch_blocks != 0 && validator_of(from).is_some(),
     }
@@ -370,7 +448,9 @@ fn call_allowed(call: &Call, s: &Signed, height: u64) -> bool {
     if mode() == mode::KEY {
         // Under the key: the key submits, and its submission executes at once.
         return match call {
-            Call::Submit { target, data } => value == 0 && key_acts(from) && track_of(target, data, true).is_some(),
+            Call::Submit { target, data } => {
+                value == 0 && key_acts(from) && track_of(target, data, true).is_some()
+            }
             _ => false,
         };
     }
@@ -383,11 +463,31 @@ fn call_allowed(call: &Call, s: &Signed, height: u64) -> bool {
             };
             bonded && track_of(target, data, false).is_some() && open().len() < MAX_OPEN_PROPOSALS
         }
-        Call::Vote { id, .. } => value == 0 && validator_of(from).is_some() && proposal(*id).is_some_and(|p| p.status == status::VOTING && height <= p.voting_end),
-        Call::Execute { id } => value == 0 && proposal(*id).is_some_and(|p| p.status == status::PASSED && (p.executable_at..=p.expires_at).contains(&height)),
-        Call::Veto { id } => value == 0 && guardian_acts(from) && proposal(*id).is_some_and(|p| vetoable(&p)),
-        Call::Pause { target } => value == 0 && guardian_acts(from) && *target == VERIFIER_ADDRESS && crate::bridge::governed(target),
-        Call::SetGuardian { .. } | Call::SetMode { .. } | Call::SetParams { .. } | Call::SetFeeParams { .. } => false,
+        Call::Vote { id, .. } => {
+            value == 0
+                && validator_of(from).is_some()
+                && proposal(*id)
+                    .is_some_and(|p| p.status == status::VOTING && height <= p.voting_end)
+        }
+        Call::Execute { id } => {
+            value == 0
+                && proposal(*id).is_some_and(|p| {
+                    p.status == status::PASSED && (p.executable_at..=p.expires_at).contains(&height)
+                })
+        }
+        Call::Veto { id } => {
+            value == 0 && guardian_acts(from) && proposal(*id).is_some_and(|p| vetoable(&p))
+        }
+        Call::Pause { target } => {
+            value == 0
+                && guardian_acts(from)
+                && *target == VERIFIER_ADDRESS
+                && crate::bridge::governed(target)
+        }
+        Call::SetGuardian { .. }
+        | Call::SetMode { .. }
+        | Call::SetParams { .. }
+        | Call::SetFeeParams { .. } => false,
     }
 }
 
@@ -401,7 +501,8 @@ fn guardian_acts(from: &Address) -> bool {
 /// guardian that vetoes, and a guardian never protects what a majority
 /// stops on the fast track.
 fn vetoable(p: &Proposal) -> bool {
-    let names_guardian = p.target == GOVERNANCE_ADDRESS && matches!(Call::decode(&p.data), Some(Call::SetGuardian { .. }));
+    let names_guardian = p.target == GOVERNANCE_ADDRESS
+        && matches!(Call::decode(&p.data), Some(Call::SetGuardian { .. }));
     !p.fast_track && !names_guardian
 }
 
@@ -421,12 +522,16 @@ fn code_of(target: &Address, data: &[u8]) -> Option<Hash> {
 /// chunks that hash to `code_hash`, or for an install a module already in
 /// state under its hash.
 fn code_complete(code_hash: &Hash, module: bool) -> bool {
-    (module && state::get_raw(&state::code_key(code_hash)).is_some()) || assemble(code_hash).is_some_and(|(code, _)| state::keccak256(&code) == *code_hash)
+    (module && state::get_raw(&state::code_key(code_hash)).is_some())
+        || assemble(code_hash).is_some_and(|(code, _)| state::keccak256(&code) == *code_hash)
 }
 
 /// Whether an open proposal names `code_hash`: its code is frozen while one does.
 fn claimed(code_hash: &Hash) -> bool {
-    open().into_iter().filter_map(|o| proposal(o.id)).any(|p| code_of(&p.target, &p.data) == Some(*code_hash))
+    open()
+        .into_iter()
+        .filter_map(|o| proposal(o.id))
+        .any(|p| code_of(&p.target, &p.data) == Some(*code_hash))
 }
 
 /// Admission: a transaction to the governance or module address must be
@@ -443,7 +548,11 @@ pub fn admit(s: &Signed) -> Result<(), u32> {
             return Err(reason::GAS_TOO_LOW);
         }
     }
-    if system && request_of(s, next).is_none() { Err(reason::SYSTEM_ACTION) } else { Ok(()) }
+    if system && request_of(s, next).is_none() {
+        Err(reason::SYSTEM_ACTION)
+    } else {
+        Ok(())
+    }
 }
 
 // ---- Execution ----
@@ -461,13 +570,21 @@ pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Out
         return crate::native::run(message, block, true);
     }
     let Some(request) = request_of(s, height) else {
-        return Outcome { status: call_status::INVALID, gas_used: 0, output: Vec::new(), logs: Vec::new(), contract: None };
+        return Outcome {
+            status: call_status::INVALID,
+            gas_used: 0,
+            output: Vec::new(),
+            logs: Vec::new(),
+            contract: None,
+        };
     };
     let mut outcome = crate::native::run(message, block, true);
     if outcome.status == call_status::SUCCESS {
         let applied = match request {
             Request::Upgrade(action) => apply_upgrade(action, &s.from, height),
-            Request::Install(install) => crate::modules::install_action(&install, height).map(|log| vec![log]),
+            Request::Install(install) => {
+                crate::modules::install_action(&install, height).map(|log| vec![log])
+            }
             Request::Call(call) => {
                 // The governance surcharge, paid like every fee (spec 13 §9.9).
                 outcome.gas_used += GOVERNANCE_GAS;
@@ -496,12 +613,19 @@ pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Out
 /// if its state checks fail.
 fn apply_upgrade(action: Action, from: &Address, height: u64) -> Option<Vec<Log>> {
     match action {
-        Action::Stage { code_hash, index, chunk } => {
+        Action::Stage {
+            code_hash,
+            index,
+            chunk,
+        } => {
             // Frozen code: the pending upgrade's, every enacted kernel's, and
             // what an open proposal names. And a code hash belongs to the
             // account that staged its first chunk, so nobody spoils another's
             // upload by writing a chunk of their own under it (spec 13 §3).
-            if pending().is_some_and(|p| p.code_hash == code_hash) || enacted(&code_hash) || claimed(&code_hash) {
+            if pending().is_some_and(|p| p.code_hash == code_hash)
+                || enacted(&code_hash)
+                || claimed(&code_hash)
+            {
                 return None;
             }
             match state::get::<Address>(&keys::staker(&code_hash)) {
@@ -512,10 +636,18 @@ fn apply_upgrade(action: Action, from: &Address, height: u64) -> Option<Vec<Log>
             state::set_raw(&keys::chunk(&code_hash, index), &chunk);
             Some(Vec::new())
         }
-        Action::Propose { code_hash, activation_height, required_gates } => {
+        Action::Propose {
+            code_hash,
+            activation_height,
+            required_gates,
+        } => {
             let earliest = height.saturating_add(params().min_delay.max(1));
             // Block `H + 1` must exist, and a kernel the chain already ran never comes back.
-            if pending().is_some() || activation_height < earliest || activation_height == u64::MAX || enacted(&code_hash) {
+            if pending().is_some()
+                || activation_height < earliest
+                || activation_height == u64::MAX
+                || enacted(&code_hash)
+            {
                 return None;
             }
             let (code, chunks) = assemble(&code_hash)?;
@@ -523,8 +655,22 @@ fn apply_upgrade(action: Action, from: &Address, height: u64) -> Option<Vec<Log>
                 return None;
             }
             let size = u32::try_from(code.len()).ok()?;
-            state::set(keys::PENDING, &PendingUpgrade { code_hash, activation_height, required_gates, size, chunks, proposed_at: height });
-            Some(vec![proposed_log(&code_hash, activation_height, required_gates)])
+            state::set(
+                keys::PENDING,
+                &PendingUpgrade {
+                    code_hash,
+                    activation_height,
+                    required_gates,
+                    size,
+                    chunks,
+                    proposed_at: height,
+                },
+            );
+            Some(vec![proposed_log(
+                &code_hash,
+                activation_height,
+                required_gates,
+            )])
         }
         Action::Cancel { code_hash } => {
             pending().filter(|p| p.code_hash == code_hash)?;
@@ -533,7 +679,13 @@ fn apply_upgrade(action: Action, from: &Address, height: u64) -> Option<Vec<Log>
         }
         Action::Signal { features } => {
             let (id, _) = validator_of(from)?;
-            state::set(&keys::signal(&id), &Signal { epoch: epoch_of(height, params().epoch_blocks), features });
+            state::set(
+                &keys::signal(&id),
+                &Signal {
+                    epoch: epoch_of(height, params().epoch_blocks),
+                    features,
+                },
+            );
             Some(Vec::new())
         }
     }
@@ -544,7 +696,9 @@ fn apply_upgrade(action: Action, from: &Address, height: u64) -> Option<Vec<Log>
 fn apply_call(call: Call, s: &Signed, block: BlockFields) -> Option<Vec<Log>> {
     let height = block.number;
     match call {
-        Call::Submit { target, data } if mode() == mode::KEY => enact(&s.from, &target, &data, block),
+        Call::Submit { target, data } if mode() == mode::KEY => {
+            enact(&s.from, &target, &data, block)
+        }
         Call::Submit { target, data } => {
             // What a proposal runs code of is complete when the proposal
             // opens, and frozen from then on, so validators vote on the code
@@ -561,8 +715,13 @@ fn apply_call(call: Call, s: &Signed, block: BlockFields) -> Option<Vec<Log>> {
             let (executable_at, expires_at) = if fast {
                 (0, voting_end)
             } else {
-                let first = voting_end.saturating_add(rules.timelock_blocks).saturating_add(1);
-                (first, first.saturating_add(rules.voting_blocks).saturating_sub(1))
+                let first = voting_end
+                    .saturating_add(rules.timelock_blocks)
+                    .saturating_add(1);
+                (
+                    first,
+                    first.saturating_add(rules.voting_blocks).saturating_sub(1),
+                )
             };
             let p = Proposal {
                 id,
@@ -582,7 +741,10 @@ fn apply_call(call: Call, s: &Signed, block: BlockFields) -> Option<Vec<Log>> {
             };
             put_proposal(&p);
             let mut list = open();
-            list.push(OpenProposal { id, due: voting_end });
+            list.push(OpenProposal {
+                id,
+                due: voting_end,
+            });
             set_open(&list);
             state::set(gov::keys::NEXT, &(id + 1));
             Some(vec![gov::submitted_log(&p)])
@@ -619,7 +781,10 @@ fn apply_call(call: Call, s: &Signed, block: BlockFields) -> Option<Vec<Log>> {
             Some(vec![gov::vetoed_log(id)])
         }
         Call::Pause { target } => enact(&s.from, &target, &lcabi::PAUSE, block),
-        Call::SetGuardian { .. } | Call::SetMode { .. } | Call::SetParams { .. } | Call::SetFeeParams { .. } => None,
+        Call::SetGuardian { .. }
+        | Call::SetMode { .. }
+        | Call::SetParams { .. }
+        | Call::SetFeeParams { .. } => None,
     }
 }
 
@@ -637,7 +802,9 @@ fn assemble(code_hash: &Hash) -> Option<(Vec<u8>, u32)> {
     let mut code = Vec::new();
     let mut chunks = 0;
     while chunks < MAX_CHUNKS {
-        let Some(chunk) = state::get_raw(&keys::chunk(code_hash, chunks)) else { break };
+        let Some(chunk) = state::get_raw(&keys::chunk(code_hash, chunks)) else {
+            break;
+        };
         code.extend_from_slice(&chunk);
         chunks += 1;
     }
@@ -657,7 +824,9 @@ pub fn end_block(height: u64) {
         if entry.due != height {
             continue;
         }
-        let Some(p) = proposal(entry.id) else { continue };
+        let Some(p) = proposal(entry.id) else {
+            continue;
+        };
         if p.status == status::VOTING {
             close_voting(p);
         } else {
@@ -676,7 +845,10 @@ pub fn end_block(height: u64) {
                 signals.push((weight, signal.features));
             }
         }
-        state::set(keys::BOOK, &book().end_epoch(epoch, p.epoch_blocks, &signals, total));
+        state::set(
+            keys::BOOK,
+            &book().end_epoch(epoch, p.epoch_blocks, &signals, total),
+        );
     }
     if let Some(up) = pending()
         && up.activation_height == height
@@ -690,8 +862,22 @@ pub fn end_block(height: u64) {
 // ---- Queries ----
 
 fn upgrade_status() -> UpgradeStatus {
-    let validators = validators().into_iter().map(|(id, weight)| ValidatorSignal { id, weight, signal: state::get(&keys::signal(&id)) }).collect();
-    UpgradeStatus { version: KERNEL_VERSION, params: params(), pending: pending(), enacted: state::get(keys::ENACTED), gates: book(), validators: Seq(validators) }
+    let validators = validators()
+        .into_iter()
+        .map(|(id, weight)| ValidatorSignal {
+            id,
+            weight,
+            signal: state::get(&keys::signal(&id)),
+        })
+        .collect();
+    UpgradeStatus {
+        version: KERNEL_VERSION,
+        params: params(),
+        pending: pending(),
+        enacted: state::get(keys::ENACTED),
+        gates: book(),
+        validators: Seq(validators),
+    }
 }
 
 /// An open proposal with its live tally and every vote.
@@ -706,15 +892,36 @@ fn view(p: Proposal) -> ProposalView {
             } else {
                 no = no.saturating_add(weight);
             }
-            votes.push(Ballot { validator, support, weight });
+            votes.push(Ballot {
+                validator,
+                support,
+                weight,
+            });
         }
     }
-    ProposalView { proposal: p, yes, no, total, votes: Seq(votes) }
+    ProposalView {
+        proposal: p,
+        yes,
+        no,
+        total,
+        votes: Seq(votes),
+    }
 }
 
 fn governance_status() -> GovernanceStatus {
-    let proposals = open().into_iter().filter_map(|o| proposal(o.id)).map(view).collect();
-    GovernanceStatus { mode: mode(), key: key(), guardian: guardian(), params: rules(), next_id: state::get(gov::keys::NEXT).unwrap_or(1), proposals: Seq(proposals) }
+    let proposals = open()
+        .into_iter()
+        .filter_map(|o| proposal(o.id))
+        .map(view)
+        .collect();
+    GovernanceStatus {
+        mode: mode(),
+        key: key(),
+        guardian: guardian(),
+        params: rules(),
+        next_id: state::get(gov::keys::NEXT).unwrap_or(1),
+        proposals: Seq(proposals),
+    }
 }
 
 /// The upgrade and governance queries; status 3 for any other method.
@@ -724,15 +931,36 @@ pub fn query(method: &str, params: &[u8]) -> QueryResult {
         query::KERNEL_VERSION => ok(KERNEL_VERSION.to_bytes()),
         query::STATUS => ok(upgrade_status().to_bytes()),
         query::CODE => match Hash::from_bytes(params) {
-            Ok(code_hash) => assemble(&code_hash).map_or(QueryResult { status: 1, body: Vec::new() }, |(code, _)| ok(code.to_bytes())),
-            Err(_) => QueryResult { status: 2, body: Vec::new() },
+            Ok(code_hash) => assemble(&code_hash).map_or(
+                QueryResult {
+                    status: 1,
+                    body: Vec::new(),
+                },
+                |(code, _)| ok(code.to_bytes()),
+            ),
+            Err(_) => QueryResult {
+                status: 2,
+                body: Vec::new(),
+            },
         },
         gov::query::GOVERNANCE => ok(governance_status().to_bytes()),
         gov::query::PROPOSAL => match u64::from_bytes(params) {
-            Ok(id) => proposal(id).map_or(QueryResult { status: 1, body: Vec::new() }, |p| ok(view(p).to_bytes())),
-            Err(_) => QueryResult { status: 2, body: Vec::new() },
+            Ok(id) => proposal(id).map_or(
+                QueryResult {
+                    status: 1,
+                    body: Vec::new(),
+                },
+                |p| ok(view(p).to_bytes()),
+            ),
+            Err(_) => QueryResult {
+                status: 2,
+                body: Vec::new(),
+            },
         },
-        _ => QueryResult { status: 3, body: Vec::new() },
+        _ => QueryResult {
+            status: 3,
+            body: Vec::new(),
+        },
     }
 }
 
@@ -742,12 +970,21 @@ pub fn query(method: &str, params: &[u8]) -> QueryResult {
 /// upgrade in chain state, from chain state alone: the driver state differs
 /// between nodes and must not reach the commitment.
 pub fn migrate(args: &MigrateArgs) {
-    let Some(up) = pending() else { solo_guest::trap() };
-    if args.from_version.checked_add(1) != Some(KERNEL_VERSION) || state::height() != Some(up.activation_height) {
+    let Some(up) = pending() else {
+        solo_guest::trap()
+    };
+    if args.from_version.checked_add(1) != Some(KERNEL_VERSION)
+        || state::height() != Some(up.activation_height)
+    {
         solo_guest::trap();
     }
     state::delete(keys::PENDING);
-    let enacted = EnactedUpgrade { code_hash: up.code_hash, height: up.activation_height, from_version: args.from_version, to_version: KERNEL_VERSION };
+    let enacted = EnactedUpgrade {
+        code_hash: up.code_hash,
+        height: up.activation_height,
+        from_version: args.from_version,
+        to_version: KERNEL_VERSION,
+    };
     state::set(&keys::kernel(&up.code_hash), &enacted);
     state::set(keys::ENACTED, &enacted);
 }

@@ -39,21 +39,29 @@ pub fn set_params(p: &FeeParams) -> bool {
 /// parent at the floor that used nothing.
 pub fn next_base_fee() -> u64 {
     let p = params();
-    let parent = state::height().and_then(state::block_by_number).map_or((p.min_base_fee, 0), |h| (h.base_fee, h.gas_used));
+    let parent = state::height()
+        .and_then(state::block_by_number)
+        .map_or((p.min_base_fee, 0), |h| (h.base_fee, h.gas_used));
     p.next_base_fee(parent.0, parent.1, BLOCK_GAS_LIMIT)
 }
 
 /// The base fee of the executed head: what a call query sees as `BASEFEE`,
 /// as geth's `eth_call` at `latest` does; the floor before the first block.
 pub fn head_base_fee() -> u64 {
-    state::height().and_then(state::block_by_number).map_or_else(|| params().min_base_fee, |h| h.base_fee)
+    state::height()
+        .and_then(state::block_by_number)
+        .map_or_else(|| params().min_base_fee, |h| h.base_fee)
 }
 
 /// The block beneficiary (spec 23 §4): the fee vault on a chain with
 /// staking, whose balance the end of the block moves to the reward pool;
 /// the zero address, where nobody spends, without.
 pub fn beneficiary() -> Address {
-    if crate::staking::enabled() { FEE_VAULT } else { [0; 20] }
+    if crate::staking::enabled() {
+        FEE_VAULT
+    } else {
+        [0; 20]
+    }
 }
 
 fn credit(address: &Address, amount: u128) {
@@ -87,7 +95,10 @@ pub fn pay_surcharge(s: &Signed, gas: u64, block: BlockFields) {
 /// began, else burned, which the EVM already did by crediting nobody.
 pub fn route_base_fee(block: BlockFields, gas_used: u64) {
     if block.treasury != [0; 20] && block.base_fee != 0 && gas_used != 0 {
-        credit(&block.treasury, u128::from(gas_used) * u128::from(block.base_fee));
+        credit(
+            &block.treasury,
+            u128::from(gas_used) * u128::from(block.base_fee),
+        );
     }
 }
 
@@ -110,5 +121,9 @@ pub fn sweep() {
 
 /// The `fees` query (spec 23 §7).
 pub fn status() -> FeeStatus {
-    FeeStatus { params: params(), base_fee: next_base_fee(), pool: crate::staking::pool() }
+    FeeStatus {
+        params: params(),
+        base_fee: next_base_fee(),
+        pool: crate::staking::pool(),
+    }
 }

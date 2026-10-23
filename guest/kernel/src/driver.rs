@@ -12,15 +12,17 @@
 
 use alloc::vec::Vec;
 
+use solo_abi::bridge::FinalityProof;
 use solo_abi::chain::consensus::{
-    EQUIVOCATION_PENALTY, KEY_ROLE, KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE, MAX_BACKOFF, MAX_EVIDENCE, TOPIC, identity_preimage, leader,
-    propose_timer, signing_preimage, timeout_timer, timer_view, view_timeout_ms,
+    EQUIVOCATION_PENALTY, KEY_ROLE, KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE, MAX_BACKOFF,
+    MAX_EVIDENCE, TOPIC, identity_preimage, leader, propose_timer, signing_preimage, timeout_timer,
+    timer_view, view_timeout_ms,
 };
 use solo_abi::chain::{
-    BLOCK_GAS_LIMIT, BlockHeader, Certificate, ConsensusMessage, Evidence, GenesisParams, Participation, Proposal, Signature, SignedHash, SignedVote, SimplexState,
-    SyncRequest, SyncResponse, keys,
+    BLOCK_GAS_LIMIT, BlockHeader, Certificate, ConsensusMessage, Evidence, GenesisParams,
+    Participation, Proposal, Signature, SignedHash, SignedVote, SimplexState, SyncRequest,
+    SyncResponse, keys,
 };
-use solo_abi::bridge::FinalityProof;
 use solo_abi::codec::Seq;
 use solo_abi::staking::{MAX_DKG, PartialShare, epoch_end, epoch_of, first_view, view_epoch};
 use solo_abi::types::{Block, Effect, Hash, Input, MigrateArgs};
@@ -62,7 +64,9 @@ const ZERO: Hash = [0; 32];
 /// The anchor a leader puts in its proposal (spec 08 §5): its executed
 /// head and that block's state root, or none before the first block.
 fn anchor() -> (u64, Hash) {
-    state::height().and_then(|h| state::block_by_number(h).map(|b| (h, b.state_root))).unwrap_or((0, ZERO))
+    state::height()
+        .and_then(|h| state::block_by_number(h).map(|b| (h, b.state_root)))
+        .unwrap_or((0, ZERO))
 }
 
 /// Whether a shareholder signs the certificate of `p` (spec 08 §6a): its
@@ -73,7 +77,8 @@ fn anchored(p: &Proposal) -> bool {
     if p.anchor_height == 0 {
         return p.anchor_root == ZERO;
     }
-    p.anchor_height < p.height && state::block_by_number(p.anchor_height).is_some_and(|b| b.state_root == p.anchor_root)
+    p.anchor_height < p.height
+        && state::block_by_number(p.anchor_height).is_some_and(|b| b.state_root == p.anchor_root)
 }
 
 /// `query::FINALITY_PROOF` (spec 17 §5): the threshold certificate this
@@ -82,12 +87,18 @@ pub fn finality_proof(height: u64) -> Option<FinalityProof> {
     let certificate = persist::get_raw(&key(b"bcert/", &[&height.to_le_bytes()]))?;
     let hash = solo_abi::rotation::threshold_certificate(&certificate)?.block_hash;
     let proposal = persist::get_raw(&key(b"prop/", &[&hash]))?;
-    Some(FinalityProof { certificate, proposal })
+    Some(FinalityProof {
+        certificate,
+        proposal,
+    })
 }
 
 /// The persisted driver state.
 pub fn load() -> SimplexState {
-    persist::get(STATE_KEY).unwrap_or(SimplexState { view: 1, ..SimplexState::default() })
+    persist::get(STATE_KEY).unwrap_or(SimplexState {
+        view: 1,
+        ..SimplexState::default()
+    })
 }
 
 fn save(s: &SimplexState) {
@@ -154,7 +165,15 @@ impl Ctx {
         let mut s = load();
         s.now_ms = persist::time_now();
         let params = state::params();
-        let mut c = Ctx { s, chain_id: state::chain_id(), params, epoch: 0, set: Vec::new(), effects: Vec::new(), peer: None };
+        let mut c = Ctx {
+            s,
+            chain_id: state::chain_id(),
+            params,
+            epoch: 0,
+            set: Vec::new(),
+            effects: Vec::new(),
+            peer: None,
+        };
         c.load_set();
         c
     }
@@ -164,7 +183,11 @@ impl Ctx {
     /// of the next block to execute, whose set it knows.
     fn load_set(&mut self) {
         let blocks = self.params.staking.epoch_blocks;
-        self.epoch = if blocks == 0 { 0 } else { view_epoch(self.s.view).min(epoch_of(state::height().unwrap_or(0) + 1, blocks)) };
+        self.epoch = if blocks == 0 {
+            0
+        } else {
+            view_epoch(self.s.view).min(epoch_of(state::height().unwrap_or(0) + 1, blocks))
+        };
         self.set = staking::set_entries_in(blocks, self.epoch).unwrap_or_default();
     }
 
@@ -174,7 +197,11 @@ impl Ctx {
 
     /// The epoch of `view`: its high 32 bits with staking, always 0 without.
     fn view_epoch(&self, view: u64) -> u64 {
-        if self.params.staking.epoch_blocks == 0 { 0 } else { view_epoch(view) }
+        if self.params.staking.epoch_blocks == 0 {
+            0
+        } else {
+            view_epoch(view)
+        }
     }
 
     /// The last height of `epoch`, with staking.
@@ -186,13 +213,18 @@ impl Ctx {
     /// Whether `p` extends its epoch's last block: a suffix proposal, which
     /// only finalizes that block and is never executed (spec 08 §3a).
     fn is_suffix(&self, p: &Proposal) -> bool {
-        self.epoch_end(self.view_epoch(p.view)).is_some_and(|end| p.height > end)
+        self.epoch_end(self.view_epoch(p.view))
+            .is_some_and(|end| p.height > end)
     }
 
     /// The validator set of the epoch of `view`, if this node knows it.
     fn set_for(&self, view: u64) -> Option<Set> {
         let epoch = self.view_epoch(view);
-        if epoch == self.epoch { Some(self.set.clone()) } else { staking::set_entries_in(self.params.staking.epoch_blocks, epoch) }
+        if epoch == self.epoch {
+            Some(self.set.clone())
+        } else {
+            staking::set_entries_in(self.params.staking.epoch_blocks, epoch)
+        }
     }
 
     fn quorum(&self, view: u64, votes: &[SignedVote]) -> bool {
@@ -200,7 +232,9 @@ impl Ctx {
     }
 
     fn is_leader(&self, view: u64) -> bool {
-        self.n() > 0 && self.view_epoch(view) == self.epoch && self.s.me == Some(leader(view, self.n()) as u32)
+        self.n() > 0
+            && self.view_epoch(view) == self.epoch
+            && self.s.me == Some(leader(view, self.n()) as u32)
     }
 
     fn message_hash(&self, kind: u8, view: u64, hash: &Hash) -> Hash {
@@ -208,7 +242,8 @@ impl Ctx {
     }
 
     fn signer(&self, kind: u8, view: u64, hash: &Hash, sig: &Signature) -> Option<Hash> {
-        tx::recover_pubkey(&self.message_hash(kind, view, hash), &sig.0).map(|pubkey| state::keccak256(&pubkey))
+        tx::recover_pubkey(&self.message_hash(kind, view, hash), &sig.0)
+            .map(|pubkey| state::keccak256(&pubkey))
     }
 
     /// Who signed `kind(view, hash)`, as an index into the set of the view's epoch.
@@ -236,7 +271,10 @@ impl Ctx {
     }
 
     fn broadcast(&mut self, m: &ConsensusMessage) {
-        self.effects.push(Effect::Broadcast { topic: TOPIC, payload: m.to_bytes() });
+        self.effects.push(Effect::Broadcast {
+            topic: TOPIC,
+            payload: m.to_bytes(),
+        });
     }
 
     fn proposal(hash: &Hash) -> Option<Proposal> {
@@ -266,7 +304,11 @@ impl Ctx {
     fn add_partial(view: u64, hash: &Hash, partial: PartialShare) {
         let k = key(b"part/", &[&view.to_le_bytes(), hash]);
         let mut partials: Seq<PartialShare> = persist::get(&k).unwrap_or_default();
-        if !partials.0.iter().any(|p| (p.key_set, p.index) == (partial.key_set, partial.index)) {
+        if !partials
+            .0
+            .iter()
+            .any(|p| (p.key_set, p.index) == (partial.key_set, partial.index))
+        {
             partials.0.push(partial);
             persist::set(&k, &partials);
         }
@@ -275,8 +317,12 @@ impl Ctx {
     fn enter_view(&mut self, view: u64) {
         if view > self.s.view {
             // The old view's timers are stale; the host need not keep them.
-            self.effects.push(Effect::CancelTimer { timer_id: timeout_timer(self.s.view) });
-            self.effects.push(Effect::CancelTimer { timer_id: propose_timer(self.s.view) });
+            self.effects.push(Effect::CancelTimer {
+                timer_id: timeout_timer(self.s.view),
+            });
+            self.effects.push(Effect::CancelTimer {
+                timer_id: propose_timer(self.s.view),
+            });
         }
         self.s.view = view;
         self.s.voted = false;
@@ -290,15 +336,19 @@ impl Ctx {
     /// certificate, and messages kept for the new epoch are taken up again.
     /// A node whose view is already past the first view keeps it.
     fn enter_epoch(&mut self, epoch: u64) {
-        let Some(set) = staking::set_entries_in(self.params.staking.epoch_blocks, epoch) else { return };
+        let Some(set) = staking::set_entries_in(self.params.staking.epoch_blocks, epoch) else {
+            return;
+        };
         self.epoch = epoch;
         self.set = set;
         let height = self.s.finalized_height;
         // A tip of an earlier epoch is the last block or a suffix proposal on it; a tip
         // of this epoch or a later one (a restarted node catching up) stays.
         if self.view_epoch(self.s.tip_view) < epoch
-            && let Some(head) = persist::get::<Hash>(&key(b"final/", &[&height.to_le_bytes()])).and_then(|h| Self::proposal(&h))
-            && let Some(certificate) = persist::get::<Certificate>(&key(b"cert/", &[&height.to_le_bytes()]))
+            && let Some(head) = persist::get::<Hash>(&key(b"final/", &[&height.to_le_bytes()]))
+                .and_then(|h| Self::proposal(&h))
+            && let Some(certificate) =
+                persist::get::<Certificate>(&key(b"cert/", &[&height.to_le_bytes()]))
         {
             persist::set(TIP_KEY, &certificate);
             persist::set(ENTRY_KEY, &certificate);
@@ -309,8 +359,12 @@ impl Ctx {
         }
         let view = first_view(epoch);
         if view > self.s.view {
-            self.effects.push(Effect::CancelTimer { timer_id: timeout_timer(self.s.view) });
-            self.effects.push(Effect::CancelTimer { timer_id: propose_timer(self.s.view) });
+            self.effects.push(Effect::CancelTimer {
+                timer_id: timeout_timer(self.s.view),
+            });
+            self.effects.push(Effect::CancelTimer {
+                timer_id: propose_timer(self.s.view),
+            });
             self.s.view = view;
             self.s.me = self.identify();
             self.s.voted = false;
@@ -353,14 +407,23 @@ impl Ctx {
     /// and never in place of a request a verified message sent (spec 08 §3a).
     fn keep_for_later(&mut self, m: &ConsensusMessage, epoch: u64) {
         let Some(peer) = self.peer else { return };
-        let Some(signer) = self.future_signer(m).filter(|id| staking::record(id).is_some_and(|r| !r.jailed)) else {
+        let Some(signer) = self
+            .future_signer(m)
+            .filter(|id| staking::record(id).is_some_and(|r| !r.jailed))
+        else {
             self.send_sync(true);
             return;
         };
         let mut future: Seq<Vec<u8>> = persist::get(FUTURE_KEY).unwrap_or_default();
-        let held = future.0.iter().filter(|e| e.get(32..64) == Some(&signer[..])).count();
+        let held = future
+            .0
+            .iter()
+            .filter(|e| e.get(32..64) == Some(&signer[..]))
+            .count();
         if epoch == self.epoch + 1 && future.0.len() < FUTURE_CAP && held < FUTURE_PER_SIGNER {
-            future.0.push([&peer[..], &signer[..], &m.to_bytes()].concat());
+            future
+                .0
+                .push([&peer[..], &signer[..], &m.to_bytes()].concat());
             persist::set(FUTURE_KEY, &future);
         }
         self.request_sync();
@@ -369,16 +432,39 @@ impl Ctx {
     /// Who signed `m`: the proposer, the voter, or a certificate's first voter.
     fn future_signer(&self, m: &ConsensusMessage) -> Option<Hash> {
         match m {
-            ConsensusMessage::Propose { proposal, signature } => {
-                self.signer(KIND_PROPOSE, proposal.view, &state::keccak256(&proposal.to_bytes()), signature)
+            ConsensusMessage::Propose {
+                proposal,
+                signature,
+            } => self.signer(
+                KIND_PROPOSE,
+                proposal.view,
+                &state::keccak256(&proposal.to_bytes()),
+                signature,
+            ),
+            ConsensusMessage::Vote {
+                view,
+                hash,
+                signature,
+            } => self.signer(KIND_VOTE, *view, hash, signature),
+            ConsensusMessage::Finalize {
+                view,
+                hash,
+                signature,
             }
-            ConsensusMessage::Vote { view, hash, signature } => self.signer(KIND_VOTE, *view, hash, signature),
-            ConsensusMessage::Finalize { view, hash, signature } | ConsensusMessage::FinalizeShare { view, hash, signature, .. } => {
-                self.signer(KIND_FINALIZE, *view, hash, signature)
-            }
+            | ConsensusMessage::FinalizeShare {
+                view,
+                hash,
+                signature,
+                ..
+            } => self.signer(KIND_FINALIZE, *view, hash, signature),
             ConsensusMessage::Certificate { certificate, .. } => {
                 let first = certificate.votes.0.first()?;
-                self.signer(certificate.kind, certificate.view, &certificate.hash, &first.signature)
+                self.signer(
+                    certificate.kind,
+                    certificate.view,
+                    &certificate.hash,
+                    &first.signature,
+                )
             }
             ConsensusMessage::Dkg { .. } => None,
         }
@@ -396,13 +482,19 @@ impl Ctx {
         self.s.answered = Seq(Vec::new());
         self.s.view_started_ms = self.s.now_ms;
         let slot = self.params.slot_ms;
-        self.effects.push(Effect::SetTimer { timer_id: timeout_timer(view), deadline_ms: self.s.now_ms + self.timeout_ms() });
+        self.effects.push(Effect::SetTimer {
+            timer_id: timeout_timer(view),
+            deadline_ms: self.s.now_ms + self.timeout_ms(),
+        });
         if self.is_leader(view) && !self.s.voted && !self.s.timed_out {
             let at = self.s.tip_timestamp_ms + slot;
             if at <= self.s.now_ms {
                 self.request_mempool();
             } else {
-                self.effects.push(Effect::SetTimer { timer_id: propose_timer(view), deadline_ms: at });
+                self.effects.push(Effect::SetTimer {
+                    timer_id: propose_timer(view),
+                    deadline_ms: at,
+                });
             }
         }
     }
@@ -414,7 +506,11 @@ impl Ctx {
     fn request_mempool(&mut self) {
         self.s.proposing = true;
         let skip = Seq(self.carried());
-        self.effects.push(Effect::MempoolTake { max_bytes: 1 << 20, max_gas: BLOCK_GAS_LIMIT, skip });
+        self.effects.push(Effect::MempoolTake {
+            max_bytes: 1 << 20,
+            max_gas: BLOCK_GAS_LIMIT,
+            skip,
+        });
     }
 
     fn on_timer(&mut self, timer_id: u64, now_ms: u64) {
@@ -432,7 +528,10 @@ impl Ctx {
             self.cast(KIND_VOTE, view, ZERO);
             self.check_timeout(view);
             if self.s.view == view {
-                self.effects.push(Effect::SetTimer { timer_id, deadline_ms: now_ms + self.timeout_ms() });
+                self.effects.push(Effect::SetTimer {
+                    timer_id,
+                    deadline_ms: now_ms + self.timeout_ms(),
+                });
             }
         } else if self.is_leader(view) && !self.s.proposing && !self.s.voted && !self.s.timed_out {
             self.request_mempool();
@@ -464,8 +563,13 @@ impl Ctx {
             (proposal.anchor_height, proposal.anchor_root) = anchor();
         }
         let hash = state::keccak256(&proposal.to_bytes());
-        let Some(signature) = self.sign(KIND_PROPOSE, view, &hash) else { return };
-        self.broadcast(&ConsensusMessage::Propose { proposal: proposal.clone(), signature });
+        let Some(signature) = self.sign(KIND_PROPOSE, view, &hash) else {
+            return;
+        };
+        self.broadcast(&ConsensusMessage::Propose {
+            proposal: proposal.clone(),
+            signature,
+        });
         self.handle_proposal(proposal, hash);
     }
 
@@ -479,7 +583,9 @@ impl Ctx {
         let mut carried = Vec::new();
         let mut cursor = (self.s.tip_height > executed).then_some(self.s.tip_hash);
         while let Some(hash) = cursor {
-            let Some(p) = Self::proposal(&hash) else { break };
+            let Some(p) = Self::proposal(&hash) else {
+                break;
+            };
             carried.extend(p.txs.0.iter().map(|raw| state::keccak256(raw)));
             cursor = (p.height > executed + 1).then_some(p.parent);
         }
@@ -509,7 +615,9 @@ impl Ctx {
     fn pending_evidence() -> Seq<Evidence> {
         let mut pending: Seq<Evidence> = persist::get(PENDING_EVIDENCE_KEY).unwrap_or_default();
         let before = pending.0.len();
-        pending.0.retain(|e| state::get_raw(&key(keys::EVIDENCE_SEEN, &[&e.id()])).is_none());
+        pending
+            .0
+            .retain(|e| state::get_raw(&key(keys::EVIDENCE_SEEN, &[&e.id()])).is_none());
         if pending.0.len() != before {
             persist::set(PENDING_EVIDENCE_KEY, &pending);
         }
@@ -520,7 +628,9 @@ impl Ctx {
     fn on_message(&mut self, m: ConsensusMessage) {
         let view = match &m {
             ConsensusMessage::Propose { proposal, .. } => Some(proposal.view),
-            ConsensusMessage::Vote { view, .. } | ConsensusMessage::Finalize { view, .. } | ConsensusMessage::FinalizeShare { view, .. } => Some(*view),
+            ConsensusMessage::Vote { view, .. }
+            | ConsensusMessage::Finalize { view, .. }
+            | ConsensusMessage::FinalizeShare { view, .. } => Some(*view),
             ConsensusMessage::Certificate { certificate, .. } => Some(certificate.view),
             ConsensusMessage::Dkg { .. } => None,
         };
@@ -529,12 +639,17 @@ impl Ctx {
             return;
         }
         match m {
-            ConsensusMessage::Propose { proposal, signature } => {
+            ConsensusMessage::Propose {
+                proposal,
+                signature,
+            } => {
                 let view = proposal.view;
                 if self.n() == 0 || view == 0 {
                     return;
                 }
-                let Some(set) = self.set_for(view) else { return };
+                let Some(set) = self.set_for(view) else {
+                    return;
+                };
                 let hash = state::keccak256(&proposal.to_bytes());
                 let proposer = leader(view, set.len()) as u32;
                 if self.verify(KIND_PROPOSE, view, &hash, &signature) != Some(proposer) {
@@ -550,23 +665,49 @@ impl Ctx {
                     self.handle_proposal(proposal, hash);
                 }
             }
-            ConsensusMessage::Vote { view, hash, signature } => {
+            ConsensusMessage::Vote {
+                view,
+                hash,
+                signature,
+            } => {
                 if view < self.s.view {
                     self.late_vote(view, hash, signature);
                     return;
                 }
-                let Some(validator) = self.verify(KIND_VOTE, view, &hash, &signature) else { return };
+                let Some(validator) = self.verify(KIND_VOTE, view, &hash, &signature) else {
+                    return;
+                };
                 self.observe(KIND_VOTE, view, validator, SignedHash { hash, signature });
-                Self::add_vote(b"votes/", view, &hash, SignedVote { validator, signature });
+                Self::add_vote(
+                    b"votes/",
+                    view,
+                    &hash,
+                    SignedVote {
+                        validator,
+                        signature,
+                    },
+                );
                 if hash == ZERO {
                     self.check_timeout(view);
                 } else {
                     self.check_notarization(view, &hash);
                 }
             }
-            ConsensusMessage::Finalize { view, hash, signature } => self.on_finalize(view, hash, signature, Vec::new()),
-            ConsensusMessage::FinalizeShare { view, hash, signature, partials } => self.on_finalize(view, hash, signature, partials.0),
-            ConsensusMessage::Certificate { certificate, proposal } => self.on_certificate(certificate, proposal),
+            ConsensusMessage::Finalize {
+                view,
+                hash,
+                signature,
+            } => self.on_finalize(view, hash, signature, Vec::new()),
+            ConsensusMessage::FinalizeShare {
+                view,
+                hash,
+                signature,
+                partials,
+            } => self.on_finalize(view, hash, signature, partials.0),
+            ConsensusMessage::Certificate {
+                certificate,
+                proposal,
+            } => self.on_certificate(certificate, proposal),
             ConsensusMessage::Dkg { envelope } => {
                 for envelope in dkg::receive(self.chain_id, envelope) {
                     self.broadcast(&ConsensusMessage::Dkg { envelope });
@@ -578,9 +719,22 @@ impl Ctx {
     /// A finalize vote, with the voter's partial signatures when it holds
     /// shares, one per share. Finalize votes of an epoch this node has left
     /// only matter as evidence.
-    fn on_finalize(&mut self, view: u64, hash: Hash, signature: Signature, partials: Vec<PartialShare>) {
-        let Some(validator) = self.verify(KIND_FINALIZE, view, &hash, &signature) else { return };
-        self.observe(KIND_FINALIZE, view, validator, SignedHash { hash, signature });
+    fn on_finalize(
+        &mut self,
+        view: u64,
+        hash: Hash,
+        signature: Signature,
+        partials: Vec<PartialShare>,
+    ) {
+        let Some(validator) = self.verify(KIND_FINALIZE, view, &hash, &signature) else {
+            return;
+        };
+        self.observe(
+            KIND_FINALIZE,
+            view,
+            validator,
+            SignedHash { hash, signature },
+        );
         if self.view_epoch(view) < self.epoch {
             return;
         }
@@ -597,7 +751,15 @@ impl Ctx {
             }
             Self::add_partial(view, &hash, partial);
         }
-        Self::add_vote(b"fin/", view, &hash, SignedVote { validator, signature });
+        Self::add_vote(
+            b"fin/",
+            view,
+            &hash,
+            SignedVote {
+                validator,
+                signature,
+            },
+        );
         self.check_finalization(view, &hash);
     }
 
@@ -606,11 +768,20 @@ impl Ctx {
         if proposal.height > self.s.tip_height + 1 {
             self.request_sync();
         }
-        let extends_tip = proposal.parent == self.s.tip_hash && proposal.height == self.s.tip_height + 1;
+        let extends_tip =
+            proposal.parent == self.s.tip_hash && proposal.height == self.s.tip_height + 1;
         let bounded = proposal.evidence.0.len() <= MAX_EVIDENCE && proposal.dkg.0.len() <= MAX_DKG;
-        let empty = proposal.txs.0.is_empty() && proposal.evidence.0.is_empty() && proposal.dkg.0.is_empty();
+        let empty = proposal.txs.0.is_empty()
+            && proposal.evidence.0.is_empty()
+            && proposal.dkg.0.is_empty();
         let fits = !self.is_suffix(&proposal) || empty;
-        if proposal.view == self.s.view && extends_tip && bounded && fits && !self.s.voted && !self.s.timed_out {
+        if proposal.view == self.s.view
+            && extends_tip
+            && bounded
+            && fits
+            && !self.s.voted
+            && !self.s.timed_out
+        {
             self.s.voted = true;
             self.cast(KIND_VOTE, proposal.view, hash);
         }
@@ -621,7 +792,8 @@ impl Ctx {
     /// holds a quorum for it and lacks the proposal itself.
     fn late_proposal(&mut self, proposal: Proposal, hash: Hash) {
         let view = proposal.view;
-        let certified = self.quorum(view, &Self::votes(b"votes/", view, &hash).0) || self.quorum(view, &Self::votes(b"fin/", view, &hash).0);
+        let certified = self.quorum(view, &Self::votes(b"votes/", view, &hash).0)
+            || self.quorum(view, &Self::votes(b"fin/", view, &hash).0);
         if !certified || Self::proposal(&hash).is_some() {
             return;
         }
@@ -634,11 +806,15 @@ impl Ctx {
     fn late_vote(&mut self, view: u64, hash: Hash, signature: Signature) {
         // A block vote for what this node notarized in the previous view is
         // routine: its sender is about to notarize the same proposal itself.
-        let routine = hash != ZERO && view + 1 == self.s.view && persist::get::<Hash>(&key(b"notar/", &[&view.to_le_bytes()])) == Some(hash);
+        let routine = hash != ZERO
+            && view + 1 == self.s.view
+            && persist::get::<Hash>(&key(b"notar/", &[&view.to_le_bytes()])) == Some(hash);
         if routine || self.peer.is_some_and(|p| self.s.answered.0.contains(&p)) {
             return;
         }
-        let Some(validator) = self.verify(KIND_VOTE, view, &hash, &signature) else { return };
+        let Some(validator) = self.verify(KIND_VOTE, view, &hash, &signature) else {
+            return;
+        };
         self.observe(KIND_VOTE, view, validator, SignedHash { hash, signature });
         self.forward_certificates(view, validator);
     }
@@ -655,14 +831,18 @@ impl Ctx {
     /// the message that asked for it.
     fn forward_certificates(&mut self, view: u64, signer: u32) {
         let Some(peer) = self.peer else { return };
-        let signer_id = self.set_for(view).and_then(|set| set.get(signer as usize).map(|v| v.0));
+        let signer_id = self
+            .set_for(view)
+            .and_then(|set| set.get(signer as usize).map(|v| v.0));
         if signer_id != Some(peer) || self.s.answered.0.contains(&peer) {
             return;
         }
         self.s.answered.0.push(peer);
         let entry: Option<Certificate> = persist::get(ENTRY_KEY);
         if let Some(tip) = persist::get::<Certificate>(TIP_KEY)
-            && entry.as_ref().is_none_or(|e| (e.view, e.hash) != (tip.view, tip.hash))
+            && entry
+                .as_ref()
+                .is_none_or(|e| (e.view, e.hash) != (tip.view, tip.hash))
         {
             self.send_certificate(peer, tip);
         }
@@ -672,16 +852,32 @@ impl Ctx {
     }
 
     fn send_certificate(&mut self, peer: Hash, certificate: Certificate) {
-        let proposal = if certificate.hash == ZERO { None } else { Self::proposal(&certificate.hash) };
-        let m = ConsensusMessage::Certificate { certificate, proposal };
-        self.effects.push(Effect::Send { peer, topic: TOPIC, payload: m.to_bytes() });
+        let proposal = if certificate.hash == ZERO {
+            None
+        } else {
+            Self::proposal(&certificate.hash)
+        };
+        let m = ConsensusMessage::Certificate {
+            certificate,
+            proposal,
+        };
+        self.effects.push(Effect::Send {
+            peer,
+            topic: TOPIC,
+            payload: m.to_bytes(),
+        });
     }
 
     /// A certificate from a peer: it must pass [`Ctx::verified`], or it is
     /// dropped whole. Certificates of an epoch this node has left teach it
     /// nothing.
     fn on_certificate(&mut self, certificate: Certificate, proposal: Option<Proposal>) {
-        let Certificate { kind, view, hash, votes } = certificate;
+        let Certificate {
+            kind,
+            view,
+            hash,
+            votes,
+        } = certificate;
         if self.view_epoch(view) < self.epoch {
             return;
         }
@@ -698,9 +894,15 @@ impl Ctx {
         {
             return;
         }
-        let prefix: &[u8] = if kind == KIND_FINALIZE { b"fin/" } else { b"votes/" };
+        let prefix: &[u8] = if kind == KIND_FINALIZE {
+            b"fin/"
+        } else {
+            b"votes/"
+        };
         // A quorum this node already holds, with its proposal, teaches it nothing.
-        if self.quorum(view, &Self::votes(prefix, view, &hash).0) && (!names_proposal || Self::proposal(&hash).is_some()) {
+        if self.quorum(view, &Self::votes(prefix, view, &hash).0)
+            && (!names_proposal || Self::proposal(&hash).is_some())
+        {
             return;
         }
         if !self.verified(kind, view, &hash, &votes.0) {
@@ -728,7 +930,9 @@ impl Ctx {
     /// most `n` recoveries however large its message. Every vote that
     /// verifies is observed (§9), even when the certificate as a whole fails.
     fn verified(&mut self, kind: u8, view: u64, hash: &Hash, votes: &[SignedVote]) -> bool {
-        let Some(set) = self.set_for(view) else { return false };
+        let Some(set) = self.set_for(view) else {
+            return false;
+        };
         let n = set.len();
         if votes.len() > n {
             return false;
@@ -747,7 +951,15 @@ impl Ctx {
             if self.verify(kind, view, hash, &vote.signature) != Some(vote.validator) {
                 return false;
             }
-            self.observe(kind, view, vote.validator, SignedHash { hash: *hash, signature: vote.signature });
+            self.observe(
+                kind,
+                view,
+                vote.validator,
+                SignedHash {
+                    hash: *hash,
+                    signature: vote.signature,
+                },
+            );
         }
         true
     }
@@ -759,7 +971,10 @@ impl Ctx {
         if kind == KIND_VOTE && signed.hash == ZERO {
             return;
         }
-        let k = key(b"sig/", &[&[kind], &view.to_le_bytes(), &validator.to_le_bytes()]);
+        let k = key(
+            b"sig/",
+            &[&[kind], &view.to_le_bytes(), &validator.to_le_bytes()],
+        );
         let Some(first) = persist::get::<SignedHash>(&k) else {
             persist::set(&k, &signed);
             return;
@@ -776,9 +991,15 @@ impl Ctx {
         let mut pending: Seq<Evidence> = persist::get(PENDING_EVIDENCE_KEY).unwrap_or_default();
         pending.0.push(evidence);
         persist::set(PENDING_EVIDENCE_KEY, &pending);
-        self.effects.push(Effect::Metric { name: b"equivocations".to_vec(), value: 1 });
+        self.effects.push(Effect::Metric {
+            name: b"equivocations".to_vec(),
+            value: 1,
+        });
         if let Some(peer) = self.peer {
-            self.effects.push(Effect::PeerScore { peer, delta: EQUIVOCATION_PENALTY });
+            self.effects.push(Effect::PeerScore {
+                peer,
+                delta: EQUIVOCATION_PENALTY,
+            });
         }
     }
 
@@ -788,10 +1009,19 @@ impl Ctx {
     /// shares of the active key set and the proposal is not a suffix.
     fn cast(&mut self, kind: u8, view: u64, hash: Hash) {
         let Some(me) = self.s.me else { return };
-        let Some(signature) = self.sign(kind, view, &hash) else { return };
-        let vote = SignedVote { validator: me, signature };
+        let Some(signature) = self.sign(kind, view, &hash) else {
+            return;
+        };
+        let vote = SignedVote {
+            validator: me,
+            signature,
+        };
         if kind != KIND_FINALIZE {
-            self.broadcast(&ConsensusMessage::Vote { view, hash, signature });
+            self.broadcast(&ConsensusMessage::Vote {
+                view,
+                hash,
+                signature,
+            });
             Self::add_vote(b"votes/", view, &hash, vote);
             return;
         }
@@ -801,12 +1031,21 @@ impl Ctx {
             .map(|(p, id)| dkg::partials(self.chain_id, &id, p.height, &hash))
             .unwrap_or_default();
         if partials.is_empty() {
-            self.broadcast(&ConsensusMessage::Finalize { view, hash, signature });
+            self.broadcast(&ConsensusMessage::Finalize {
+                view,
+                hash,
+                signature,
+            });
         } else {
             for partial in &partials {
                 Self::add_partial(view, &hash, partial.clone());
             }
-            self.broadcast(&ConsensusMessage::FinalizeShare { view, hash, signature, partials: Seq(partials) });
+            self.broadcast(&ConsensusMessage::FinalizeShare {
+                view,
+                hash,
+                signature,
+                partials: Seq(partials),
+            });
         }
         Self::add_vote(b"fin/", view, &hash, vote);
     }
@@ -819,7 +1058,13 @@ impl Ctx {
         persist::set(ENTRY_KEY, certificate);
         if certificate.hash == ZERO {
             self.s.backoff = (self.s.backoff + 1).min(MAX_BACKOFF);
-        } else if self.s.now_ms.saturating_sub(self.s.view_started_ms).saturating_mul(2) < self.timeout_ms() {
+        } else if self
+            .s
+            .now_ms
+            .saturating_sub(self.s.view_started_ms)
+            .saturating_mul(2)
+            < self.timeout_ms()
+        {
             self.s.backoff = self.s.backoff.saturating_sub(1);
         }
         self.enter_view(certificate.view + 1);
@@ -833,14 +1078,24 @@ impl Ctx {
         }
         let votes = Self::votes(b"votes/", view, &ZERO);
         if self.quorum(view, &votes.0) {
-            self.advance(&Certificate { kind: KIND_VOTE, view, hash: ZERO, votes });
+            self.advance(&Certificate {
+                kind: KIND_VOTE,
+                view,
+                hash: ZERO,
+                votes,
+            });
         }
     }
 
     fn check_notarization(&mut self, view: u64, hash: &Hash) {
         let votes = Self::votes(b"votes/", view, hash);
         if self.quorum(view, &votes.0) {
-            self.notarized(&Certificate { kind: KIND_VOTE, view, hash: *hash, votes });
+            self.notarized(&Certificate {
+                kind: KIND_VOTE,
+                view,
+                hash: *hash,
+                votes,
+            });
         }
     }
 
@@ -893,7 +1148,12 @@ impl Ctx {
         if !self.quorum(view, &votes.0) {
             return;
         }
-        let certificate = Certificate { kind: KIND_FINALIZE, view, hash: *hash, votes };
+        let certificate = Certificate {
+            kind: KIND_FINALIZE,
+            view,
+            hash: *hash,
+            votes,
+        };
         if view >= self.s.view || view > self.s.tip_view {
             self.notarized(&certificate);
         }
@@ -910,7 +1170,11 @@ impl Ctx {
             if p.height <= self.s.finalized_height {
                 break;
             }
-            cursor = if p.height == 1 { None } else { Self::proposal(&p.parent) };
+            cursor = if p.height == 1 {
+                None
+            } else {
+                Self::proposal(&p.parent)
+            };
             chain.push(p);
         }
         if chain.last().map(|p| p.height) != Some(self.s.finalized_height + 1) {
@@ -920,10 +1184,15 @@ impl Ctx {
         let threshold = if self.is_suffix(&head) {
             None
         } else {
-            let partials: Seq<PartialShare> = persist::get(&key(b"part/", &[&view.to_le_bytes(), hash])).unwrap_or_default();
+            let partials: Seq<PartialShare> =
+                persist::get(&key(b"part/", &[&view.to_le_bytes(), hash])).unwrap_or_default();
             dkg::certificate(self.chain_id, head.height, hash, &partials.0)
         };
-        self.adopt(chain.into_iter().rev().collect(), &certificate, threshold.as_deref());
+        self.adopt(
+            chain.into_iter().rev().collect(),
+            &certificate,
+            threshold.as_deref(),
+        );
     }
 
     /// Records `chain` (consecutive, lowest first, extending the finalized
@@ -934,7 +1203,11 @@ impl Ctx {
         for p in chain {
             let hash = state::keccak256(&p.to_bytes());
             Self::store_proposal(&hash, &p);
-            if self.is_suffix(&p) || self.epoch_end(self.view_epoch(certificate.view)).is_some_and(|end| p.height > end) {
+            if self.is_suffix(&p)
+                || self
+                    .epoch_end(self.view_epoch(certificate.view))
+                    .is_some_and(|end| p.height > end)
+            {
                 continue;
             }
             persist::set(&key(b"final/", &[&p.height.to_le_bytes()]), &hash);
@@ -972,7 +1245,9 @@ impl Ctx {
     fn recover_log(&mut self, from: u64, to: u64) {
         for height in from..=to {
             let h = height.to_le_bytes();
-            let Some(bytes) = state::get_raw(&key(LOG_PROPOSAL, &[&h])) else { continue };
+            let Some(bytes) = state::get_raw(&key(LOG_PROPOSAL, &[&h])) else {
+                continue;
+            };
             let hash = state::keccak256(&bytes);
             persist::set_raw(&key(b"prop/", &[&hash]), &bytes);
             persist::set(&key(b"final/", &[&h]), &hash);
@@ -1004,9 +1279,24 @@ impl Ctx {
 
     /// Asks the host to execute finalized proposal `p`.
     fn execute(&mut self, p: Proposal) {
-        let header = BlockHeader { height: p.height, parent_hash: p.parent, timestamp_ms: p.timestamp_ms, ..BlockHeader::default() };
-        let participation = Participation { evidence: p.evidence, dkg: p.dkg }.to_bytes();
-        self.effects.push(Effect::ExecuteBlock { block: Block { header: header.to_bytes(), txs: p.txs, participation } });
+        let header = BlockHeader {
+            height: p.height,
+            parent_hash: p.parent,
+            timestamp_ms: p.timestamp_ms,
+            ..BlockHeader::default()
+        };
+        let participation = Participation {
+            evidence: p.evidence,
+            dkg: p.dkg,
+        }
+        .to_bytes();
+        self.effects.push(Effect::ExecuteBlock {
+            block: Block {
+                header: header.to_bytes(),
+                txs: p.txs,
+                participation,
+            },
+        });
     }
 
     /// Begins re-executing, from the proposals and certificates this node
@@ -1074,8 +1364,15 @@ impl Ctx {
         self.s.sync_pending = true;
         self.s.sync_request_id += 1;
         self.s.sync_peer = peer;
-        let payload = SyncRequest { from_height: self.s.finalized_height + 1 }.to_bytes();
-        self.effects.push(Effect::Request { peer, request_id: self.s.sync_request_id, payload });
+        let payload = SyncRequest {
+            from_height: self.s.finalized_height + 1,
+        }
+        .to_bytes();
+        self.effects.push(Effect::Request {
+            peer,
+            request_id: self.s.sync_request_id,
+            payload,
+        });
     }
 
     /// Serves finalized proposals from the requested height, never past the
@@ -1083,9 +1380,16 @@ impl Ctx {
     /// that certified them; a batch ends at the head of its certificate,
     /// which can be a suffix proposal.
     fn on_request(&mut self, request_id: u64, payload: &[u8]) {
-        let Ok(request) = SyncRequest::from_bytes(payload) else { return };
+        let Ok(request) = SyncRequest::from_bytes(payload) else {
+            return;
+        };
         let fin = self.s.finalized_height;
-        let mut response = SyncResponse { finalized_height: fin, proposals: Seq(Vec::new()), certificate: None, threshold: Vec::new() };
+        let mut response = SyncResponse {
+            finalized_height: fin,
+            proposals: Seq(Vec::new()),
+            certificate: None,
+            threshold: Vec::new(),
+        };
         let from = request.from_height;
         if from >= 1 && from <= fin {
             let mut top = (from + SYNC_BATCH - 1).min(fin);
@@ -1093,14 +1397,19 @@ impl Ctx {
             if blocks != 0 {
                 top = top.min(epoch_end(epoch_of(from, blocks), blocks));
             }
-            if let Some(certificate) = persist::get::<Certificate>(&key(b"cert/", &[&top.to_le_bytes()]))
+            if let Some(certificate) =
+                persist::get::<Certificate>(&key(b"cert/", &[&top.to_le_bytes()]))
                 && let Some(head) = Self::proposal(&certificate.hash)
             {
                 let mut proposals = Vec::new();
                 let mut cursor = Some(head);
                 while let Some(p) = cursor {
                     let height = p.height;
-                    cursor = if height > from { Self::proposal(&p.parent) } else { None };
+                    cursor = if height > from {
+                        Self::proposal(&p.parent)
+                    } else {
+                        None
+                    };
                     proposals.push(p);
                     if height == from {
                         break;
@@ -1110,11 +1419,15 @@ impl Ctx {
                     proposals.reverse();
                     response.proposals = Seq(proposals);
                     response.certificate = Some(certificate);
-                    response.threshold = persist::get_raw(&key(b"bcert/", &[&top.to_le_bytes()])).unwrap_or_default();
+                    response.threshold = persist::get_raw(&key(b"bcert/", &[&top.to_le_bytes()]))
+                        .unwrap_or_default();
                 }
             }
         }
-        self.effects.push(Effect::Respond { request_id, payload: response.to_bytes() });
+        self.effects.push(Effect::Respond {
+            request_id,
+            payload: response.to_bytes(),
+        });
     }
 
     /// Verifies and adopts a sync response; asks for more if the peer is
@@ -1128,17 +1441,29 @@ impl Ctx {
             return;
         }
         self.s.sync_pending = false;
-        let Ok(response) = SyncResponse::from_bytes(payload) else { return };
-        let Some(certificate) = response.certificate else { return };
+        let Ok(response) = SyncResponse::from_bytes(payload) else {
+            return;
+        };
+        let Some(certificate) = response.certificate else {
+            return;
+        };
         let proposals = response.proposals.0;
         let Some(last) = proposals.last() else { return };
-        if certificate.kind != KIND_FINALIZE || state::keccak256(&last.to_bytes()) != certificate.hash {
+        if certificate.kind != KIND_FINALIZE
+            || state::keccak256(&last.to_bytes()) != certificate.hash
+        {
             return;
         }
-        if !self.verified(KIND_FINALIZE, certificate.view, &certificate.hash, &certificate.votes.0) {
+        if !self.verified(
+            KIND_FINALIZE,
+            certificate.view,
+            &certificate.hash,
+            &certificate.votes.0,
+        ) {
             return;
         }
-        let threshold = !self.is_suffix(last) && dkg::certifies(self.chain_id, &response.threshold, last, &certificate.hash);
+        let threshold = !self.is_suffix(last)
+            && dkg::certifies(self.chain_id, &response.threshold, last, &certificate.hash);
         let current = self.view_epoch(certificate.view) == self.epoch;
         let mut parent = self.finalized_hash();
         let mut height = self.s.finalized_height;
@@ -1150,7 +1475,11 @@ impl Ctx {
             height = p.height;
         }
         let head = last.clone();
-        self.adopt(proposals, &certificate, threshold.then_some(response.threshold.as_slice()));
+        self.adopt(
+            proposals,
+            &certificate,
+            threshold.then_some(response.threshold.as_slice()),
+        );
         // A finalized head from a later view than the tip's replaces it; a
         // tip from a later view already extends the head.
         if current {
@@ -1171,10 +1500,19 @@ impl Ctx {
     /// threshold certificate when it has one; this node's DKG duties and the
     /// envelopes it still holds; and, at the end of an epoch, the next one.
     fn on_executed(&mut self, height: u64) {
-        if let Some(certificate) = persist::get::<Certificate>(&key(b"cert/", &[&height.to_le_bytes()])) {
-            let bytes = persist::get_raw(&key(b"bcert/", &[&height.to_le_bytes()])).unwrap_or_else(|| certificate.to_bytes());
-            self.effects.push(Effect::FinalizeBlock { height, certificate: bytes });
-            self.effects.push(Effect::Metric { name: b"blocks".to_vec(), value: 1 });
+        if let Some(certificate) =
+            persist::get::<Certificate>(&key(b"cert/", &[&height.to_le_bytes()]))
+        {
+            let bytes = persist::get_raw(&key(b"bcert/", &[&height.to_le_bytes()]))
+                .unwrap_or_else(|| certificate.to_bytes());
+            self.effects.push(Effect::FinalizeBlock {
+                height,
+                certificate: bytes,
+            });
+            self.effects.push(Effect::Metric {
+                name: b"blocks".to_vec(),
+                value: 1,
+            });
         }
         self.dkg_step(height);
         if self.epoch_end(self.epoch).is_some_and(|end| height >= end) {
@@ -1208,7 +1546,9 @@ impl Ctx {
             return;
         }
         dkg::pool_prune(executed);
-        let Some(me) = dkg::my_id(self.chain_id) else { return };
+        let Some(me) = dkg::my_id(self.chain_id) else {
+            return;
+        };
         if let Some(envelope) = dkg::duties(self.chain_id, &me, executed) {
             dkg::pool_add(self.chain_id, envelope.clone());
             self.broadcast(&ConsensusMessage::Dkg { envelope });
@@ -1223,7 +1563,10 @@ impl Ctx {
 pub fn step(input: &Input) -> Seq<Effect> {
     let mut c = Ctx::open();
     match input {
-        Input::Started { now_ms, resumed_state } => {
+        Input::Started {
+            now_ms,
+            resumed_state,
+        } => {
             if let Some(bytes) = resumed_state
                 && let Ok(restored) = SimplexState::from_bytes(bytes)
             {
@@ -1235,7 +1578,9 @@ pub fn step(input: &Input) -> Seq<Effect> {
             // syncs the rest, instead of executing on the wrong parent; a replay
             // a restart cut short goes on to where it was headed.
             let executed = state::height().unwrap_or(0);
-            let remembered = c.s.finalized_height.max(persist::get(REPLAY_KEY).unwrap_or(0));
+            let remembered =
+                c.s.finalized_height
+                    .max(persist::get(REPLAY_KEY).unwrap_or(0));
             if remembered > executed {
                 c.s.finalized_height = executed;
             } else if executed > c.s.finalized_height {
@@ -1258,21 +1603,34 @@ pub fn step(input: &Input) -> Seq<Effect> {
         }
         Input::TimerFired { timer_id, now_ms } => c.on_timer(*timer_id, *now_ms),
         Input::MempoolContents { txs } => c.on_mempool(&txs.0),
-        Input::NetworkMessage { peer, topic, payload } if *topic == TOPIC => {
+        Input::NetworkMessage {
+            peer,
+            topic,
+            payload,
+        } if *topic == TOPIC => {
             c.peer = Some(*peer);
             if let Ok(m) = ConsensusMessage::from_bytes(payload) {
                 c.on_message(m);
             }
         }
-        Input::Request { peer, request_id, payload } => {
+        Input::Request {
+            peer,
+            request_id,
+            payload,
+        } => {
             c.peer = Some(*peer);
             c.on_request(*request_id, payload);
         }
-        Input::Response { request_id, payload } => c.on_response(*request_id, payload),
+        Input::Response {
+            request_id,
+            payload,
+        } => c.on_response(*request_id, payload),
         Input::BlockExecuted { height, .. } => c.on_executed(*height),
         _ => {}
     }
     save(&c.s);
-    c.effects.push(Effect::PersistState { state: c.s.to_bytes() });
+    c.effects.push(Effect::PersistState {
+        state: c.s.to_bytes(),
+    });
     Seq(c.effects)
 }

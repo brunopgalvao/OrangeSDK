@@ -66,7 +66,9 @@ impl Store {
     /// A `u64` stored little-endian under `key`, 0 if absent or malformed.
     #[must_use]
     pub fn get_u64(&self, key: &[u8]) -> u64 {
-        self.get(key).and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok()).map_or(0, u64::from_le_bytes)
+        self.get(key)
+            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+            .map_or(0, u64::from_le_bytes)
     }
 
     /// Stores `value` little-endian under `key`.
@@ -77,14 +79,24 @@ impl Store {
     /// The write set, in key order.
     #[must_use]
     pub fn into_writes(self) -> Vec<Write> {
-        self.writes.into_iter().map(|(key, value)| Write { key, value }).collect()
+        self.writes
+            .into_iter()
+            .map(|(key, value)| Write { key, value })
+            .collect()
     }
 }
 
 fn host_get(key: &[u8]) -> Option<Vec<u8>> {
     let mut buf = alloc::vec![0u8; 256];
     // SAFETY: valid pointers into our own buffers.
-    let len = unsafe { host::__solo_import_storage_get(key.as_ptr(), key.len() as u32, buf.as_mut_ptr(), buf.len() as u32) };
+    let len = unsafe {
+        host::__solo_import_storage_get(
+            key.as_ptr(),
+            key.len() as u32,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        )
+    };
     if len == u64::from(u32::MAX) {
         return None;
     }
@@ -92,7 +104,14 @@ fn host_get(key: &[u8]) -> Option<Vec<u8>> {
     if len > buf.len() {
         buf = alloc::vec![0u8; len];
         // SAFETY: as above, with a buffer large enough for the whole value.
-        unsafe { host::__solo_import_storage_get(key.as_ptr(), key.len() as u32, buf.as_mut_ptr(), buf.len() as u32) };
+        unsafe {
+            host::__solo_import_storage_get(
+                key.as_ptr(),
+                key.len() as u32,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+            )
+        };
     }
     buf.truncate(len);
     Some(buf)
@@ -103,7 +122,9 @@ fn host_get(key: &[u8]) -> Option<Vec<u8>> {
 pub fn keccak256(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     // SAFETY: valid pointers into our own buffers.
-    unsafe { host::__solo_import_hash_keccak256(data.as_ptr(), data.len() as u32, out.as_mut_ptr()) };
+    unsafe {
+        host::__solo_import_hash_keccak256(data.as_ptr(), data.len() as u32, out.as_mut_ptr())
+    };
     out
 }
 
@@ -112,14 +133,24 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
 /// them. An input that is no `ModuleCall` traps.
 pub fn run(handler: fn(&ModuleCall, &mut Store) -> Result<Vec<u8>, Vec<u8>>) -> Vec<u8> {
     let input = solo_guest::input_vec();
-    let Ok(call) = ModuleCall::from_bytes(&input) else { solo_guest::trap() };
+    let Ok(call) = ModuleCall::from_bytes(&input) else {
+        solo_guest::trap()
+    };
     let mut store = match &call {
         ModuleCall::Call { pending, .. } => Store::new(&pending.0),
         _ => Store::default(),
     };
     let output = match handler(&call, &mut store) {
-        Ok(data) => ModuleOutput { status: status::RETURN, data, writes: Seq(store.into_writes()) },
-        Err(data) => ModuleOutput { status: status::REVERT, data, writes: Seq(Vec::new()) },
+        Ok(data) => ModuleOutput {
+            status: status::RETURN,
+            data,
+            writes: Seq(store.into_writes()),
+        },
+        Err(data) => ModuleOutput {
+            status: status::REVERT,
+            data,
+            writes: Seq(Vec::new()),
+        },
     };
     output.to_bytes()
 }
@@ -129,7 +160,9 @@ pub fn run(handler: fn(&ModuleCall, &mut Store) -> Result<Vec<u8>, Vec<u8>>) -> 
 #[macro_export]
 macro_rules! module {
     ($handler:path) => {
-        solo_guest::solo_export!(main, |_input: &[u8]| -> alloc::vec::Vec<u8> { $crate::run($handler) });
+        solo_guest::solo_export!(main, |_input: &[u8]| -> alloc::vec::Vec<u8> {
+            $crate::run($handler)
+        });
     };
 }
 
@@ -146,13 +179,18 @@ pub mod abi {
     /// Argument word `index` after the selector.
     #[must_use]
     pub fn arg(data: &[u8], index: usize) -> Option<[u8; 32]> {
-        data.get(4 + 32 * index..4 + 32 * (index + 1))?.try_into().ok()
+        data.get(4 + 32 * index..4 + 32 * (index + 1))?
+            .try_into()
+            .ok()
     }
 
     /// A word as a `u64`, if its high 24 bytes are zero.
     #[must_use]
     pub fn as_u64(word: &[u8; 32]) -> Option<u64> {
-        word[..24].iter().all(|b| *b == 0).then(|| u64::from_be_bytes(word[24..].try_into().expect("8 bytes")))
+        word[..24]
+            .iter()
+            .all(|b| *b == 0)
+            .then(|| u64::from_be_bytes(word[24..].try_into().expect("8 bytes")))
     }
 
     /// A word holding `value`.

@@ -23,7 +23,9 @@ impl Crypto for HostCrypto {
     fn sha256(&self, data: &[u8]) -> Hash {
         let mut out = [0u8; 32];
         // SAFETY: valid pointers into our own buffers.
-        unsafe { host::__solo_import_hash_sha256(data.as_ptr(), data.len() as u32, out.as_mut_ptr()) };
+        unsafe {
+            host::__solo_import_hash_sha256(data.as_ptr(), data.len() as u32, out.as_mut_ptr())
+        };
         out
     }
 
@@ -55,7 +57,10 @@ impl Storage for Namespace<'_> {
 fn handle(call: &ModuleCall, store: &mut Store) -> Result<Vec<u8>, Vec<u8>> {
     match call {
         ModuleCall::Call { context, data, .. } => {
-            let ctx = Context { caller: context.caller, timestamp: context.timestamp };
+            let ctx = Context {
+                caller: context.caller,
+                timestamp: context.timestamp,
+            };
             verifier::call(&HostCrypto, &mut Namespace(store), &ctx, data)
         }
         ModuleCall::Query { data } => verifier::query(&Namespace(store), data),

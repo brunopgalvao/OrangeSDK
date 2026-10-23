@@ -7,8 +7,13 @@ use alloc::vec::Vec;
 
 use solo_abi::Decode;
 use solo_abi::codec::Seq;
-use solo_abi::rotation::{Handoff, MAX_EVIDENCE_QUERY, RotationCertificate, ThresholdEvidence, keys, offence, query, rotation_message};
-use solo_abi::staking::{DST_SIGNATURE, G1_LENGTH, G2_LENGTH, KeySetRecord, epoch_of, keys as skeys};
+use solo_abi::rotation::{
+    Handoff, MAX_EVIDENCE_QUERY, RotationCertificate, ThresholdEvidence, keys, offence, query,
+    rotation_message,
+};
+use solo_abi::staking::{
+    DST_SIGNATURE, G1_LENGTH, G2_LENGTH, KeySetRecord, epoch_of, keys as skeys,
+};
 use solo_abi::types::{Hash, QueryResult};
 use solo_guest::host;
 
@@ -26,8 +31,14 @@ pub fn verify(message: &[u8], signature: &[u8], key: &[u8]) -> bool {
     }
     // SAFETY: valid pointers into our own buffers of the sizes the host reads.
     unsafe {
-        host::__solo_import_bls12381_verify(message.as_ptr(), message.len() as u32, signature.as_ptr(), key.as_ptr(), DST_SIGNATURE.as_ptr(), DST_SIGNATURE.len() as u32)
-            == 0
+        host::__solo_import_bls12381_verify(
+            message.as_ptr(),
+            message.len() as u32,
+            signature.as_ptr(),
+            key.as_ptr(),
+            DST_SIGNATURE.as_ptr(),
+            DST_SIGNATURE.len() as u32,
+        ) == 0
     }
 }
 
@@ -62,7 +73,9 @@ pub fn adopted(record: &KeySetRecord, height: u64) {
 pub fn pending() -> Option<KeySetRecord> {
     let active: u64 = state::get(skeys::ACTIVE)?;
     let newest: u64 = state::get(keys::ADOPTED)?;
-    (newest > active).then(|| staking::key_set(newest)).flatten()
+    (newest > active)
+        .then(|| staking::key_set(newest))
+        .flatten()
 }
 
 /// Whether `certificate` hands the active key off to the pending target,
@@ -84,9 +97,19 @@ pub fn handoff_target(certificate: &RotationCertificate) -> Option<KeySetRecord>
 /// handoff record, the height that replaced the old key set, and the new
 /// active key set (spec 15 §6.6).
 pub fn record_handoff(body: &[u8], height: u64) {
-    let Ok(certificate) = RotationCertificate::from_bytes(body) else { return };
-    let Some(target) = handoff_target(&certificate) else { return };
-    let record = Handoff { from: certificate.from, to: target.id, key: target.group_key().unwrap_or_default().to_vec(), signature: certificate.signature, height };
+    let Ok(certificate) = RotationCertificate::from_bytes(body) else {
+        return;
+    };
+    let Some(target) = handoff_target(&certificate) else {
+        return;
+    };
+    let record = Handoff {
+        from: certificate.from,
+        to: target.id,
+        key: target.group_key().unwrap_or_default().to_vec(),
+        signature: certificate.signature,
+        height,
+    };
     state::set(&id_key(keys::HANDOFF, record.from), &record);
     state::set(&id_key(keys::REPLACED, record.from), &height);
     activate(&target, height);
@@ -116,7 +139,9 @@ pub fn offender(evidence: &ThresholdEvidence, height: u64) -> Option<Hash> {
         let a = evidence.anchored()?;
         a.anchor_height != 0
             && if evidence.kind == offence::ANCHOR {
-                a.anchor_height < height && state::block_by_number(a.anchor_height).is_some_and(|b| b.state_root != a.anchor_root)
+                a.anchor_height < height
+                    && state::block_by_number(a.anchor_height)
+                        .is_some_and(|b| b.state_root != a.anchor_root)
             } else {
                 replaced(evidence.key_set).is_some_and(|r| r <= a.anchor_height)
             }
@@ -157,17 +182,27 @@ pub fn record_evidence_body(body: &[u8], height: u64) {
 pub fn query(method: &str, params: &[u8]) -> Option<QueryResult> {
     let found = |body: Option<Vec<u8>>| match body {
         Some(body) => QueryResult { status: 0, body },
-        None => QueryResult { status: 1, body: Vec::new() },
+        None => QueryResult {
+            status: 1,
+            body: Vec::new(),
+        },
     };
     let Ok(first) = u64::from_bytes(params) else {
-        return [query::HANDOFF, query::THRESHOLD_EVIDENCE].contains(&method).then(|| QueryResult { status: 2, body: Vec::new() });
+        return [query::HANDOFF, query::THRESHOLD_EVIDENCE]
+            .contains(&method)
+            .then(|| QueryResult {
+                status: 2,
+                body: Vec::new(),
+            });
     };
     match method {
         query::HANDOFF => Some(found(state::get_raw(&id_key(keys::HANDOFF, first)))),
         query::THRESHOLD_EVIDENCE => {
             let count: u64 = state::get(keys::EVIDENCE_COUNT).unwrap_or(0);
             let end = count.min(first.saturating_add(MAX_EVIDENCE_QUERY as u64));
-            let records: Vec<ThresholdEvidence> = (first..end).filter_map(|i| state::get(&id_key(keys::EVIDENCE, i))).collect();
+            let records: Vec<ThresholdEvidence> = (first..end)
+                .filter_map(|i| state::get(&id_key(keys::EVIDENCE, i)))
+                .collect();
             Some(found(Some(solo_abi::Encode::to_bytes(&Seq(records)))))
         }
         _ => None,

@@ -52,16 +52,24 @@ stubs!(
 /// The precompile functions behind gate 2 (spec 05 §4.8).
 mod host {
     unsafe extern "C" {
-        pub fn __solo_import_evm_modexp(input: *const u8, base_len: u32, exp_len: u32, mod_len: u32, dst: *mut u8) -> u64;
+        pub fn __solo_import_evm_modexp(
+            input: *const u8,
+            base_len: u32,
+            exp_len: u32,
+            mod_len: u32,
+            dst: *mut u8,
+        ) -> u64;
         pub fn __solo_import_evm_bn254_add(input: *const u8, dst: *mut u8) -> u64;
         pub fn __solo_import_evm_bn254_mul(input: *const u8, dst: *mut u8) -> u64;
         pub fn __solo_import_evm_bn254_pairing(pairs: *const u8, count: u32) -> u64;
         pub fn __solo_import_evm_blake2f(input: *const u8, dst: *mut u8) -> u64;
         pub fn __solo_import_evm_kzg_point_evaluation(input: *const u8) -> u64;
         pub fn __solo_import_evm_bls12381_g1_add(input: *const u8, dst: *mut u8) -> u64;
-        pub fn __solo_import_evm_bls12381_g1_msm(pairs: *const u8, count: u32, dst: *mut u8) -> u64;
+        pub fn __solo_import_evm_bls12381_g1_msm(pairs: *const u8, count: u32, dst: *mut u8)
+        -> u64;
         pub fn __solo_import_evm_bls12381_g2_add(input: *const u8, dst: *mut u8) -> u64;
-        pub fn __solo_import_evm_bls12381_g2_msm(pairs: *const u8, count: u32, dst: *mut u8) -> u64;
+        pub fn __solo_import_evm_bls12381_g2_msm(pairs: *const u8, count: u32, dst: *mut u8)
+        -> u64;
         pub fn __solo_import_evm_bls12381_pairing(pairs: *const u8, count: u32) -> u64;
         pub fn __solo_import_evm_bls12381_map_fp_to_g1(input: *const u8, dst: *mut u8) -> u64;
         pub fn __solo_import_evm_bls12381_map_fp2_to_g2(input: *const u8, dst: *mut u8) -> u64;
@@ -87,7 +95,10 @@ const FIXED: [Option<(usize, usize)>; 13] = [
 ];
 
 fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    let word: [u8; 4] = bytes.get(at..at + 4).and_then(|b| b.try_into().ok()).unwrap_or_else(|| solo_guest::trap());
+    let word: [u8; 4] = bytes
+        .get(at..at + 4)
+        .and_then(|b| b.try_into().ok())
+        .unwrap_or_else(|| solo_guest::trap());
     u32::from_le_bytes(word)
 }
 
@@ -132,13 +143,27 @@ fn run(op: u8, x: &[u8]) -> (u64, Vec<u8>) {
             }
             let mut dst = vec![0u8; modulus as usize];
             // SAFETY: the operands follow the lengths, and `dst` holds `modulus` bytes.
-            let status = unsafe { host::__solo_import_evm_modexp(p.wrapping_add(12), base, exp, modulus, dst.as_mut_ptr()) };
+            let status = unsafe {
+                host::__solo_import_evm_modexp(
+                    p.wrapping_add(12),
+                    base,
+                    exp,
+                    modulus,
+                    dst.as_mut_ptr(),
+                )
+            };
             (status, dst)
         }
         // SAFETY: `x` holds `count` whole pairs.
-        3 => (unsafe { host::__solo_import_evm_bn254_pairing(p, count(x, 192)) }, Vec::new()),
+        3 => (
+            unsafe { host::__solo_import_evm_bn254_pairing(p, count(x, 192)) },
+            Vec::new(),
+        ),
         // SAFETY: as above.
-        10 => (unsafe { host::__solo_import_evm_bls12381_pairing(p, count(x, 288)) }, Vec::new()),
+        10 => (
+            unsafe { host::__solo_import_evm_bls12381_pairing(p, count(x, 288)) },
+            Vec::new(),
+        ),
         7 | 9 => {
             let (size, out) = if op == 7 { (128, 96) } else { (224, 192) };
             let mut dst = vec![0u8; out];
@@ -161,7 +186,9 @@ solo_guest::solo_main!(entry);
 
 fn entry(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) -> (u64, u64) {
     let input = solo_guest::input_vec();
-    let Some((&op, operands)) = input.split_first() else { solo_guest::trap() };
+    let Some((&op, operands)) = input.split_first() else {
+        solo_guest::trap()
+    };
     let (status, result) = run(op, operands);
     let mut out = Vec::with_capacity(1 + result.len());
     out.push(status as u8);

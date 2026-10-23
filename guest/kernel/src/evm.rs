@@ -4,16 +4,19 @@ use alloc::vec::Vec;
 use core::convert::Infallible;
 
 use revm::bytecode::Bytecode;
-use revm::context::result::{ExecutionResult, Output};
 use revm::context::either::Either;
-use revm::context::transaction::{AccessList, AccessListItem, Authorization as RAuthorization, RecoveredAuthority, RecoveredAuthorization};
+use revm::context::result::{ExecutionResult, Output};
+use revm::context::transaction::{
+    AccessList, AccessListItem, Authorization as RAuthorization, RecoveredAuthority,
+    RecoveredAuthorization,
+};
 use revm::context::{BlockEnv, Context, TxEnv};
 use revm::handler::{EthPrecompiles, MainnetContext, PrecompileProvider};
 use revm::interpreter::InterpreterResult;
 use revm::precompile::bls12_381::{G1Point, G1PointScalar, G2Point, G2PointScalar};
 use revm::precompile::{Crypto, PrecompileHalt};
-use revm::primitives::hardfork::SpecId;
 use revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE;
+use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address as RAddress, B256, Bytes, KECCAK_EMPTY, TxKind, U256};
 use revm::state::{Account as RAccount, AccountInfo};
 use revm::{Database, ExecuteEvm, MainBuilder, MainContext};
@@ -34,8 +37,18 @@ impl Database for StateDb {
         let Some(account) = state::get::<Account>(&state::account_key(&address.0.0)) else {
             return Ok(None);
         };
-        let code_hash = if account.code_hash == [0; 32] { KECCAK_EMPTY } else { B256::from(account.code_hash) };
-        Ok(Some(AccountInfo { balance: U256::from(account.balance), nonce: account.nonce, code_hash, code: None, ..AccountInfo::default() }))
+        let code_hash = if account.code_hash == [0; 32] {
+            KECCAK_EMPTY
+        } else {
+            B256::from(account.code_hash)
+        };
+        Ok(Some(AccountInfo {
+            balance: U256::from(account.balance),
+            nonce: account.nonce,
+            code_hash,
+            code: None,
+            ..AccountInfo::default()
+        }))
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Infallible> {
@@ -46,7 +59,10 @@ impl Database for StateDb {
     }
 
     fn storage(&mut self, address: RAddress, index: U256) -> Result<U256, Infallible> {
-        Ok(state::get_raw(&state::slot_key(&address.0.0, &index.to_be_bytes::<32>())).map_or(U256::ZERO, |v| U256::from_be_slice(&v)))
+        Ok(
+            state::get_raw(&state::slot_key(&address.0.0, &index.to_be_bytes::<32>()))
+                .map_or(U256::ZERO, |v| U256::from_be_slice(&v)),
+        )
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Infallible> {
@@ -88,7 +104,10 @@ fn u128_of(v: U256) -> u128 {
 /// native contract, spec 16 §5, or the outbox, spec 17 §2.3) gets only its
 /// balance, nonce and code hash written here, and is deleted when it has none
 /// of them.
-fn commit<P: Precompiles>(changes: impl IntoIterator<Item = (RAddress, RAccount)>, precompiles: &P) {
+fn commit<P: Precompiles>(
+    changes: impl IntoIterator<Item = (RAddress, RAccount)>,
+    precompiles: &P,
+) {
     for (address, account) in changes {
         if !account.is_touched() {
             continue;
@@ -101,8 +120,19 @@ fn commit<P: Precompiles>(changes: impl IntoIterator<Item = (RAddress, RAccount)
                 // empty outbox) is left out of state; its slots are its provider's.
                 state::delete(&state::account_key(&a));
             } else {
-                let code_hash = if info.code_hash == KECCAK_EMPTY { [0; 32] } else { info.code_hash.0 };
-                state::set_account(&a, &Account { balance: u128_of(info.balance), nonce: info.nonce, code_hash });
+                let code_hash = if info.code_hash == KECCAK_EMPTY {
+                    [0; 32]
+                } else {
+                    info.code_hash.0
+                };
+                state::set_account(
+                    &a,
+                    &Account {
+                        balance: u128_of(info.balance),
+                        nonce: info.nonce,
+                        code_hash,
+                    },
+                );
             }
             continue;
         }
@@ -123,7 +153,11 @@ fn commit<P: Precompiles>(changes: impl IntoIterator<Item = (RAddress, RAccount)
             state::delete(&state::account_key(&a));
             continue;
         }
-        let code_hash = if info.code_hash == KECCAK_EMPTY { [0; 32] } else { info.code_hash.0 };
+        let code_hash = if info.code_hash == KECCAK_EMPTY {
+            [0; 32]
+        } else {
+            info.code_hash.0
+        };
         // Code enters state by a creation, or as the delegation designator an
         // EIP-7702 authorization writes, which revm sets without creating.
         if let Some(code) = &info.code
@@ -132,7 +166,14 @@ fn commit<P: Precompiles>(changes: impl IntoIterator<Item = (RAddress, RAccount)
         {
             state::set_raw(&state::code_key(&code_hash), code.original_byte_slice());
         }
-        state::set_account(&a, &Account { balance: u128_of(info.balance), nonce: info.nonce, code_hash });
+        state::set_account(
+            &a,
+            &Account {
+                balance: u128_of(info.balance),
+                nonce: info.nonce,
+                code_hash,
+            },
+        );
         for (key, slot) in account.changed_storage_slots() {
             let k = state::slot_key(&a, &key.to_be_bytes::<32>());
             if slot.present_value.is_zero() {
@@ -247,7 +288,9 @@ impl Env {
 /// a kernel adds its own beside them through this trait, so this file
 /// builds without them (the reference kernel's native contracts are in
 /// `native.rs`).
-pub trait Precompiles: PrecompileProvider<MainnetContext<StateDb>, Output = InterpreterResult> + Sized {
+pub trait Precompiles:
+    PrecompileProvider<MainnetContext<StateDb>, Output = InterpreterResult> + Sized
+{
     /// The provider for one message at `block`; `query` for a call query.
     fn for_message(block: BlockFields, query: bool) -> Self;
 
@@ -279,7 +322,9 @@ pub fn run_in<P: Precompiles>(message: Message, env: &Env, commit_state: bool) -
         caller: RAddress::from(message.caller),
         gas_limit: message.gas_limit,
         gas_price: message.gas_price,
-        kind: message.to.map_or(TxKind::Create, |to| TxKind::Call(RAddress::from(to))),
+        kind: message
+            .to
+            .map_or(TxKind::Create, |to| TxKind::Call(RAddress::from(to))),
         value: U256::from(message.value),
         data: Bytes::from(message.data),
         nonce: message.nonce.unwrap_or(0),
@@ -288,11 +333,18 @@ pub fn run_in<P: Precompiles>(message: Message, env: &Env, commit_state: bool) -
             message
                 .access_list
                 .into_iter()
-                .map(|i| AccessListItem { address: RAddress::from(i.address), storage_keys: i.keys.into_iter().map(B256::from).collect() })
+                .map(|i| AccessListItem {
+                    address: RAddress::from(i.address),
+                    storage_keys: i.keys.into_iter().map(B256::from).collect(),
+                })
                 .collect(),
         ),
         gas_priority_fee: message.priority_fee,
-        authorization_list: message.authorization_list.into_iter().map(recovered).collect(),
+        authorization_list: message
+            .authorization_list
+            .into_iter()
+            .map(recovered)
+            .collect(),
         ..TxEnv::default()
     };
     let mut block_env = BlockEnv {
@@ -305,7 +357,8 @@ pub fn run_in<P: Precompiles>(message: Message, env: &Env, commit_state: bool) -
         prevrandao: Some(B256::from(env.prevrandao)),
         ..BlockEnv::default()
     };
-    block_env.set_blob_excess_gas_and_price(env.excess_blob_gas, BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE);
+    block_env
+        .set_blob_excess_gas_and_price(env.excess_blob_gas, BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE);
     let mut evm = Context::mainnet()
         .modify_cfg_chained(|cfg| {
             cfg.set_spec_and_mainnet_gas_params(SpecId::OSAKA);
@@ -322,38 +375,84 @@ pub fn run_in<P: Precompiles>(message: Message, env: &Env, commit_state: bool) -
         .with_db(StateDb)
         .build_mainnet()
         .with_precompiles(P::for_message(
-            BlockFields { number: env.number, timestamp: env.timestamp, base_fee: env.basefee, beneficiary: env.beneficiary, treasury: [0; 20] },
+            BlockFields {
+                number: env.number,
+                timestamp: env.timestamp,
+                base_fee: env.basefee,
+                beneficiary: env.beneficiary,
+                treasury: [0; 20],
+            },
             !commit_state,
         ));
     let Ok(result) = evm.transact(tx) else {
-        return Outcome { status: call_status::INVALID, gas_used: 0, output: Vec::new(), logs: Vec::new(), contract: None };
+        return Outcome {
+            status: call_status::INVALID,
+            gas_used: 0,
+            output: Vec::new(),
+            logs: Vec::new(),
+            contract: None,
+        };
     };
     let (status, gas_used, output, logs, contract) = match result.result {
-        ExecutionResult::Success { gas, logs, output, .. } => {
+        ExecutionResult::Success {
+            gas, logs, output, ..
+        } => {
             let (bytes, contract) = match output {
                 Output::Call(b) => (b, None),
                 Output::Create(b, address) => (b, address.map(|a| a.0.0)),
             };
-            (call_status::SUCCESS, gas.tx_gas_used(), bytes.to_vec(), logs, contract)
+            (
+                call_status::SUCCESS,
+                gas.tx_gas_used(),
+                bytes.to_vec(),
+                logs,
+                contract,
+            )
         }
-        ExecutionResult::Revert { gas, logs, output } => (call_status::REVERT, gas.tx_gas_used(), output.to_vec(), logs, None),
-        ExecutionResult::Halt { gas, logs, .. } => (call_status::HALT, gas.tx_gas_used(), Vec::new(), logs, None),
+        ExecutionResult::Revert { gas, logs, output } => (
+            call_status::REVERT,
+            gas.tx_gas_used(),
+            output.to_vec(),
+            logs,
+            None,
+        ),
+        ExecutionResult::Halt { gas, logs, .. } => {
+            (call_status::HALT, gas.tx_gas_used(), Vec::new(), logs, None)
+        }
     };
     if commit_state {
         commit(result.state, &evm.precompiles);
     }
     let logs = logs
         .into_iter()
-        .map(|l| Log { address: l.address.0.0, topics: Seq(l.data.topics().iter().map(|t| t.0).collect()), data: l.data.data.to_vec() })
+        .map(|l| Log {
+            address: l.address.0.0,
+            topics: Seq(l.data.topics().iter().map(|t| t.0).collect()),
+            data: l.data.data.to_vec(),
+        })
         .collect();
-    Outcome { status, gas_used, output, logs, contract }
+    Outcome {
+        status,
+        gas_used,
+        output,
+        logs,
+        contract,
+    }
 }
 
 /// An authorization as revm applies it: recovered by the kernel through the
 /// host, so revm needs no signature code of its own (spec 20 §2.2).
-fn recovered((auth, authority): (solo_eth::Authorization, Option<Address>)) -> Either<revm::context::transaction::SignedAuthorization, RecoveredAuthorization> {
-    let inner = RAuthorization { chain_id: U256::from_be_bytes(auth.chain_id), address: RAddress::from(auth.address), nonce: auth.nonce };
-    let authority = authority.map_or(RecoveredAuthority::Invalid, |a| RecoveredAuthority::Valid(RAddress::from(a)));
+fn recovered(
+    (auth, authority): (solo_eth::Authorization, Option<Address>),
+) -> Either<revm::context::transaction::SignedAuthorization, RecoveredAuthorization> {
+    let inner = RAuthorization {
+        chain_id: U256::from_be_bytes(auth.chain_id),
+        address: RAddress::from(auth.address),
+        nonce: auth.nonce,
+    };
+    let authority = authority.map_or(RecoveredAuthority::Invalid, |a| {
+        RecoveredAuthority::Valid(RAddress::from(a))
+    });
     Either::Right(RecoveredAuthorization::new_unchecked(inner, authority))
 }
 
@@ -374,11 +473,18 @@ impl Crypto for HostCrypto {
     fn sha256(&self, input: &[u8]) -> [u8; 32] {
         let mut out = [0u8; 32];
         // SAFETY: valid pointers into our own buffers.
-        unsafe { host::__solo_import_hash_sha256(input.as_ptr(), input.len() as u32, out.as_mut_ptr()) };
+        unsafe {
+            host::__solo_import_hash_sha256(input.as_ptr(), input.len() as u32, out.as_mut_ptr())
+        };
         out
     }
 
-    fn secp256k1_ecrecover(&self, sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 32], PrecompileHalt> {
+    fn secp256k1_ecrecover(
+        &self,
+        sig: &[u8; 64],
+        recid: u8,
+        msg: &[u8; 32],
+    ) -> Result<[u8; 32], PrecompileHalt> {
         let mut full = [0u8; 65];
         full[..64].copy_from_slice(sig);
         full[64] = recid;
@@ -391,7 +497,8 @@ impl Crypto for HostCrypto {
             full[32..64].copy_from_slice(&(n - s).to_be_bytes::<32>());
             full[64] ^= 1;
         }
-        let address = crate::tx::recover_address(msg, &full).ok_or(PrecompileHalt::Secp256k1RecoverFailed)?;
+        let address =
+            crate::tx::recover_address(msg, &full).ok_or(PrecompileHalt::Secp256k1RecoverFailed)?;
         let mut out = [0u8; 32];
         out[12..].copy_from_slice(&address);
         Ok(out)
@@ -424,7 +531,13 @@ impl Crypto for HostCrypto {
         crate::precompiles::blake2f(rounds, h, m, t, f);
     }
 
-    fn verify_kzg_proof(&self, z: &[u8; 32], y: &[u8; 32], commitment: &[u8; 48], proof: &[u8; 48]) -> Result<(), PrecompileHalt> {
+    fn verify_kzg_proof(
+        &self,
+        z: &[u8; 32],
+        y: &[u8; 32],
+        commitment: &[u8; 48],
+        proof: &[u8; 48],
+    ) -> Result<(), PrecompileHalt> {
         crate::precompiles::kzg(z, y, commitment, proof)
     }
 
@@ -432,7 +545,10 @@ impl Crypto for HostCrypto {
         crate::precompiles::g1_add(a, b)
     }
 
-    fn bls12_381_g1_msm(&self, pairs: &mut dyn Iterator<Item = Result<G1PointScalar, PrecompileHalt>>) -> Result<[u8; 96], PrecompileHalt> {
+    fn bls12_381_g1_msm(
+        &self,
+        pairs: &mut dyn Iterator<Item = Result<G1PointScalar, PrecompileHalt>>,
+    ) -> Result<[u8; 96], PrecompileHalt> {
         crate::precompiles::g1_msm(pairs)
     }
 
@@ -440,11 +556,17 @@ impl Crypto for HostCrypto {
         crate::precompiles::g2_add(a, b)
     }
 
-    fn bls12_381_g2_msm(&self, pairs: &mut dyn Iterator<Item = Result<G2PointScalar, PrecompileHalt>>) -> Result<[u8; 192], PrecompileHalt> {
+    fn bls12_381_g2_msm(
+        &self,
+        pairs: &mut dyn Iterator<Item = Result<G2PointScalar, PrecompileHalt>>,
+    ) -> Result<[u8; 192], PrecompileHalt> {
         crate::precompiles::g2_msm(pairs)
     }
 
-    fn bls12_381_pairing_check(&self, pairs: &[(G1Point, G2Point)]) -> Result<bool, PrecompileHalt> {
+    fn bls12_381_pairing_check(
+        &self,
+        pairs: &[(G1Point, G2Point)],
+    ) -> Result<bool, PrecompileHalt> {
         crate::precompiles::pairing(pairs)
     }
 
@@ -477,5 +599,7 @@ pub fn code_of(account: &Account) -> Vec<u8> {
 
 /// Storage slot of `address`.
 pub fn storage(address: &Address, slot: &Hash) -> Hash {
-    state::get_raw(&state::slot_key(address, slot)).and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()).unwrap_or([0; 32])
+    state::get_raw(&state::slot_key(address, slot))
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+        .unwrap_or([0; 32])
 }

@@ -55,7 +55,9 @@ impl Crypto for HostCrypto {
     fn sha256(&self, data: &[u8]) -> Hash {
         let mut out = [0u8; 32];
         // SAFETY: valid pointers into our own buffers.
-        unsafe { host::__solo_import_hash_sha256(data.as_ptr(), data.len() as u32, out.as_mut_ptr()) };
+        unsafe {
+            host::__solo_import_hash_sha256(data.as_ptr(), data.len() as u32, out.as_mut_ptr())
+        };
         out
     }
 
@@ -74,14 +76,25 @@ fn unhex(s: &str) -> Vec<u8> {
         b'a'..=b'f' => c - b'a' + 10,
         _ => solo_guest::trap(),
     };
-    s.trim().as_bytes().chunks(2).map(|p| digit(p[0]) << 4 | digit(p[1])).collect()
+    s.trim()
+        .as_bytes()
+        .chunks(2)
+        .map(|p| digit(p[0]) << 4 | digit(p[1]))
+        .collect()
 }
 
 /// Gives `address` `code`, stored by its `keccak256`, and nonce 1.
 fn place(address: &solo_abi::types::Address, code: &[u8]) {
     let code_hash = state::keccak256(code);
     state::set_raw(&state::code_key(&code_hash), code);
-    state::set_account(address, &Account { balance: 0, nonce: 1, code_hash });
+    state::set_account(
+        address,
+        &Account {
+            balance: 0,
+            nonce: 1,
+            code_hash,
+        },
+    );
 }
 
 /// Genesis (spec 18 §4.1). With a light-client module in the parameters,
@@ -98,12 +111,21 @@ pub fn init(genesis: &Genesis) {
         return;
     }
     let ours = [LIGHT_CLIENT_ADDRESS, VERIFIER_ADDRESS, INBOX_ADDRESS];
-    let allocated = params.allocations.0.iter().any(|a| ours.contains(&a.address));
-    let sizes_ok = [&bridge.light_client, &bridge.verifier].iter().all(|m| !m.is_empty() && m.len() <= modules::MAX_MODULE_SIZE);
+    let allocated = params
+        .allocations
+        .0
+        .iter()
+        .any(|a| ours.contains(&a.address));
+    let sizes_ok = [&bridge.light_client, &bridge.verifier]
+        .iter()
+        .all(|m| !m.is_empty() && m.len() <= modules::MAX_MODULE_SIZE);
     if allocated || !sizes_ok {
         solo_guest::trap();
     }
-    for (address, module) in [(LIGHT_CLIENT_ADDRESS, &bridge.light_client), (VERIFIER_ADDRESS, &bridge.verifier)] {
+    for (address, module) in [
+        (LIGHT_CLIENT_ADDRESS, &bridge.light_client),
+        (VERIFIER_ADDRESS, &bridge.verifier),
+    ] {
         let code_hash = state::keccak256(module);
         state::set_raw(&state::code_key(&code_hash), module);
         place(&address, &modules::designator(&code_hash));
@@ -112,16 +134,29 @@ pub fn init(genesis: &Genesis) {
     // The modules take their governance from the governance track in force
     // (spec 13 §9.5): the key, or the governance address.
     let governance = crate::governance::authority();
-    if client::genesis(&HostCrypto, &mut Namespace(LIGHT_CLIENT_ADDRESS), &bridge, governance).is_err() {
+    if client::genesis(
+        &HostCrypto,
+        &mut Namespace(LIGHT_CLIENT_ADDRESS),
+        &bridge,
+        governance,
+    )
+    .is_err()
+    {
         solo_guest::trap();
     }
-    verifier::genesis(&mut Namespace(VERIFIER_ADDRESS), &bridge, genesis.chain_id, governance);
+    verifier::genesis(
+        &mut Namespace(VERIFIER_ADDRESS),
+        &bridge,
+        genesis.chain_id,
+        governance,
+    );
 }
 
 /// Whether `address` is a governed native contract of the bridge: one of
 /// its two addresses, holding a module designator (the bridge is on).
 pub fn governed(address: &Address) -> bool {
-    (*address == LIGHT_CLIENT_ADDRESS || *address == VERIFIER_ADDRESS) && modules::designated(&crate::evm::code(address)).is_some()
+    (*address == LIGHT_CLIENT_ADDRESS || *address == VERIFIER_ADDRESS)
+        && modules::designated(&crate::evm::code(address)).is_some()
 }
 
 /// Names `governance` as the account both modules take governed calls
@@ -129,12 +164,36 @@ pub fn governed(address: &Address) -> bool {
 /// happens on a chain without the bridge.
 pub fn set_governance(governance: &Address) {
     let mut light = Namespace(LIGHT_CLIENT_ADDRESS);
-    if let Some(cfg) = light.get(client::keys::CONFIG).and_then(|b| client::Config::from_bytes(&b).ok()) {
-        light.set(client::keys::CONFIG, Some(&client::Config { governance: *governance, ..cfg }.to_bytes()));
+    if let Some(cfg) = light
+        .get(client::keys::CONFIG)
+        .and_then(|b| client::Config::from_bytes(&b).ok())
+    {
+        light.set(
+            client::keys::CONFIG,
+            Some(
+                &client::Config {
+                    governance: *governance,
+                    ..cfg
+                }
+                .to_bytes(),
+            ),
+        );
     }
     let mut messages = Namespace(VERIFIER_ADDRESS);
-    if let Some(cfg) = messages.get(verifier::keys::CONFIG).and_then(|b| verifier::Config::from_bytes(&b).ok()) {
-        messages.set(verifier::keys::CONFIG, Some(&verifier::Config { governance: *governance, ..cfg }.to_bytes()));
+    if let Some(cfg) = messages
+        .get(verifier::keys::CONFIG)
+        .and_then(|b| verifier::Config::from_bytes(&b).ok())
+    {
+        messages.set(
+            verifier::keys::CONFIG,
+            Some(
+                &verifier::Config {
+                    governance: *governance,
+                    ..cfg
+                }
+                .to_bytes(),
+            ),
+        );
     }
 }
 
@@ -150,7 +209,14 @@ pub fn govern(target: &Address, data: &[u8], block: BlockFields, gas: u64) -> Op
     let code_hash = modules::designated(&crate::evm::code(target))?;
     let namespace = modules::namespace(target);
     let call = ModuleCall::Call {
-        context: CallContext { address: *target, caller: crate::governance::authority(), value: 0, height: block.number, timestamp: block.timestamp, is_static: false },
+        context: CallContext {
+            address: *target,
+            caller: crate::governance::authority(),
+            value: 0,
+            height: block.number,
+            timestamp: block.timestamp,
+            is_static: false,
+        },
         data: data.to_vec(),
         pending: Seq(Vec::new()),
     };
@@ -168,7 +234,13 @@ pub fn govern(target: &Address, data: &[u8], block: BlockFields, gas: u64) -> Op
 /// address must pass the module's cheap checks.
 pub fn admit(s: &Signed) -> Result<(), u32> {
     match s.tx.to {
-        Some(to) => client::admit(&Namespace(LIGHT_CLIENT_ADDRESS), &Namespace(VERIFIER_ADDRESS), &to, s.tx.value, &s.tx.input),
+        Some(to) => client::admit(
+            &Namespace(LIGHT_CLIENT_ADDRESS),
+            &Namespace(VERIFIER_ADDRESS),
+            &to,
+            s.tx.value,
+            &s.tx.input,
+        ),
         None => Ok(()),
     }
 }

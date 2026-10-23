@@ -52,7 +52,9 @@ fn handle(call: &ModuleCall, store: &mut Store) -> Result<Vec<u8>, Vec<u8>> {
         ModuleCall::Init { arg } => {
             let start = match arg.len() {
                 0 => 0,
-                _ => <[u8; 8]>::try_from(arg.as_slice()).map_err(|_| Vec::new()).map(u64::from_le_bytes)?,
+                _ => <[u8; 8]>::try_from(arg.as_slice())
+                    .map_err(|_| Vec::new())
+                    .map(u64::from_le_bytes)?,
             };
             store.set_u64(COUNT, start);
             store.set_u64(INITIAL, start);
@@ -72,7 +74,11 @@ fn handle(call: &ModuleCall, store: &mut Store) -> Result<Vec<u8>, Vec<u8>> {
     }
 }
 
-fn dispatch(data: &[u8], context: Option<&CallContext>, store: &mut Store) -> Result<Vec<u8>, Vec<u8>> {
+fn dispatch(
+    data: &[u8],
+    context: Option<&CallContext>,
+    store: &mut Store,
+) -> Result<Vec<u8>, Vec<u8>> {
     let words = |w: [u8; 32]| Ok(w.to_vec());
     match selector(data).ok_or_else(Vec::new)? {
         [0x06, 0x66, 0x1a, 0xbd] => words(word(u128::from(store.get_u64(COUNT)))),
@@ -80,7 +86,10 @@ fn dispatch(data: &[u8], context: Option<&CallContext>, store: &mut Store) -> Re
         [0x96, 0x7f, 0xf2, 0x3e] => words(word(u128::from(store.get_u64(BLOCKS)))),
         [0x25, 0x15, 0x9a, 0xa9] => words(word(u128::from(store.get_u64(LAST)))),
         [0x10, 0x03, 0xe2, 0xd2] => {
-            let n = arg(data, 0).as_ref().and_then(as_u64).ok_or_else(Vec::new)?;
+            let n = arg(data, 0)
+                .as_ref()
+                .and_then(as_u64)
+                .ok_or_else(Vec::new)?;
             let count = store.get_u64(COUNT).checked_add(n).ok_or_else(Vec::new)?;
             store.set_u64(COUNT, count);
             words(word(u128::from(count)))
@@ -88,7 +97,9 @@ fn dispatch(data: &[u8], context: Option<&CallContext>, store: &mut Store) -> Re
         [0x13, 0x2e, 0x4f, 0x3c] => Err(encode(FAILED, &[arg(data, 0).unwrap_or_default()])),
         [0x29, 0x5b, 0x4e, 0x17] => words(word(context.map_or(0, |c| c.value))),
         [0xf0, 0xac, 0xd7, 0xd5] => spin(),
-        [0xa0, 0x49, 0x0f, 0xa0] => words(solo_module::keccak256(&bytes_arg(data, 0).ok_or_else(Vec::new)?)),
+        [0xa0, 0x49, 0x0f, 0xa0] => words(solo_module::keccak256(
+            &bytes_arg(data, 0).ok_or_else(Vec::new)?,
+        )),
         [0xb3, 0xb3, 0x6b, 0xb3] => words(address(&context.map_or([0; 20], |c| c.caller))),
         [0x38, 0x63, 0x6e, 0x9a] => {
             let key = bytes_arg(data, 0).ok_or_else(Vec::new)?;
@@ -97,7 +108,10 @@ fn dispatch(data: &[u8], context: Option<&CallContext>, store: &mut Store) -> Re
             Ok(Vec::new())
         }
         [0xe8, 0x33, 0xa9, 0x0d] => {
-            let mode = arg(data, 0).as_ref().and_then(as_u64).ok_or_else(Vec::new)?;
+            let mode = arg(data, 0)
+                .as_ref()
+                .and_then(as_u64)
+                .ok_or_else(Vec::new)?;
             store.set_u64(HOOKS, mode);
             Ok(Vec::new())
         }

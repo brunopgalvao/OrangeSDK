@@ -32,7 +32,9 @@ pub fn authority(auth: &solo_eth::Authorization) -> Option<Address> {
 pub fn recover_pubkey(msg: &Hash, sig: &[u8; 65]) -> Option<[u8; 64]> {
     let mut pubkey = [0u8; 64];
     // SAFETY: valid pointers into our own buffers of the stated sizes.
-    let status = unsafe { host::__solo_import_secp256k1_recover(msg.as_ptr(), sig.as_ptr(), pubkey.as_mut_ptr()) };
+    let status = unsafe {
+        host::__solo_import_secp256k1_recover(msg.as_ptr(), sig.as_ptr(), pubkey.as_mut_ptr())
+    };
     (status == 0).then_some(pubkey)
 }
 
@@ -56,7 +58,12 @@ pub fn decode_signed(raw: &[u8], chain_id: u64) -> Result<Signed, u32> {
     if tx.chain_id.is_some_and(|id| id != chain_id) {
         return Err(reason::WRONG_CHAIN);
     }
-    let from = recover_address(&keccak256(&tx.signing_payload), &tx.signature()).ok_or(reason::BAD_SIGNATURE)?;
+    let from = recover_address(&keccak256(&tx.signing_payload), &tx.signature())
+        .ok_or(reason::BAD_SIGNATURE)?;
     let authorities = tx.authorization_list.iter().map(authority).collect();
-    Ok(Signed { tx, from, authorities })
+    Ok(Signed {
+        tx,
+        from,
+        authorities,
+    })
 }

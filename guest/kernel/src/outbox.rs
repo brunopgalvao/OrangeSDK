@@ -26,7 +26,9 @@ use crate::tx::Signed;
 /// Admission (spec 17 §2.2): a transaction sent to the outbox must carry a
 /// `send` it accepts.
 pub fn admit(s: &Signed) -> Result<(), u32> {
-    if s.tx.to == Some(OUTBOX_ADDRESS) && !SendCall::decode(&s.tx.input).is_some_and(|c| c.acceptable(state::chain_id())) {
+    if s.tx.to == Some(OUTBOX_ADDRESS)
+        && !SendCall::decode(&s.tx.input).is_some_and(|c| c.acceptable(state::chain_id()))
+    {
         Err(reason::OUTBOX_MESSAGE)
     } else {
         Ok(())
@@ -40,22 +42,38 @@ pub fn is_outbox(inputs: &CallInputs) -> bool {
 }
 
 /// Serves a message call that [`is_outbox`].
-pub fn call<CTX: ContextTr>(ctx: &mut CTX, inputs: &CallInputs) -> Result<InterpreterResult, String> {
+pub fn call<CTX: ContextTr>(
+    ctx: &mut CTX,
+    inputs: &CallInputs,
+) -> Result<InterpreterResult, String> {
     let limit = inputs.gas_limit;
     let mut gas = Gas::new_with_regular_gas_and_reservoir(limit, inputs.reservoir);
     let target = inputs.target_address;
     let data = inputs.input.bytes(ctx);
     let call = SendCall::decode(&data).filter(|c| c.acceptable(state::chain_id()));
-    let Some(call) = call.filter(|_| inputs.scheme == CallScheme::Call && !inputs.is_static && target.0.0 == OUTBOX_ADDRESS) else {
-        return Ok(InterpreterResult::new(InstructionResult::Revert, Bytes::new(), gas));
+    let Some(call) = call.filter(|_| {
+        inputs.scheme == CallScheme::Call && !inputs.is_static && target.0.0 == OUTBOX_ADDRESS
+    }) else {
+        return Ok(InterpreterResult::new(
+            InstructionResult::Revert,
+            Bytes::new(),
+            gas,
+        ));
     };
     let cost = send_gas(call.payload.len());
     if !gas.record_regular_cost(cost) {
         gas.spend_all();
-        return Ok(InterpreterResult::new(InstructionResult::PrecompileOOG, Bytes::new(), gas));
+        return Ok(InterpreterResult::new(
+            InstructionResult::PrecompileOOG,
+            Bytes::new(),
+            gas,
+        ));
     }
     let journal = ctx.journal_mut();
-    let last = journal.sload(target, U256::from_be_bytes(NONCE_SLOT)).map_err(|_| String::from("database"))?.data;
+    let last = journal
+        .sload(target, U256::from_be_bytes(NONCE_SLOT))
+        .map_err(|_| String::from("database"))?
+        .data;
     let nonce = u64::try_from(last).unwrap_or(u64::MAX - 1) + 1;
     let message = Message {
         source_chain_id: state::chain_id(),
@@ -67,11 +85,27 @@ pub fn call<CTX: ContextTr>(ctx: &mut CTX, inputs: &CallInputs) -> Result<Interp
         payload: call.payload,
     };
     let hash = state::keccak256(&message.encode());
-    journal.sstore(target, U256::from_be_bytes(NONCE_SLOT), U256::from(nonce)).map_err(|_| String::from("database"))?;
-    journal.sstore(target, U256::from_be_bytes(message_slot(nonce)), U256::from_be_bytes(hash)).map_err(|_| String::from("database"))?;
+    journal
+        .sstore(target, U256::from_be_bytes(NONCE_SLOT), U256::from(nonce))
+        .map_err(|_| String::from("database"))?;
+    journal
+        .sstore(
+            target,
+            U256::from_be_bytes(message_slot(nonce)),
+            U256::from_be_bytes(hash),
+        )
+        .map_err(|_| String::from("database"))?;
     let topics = message.topics().iter().map(|t| B256::from(*t)).collect();
-    journal.log(RLog::new_unchecked(target, topics, Bytes::from(message.log_data(&hash))));
-    Ok(InterpreterResult::new(InstructionResult::Return, Bytes::from(message_slot(nonce).to_vec()), gas))
+    journal.log(RLog::new_unchecked(
+        target,
+        topics,
+        Bytes::from(message.log_data(&hash)),
+    ));
+    Ok(InterpreterResult::new(
+        InstructionResult::Return,
+        Bytes::from(message_slot(nonce).to_vec()),
+        gas,
+    ))
 }
 
 /// Commits the slots the outbox wrote. It has no code and no nonce, so the
@@ -83,7 +117,10 @@ pub fn commit(address: &Address, account: &RAccount) -> bool {
         return false;
     }
     for (key, slot) in account.changed_storage_slots() {
-        state::set_raw(&state::slot_key(address, &key.to_be_bytes::<32>()), &slot.present_value.to_be_bytes::<32>());
+        state::set_raw(
+            &state::slot_key(address, &key.to_be_bytes::<32>()),
+            &slot.present_value.to_be_bytes::<32>(),
+        );
     }
     true
 }

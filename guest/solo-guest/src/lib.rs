@@ -100,17 +100,41 @@ pub mod host {
         pub fn __solo_import_input_read(dst: *mut u8, offset: u32, len: u32) -> u64;
         pub fn __solo_import_output_write(src: *const u8, len: u32) -> u64;
         pub fn __solo_import_gas_remaining() -> u64;
-        pub fn __solo_import_storage_get(key: *const u8, key_len: u32, dst: *mut u8, cap: u32) -> u64;
-        pub fn __solo_import_storage_set(key: *const u8, key_len: u32, val: *const u8, val_len: u32) -> u64;
+        pub fn __solo_import_storage_get(
+            key: *const u8,
+            key_len: u32,
+            dst: *mut u8,
+            cap: u32,
+        ) -> u64;
+        pub fn __solo_import_storage_set(
+            key: *const u8,
+            key_len: u32,
+            val: *const u8,
+            val_len: u32,
+        ) -> u64;
         pub fn __solo_import_storage_delete(key: *const u8, key_len: u32) -> u64;
         pub fn __solo_import_storage_commit(dst: *mut u8) -> u64;
         pub fn __solo_import_storage_iter_open(prefix: *const u8, prefix_len: u32) -> u64;
-        pub fn __solo_import_storage_iter_next(handle: u64, key: *mut u8, key_cap: u32, val: *mut u8, val_cap: u32) -> super::Pair;
+        pub fn __solo_import_storage_iter_next(
+            handle: u64,
+            key: *mut u8,
+            key_cap: u32,
+            val: *mut u8,
+            val_cap: u32,
+        ) -> super::Pair;
         /// `a0` = status, `a1` = callee gas used (spec 05 §4.4).
-        pub fn __solo_import_invoke(code_hash: *const u8, namespace: *const u8, input: *const u8, input_len: u32, gas_limit: u64, flags: u64) -> super::Pair;
+        pub fn __solo_import_invoke(
+            code_hash: *const u8,
+            namespace: *const u8,
+            input: *const u8,
+            input_len: u32,
+            gas_limit: u64,
+            flags: u64,
+        ) -> super::Pair;
         pub fn __solo_import_invoke_output_len() -> u64;
         pub fn __solo_import_invoke_output_read(dst: *mut u8, offset: u32, len: u32) -> u64;
-        pub fn __solo_import_secp256k1_recover(msg: *const u8, sig: *const u8, dst: *mut u8) -> u64;
+        pub fn __solo_import_secp256k1_recover(msg: *const u8, sig: *const u8, dst: *mut u8)
+        -> u64;
         pub fn __solo_import_hash_keccak256(src: *const u8, len: u32, dst: *mut u8) -> u64;
         pub fn __solo_import_hash_sha256(src: *const u8, len: u32, dst: *mut u8) -> u64;
         pub fn __solo_import_p256_verify(msg: *const u8, sig: *const u8, pubkey: *const u8) -> u64;
@@ -123,13 +147,40 @@ pub mod host {
             dst_len: u32,
         ) -> u64;
         pub fn __solo_import_bls12381_pairing_check(pairs: *const u8, count: u32) -> u64;
-        pub fn __solo_import_bls12381_fast_aggregate_verify(keys: *const u8, count: u32, msg: *const u8, msg_len: u32, sig: *const u8) -> u64;
-        pub fn __solo_import_sign(key_role: u64, msg: *const u8, msg_len: u32, dst: *mut u8, cap: u32) -> u64;
+        pub fn __solo_import_bls12381_fast_aggregate_verify(
+            keys: *const u8,
+            count: u32,
+            msg: *const u8,
+            msg_len: u32,
+            sig: *const u8,
+        ) -> u64;
+        pub fn __solo_import_sign(
+            key_role: u64,
+            msg: *const u8,
+            msg_len: u32,
+            dst: *mut u8,
+            cap: u32,
+        ) -> u64;
         pub fn __solo_import_time_now() -> u64;
-        pub fn __solo_import_persist_set(key: *const u8, key_len: u32, val: *const u8, val_len: u32) -> u64;
-        pub fn __solo_import_persist_get(key: *const u8, key_len: u32, dst: *mut u8, cap: u32) -> u64;
+        pub fn __solo_import_persist_set(
+            key: *const u8,
+            key_len: u32,
+            val: *const u8,
+            val_len: u32,
+        ) -> u64;
+        pub fn __solo_import_persist_get(
+            key: *const u8,
+            key_len: u32,
+            dst: *mut u8,
+            cap: u32,
+        ) -> u64;
         pub fn __solo_import_log_emit(level: u32, msg: *const u8, len: u32) -> u64;
-        pub fn __solo_import_metric_emit(name: *const u8, name_len: u32, value: i64, kind: u32) -> u64;
+        pub fn __solo_import_metric_emit(
+            name: *const u8,
+            name_len: u32,
+            value: i64,
+            kind: u32,
+        ) -> u64;
     }
 }
 
@@ -221,7 +272,14 @@ macro_rules! __paste_export {
 macro_rules! solo_main {
     ($f:path) => {
         #[unsafe(no_mangle)]
-        pub extern "C" fn solo_export_main(a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> ! {
+        pub extern "C" fn solo_export_main(
+            a0: u64,
+            a1: u64,
+            a2: u64,
+            a3: u64,
+            a4: u64,
+            a5: u64,
+        ) -> ! {
             let (r0, r1): (u64, u64) = $f(a0, a1, a2, a3, a4, a5);
             $crate::halt(r0, r1)
         }

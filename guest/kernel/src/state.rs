@@ -12,7 +12,14 @@ use solo_guest::host;
 pub fn get_raw(key: &[u8]) -> Option<Vec<u8>> {
     let mut buf = alloc::vec![0u8; 4096];
     // SAFETY: valid pointers into our own buffers.
-    let len = unsafe { host::__solo_import_storage_get(key.as_ptr(), key.len() as u32, buf.as_mut_ptr(), buf.len() as u32) };
+    let len = unsafe {
+        host::__solo_import_storage_get(
+            key.as_ptr(),
+            key.len() as u32,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        )
+    };
     if len == u64::from(u32::MAX) {
         return None;
     }
@@ -20,7 +27,14 @@ pub fn get_raw(key: &[u8]) -> Option<Vec<u8>> {
     if len > buf.len() {
         buf = alloc::vec![0u8; len];
         // SAFETY: as above, with a buffer large enough for the whole value.
-        unsafe { host::__solo_import_storage_get(key.as_ptr(), key.len() as u32, buf.as_mut_ptr(), buf.len() as u32) };
+        unsafe {
+            host::__solo_import_storage_get(
+                key.as_ptr(),
+                key.len() as u32,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+            )
+        };
     }
     buf.truncate(len);
     Some(buf)
@@ -29,7 +43,14 @@ pub fn get_raw(key: &[u8]) -> Option<Vec<u8>> {
 /// Writes a raw value.
 pub fn set_raw(key: &[u8], value: &[u8]) {
     // SAFETY: valid pointers into our own buffers.
-    unsafe { host::__solo_import_storage_set(key.as_ptr(), key.len() as u32, value.as_ptr(), value.len() as u32) };
+    unsafe {
+        host::__solo_import_storage_set(
+            key.as_ptr(),
+            key.len() as u32,
+            value.as_ptr(),
+            value.len() as u32,
+        )
+    };
 }
 
 /// Deletes a value.
@@ -93,7 +114,10 @@ pub fn last_hash() -> Hash {
 /// Stores a block and its index entries.
 pub fn put_block(header: &BlockHeader, hash: &Hash) {
     set(&block_key(header.height), header);
-    set_raw(&concat(keys::BLOCK_NUMBER, &header.height.to_be_bytes()), hash);
+    set_raw(
+        &concat(keys::BLOCK_NUMBER, &header.height.to_be_bytes()),
+        hash,
+    );
     set(&concat(keys::BLOCK_HASH, hash), &header.height);
     set(keys::HEIGHT, &header.height);
     set(keys::LAST_HASH, hash);
@@ -108,7 +132,8 @@ pub fn block_by_number(height: u64) -> Option<BlockHeader> {
 /// `BLOCKHASH` costs one read of 32 bytes however large the header is
 /// (spec 19 §4).
 pub fn block_hash(height: u64) -> Option<Hash> {
-    get_raw(&concat(keys::BLOCK_NUMBER, &height.to_be_bytes())).and_then(|v| Hash::try_from(v.as_slice()).ok())
+    get_raw(&concat(keys::BLOCK_NUMBER, &height.to_be_bytes()))
+        .and_then(|v| Hash::try_from(v.as_slice()).ok())
 }
 
 /// Block header by hash.
@@ -149,7 +174,9 @@ pub fn put_evidence(evidence: &Evidence) -> bool {
 /// Evidence records from index `first`, at most `EVIDENCE_PAGE` of them.
 pub fn evidence_from(first: u64) -> Vec<Evidence> {
     let count: u64 = get(keys::EVIDENCE_COUNT).unwrap_or(0);
-    (first..count.min(first.saturating_add(EVIDENCE_PAGE))).filter_map(|i| get(&concat(keys::EVIDENCE, &i.to_be_bytes()))).collect()
+    (first..count.min(first.saturating_add(EVIDENCE_PAGE)))
+        .filter_map(|i| get(&concat(keys::EVIDENCE, &i.to_be_bytes())))
+        .collect()
 }
 
 /// Genesis parameters as stored.
@@ -182,13 +209,18 @@ pub fn slot_key(address: &Address, slot: &Hash) -> Vec<u8> {
 /// storage out of a creation's reach (see `evm::commit`).
 pub fn init(genesis: &Genesis) {
     set(keys::CHAIN_ID, &genesis.chain_id);
-    let mut params = GenesisParams::from_bytes(&genesis.params).unwrap_or_else(|_| solo_guest::trap());
+    let mut params =
+        GenesisParams::from_bytes(&genesis.params).unwrap_or_else(|_| solo_guest::trap());
     let allocations = core::mem::take(&mut params.allocations.0);
     params.bridge_in = solo_abi::bridge_in::BridgeInParams::default();
     set(b"meta/params", &params);
     set_raw(b"meta/validators", &genesis.validators);
     for allocation in &allocations {
-        let has_storage = allocation.storage.0.iter().any(|slot| slot.value != [0; 32]);
+        let has_storage = allocation
+            .storage
+            .0
+            .iter()
+            .any(|slot| slot.value != [0; 32]);
         if has_storage && allocation.code.is_empty() && allocation.nonce == 0 {
             solo_guest::trap();
         }
@@ -199,7 +231,14 @@ pub fn init(genesis: &Genesis) {
             set_raw(&code_key(&hash), &allocation.code);
             hash
         };
-        set_account(&allocation.address, &Account { balance: allocation.balance, nonce: allocation.nonce, code_hash });
+        set_account(
+            &allocation.address,
+            &Account {
+                balance: allocation.balance,
+                nonce: allocation.nonce,
+                code_hash,
+            },
+        );
         for slot in &allocation.storage.0 {
             if slot.value != [0; 32] {
                 set_raw(&slot_key(&allocation.address, &slot.key), &slot.value);
@@ -213,7 +252,9 @@ pub fn init(genesis: &Genesis) {
 pub fn keccak256(data: &[u8]) -> Hash {
     let mut out = [0u8; 32];
     // SAFETY: valid pointers into our own buffers.
-    unsafe { host::__solo_import_hash_keccak256(data.as_ptr(), data.len() as u32, out.as_mut_ptr()) };
+    unsafe {
+        host::__solo_import_hash_keccak256(data.as_ptr(), data.len() as u32, out.as_mut_ptr())
+    };
     out
 }
 

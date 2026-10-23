@@ -10,14 +10,18 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use solo_abi::chain::consensus::signing_preimage;
-use solo_abi::chain::{Account, BLOCK_GAS_LIMIT, Evidence, Log, Validator, ValidatorSet, call_status, reason};
+use solo_abi::chain::{
+    Account, BLOCK_GAS_LIMIT, Evidence, Log, Validator, ValidatorSet, call_status, reason,
+};
 use solo_abi::codec::Seq;
 use solo_abi::fees::mul_div;
 use solo_abi::rotation::{HANDOFF_EPOCHS, REPORT_GAS, ThresholdEvidence};
 use solo_abi::staking::{
-    Delegation, DelegationEntry, DkgEnvelope, DkgRun, G1_LENGTH, G2_LENGTH, GWEI, KIND_DKG, KeySetRecord, KeySetVote, MAX_DELEGATIONS, MAX_DELEGATORS,
-    MAX_DKG, MAX_REGISTERED, SLASH_BPS, STAKING_ADDRESS, StakeEntry, StakeRecord, StakingAction, StakingParams, StakingStatus, address_word,
-    dkg_header, envelope, epoch_of, epoch_start, event, keys, query, session_preimage, stake_shares, view_epoch, word,
+    Delegation, DelegationEntry, DkgEnvelope, DkgRun, G1_LENGTH, G2_LENGTH, GWEI, KIND_DKG,
+    KeySetRecord, KeySetVote, MAX_DELEGATIONS, MAX_DELEGATORS, MAX_DKG, MAX_REGISTERED, SLASH_BPS,
+    STAKING_ADDRESS, StakeEntry, StakeRecord, StakingAction, StakingParams, StakingStatus,
+    address_word, dkg_header, envelope, epoch_of, epoch_start, event, keys, query,
+    session_preimage, stake_shares, view_epoch, word,
 };
 use solo_abi::types::{Address, Genesis, Hash, QueryResult};
 use solo_abi::{Decode, Encode};
@@ -49,7 +53,12 @@ fn run_key(epoch: u64) -> Vec<u8> {
 }
 
 fn message_key(epoch: u64, phase: u8, index: u32) -> Vec<u8> {
-    concat(&[keys::MESSAGE, &epoch.to_be_bytes(), &[phase], &index.to_be_bytes()])
+    concat(&[
+        keys::MESSAGE,
+        &epoch.to_be_bytes(),
+        &[phase],
+        &index.to_be_bytes(),
+    ])
 }
 
 fn vote_key(epoch: u64, id: &Hash) -> Vec<u8> {
@@ -107,12 +116,16 @@ fn delegation(id: &Hash, delegator: &Address) -> Option<Delegation> {
 
 /// A validator's delegators, in the order they first delegated.
 fn delegators(id: &Hash) -> Vec<Address> {
-    state::get::<Seq<Address>>(&delegators_key(id)).map(|s| s.0).unwrap_or_default()
+    state::get::<Seq<Address>>(&delegators_key(id))
+        .map(|s| s.0)
+        .unwrap_or_default()
 }
 
 /// The validators an account delegates to, in the order it first did.
 fn delegated_to(delegator: &Address) -> Vec<Hash> {
-    state::get::<Seq<Hash>>(&delegated_to_key(delegator)).map(|s| s.0).unwrap_or_default()
+    state::get::<Seq<Hash>>(&delegated_to_key(delegator))
+        .map(|s| s.0)
+        .unwrap_or_default()
 }
 
 fn set_list<T: Encode + Clone>(key: &[u8], list: &[T]) {
@@ -131,9 +144,15 @@ fn put_delegation(id: &Hash, delegator: &Address, d: &Delegation) {
         return;
     }
     state::delete(&delegation_key(id, delegator));
-    let rest: Vec<Address> = delegators(id).into_iter().filter(|a| a != delegator).collect();
+    let rest: Vec<Address> = delegators(id)
+        .into_iter()
+        .filter(|a| a != delegator)
+        .collect();
     set_list(&delegators_key(id), &rest);
-    let rest: Vec<Hash> = delegated_to(delegator).into_iter().filter(|v| v != id).collect();
+    let rest: Vec<Hash> = delegated_to(delegator)
+        .into_iter()
+        .filter(|v| v != id)
+        .collect();
     set_list(&delegated_to_key(delegator), &rest);
 }
 
@@ -148,7 +167,9 @@ fn put_record(id: &Hash, record: &StakeRecord) {
 
 /// Registered validator ids, in registration order.
 fn ids() -> Vec<Hash> {
-    state::get::<Seq<Hash>>(keys::IDS).map(|s| s.0).unwrap_or_default()
+    state::get::<Seq<Hash>>(keys::IDS)
+        .map(|s| s.0)
+        .unwrap_or_default()
 }
 
 fn id_of(address: &Address) -> Option<Hash> {
@@ -176,7 +197,13 @@ pub fn set_entries(epoch: u64) -> Option<Vec<(Hash, u64)>> {
 
 /// [`set_entries`] for a caller that already holds `epoch_blocks`.
 pub fn set_entries_in(epoch_blocks: u64, epoch: u64) -> Option<Vec<(Hash, u64)>> {
-    set_in(epoch_blocks, epoch).map(|s| s.validators.0.into_iter().map(|v| (v.id, v.weight)).collect())
+    set_in(epoch_blocks, epoch).map(|s| {
+        s.validators
+            .0
+            .into_iter()
+            .map(|v| (v.id, v.weight))
+            .collect()
+    })
 }
 
 /// The DKG run of `epoch`, if one was scheduled.
@@ -199,7 +226,11 @@ pub fn has_vote(epoch: u64, id: &Hash) -> bool {
 pub fn transcript(run: &DkgRun, upto: u8) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     for phase in 0..upto.min(3) {
-        let senders = if phase == 1 { run.recipients.0.len() } else { run.dealers.0.len() };
+        let senders = if phase == 1 {
+            run.recipients.0.len()
+        } else {
+            run.dealers.0.len()
+        };
         for index in 1..=senders as u32 {
             if let Some(m) = state::get_raw(&message_key(run.epoch, phase, index)) {
                 out.push(m);
@@ -275,7 +306,10 @@ pub fn init(genesis: &Genesis) {
     if p.dkg_phase_blocks.saturating_mul(4) > p.epoch_blocks {
         solo_guest::trap();
     }
-    if p.dkg_phase_blocks != 0 && (p.max_key_age == 0 || p.unbonding_epochs <= p.max_key_age.saturating_add(HANDOFF_EPOCHS)) {
+    if p.dkg_phase_blocks != 0
+        && (p.max_key_age == 0
+            || p.unbonding_epochs <= p.max_key_age.saturating_add(HANDOFF_EPOCHS))
+    {
         solo_guest::trap();
     }
     let set = ValidatorSet::from_bytes(&genesis.validators).unwrap_or_else(|_| solo_guest::trap());
@@ -288,11 +322,25 @@ pub fn init(genesis: &Genesis) {
     let mut total = 0u128;
     let mut registered = Vec::new();
     for v in &set.validators.0 {
-        let dkg_key = p.keys.0.iter().find(|k| k.id == v.id).map(|k| k.dkg_key.clone()).unwrap_or_default();
+        let dkg_key = p
+            .keys
+            .0
+            .iter()
+            .find(|k| k.id == v.id)
+            .map(|k| k.dkg_key.clone())
+            .unwrap_or_default();
         let stake = u128::from(v.weight) * GWEI;
         total += stake;
         let address = address_of(&v.id);
-        put_record(&v.id, &StakeRecord { address, stake, dkg_key, ..StakeRecord::default() });
+        put_record(
+            &v.id,
+            &StakeRecord {
+                address,
+                stake,
+                dkg_key,
+                ..StakeRecord::default()
+            },
+        );
         state::set(&concat(&[keys::BY_ADDRESS, &address]), &v.id);
         registered.push(v.id);
     }
@@ -359,8 +407,14 @@ fn action_of(s: &Signed, height: u64, charge: bool) -> Option<(StakingAction, Ha
                 Some(_) => return None,
                 // A new validator bonds at least the stake selection needs, so a
                 // registration slot is never free to take (spec 15 §3.3).
-                None if value >= p.min_stake.max(GWEI) && value % GWEI == 0 && ids().len() < MAX_REGISTERED => {
-                    let pubkey = tx::recover_pubkey(&state::keccak256(&s.tx.signing_payload), &s.tx.signature())?;
+                None if value >= p.min_stake.max(GWEI)
+                    && value % GWEI == 0
+                    && ids().len() < MAX_REGISTERED =>
+                {
+                    let pubkey = tx::recover_pubkey(
+                        &state::keccak256(&s.tx.signing_payload),
+                        &s.tx.signature(),
+                    )?;
                     state::keccak256(&pubkey)
                 }
                 None => return None,
@@ -376,8 +430,16 @@ fn action_of(s: &Signed, height: u64, charge: bool) -> Option<(StakingAction, Ha
         }
         StakingAction::Withdraw => {
             // Released stake of its own, or behind any validator it delegates to.
-            let own = registered.as_ref().filter(|(_, r)| r.unbonding > 0 && epoch >= r.release_epoch).map(|(id, _)| *id);
-            let delegated = || delegated_to(&s.from).iter().any(|v| released_delegation(v, &s.from, epoch)).then_some([0; 32]);
+            let own = registered
+                .as_ref()
+                .filter(|(_, r)| r.unbonding > 0 && epoch >= r.release_epoch)
+                .map(|(id, _)| *id);
+            let delegated = || {
+                delegated_to(&s.from)
+                    .iter()
+                    .any(|v| released_delegation(v, &s.from, epoch))
+                    .then_some([0; 32])
+            };
             (value == 0).then(|| own.or_else(delegated))??
         }
         StakingAction::Delegate { validator } => {
@@ -390,7 +452,10 @@ fn action_of(s: &Signed, height: u64, charge: bool) -> Option<(StakingAction, Ha
                 return None;
             }
             let first = delegation(&id, &s.from).is_none();
-            if first && (delegators(&id).len() >= MAX_DELEGATORS || delegated_to(&s.from).len() >= MAX_DELEGATIONS) {
+            if first
+                && (delegators(&id).len() >= MAX_DELEGATORS
+                    || delegated_to(&s.from).len() >= MAX_DELEGATIONS)
+            {
                 return None;
             }
             id
@@ -417,7 +482,11 @@ fn action_of(s: &Signed, height: u64, charge: bool) -> Option<(StakingAction, Ha
 /// Admission: a transaction to the staking address must be able to run.
 pub fn admit(s: &Signed) -> Result<(), u32> {
     let next = state::height().unwrap_or(0) + 1;
-    if s.tx.to == Some(STAKING_ADDRESS) && action_of(s, next, false).is_none() { Err(reason::STAKING_ACTION) } else { Ok(()) }
+    if s.tx.to == Some(STAKING_ADDRESS) && action_of(s, next, false).is_none() {
+        Err(reason::STAKING_ACTION)
+    } else {
+        Ok(())
+    }
 }
 
 /// Whether `s` goes to the staking address.
@@ -431,7 +500,13 @@ pub fn is_staking(s: &Signed) -> bool {
 /// then applies its action.
 pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Outcome {
     let Some((action, id)) = action_of(s, height, true) else {
-        return Outcome { status: call_status::INVALID, gas_used: 0, output: Vec::new(), logs: Vec::new(), contract: None };
+        return Outcome {
+            status: call_status::INVALID,
+            gas_used: 0,
+            output: Vec::new(),
+            logs: Vec::new(),
+            contract: None,
+        };
     };
     let report = matches!(action, StakingAction::Report { .. });
     let mut outcome = crate::native::run(message, block, true);
@@ -445,12 +520,20 @@ pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Out
 }
 
 fn log(topic: Hash, address: &Address, data: Vec<u8>) -> Log {
-    Log { address: STAKING_ADDRESS, topics: Seq(vec![topic, address_word(address)]), data }
+    Log {
+        address: STAKING_ADDRESS,
+        topics: Seq(vec![topic, address_word(address)]),
+        data,
+    }
 }
 
 /// A log with two indexed addresses: a delegator and a validator.
 fn log2(topic: Hash, first: &Address, second: &Address, data: Vec<u8>) -> Log {
-    Log { address: STAKING_ADDRESS, topics: Seq(vec![topic, address_word(first), address_word(second)]), data }
+    Log {
+        address: STAKING_ADDRESS,
+        topics: Seq(vec![topic, address_word(first), address_word(second)]),
+        data,
+    }
 }
 
 /// Applies a `withdraw` (spec 15 §3.4, §10.1): every released amount, the
@@ -495,14 +578,24 @@ fn delegate(action: &StakingAction, id: &Hash, s: &Signed, epoch: u64) -> Vec<Lo
             }
             d.stake += s.tx.value;
             r.delegated += s.tx.value;
-            vec![log2(event::DELEGATED, &s.from, validator, word(s.tx.value).to_vec())]
+            vec![log2(
+                event::DELEGATED,
+                &s.from,
+                validator,
+                word(s.tx.value).to_vec(),
+            )]
         }
         StakingAction::Undelegate { validator, amount } => {
             d.stake -= amount;
             d.unbonding += amount;
             d.release_epoch = epoch + 1 + params().unbonding_epochs;
             r.delegated -= amount;
-            vec![log2(event::UNDELEGATED, &s.from, validator, [word(*amount), word(u128::from(d.release_epoch))].concat())]
+            vec![log2(
+                event::UNDELEGATED,
+                &s.from,
+                validator,
+                [word(*amount), word(u128::from(d.release_epoch))].concat(),
+            )]
         }
         _ => Vec::new(),
     };
@@ -511,13 +604,21 @@ fn delegate(action: &StakingAction, id: &Hash, s: &Signed, epoch: u64) -> Vec<Lo
     logs
 }
 
-fn apply(action: StakingAction, id: &Hash, s: &Signed, height: u64, block: BlockFields) -> Vec<Log> {
+fn apply(
+    action: StakingAction,
+    id: &Hash,
+    s: &Signed,
+    height: u64,
+    block: BlockFields,
+) -> Vec<Log> {
     let p = params();
     let epoch = epoch_of(height, p.epoch_blocks);
     match &action {
         StakingAction::Report { evidence } => return report(evidence, id, s, block),
         StakingAction::Withdraw => return withdraw(s, epoch),
-        StakingAction::Delegate { .. } | StakingAction::Undelegate { .. } => return delegate(&action, id, s, epoch),
+        StakingAction::Delegate { .. } | StakingAction::Undelegate { .. } => {
+            return delegate(&action, id, s, epoch);
+        }
         _ => {}
     }
     let mut r = record(id).unwrap_or_default();
@@ -544,7 +645,11 @@ fn apply(action: StakingAction, id: &Hash, s: &Signed, height: u64, block: Block
             r.stake -= amount;
             r.unbonding += amount;
             r.release_epoch = epoch + 1 + p.unbonding_epochs;
-            vec![log(event::UNBONDED, &s.from, [word(amount), word(u128::from(r.release_epoch))].concat())]
+            vec![log(
+                event::UNBONDED,
+                &s.from,
+                [word(amount), word(u128::from(r.release_epoch))].concat(),
+            )]
         }
         _ => Vec::new(),
     };
@@ -560,7 +665,15 @@ fn report(evidence: &[u8], id: &Hash, s: &Signed, block: BlockFields) -> Vec<Log
     rotation::put_evidence(&evidence, id);
     fees::pay_surcharge(s, REPORT_GAS, block);
     let address = record(id).map_or_else(|| address_of(id), |r| r.address);
-    vec![log(event::REPORTED, &address, [word(u128::from(evidence.kind)), word(u128::from(evidence.key_set))].concat())]
+    vec![log(
+        event::REPORTED,
+        &address,
+        [
+            word(u128::from(evidence.kind)),
+            word(u128::from(evidence.key_set)),
+        ]
+        .concat(),
+    )]
 }
 
 /// `x · SLASH_BPS / 10 000` without overflow.
@@ -579,8 +692,12 @@ pub fn slash(evidence: &Evidence) {
     if params().epoch_blocks == 0 {
         return;
     }
-    let Some(set) = set_of(view_epoch(evidence.view)) else { return };
-    let Some(v) = set.validators.0.get(evidence.validator as usize) else { return };
+    let Some(set) = set_of(view_epoch(evidence.view)) else {
+        return;
+    };
+    let Some(v) = set.validators.0.get(evidence.validator as usize) else {
+        return;
+    };
     slash_id(&v.id);
 }
 
@@ -591,7 +708,10 @@ pub fn slash_id(id: &Hash) {
     let mut r = record(id).unwrap_or_else(|| {
         let address = address_of(id);
         state::set(&concat(&[keys::BY_ADDRESS, &address]), id);
-        StakeRecord { address, ..StakeRecord::default() }
+        StakeRecord {
+            address,
+            ..StakeRecord::default()
+        }
     });
     if r.jailed {
         return;
@@ -620,7 +740,9 @@ pub fn slash_id(id: &Hash) {
 pub fn evidence_set(view: u64) -> Vec<Hash> {
     let blocks = params().epoch_blocks;
     let epoch = if blocks == 0 { 0 } else { view_epoch(view) };
-    set_entries_in(blocks, epoch).map(|s| s.into_iter().map(|(id, _)| id).collect()).unwrap_or_default()
+    set_entries_in(blocks, epoch)
+        .map(|s| s.into_iter().map(|(id, _)| id).collect())
+        .unwrap_or_default()
 }
 
 /// The next set: registered validators that are not jailed and whose own
@@ -633,16 +755,27 @@ fn select(p: &StakingParams) -> Option<ValidatorSet> {
     let mut candidates: Vec<(usize, Hash, u128)> = ids()
         .into_iter()
         .enumerate()
-        .filter_map(|(i, id)| record(&id).filter(|r| !r.jailed && r.stake >= floor).map(|r| (i, id, r.stake + r.delegated)))
+        .filter_map(|(i, id)| {
+            record(&id)
+                .filter(|r| !r.jailed && r.stake >= floor)
+                .map(|r| (i, id, r.stake + r.delegated))
+        })
         .collect();
     candidates.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
     if p.max_validators != 0 {
         candidates.truncate(p.max_validators as usize);
     }
     candidates.sort_by_key(|c| c.0);
-    let validators: Vec<Validator> =
-        candidates.into_iter().map(|(_, id, stake)| Validator { id, weight: u64::try_from(stake / GWEI).unwrap_or(u64::MAX) }).collect();
-    (!validators.is_empty()).then_some(ValidatorSet { validators: Seq(validators) })
+    let validators: Vec<Validator> = candidates
+        .into_iter()
+        .map(|(_, id, stake)| Validator {
+            id,
+            weight: u64::try_from(stake / GWEI).unwrap_or(u64::MAX),
+        })
+        .collect();
+    (!validators.is_empty()).then_some(ValidatorSet {
+        validators: Seq(validators),
+    })
 }
 
 /// Schedules epoch `epoch`'s DKG run for `set`: always a fresh key among
@@ -654,8 +787,19 @@ fn select(p: &StakingParams) -> Option<ValidatorSet> {
 /// members with a share; when they hold fewer shares than the threshold
 /// there is no run.
 fn schedule_run(epoch: u64, set: &ValidatorSet) {
-    let records: Vec<Option<StakeRecord>> = set.validators.0.iter().map(|v| record(&v.id).filter(|r| !r.dkg_key.is_empty())).collect();
-    let members: Vec<(u64, bool)> = set.validators.0.iter().zip(&records).map(|(v, r)| (v.weight, r.is_some())).collect();
+    let records: Vec<Option<StakeRecord>> = set
+        .validators
+        .0
+        .iter()
+        .map(|v| record(&v.id).filter(|r| !r.dkg_key.is_empty()))
+        .collect();
+    let members: Vec<(u64, bool)> = set
+        .validators
+        .0
+        .iter()
+        .zip(&records)
+        .map(|(v, r)| (v.weight, r.is_some()))
+        .collect();
     let (counts, threshold) = stake_shares(&members);
     let mut recipients = Vec::new();
     let mut keys_of = Vec::new();
@@ -694,7 +838,11 @@ fn prune(next: &ValidatorSet) {
         .into_iter()
         .filter(|id| {
             let Some(r) = record(id) else { return false };
-            let empty = !r.jailed && r.stake == 0 && r.unbonding == 0 && delegators(id).is_empty() && !next.validators.0.iter().any(|v| v.id == *id);
+            let empty = !r.jailed
+                && r.stake == 0
+                && r.unbonding == 0
+                && delegators(id).is_empty()
+                && !next.validators.0.iter().any(|v| v.id == *id);
             if empty {
                 state::delete(&record_key(id));
                 state::delete(&concat(&[keys::BY_ADDRESS, &r.address]));
@@ -745,7 +893,11 @@ fn distribute(epoch: u64) {
         let mut rest = share;
         if stakes != 0 {
             for delegator in delegators(&v.id) {
-                let part = mul_div(share, delegation(&v.id, &delegator).unwrap_or_default().stake, stakes);
+                let part = mul_div(
+                    share,
+                    delegation(&v.id, &delegator).unwrap_or_default().stake,
+                    stakes,
+                );
                 if part != 0 {
                     credit(&delegator, part);
                     rest -= part;
@@ -753,7 +905,11 @@ fn distribute(epoch: u64) {
             }
         }
         if rest != 0 {
-            let own = if r.address == [0; 20] { address_of(&v.id) } else { r.address };
+            let own = if r.address == [0; 20] {
+                address_of(&v.id)
+            } else {
+                r.address
+            };
             credit(&own, rest);
         }
         paid += share;
@@ -796,13 +952,17 @@ pub fn record_dkg(envelopes: &[Vec<u8>], height: u64) {
     let phase = ((height - epoch_start(epoch, p.epoch_blocks)) / p.dkg_phase_blocks).min(3);
     let chain_id = state::chain_id();
     for raw in envelopes.iter().take(MAX_DKG) {
-        let Ok(env) = DkgEnvelope::from_bytes(raw) else { continue };
+        let Ok(env) = DkgEnvelope::from_bytes(raw) else {
+            continue;
+        };
         if env.epoch != epoch {
             continue;
         }
         let body_hash = state::keccak256(&DkgEnvelope::signed_hash_preimage(env.kind, &env.body));
         let digest = state::keccak256(&signing_preimage(KIND_DKG, chain_id, epoch, &body_hash));
-        let Some(pubkey) = tx::recover_pubkey(&digest, &env.signature.0) else { continue };
+        let Some(pubkey) = tx::recover_pubkey(&digest, &env.signature.0) else {
+            continue;
+        };
         let signer = state::keccak256(&pubkey);
         match env.kind {
             envelope::MESSAGE => record_message(&run, &env.body, &signer, phase),
@@ -815,11 +975,17 @@ pub fn record_dkg(envelopes: &[Vec<u8>], height: u64) {
 }
 
 fn record_message(run: &DkgRun, body: &[u8], signer: &Hash, now: u64) {
-    let Some((phase, session, index)) = dkg_header(body) else { return };
+    let Some((phase, session, index)) = dkg_header(body) else {
+        return;
+    };
     if session != run.session || u64::from(phase) != now {
         return;
     }
-    let roster = if phase == 1 { &run.recipients.0 } else { &run.dealers.0 };
+    let roster = if phase == 1 {
+        &run.recipients.0
+    } else {
+        &run.dealers.0
+    };
     if index == 0 || roster.get(index as usize - 1) != Some(signer) {
         return;
     }
@@ -834,10 +1000,20 @@ fn confirm(run: &DkgRun, body: &[u8], signer: &Hash, height: u64) {
     if key_set(epoch).is_some() || has_vote(epoch, signer) {
         return;
     }
-    let Ok(vote) = KeySetVote::from_bytes(body) else { return };
+    let Ok(vote) = KeySetVote::from_bytes(body) else {
+        return;
+    };
     let Some(set) = set_of(epoch) else { return };
     let total: u128 = set.validators.0.iter().map(|v| u128::from(v.weight)).sum();
-    let Some(weight) = set.validators.0.iter().find(|v| v.id == *signer).map(|v| u128::from(v.weight)) else { return };
+    let Some(weight) = set
+        .validators
+        .0
+        .iter()
+        .find(|v| v.id == *signer)
+        .map(|v| u128::from(v.weight))
+    else {
+        return;
+    };
     let hash = state::keccak256(body);
     state::set(&vote_key(epoch, signer), &hash);
     let k = tally_key(epoch, &hash);
@@ -854,14 +1030,25 @@ fn confirm(run: &DkgRun, body: &[u8], signer: &Hash, height: u64) {
 /// active at once; a later one waits for the active key to hand off to it
 /// (spec 15 §6.6).
 fn adopt(run: &DkgRun, vote: KeySetVote, height: u64) {
-    let shareholders: Vec<Hash> = run.recipients.0.iter().zip(&run.shares.0).flat_map(|(id, &m)| core::iter::repeat_n(*id, m as usize)).collect();
+    let shareholders: Vec<Hash> = run
+        .recipients
+        .0
+        .iter()
+        .zip(&run.shares.0)
+        .flat_map(|(id, &m)| core::iter::repeat_n(*id, m as usize))
+        .collect();
     let shaped = vote.key_set.len() == run.threshold as usize * G2_LENGTH
         && vote.public_shares.0.len() == shareholders.len()
         && vote.public_shares.0.iter().all(|s| s.len() == G2_LENGTH);
     if !shaped {
         return;
     }
-    let record = KeySetRecord { id: run.epoch, key_set: vote.key_set, public_shares: vote.public_shares, shareholders: Seq(shareholders) };
+    let record = KeySetRecord {
+        id: run.epoch,
+        key_set: vote.key_set,
+        public_shares: vote.public_shares,
+        shareholders: Seq(shareholders),
+    };
     state::set(&key_set_key(run.epoch), &record);
     rotation::adopted(&record, height);
 }
@@ -869,8 +1056,15 @@ fn adopt(run: &DkgRun, vote: KeySetVote, height: u64) {
 fn status() -> StakingStatus {
     let mut p = params();
     p.keys = Seq(Vec::new());
-    let epoch = if p.epoch_blocks == 0 { 0 } else { epoch_of(state::height().unwrap_or(0) + 1, p.epoch_blocks) };
-    let records = ids().into_iter().filter_map(|id| record(&id).map(|record| StakeEntry { id, record })).collect();
+    let epoch = if p.epoch_blocks == 0 {
+        0
+    } else {
+        epoch_of(state::height().unwrap_or(0) + 1, p.epoch_blocks)
+    };
+    let records = ids()
+        .into_iter()
+        .filter_map(|id| record(&id).map(|record| StakeEntry { id, record }))
+        .collect();
     StakingStatus {
         epoch,
         params: p,
@@ -886,7 +1080,12 @@ fn status() -> StakingStatus {
 fn delegations_of(delegator: &Address) -> Vec<DelegationEntry> {
     delegated_to(delegator)
         .into_iter()
-        .filter_map(|validator| delegation(&validator, delegator).map(|delegation| DelegationEntry { validator, delegation }))
+        .filter_map(|validator| {
+            delegation(&validator, delegator).map(|delegation| DelegationEntry {
+                validator,
+                delegation,
+            })
+        })
         .collect()
 }
 
@@ -896,12 +1095,24 @@ pub fn query(method: &str, params: &[u8]) -> Option<QueryResult> {
     match method {
         query::STAKING => Some(ok(status().to_bytes())),
         query::STAKING_SET => Some(match u64::from_bytes(params) {
-            Ok(epoch) => set_of(epoch).map_or(QueryResult { status: 1, body: Vec::new() }, |s| ok(s.to_bytes())),
-            Err(_) => QueryResult { status: 2, body: Vec::new() },
+            Ok(epoch) => set_of(epoch).map_or(
+                QueryResult {
+                    status: 1,
+                    body: Vec::new(),
+                },
+                |s| ok(s.to_bytes()),
+            ),
+            Err(_) => QueryResult {
+                status: 2,
+                body: Vec::new(),
+            },
         }),
         query::DELEGATIONS => Some(match Address::from_bytes(params) {
             Ok(delegator) => ok(Seq(delegations_of(&delegator)).to_bytes()),
-            Err(_) => QueryResult { status: 2, body: Vec::new() },
+            Err(_) => QueryResult {
+                status: 2,
+                body: Vec::new(),
+            },
         }),
         _ => None,
     }

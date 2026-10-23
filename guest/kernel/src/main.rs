@@ -25,7 +25,10 @@ mod tx;
 
 use alloc::vec::Vec;
 
-use solo_abi::types::{BuildArgs, ExecuteArgs, FinalizeArgs, Genesis, Input, MigrateArgs, QueryArgs, QueryResult, ValidateArgs};
+use solo_abi::types::{
+    BuildArgs, ExecuteArgs, FinalizeArgs, Genesis, Input, MigrateArgs, QueryArgs, QueryResult,
+    ValidateArgs,
+};
 use solo_abi::{Decode, Encode};
 
 fn decode_or_trap<T: Decode>(bytes: &[u8]) -> T {
@@ -62,7 +65,9 @@ solo_guest::solo_export!(kernel_migrate, |input: &[u8]| -> Vec<u8> {
     Vec::new()
 });
 
-solo_guest::solo_export!(kernel_version, |_input: &[u8]| -> Vec<u8> { governance::KERNEL_VERSION.to_bytes() });
+solo_guest::solo_export!(kernel_version, |_input: &[u8]| -> Vec<u8> {
+    governance::KERNEL_VERSION.to_bytes()
+});
 
 solo_guest::solo_export!(kernel_stf_validate_tx, |input: &[u8]| -> Vec<u8> {
     let args: ValidateArgs = decode_or_trap(input);

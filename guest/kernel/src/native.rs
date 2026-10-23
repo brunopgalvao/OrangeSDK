@@ -79,21 +79,35 @@ pub const HEAD_SLOT: U256 = U256::ZERO;
 impl NativeProvider {
     /// A provider for one transaction in `block`.
     pub fn new(spec: SpecId, block: BlockFields, query: bool) -> NativeProvider {
-        NativeProvider { eth: EthPrecompiles::new(spec), block, query, batches: Vec::new() }
+        NativeProvider {
+            eth: EthPrecompiles::new(spec),
+            block,
+            query,
+            batches: Vec::new(),
+        }
     }
 
     /// The writes that stand for `address` when its slot 0 holds `head`, oldest first.
     pub fn standing(&self, address: &Address, head: u64) -> Vec<&Write> {
         let mut chain = Vec::new();
         let mut id = head;
-        while let Some(batch) = id.checked_sub(1).and_then(|i| self.batches.get(i as usize)).filter(|b| b.address == *address) {
+        while let Some(batch) = id
+            .checked_sub(1)
+            .and_then(|i| self.batches.get(i as usize))
+            .filter(|b| b.address == *address)
+        {
             chain.push(batch);
             id = batch.previous;
         }
         chain.iter().rev().flat_map(|b| b.writes.iter()).collect()
     }
 
-    fn call<CTX: ContextTr>(&mut self, ctx: &mut CTX, inputs: &CallInputs, code_hash: &[u8; 32]) -> Result<InterpreterResult, String> {
+    fn call<CTX: ContextTr>(
+        &mut self,
+        ctx: &mut CTX,
+        inputs: &CallInputs,
+        code_hash: &[u8; 32],
+    ) -> Result<InterpreterResult, String> {
         let limit = inputs.gas_limit;
         let halt = |result: InstructionResult| {
             let mut gas = Gas::new_with_regular_gas_and_reservoir(limit, inputs.reservoir);
@@ -108,8 +122,15 @@ impl NativeProvider {
         let target = inputs.target_address;
         // A module runs only as the account that holds its designator:
         // no DELEGATECALL, no CALLCODE, no EIP-7702 delegation to it.
-        let own_code = ctx.journal_mut().code_hash(target).map_err(|_| String::from("database"))?.data;
-        if !matches!(inputs.scheme, CallScheme::Call | CallScheme::StaticCall) || target != inputs.bytecode_address || own_code != inputs.known_bytecode.0 {
+        let own_code = ctx
+            .journal_mut()
+            .code_hash(target)
+            .map_err(|_| String::from("database"))?
+            .data;
+        if !matches!(inputs.scheme, CallScheme::Call | CallScheme::StaticCall)
+            || target != inputs.bytecode_address
+            || own_code != inputs.known_bytecode.0
+        {
             return Ok(halt(InstructionResult::PrecompileError));
         }
         if limit < modules::CALL_GAS {
@@ -119,7 +140,11 @@ impl NativeProvider {
         if self.query {
             vm_limit = vm_limit.min(crate::modules::gas_remaining() / 2);
         }
-        let head_word = ctx.journal_mut().sload(target, HEAD_SLOT).map_err(|_| String::from("database"))?.data;
+        let head_word = ctx
+            .journal_mut()
+            .sload(target, HEAD_SLOT)
+            .map_err(|_| String::from("database"))?
+            .data;
         let head = u64::try_from(head_word).unwrap_or(0);
         let address: Address = target.0.0;
         let pending = self.standing(&address, head).into_iter().cloned().collect();
@@ -135,7 +160,13 @@ impl NativeProvider {
             data: inputs.input.bytes(ctx).to_vec(),
             pending: Seq(pending),
         };
-        let Invoked { output, gas_used } = invoke(code_hash, &modules::namespace(&address), &solo_abi::Encode::to_bytes(&call), vm_limit, false);
+        let Invoked { output, gas_used } = invoke(
+            code_hash,
+            &modules::namespace(&address),
+            &solo_abi::Encode::to_bytes(&call),
+            vm_limit,
+            false,
+        );
         let Some(output) = output else {
             return Ok(halt(InstructionResult::PrecompileError));
         };
@@ -152,8 +183,14 @@ impl NativeProvider {
             return Ok(halt(InstructionResult::PrecompileOOG));
         }
         if !writes.is_empty() {
-            self.batches.push(Batch { address, previous: head, writes });
-            ctx.journal_mut().sstore(target, HEAD_SLOT, U256::from(self.batches.len())).map_err(|_| String::from("database"))?;
+            self.batches.push(Batch {
+                address,
+                previous: head,
+                writes,
+            });
+            ctx.journal_mut()
+                .sstore(target, HEAD_SLOT, U256::from(self.batches.len()))
+                .map_err(|_| String::from("database"))?;
         }
         Ok(finish(InstructionResult::Return, used, output.data))
     }
@@ -170,10 +207,18 @@ impl Precompiles for NativeProvider {
         if crate::outbox::commit(address, account) {
             return true;
         }
-        if !account.info.code.as_ref().is_some_and(|c| modules::designated(c.original_byte_slice()).is_some()) {
+        if !account
+            .info
+            .code
+            .as_ref()
+            .is_some_and(|c| modules::designated(c.original_byte_slice()).is_some())
+        {
             return false;
         }
-        let head = account.storage.get(&HEAD_SLOT).map_or(0, |s| u64::try_from(s.present_value).unwrap_or(0));
+        let head = account
+            .storage
+            .get(&HEAD_SLOT)
+            .map_or(0, |s| u64::try_from(s.present_value).unwrap_or(0));
         let writes: Vec<_> = self.standing(address, head).into_iter().cloned().collect();
         crate::modules::apply(Some(&modules::namespace(address)), &writes);
         true
@@ -187,8 +232,14 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for NativeProvider {
         <EthPrecompiles as PrecompileProvider<CTX>>::set_spec(&mut self.eth, spec)
     }
 
-    fn run(&mut self, context: &mut CTX, inputs: &CallInputs) -> Result<Option<InterpreterResult>, String> {
-        if let Some(result) = <EthPrecompiles as PrecompileProvider<CTX>>::run(&mut self.eth, context, inputs)? {
+    fn run(
+        &mut self,
+        context: &mut CTX,
+        inputs: &CallInputs,
+    ) -> Result<Option<InterpreterResult>, String> {
+        if let Some(result) =
+            <EthPrecompiles as PrecompileProvider<CTX>>::run(&mut self.eth, context, inputs)?
+        {
             return Ok(Some(result));
         }
         if crate::outbox::is_outbox(inputs) {

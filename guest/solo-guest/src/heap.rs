@@ -50,7 +50,11 @@ impl Pool {
     #[must_use]
     pub const fn new() -> Pool {
         Pool {
-            state: UnsafeCell::new(State { next: 0, end: 0, free: [0; CLASSES] }),
+            state: UnsafeCell::new(State {
+                next: 0,
+                end: 0,
+                free: [0; CLASSES],
+            }),
         }
     }
 }
@@ -63,7 +67,11 @@ impl Default for Pool {
 
 /// The class of a block that can hold `layout`, and the block's size.
 fn class(layout: Layout) -> Option<(usize, usize)> {
-    let size = layout.size().max(layout.align()).max(1 << MIN_SHIFT).checked_next_power_of_two()?;
+    let size = layout
+        .size()
+        .max(layout.align())
+        .max(1 << MIN_SHIFT)
+        .checked_next_power_of_two()?;
     let shift = size.trailing_zeros();
     (shift <= MAX_SHIFT).then(|| ((shift - MIN_SHIFT) as usize, size))
 }
@@ -120,7 +128,9 @@ unsafe impl GlobalAlloc for Pool {
         // SAFETY: single-threaded; no other reference to the state exists.
         let s = unsafe { &mut *self.state.get() };
         // A block handed out for `layout` had a class.
-        let Some((index, _)) = class(layout) else { return };
+        let Some((index, _)) = class(layout) else {
+            return;
+        };
         // SAFETY: `ptr` is a block of at least 16 bytes that its owner gave up.
         unsafe { *(ptr as *mut usize) = s.free[index] };
         s.free[index] = ptr as usize;

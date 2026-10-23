@@ -4,9 +4,15 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use solo_abi::chain::consensus::{MAX_EVIDENCE, signing_preimage};
-use solo_abi::chain::{Account, BLOCK_GAS_LIMIT, BlockHeader, CallRequest, CallResult, Evidence, Participation, Receipt, SNAPSHOT_INTERVAL, SnapshotRecord, StorageQuery, call_status, keys, query, reason};
+use solo_abi::chain::{
+    Account, BLOCK_GAS_LIMIT, BlockHeader, CallRequest, CallResult, Evidence, Participation,
+    Receipt, SNAPSHOT_INTERVAL, SnapshotRecord, StorageQuery, call_status, keys, query, reason,
+};
 use solo_abi::codec::Seq;
-use solo_abi::types::{Address, Ahead, Block, BuildArgs, ExecuteArgs, ExecuteResult, ExecuteSummary, FinalizeArgs, Hash, QueryArgs, QueryResult, ValidateArgs, ValidateResult};
+use solo_abi::types::{
+    Address, Ahead, Block, BuildArgs, ExecuteArgs, ExecuteResult, ExecuteSummary, FinalizeArgs,
+    Hash, QueryArgs, QueryResult, ValidateArgs, ValidateResult,
+};
 use solo_abi::{Decode, Encode};
 use solo_eth::{MAX_TX_GAS, header, mpt};
 
@@ -69,9 +75,19 @@ fn check(raw: &[u8], base_fee: u64) -> Result<Signed, u32> {
 /// `ahead.reserved` less. A nonce past the end of the range has no next
 /// transaction; a balance below the reserve pays for nothing.
 fn ahead_of(account: Account, ahead: &Ahead) -> Result<Account, u32> {
-    let nonce = account.nonce.checked_add(ahead.nonces).ok_or(reason::BAD_NONCE)?;
-    let balance = account.balance.checked_sub(ahead.reserved).ok_or(reason::INSUFFICIENT_FUNDS)?;
-    Ok(Account { nonce, balance, ..account })
+    let nonce = account
+        .nonce
+        .checked_add(ahead.nonces)
+        .ok_or(reason::BAD_NONCE)?;
+    let balance = account
+        .balance
+        .checked_sub(ahead.reserved)
+        .ok_or(reason::INSUFFICIENT_FUNDS)?;
+    Ok(Account {
+        nonce,
+        balance,
+        ..account
+    })
 }
 
 /// `kernel_stf_validate_tx`: the transaction validates against the sender's
@@ -81,13 +97,16 @@ fn ahead_of(account: Account, ahead: &Ahead) -> Result<Account, u32> {
 /// wrongly can delay its own transactions but never make a block invalid.
 pub fn validate(args: &ValidateArgs) -> ValidateResult {
     let base_fee = fees::next_base_fee();
-    match check(&args.tx, base_fee).and_then(|s| admissible(&s, &ahead_of(state::account(&s.from), &args.ahead)?).map(|()| s)) {
+    match check(&args.tx, base_fee)
+        .and_then(|s| admissible(&s, &ahead_of(state::account(&s.from), &args.ahead)?).map(|()| s))
+    {
         Ok(s) => {
             // The priority is the tip the transaction pays over the base fee.
             let price = s.tx.effective_gas_price(u128::from(base_fee)).unwrap_or(0);
             ValidateResult::Valid {
                 priority: u64::try_from(price - u128::from(base_fee)).unwrap_or(u64::MAX),
-                reserved_fee: u64::try_from(s.tx.max_cost().unwrap_or(u128::MAX)).unwrap_or(u64::MAX),
+                reserved_fee: u64::try_from(s.tx.max_cost().unwrap_or(u128::MAX))
+                    .unwrap_or(u64::MAX),
             }
         }
         Err(reason) => ValidateResult::Invalid { reason },
@@ -105,11 +124,15 @@ pub fn build(args: &BuildArgs) -> Block {
         if selected.len() >= max {
             break;
         }
-        let Ok(s) = check(raw, base_fee) else { continue };
+        let Ok(s) = check(raw, base_fee) else {
+            continue;
+        };
         if gas + s.tx.gas_limit > BLOCK_GAS_LIMIT {
             continue;
         }
-        let account = accounts.entry(s.from).or_insert_with(|| state::account(&s.from));
+        let account = accounts
+            .entry(s.from)
+            .or_insert_with(|| state::account(&s.from));
         if admissible(&s, account).is_err() {
             continue;
         }
@@ -118,18 +141,35 @@ pub fn build(args: &BuildArgs) -> Block {
         gas += s.tx.gas_limit;
         selected.push(raw.clone());
     }
-    let header = BlockHeader { height: args.context.height, parent_hash: args.context.parent_hash, timestamp_ms: args.context.timestamp_ms, ..BlockHeader::default() };
-    Block { header: header.to_bytes(), txs: Seq(selected), participation: Vec::new() }
+    let header = BlockHeader {
+        height: args.context.height,
+        parent_hash: args.context.parent_hash,
+        timestamp_ms: args.context.timestamp_ms,
+        ..BlockHeader::default()
+    };
+    Block {
+        header: header.to_bytes(),
+        txs: Seq(selected),
+        participation: Vec::new(),
+    }
 }
 
 /// Whether both messages of `evidence` are signed by the validator it names
 /// in `validators`, the set of the epoch of its view.
 fn verified(evidence: &Evidence, validators: &[Hash], chain_id: u64) -> bool {
-    let Some(id) = validators.get(evidence.validator as usize) else { return false };
+    let Some(id) = validators.get(evidence.validator as usize) else {
+        return false;
+    };
     evidence.well_formed()
         && [&evidence.first, &evidence.second].iter().all(|m| {
-            let msg = state::keccak256(&signing_preimage(evidence.kind, chain_id, evidence.view, &m.hash));
-            tx::recover_pubkey(&msg, &m.signature.0).is_some_and(|pubkey| state::keccak256(&pubkey) == *id)
+            let msg = state::keccak256(&signing_preimage(
+                evidence.kind,
+                chain_id,
+                evidence.view,
+                &m.hash,
+            ));
+            tx::recover_pubkey(&msg, &m.signature.0)
+                .is_some_and(|pubkey| state::keccak256(&pubkey) == *id)
         })
 }
 
@@ -138,12 +178,19 @@ fn verified(evidence: &Evidence, validators: &[Hash], chain_id: u64) -> bool {
 /// offence is new, and the DKG envelopes it carries (spec 15 §6.2). Nothing
 /// here can make a block invalid.
 fn record_participation(participation: &[u8], height: u64) {
-    let Ok(participation) = Participation::from_bytes(participation) else { return };
+    let Ok(participation) = Participation::from_bytes(participation) else {
+        return;
+    };
     let chain_id = state::chain_id();
     for evidence in participation.evidence.0.iter().take(MAX_EVIDENCE) {
         // The slashing hook: the offender's stake is cut in the same state
         // transition that records the offence, once per offence.
-        if verified(evidence, &crate::staking::evidence_set(evidence.view), chain_id) && state::put_evidence(evidence) {
+        if verified(
+            evidence,
+            &crate::staking::evidence_set(evidence.view),
+            chain_id,
+        ) && state::put_evidence(evidence)
+        {
             crate::staking::slash(evidence);
         }
     }
@@ -151,7 +198,13 @@ fn record_participation(participation: &[u8], height: u64) {
 }
 
 fn failed(height: u64, index: u32, cumulative: u64) -> Receipt {
-    Receipt { status: 0, height, index, cumulative_gas_used: cumulative, ..Receipt::default() }
+    Receipt {
+        status: 0,
+        height,
+        index,
+        cumulative_gas_used: cumulative,
+        ..Receipt::default()
+    }
 }
 
 /// Whether the transaction with this hash has run. Every transaction that runs
@@ -163,7 +216,13 @@ pub fn has_run(tx_hash: &Hash) -> bool {
 
 /// Runs one transaction of `block` at `index`, after `cumulative` gas; `None`
 /// if it cannot run, in which case nothing changed.
-fn run_tx(raw: &[u8], chain_id: u64, block: BlockFields, index: u32, cumulative: u64) -> Option<Receipt> {
+fn run_tx(
+    raw: &[u8],
+    chain_id: u64,
+    block: BlockFields,
+    index: u32,
+    cumulative: u64,
+) -> Option<Receipt> {
     let s = decode_signed(raw, chain_id).ok()?;
     if well_formed(&s, block.base_fee).is_err() || cumulative + s.tx.gas_limit > BLOCK_GAS_LIMIT {
         return None;
@@ -179,7 +238,13 @@ fn run_tx(raw: &[u8], chain_id: u64, block: BlockFields, index: u32, cumulative:
         priority_fee: s.tx.priority_fee,
         nonce: Some(s.tx.nonce),
         access_list: s.tx.access_list.clone(),
-        authorization_list: s.tx.authorization_list.iter().cloned().zip(s.authorities.iter().copied()).collect(),
+        authorization_list: s
+            .tx
+            .authorization_list
+            .iter()
+            .cloned()
+            .zip(s.authorities.iter().copied())
+            .collect(),
     };
     let outcome = if crate::staking::is_staking(&s) {
         crate::staking::run(&s, block.number, message, block)
@@ -206,7 +271,10 @@ fn run_tx(raw: &[u8], chain_id: u64, block: BlockFields, index: u32, cumulative:
         contract: outcome.contract,
         logs: Seq(outcome.logs),
         tx_type: s.tx.tx_type,
-        effective_gas_price: s.tx.effective_gas_price(u128::from(block.base_fee)).unwrap_or(0),
+        effective_gas_price: s
+            .tx
+            .effective_gas_price(u128::from(block.base_fee))
+            .unwrap_or(0),
     })
 }
 
@@ -214,7 +282,14 @@ fn run_tx(raw: &[u8], chain_id: u64, block: BlockFields, index: u32, cumulative:
 /// feature-gate epoch, else [`SNAPSHOT_INTERVAL`].
 fn snapshot_interval() -> u64 {
     let p = state::params();
-    [p.staking.epoch_blocks, p.upgrades.epoch_blocks, SNAPSHOT_INTERVAL].into_iter().find(|n| *n != 0).unwrap_or(SNAPSHOT_INTERVAL)
+    [
+        p.staking.epoch_blocks,
+        p.upgrades.epoch_blocks,
+        SNAPSHOT_INTERVAL,
+    ]
+    .into_iter()
+    .find(|n| *n != 0)
+    .unwrap_or(SNAPSHOT_INTERVAL)
 }
 
 /// Writes the snapshot record of the epoch that ended with the block before
@@ -227,8 +302,14 @@ fn record_snapshot(height: u64) {
         return;
     }
     let epoch = (height - 1) / interval - 1;
-    let record = SnapshotRecord { height: height - 1, state_root: state::commit() };
-    state::set(&[keys::SNAPSHOT, &epoch.to_be_bytes()[..]].concat(), &record);
+    let record = SnapshotRecord {
+        height: height - 1,
+        state_root: state::commit(),
+    };
+    state::set(
+        &[keys::SNAPSHOT, &epoch.to_be_bytes()[..]].concat(),
+        &record,
+    );
     state::set(keys::SNAPSHOT_LATEST, &epoch);
 }
 
@@ -245,7 +326,9 @@ fn snapshot(params: &[u8]) -> QueryResult {
             Err(_) => return bad_params(),
         }
     };
-    found(state::get::<SnapshotRecord>(&[keys::SNAPSHOT, &epoch.to_be_bytes()[..]].concat()))
+    found(state::get::<SnapshotRecord>(
+        &[keys::SNAPSHOT, &epoch.to_be_bytes()[..]].concat(),
+    ))
 }
 
 /// `kernel_stf_execute_block`: runs every transaction in order through the
@@ -258,7 +341,8 @@ fn snapshot(params: &[u8]) -> QueryResult {
 /// transaction that ran keeps its receipt, in the one block that lists it.
 pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let chain_id = state::chain_id();
-    let template = BlockHeader::from_bytes(&args.block.header).unwrap_or_else(|_| solo_guest::trap());
+    let template =
+        BlockHeader::from_bytes(&args.block.header).unwrap_or_else(|_| solo_guest::trap());
     let height = template.height;
     // The base fee follows from the parent's header and the treasury from the
     // parameters in force (spec 23 §3), both read before anything in this
@@ -271,7 +355,10 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
         treasury: fees::params().treasury,
     };
     record_snapshot(height);
-    crate::precompiles::begin(crate::governance::gate_active(solo_upgrade::gate::PRECOMPILES, height));
+    crate::precompiles::begin(crate::governance::gate_active(
+        solo_upgrade::gate::PRECOMPILES,
+        height,
+    ));
     record_participation(&args.block.participation, height);
     crate::modules::begin_block(height, template.timestamp_ms);
     let mut receipts = Vec::new();
@@ -325,7 +412,12 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     state::put_block(&header, &block_hash);
     ExecuteResult {
         state_root,
-        summary: ExecuteSummary { gas_used: cumulative, tx_count: receipts.len() as u32, receipts_root, logs_bloom: logs_bloom.to_vec() },
+        summary: ExecuteSummary {
+            gas_used: cumulative,
+            tx_count: receipts.len() as u32,
+            receipts_root,
+            logs_bloom: logs_bloom.to_vec(),
+        },
         receipts: Seq(receipts),
     }
 }
@@ -337,13 +429,22 @@ pub fn finalize(args: &FinalizeArgs) {
 
 fn found<T: Encode>(v: Option<T>) -> QueryResult {
     match v {
-        Some(v) => QueryResult { status: 0, body: v.to_bytes() },
-        None => QueryResult { status: 1, body: Vec::new() },
+        Some(v) => QueryResult {
+            status: 0,
+            body: v.to_bytes(),
+        },
+        None => QueryResult {
+            status: 1,
+            body: Vec::new(),
+        },
     }
 }
 
 fn bad_params() -> QueryResult {
-    QueryResult { status: 2, body: Vec::new() }
+    QueryResult {
+        status: 2,
+        body: Vec::new(),
+    }
 }
 
 /// Runs a call against the head state without keeping its effects. The EVM
@@ -355,20 +456,49 @@ fn bad_params() -> QueryResult {
 fn call(request: CallRequest) -> CallResult {
     let height = state::height().unwrap_or(0);
     let timestamp = state::block_by_number(height).map_or(0, |h| h.timestamp_ms / 1000);
-    let block = BlockFields { number: height, timestamp, base_fee: fees::head_base_fee(), beneficiary: fees::beneficiary(), treasury: [0; 20] };
-    let gas = if request.gas == 0 { MAX_TX_GAS } else { request.gas.min(MAX_TX_GAS) };
-    let access_list: Vec<solo_eth::AccessItem> = request.access_list.0.into_iter().map(|item| solo_eth::AccessItem { address: item.address, keys: item.keys.0 }).collect();
+    let block = BlockFields {
+        number: height,
+        timestamp,
+        base_fee: fees::head_base_fee(),
+        beneficiary: fees::beneficiary(),
+        treasury: [0; 20],
+    };
+    let gas = if request.gas == 0 {
+        MAX_TX_GAS
+    } else {
+        request.gas.min(MAX_TX_GAS)
+    };
+    let access_list: Vec<solo_eth::AccessItem> = request
+        .access_list
+        .0
+        .into_iter()
+        .map(|item| solo_eth::AccessItem {
+            address: item.address,
+            keys: item.keys.0,
+        })
+        .collect();
     let authorization_list: Vec<_> = request
         .authorization_list
         .0
         .into_iter()
-        .map(|a| solo_eth::Authorization { chain_id: a.chain_id, address: a.address, nonce: a.nonce, y_parity: a.y_parity, r: a.r, s: a.s })
+        .map(|a| solo_eth::Authorization {
+            chain_id: a.chain_id,
+            address: a.address,
+            nonce: a.nonce,
+            y_parity: a.y_parity,
+            r: a.r,
+            s: a.s,
+        })
         .map(|a| {
             let authority = tx::authority(&a);
             (a, authority)
         })
         .collect();
-    let tx_type = if authorization_list.is_empty() { u8::from(!access_list.is_empty()) } else { solo_eth::SET_CODE_TX_TYPE };
+    let tx_type = if authorization_list.is_empty() {
+        u8::from(!access_list.is_empty())
+    } else {
+        solo_eth::SET_CODE_TX_TYPE
+    };
     // A governance call's gas includes its surcharge (spec 13 §9.9), so that
     // an estimate is a gas limit admission takes.
     let surcharge = solo_abi::governance::surcharge(request.to.as_ref(), &request.data);
@@ -386,9 +516,16 @@ fn call(request: CallRequest) -> CallResult {
         authorization_list,
     };
     // The host serves the gates active for the next block (spec 13 §7.1).
-    crate::precompiles::begin(crate::governance::gate_active(solo_upgrade::gate::PRECOMPILES, height + 1));
+    crate::precompiles::begin(crate::governance::gate_active(
+        solo_upgrade::gate::PRECOMPILES,
+        height + 1,
+    ));
     let outcome = crate::native::run(message, block, false);
-    CallResult { status: outcome.status, gas_used: outcome.gas_used + surcharge, output: outcome.output }
+    CallResult {
+        status: outcome.status,
+        gas_used: outcome.gas_used + surcharge,
+        output: outcome.output,
+    }
 }
 
 /// `kernel_query`.
@@ -397,7 +534,9 @@ pub fn query(args: &QueryArgs) -> QueryResult {
     match method {
         query::CHAIN_ID => found(Some(state::chain_id())),
         query::BLOCK_NUMBER => found(Some(state::height().unwrap_or(0))),
-        query::FINALIZED => found(Some(state::get::<u64>(solo_abi::chain::keys::FINALIZED).unwrap_or(0))),
+        query::FINALIZED => found(Some(
+            state::get::<u64>(solo_abi::chain::keys::FINALIZED).unwrap_or(0),
+        )),
         query::ACCOUNT => match Address::from_bytes(&args.params) {
             Ok(address) => found(Some(state::account(&address))),
             Err(_) => bad_params(),
