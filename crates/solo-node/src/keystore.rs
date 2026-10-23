@@ -3,8 +3,18 @@
 //! consensus key, and the threshold shares the DKG gives it. The kernel
 //! drives the DKG and reads its public messages from chain state; whatever
 //! needs a secret runs here, natively, and no secret leaves the host.
+//!
+//! A DKG answer can take seconds at the largest runs (spec 15 §6.4): the
+//! share checks at the end of dealing and the public key shares of the
+//! outcome. A node that runs its heavy work in the background computes
+//! them on threads of their own and hands the answer over when the kernel
+//! asks again, so that the loop that steps the driver goes on voting.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, Instant};
 
 use k256::ecdsa::SigningKey;
 use solo_abi::codec::Seq;
@@ -15,6 +25,15 @@ use solo_bls::{PartialSignature, PublicKeySet, SecretShare, Signature};
 
 /// Domain separation tag of a dealer's per-run seed.
 pub const DST_DEALER_SEED: &[u8] = b"SOLO-V01-DKG-SEED_XMD:SHA-256";
+
+/// How long a DKG request waits for its computation in the call that asks
+/// for it, in a keystore that computes in the background: one that ends
+/// within it is answered at once, as without the background.
+pub const QUICK_MS: u64 = 50;
+
+/// Most finished DKG answers a background keystore keeps for the kernel to
+/// ask again.
+pub const KEPT_ANSWERS: usize = 64;
 
 /// The node's DKG decryption key: `KeyGen(consensus secret, "SOLO-DKG-ENCRYPTION")`.
 ///
@@ -44,7 +63,34 @@ fn dealer_seed(key: &SigningKey, session: &[u8; 32]) -> [u8; 32] {
 #[derive(Debug, Default)]
 pub struct Keystore {
     shares: BTreeMap<u64, Vec<SecretShare>>,
+    background: Option<Background>,
 }
+
+/// DKG computations running off the node loop and their answers, by the
+/// hash of the request.
+#[derive(Debug)]
+struct Background {
+    answers: BTreeMap<[u8; 32], Answer>,
+    finished: VecDeque<[u8; 32]>,
+    done_tx: Sender<Done>,
+    done_rx: Receiver<Done>,
+    hold: Arc<AtomicBool>,
+}
+
+/// Where a request's computation is.
+#[derive(Debug, Clone)]
+enum Answer {
+    Computing,
+    /// Ended, with the answer, `None` for a run that failed.
+    Ended(Option<Vec<u8>>),
+}
+
+/// The shares a finished run gave this node, with their key set's id.
+type Made = Option<(u64, Vec<SecretShare>)>;
+
+/// A computation that ended: the request's hash, the answer and the
+/// shares it made.
+type Done = ([u8; 32], Option<Vec<u8>>, Made);
 
 impl Keystore {
     /// Whether the keystore holds a share of key set `key_set`.
@@ -53,14 +99,85 @@ impl Keystore {
         self.shares.contains_key(&key_set)
     }
 
+    /// Computes DKG answers on threads of their own from now on (`on`), or
+    /// inside the call that asks (spec 15 §6.4). In the background, a
+    /// request whose computation does not end within [`QUICK_MS`] is
+    /// answered `None`, as one that cannot be served yet; the kernel asks
+    /// again after its next block and gets the answer once it is ready,
+    /// the same bytes it would have got at once.
+    pub fn set_background(&mut self, on: bool) {
+        self.background = on.then(|| {
+            let (done_tx, done_rx) = channel();
+            Background {
+                answers: BTreeMap::new(),
+                finished: VecDeque::new(),
+                done_tx,
+                done_rx,
+                hold: Arc::default(),
+            }
+        });
+    }
+
+    /// How many DKG computations are running in the background.
+    #[must_use]
+    pub fn busy(&self) -> usize {
+        self.background.as_ref().map_or(0, |b| {
+            b.answers
+                .values()
+                .filter(|a| matches!(a, Answer::Computing))
+                .count()
+        })
+    }
+
+    /// Holds background computations before they start while `hold` is
+    /// set (tests that need one to keep running); only in builds with the
+    /// `fault-injection` feature.
+    #[cfg(feature = "fault-injection")]
+    pub fn hold(&self, hold: bool) {
+        if let Some(b) = &self.background {
+            b.hold.store(hold, Ordering::Relaxed);
+        }
+    }
+
+    /// Takes up the computations that ended: their answers, and the shares
+    /// they made, which later requests sign with. The node calls this
+    /// between steps; every request does it first.
+    pub fn drain(&mut self) {
+        while let Some(done) = self
+            .background
+            .as_ref()
+            .and_then(|b| b.done_rx.try_recv().ok())
+        {
+            self.finish(done);
+        }
+    }
+
+    fn finish(&mut self, (id, answer, made): Done) {
+        if let Some((key_set, shares)) = made {
+            self.shares.insert(key_set, shares);
+        }
+        let b = self
+            .background
+            .as_mut()
+            .expect("computed in the background");
+        b.answers.insert(id, Answer::Ended(answer));
+        b.finished.push_back(id);
+        while b.finished.len() > KEPT_ANSWERS {
+            let old = b.finished.pop_front().expect("over the cap");
+            b.answers.remove(&old);
+        }
+    }
+
     /// Answers an encoded [`KeystoreRequest`]; `None` when the request does
-    /// not decode or cannot be served (no key, no share, a failed run).
+    /// not decode or cannot be served (no key, no share, a failed run, or,
+    /// in the background, a computation that has not ended yet).
     pub fn handle(&mut self, key: Option<&SigningKey>, request: &[u8]) -> Option<Vec<u8>> {
+        self.drain();
         match KeystoreRequest::from_bytes(request).ok()? {
             KeystoreRequest::EncryptionKey => Some(encryption_key(key?).to_vec()),
-            KeystoreRequest::Dkg(request) => self.dkg(key?, &request, &[]).map(|r| r.to_bytes()),
-            KeystoreRequest::WeightedDkg { request, shares } => {
-                self.dkg(key?, &request, &shares.0).map(|r| r.to_bytes())
+            KeystoreRequest::Dkg(r) => self.dkg(key?, &r, &[], request),
+            KeystoreRequest::WeightedDkg { request: r, shares } => {
+                self.dkg(key?, &r, &shares.0, request)
             }
             KeystoreRequest::Sign { key_set, message } => {
                 key?;
@@ -89,94 +206,157 @@ impl Keystore {
         }
     }
 
-    /// Replays the run for this node up to the requested boundary, with
-    /// recipient `j` holding `shares[j − 1]` shares (one each when empty)
-    /// and, for a fresh key, dealer `j` weighing as much.
-    fn dkg(&mut self, key: &SigningKey, r: &DkgRequest, shares: &[u32]) -> Option<DkgReply> {
-        let recipients = r
-            .recipients
-            .0
-            .iter()
-            .map(|k| EncryptionKey::from_bytes(k.as_slice().try_into().ok()?).ok())
-            .collect::<Option<Vec<_>>>()?;
-        let previous = if r.previous.is_empty() {
-            None
-        } else {
-            Some(PublicKeySet::from_bytes(&r.previous).ok()?)
+    /// Replays the run for this node up to the requested boundary (see
+    /// [`run`]), here or in the background; `raw` is the encoded request,
+    /// whose hash names its answer.
+    fn dkg(
+        &mut self,
+        key: &SigningKey,
+        r: &DkgRequest,
+        shares: &[u32],
+        raw: &[u8],
+    ) -> Option<Vec<u8>> {
+        let current = self.dealing_share(r).ok()?;
+        let Some(b) = &mut self.background else {
+            let (reply, made) = run(key, r, shares, current)?;
+            if let Some((key_set, shares)) = made {
+                self.shares.insert(key_set, shares);
+            }
+            return Some(reply.to_bytes());
         };
-        let dealer = if r.dealer == 0 {
-            None
-        } else {
-            let share = if previous.is_some() {
-                let current = self.shares.get(&r.previous_id)?;
-                let current = current.iter().find(|s| s.index() == r.dealer)?;
-                Some(SecretShare::from_bytes(r.dealer, &current.to_bytes()).ok()?)
-            } else {
-                None
+        let id = solo_host::hash::keccak256(raw);
+        match b.answers.get(&id) {
+            Some(Answer::Ended(answer)) => return answer.clone(),
+            Some(Answer::Computing) => return None,
+            None => {}
+        }
+        b.answers.insert(id, Answer::Computing);
+        let (key, r, shares) = (key.clone(), r.clone(), shares.to_vec());
+        let (done, hold) = (b.done_tx.clone(), Arc::clone(&b.hold));
+        std::thread::spawn(move || {
+            while hold.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let (answer, made) = match run(&key, &r, &shares, current) {
+                Some((reply, made)) => (Some(reply.to_bytes()), made),
+                None => (None, None),
             };
-            Some(Dealer {
-                index: r.dealer,
-                seed: dealer_seed(key, &r.session),
-                share,
-            })
-        };
-        let recipient = (r.recipient != 0).then(|| Recipient {
-            index: r.recipient,
-            key: decryption_key(key),
+            // A keystore that is gone wants no answer.
+            let _ = done.send((id, answer, made));
         });
-        let weights = if previous.is_none() {
-            shares.to_vec()
-        } else {
-            Vec::new()
-        };
-        let config = Config {
-            session: r.session,
-            threshold: r.threshold,
-            dealers: r.dealers,
-            recipients,
-            shares: shares.to_vec(),
-            weights,
-            previous,
-        };
-        let (mut dkg, dealing) = Dkg::new(config, dealer, recipient).ok()?;
-        if r.upto == 0 {
-            return Some(dealing.map_or(DkgReply::Idle, |m| DkgReply::Message(m.to_bytes())));
-        }
-        for phase in 0..r.upto.min(3) {
-            for raw in r.transcript.0.iter().filter(|m| m.first() == Some(&phase)) {
-                if let Ok(message) = Message::from_bytes(raw) {
-                    let _ = dkg.handle(&message);
-                }
-            }
-            match dkg.advance().ok()? {
-                Step::Broadcast(m) if phase + 1 == r.upto => {
-                    return Some(DkgReply::Message(m.to_bytes()));
-                }
-                Step::Finished(out) => {
-                    let total = if shares.is_empty() {
-                        u32::try_from(r.recipients.0.len()).expect("checked by the run")
-                    } else {
-                        shares.iter().sum()
-                    };
-                    let public_shares = out
-                        .key_set
-                        .public_shares(total)
-                        .iter()
-                        .map(|k| k.to_bytes().to_vec())
-                        .collect();
-                    if !out.shares.is_empty() {
-                        self.shares.insert(r.key_set, out.shares);
-                    }
-                    return Some(DkgReply::Finished(KeySetVote {
-                        key_set: out.key_set.to_bytes(),
-                        public_shares: solo_abi::codec::Seq(public_shares),
-                    }));
-                }
-                _ => {}
+        // A computation that ends quickly is answered now.
+        let deadline = Instant::now() + Duration::from_millis(QUICK_MS);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let b = self.background.as_ref().expect("in the background");
+            let Ok(done) = b.done_rx.recv_timeout(left) else {
+                return None;
+            };
+            let (ended, answer) = (done.0, done.1.clone());
+            self.finish(done);
+            if ended == id {
+                return answer;
             }
         }
-        Some(DkgReply::Idle)
     }
+
+    /// The share a resharing dealer deals, copied: `Ok(None)` when the
+    /// request deals none, `Err` when the keystore lacks it.
+    fn dealing_share(&self, r: &DkgRequest) -> Result<Option<SecretShare>, ()> {
+        if r.dealer == 0 || r.previous.is_empty() {
+            return Ok(None);
+        }
+        let current = self.shares.get(&r.previous_id).ok_or(())?;
+        let current = current.iter().find(|s| s.index() == r.dealer).ok_or(())?;
+        SecretShare::from_bytes(r.dealer, &current.to_bytes())
+            .map(Some)
+            .map_err(drop)
+    }
+}
+
+/// Replays the run for this node up to the requested boundary, with
+/// recipient `j` holding `shares[j − 1]` shares (one each when empty)
+/// and, for a fresh key, dealer `j` weighing as much; a resharing dealer
+/// deals `current`. The reply, and the shares the run gave this node if
+/// it finished.
+fn run(
+    key: &SigningKey,
+    r: &DkgRequest,
+    shares: &[u32],
+    current: Option<SecretShare>,
+) -> Option<(DkgReply, Made)> {
+    let recipients = r
+        .recipients
+        .0
+        .iter()
+        .map(|k| EncryptionKey::from_bytes(k.as_slice().try_into().ok()?).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let previous = if r.previous.is_empty() {
+        None
+    } else {
+        Some(PublicKeySet::from_bytes(&r.previous).ok()?)
+    };
+    let dealer = (r.dealer != 0).then(|| Dealer {
+        index: r.dealer,
+        seed: dealer_seed(key, &r.session),
+        share: current,
+    });
+    let recipient = (r.recipient != 0).then(|| Recipient {
+        index: r.recipient,
+        key: decryption_key(key),
+    });
+    let weights = if previous.is_none() {
+        shares.to_vec()
+    } else {
+        Vec::new()
+    };
+    let config = Config {
+        session: r.session,
+        threshold: r.threshold,
+        dealers: r.dealers,
+        recipients,
+        shares: shares.to_vec(),
+        weights,
+        previous,
+    };
+    let (mut dkg, dealing) = Dkg::new(config, dealer, recipient).ok()?;
+    if r.upto == 0 {
+        let reply = dealing.map_or(DkgReply::Idle, |m| DkgReply::Message(m.to_bytes()));
+        return Some((reply, None));
+    }
+    for phase in 0..r.upto.min(3) {
+        for raw in r.transcript.0.iter().filter(|m| m.first() == Some(&phase)) {
+            if let Ok(message) = Message::from_bytes(raw) {
+                let _ = dkg.handle(&message);
+            }
+        }
+        match dkg.advance().ok()? {
+            Step::Broadcast(m) if phase + 1 == r.upto => {
+                return Some((DkgReply::Message(m.to_bytes()), None));
+            }
+            Step::Finished(out) => {
+                let total = if shares.is_empty() {
+                    u32::try_from(r.recipients.0.len()).expect("checked by the run")
+                } else {
+                    shares.iter().sum()
+                };
+                let public_shares = out
+                    .key_set
+                    .public_shares(total)
+                    .iter()
+                    .map(|k| k.to_bytes().to_vec())
+                    .collect();
+                let vote = KeySetVote {
+                    key_set: out.key_set.to_bytes(),
+                    public_shares: Seq(public_shares),
+                };
+                let made = (!out.shares.is_empty()).then_some((r.key_set, out.shares));
+                return Some((DkgReply::Finished(vote), made));
+            }
+            _ => {}
+        }
+    }
+    Some((DkgReply::Idle, None))
 }
 
 /// Combines partial signatures and verifies the result under the group key;

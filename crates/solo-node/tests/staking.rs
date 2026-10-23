@@ -913,6 +913,39 @@ fn partials_of(node: &Node, key: &SigningKey, id: u64, message: &[u8]) -> Vec<Pa
         .0
 }
 
+/// A validator that runs its heavy work in the background goes on
+/// finalizing blocks while its keystore computes a DKG answer (spec 15
+/// §6.4): held from finishing, the computation leaves the node voting;
+/// released, its answer reaches the chain in the same phase and the key
+/// set is adopted as it would be without the background.
+#[test]
+fn a_validator_finalizes_while_its_keystore_computes() {
+    let keys = keys(1);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, &[0], &[STAKE], &staking(40, 8));
+    let template = NodeConfig {
+        background: true,
+        ..at(10_000)
+    };
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &template, 20).unwrap();
+    sim.nodes[0].hold_keystore(true);
+    let asked = sim
+        .run_until(20 * SLOT_MS, |s| s.nodes[0].keystore_busy() > 0)
+        .unwrap();
+    assert!(asked);
+    let before = sim.nodes[0].finalized_height().unwrap();
+    sim.advance(5 * SLOT_MS).unwrap();
+    // Five slots on, the computation is still running and the chain has
+    // moved on by about as many blocks.
+    assert_eq!(sim.nodes[0].keystore_busy(), 1);
+    assert!(sim.nodes[0].finalized_height().unwrap() >= before + 3);
+    sim.nodes[0].hold_keystore(false);
+    let done = sim
+        .run_until(80 * SLOT_MS, |s| adopted(s, &[0], 0))
+        .unwrap();
+    assert!(done, "{:?}", sim.finalized_heights().unwrap());
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn threshold_keys_rotate_across_epochs() {

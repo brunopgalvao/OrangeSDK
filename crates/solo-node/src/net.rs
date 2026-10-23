@@ -327,10 +327,7 @@ impl Transport {
             Frame::Response {
                 request_id,
                 payload,
-            } => node.step(Input::Response {
-                request_id,
-                payload,
-            })?,
+            } => node.response(request_id, payload)?,
             Frame::SyncRequest {
                 request_id,
                 payload,

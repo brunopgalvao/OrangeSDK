@@ -49,6 +49,14 @@ pub struct NodeConfig {
     /// Where the chain state lives (spec 22): in memory, or on disk in a
     /// directory a later node resumes from.
     pub store: StoreConfig,
+    /// Whether the host's heavy work runs on threads of its own, off the
+    /// loop that steps the driver (spec 22 §7.4, spec 15 §6.4): the
+    /// snapshot exports of a serving node and the DKG computations of the
+    /// threshold keystore. A node that answers peers in real time wants
+    /// it, so that consensus is not held up; off, the default, the work
+    /// runs inside the step that asks for it, which makes every run of a
+    /// simulated network the same.
+    pub background: bool,
 }
 
 impl Default for NodeConfig {
@@ -62,6 +70,7 @@ impl Default for NodeConfig {
             state_history: STATE_HISTORY,
             history_keys_per_block: HISTORY_KEYS_PER_BLOCK,
             store: StoreConfig::Memory,
+            background: false,
         }
     }
 }
@@ -246,6 +255,14 @@ pub struct Node {
     /// The snapshots this node serves to peers that sync from it (spec 22
     /// §7.4), once [`Node::serve_snapshots`] turned it on.
     server: Option<crate::statesync::SnapshotServer>,
+    /// The host's half of block catch-up (spec 09 §6a).
+    catch_up: crate::catchup::CatchUp,
+    /// See [`NodeConfig::background`].
+    background: bool,
+    /// The snapshot export running off the node loop, if one is.
+    export_job: Option<crate::worker::ExportJob>,
+    /// While set, a background export waits before it starts (tests).
+    hold_exports: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Node {
@@ -285,6 +302,10 @@ impl Node {
             persisted: config.persisted,
             ..NodeServices::default()
         }));
+        services
+            .borrow_mut()
+            .keystore
+            .set_background(config.background);
         let state = ChainState::open(&config.store)?;
         let fresh = state.is_fresh();
         let mut exec = Executor::new(ModuleCache::default(), state);
@@ -317,6 +338,10 @@ impl Node {
             upgrades: Upgrades::new(active_gates),
             store: None,
             server: None,
+            catch_up: crate::catchup::CatchUp::default(),
+            background: config.background,
+            export_job: None,
+            hold_exports: std::sync::Arc::default(),
         };
         if fresh {
             node.call_unit(exports::INIT, &genesis.to_bytes())?;
@@ -532,6 +557,10 @@ impl Node {
     /// certificate covers the record, is tried again after the next
     /// finalized block (spec 22 §7.4).
     fn serve_latest(&mut self) {
+        self.take_export();
+        if self.export_job.is_some() {
+            return;
+        }
         let finalized = self.finalized.len();
         let latest = self
             .chain_store()
@@ -548,11 +577,77 @@ impl Node {
             return;
         };
         let path = server.path_for(epoch);
-        if let Ok(snapshot) = self.export_snapshot(Some(epoch), &path) {
-            // A file just exported reads; if it did not, the next record
-            // is exported in its place.
+        let store = self
+            .chain_store()
+            .expect("a serving node's state is on disk");
+        let Ok(export) =
+            solo_store::Snapshot::prepare_export(store, &self.persisted(), Some(epoch), &path)
+        else {
+            return;
+        };
+        if self.background {
+            // The entries, the expensive part, are walked off the node loop
+            // from the store as it is now (spec 22 §7.4).
+            let hold = std::sync::Arc::clone(&self.hold_exports);
+            self.export_job = Some(crate::worker::ExportJob::start(export, hold));
+        } else {
+            let exported = export.run(
+                solo_store::ExportLimits::default(),
+                &std::sync::atomic::AtomicBool::default(),
+            );
+            self.serve(exported);
+        }
+    }
+
+    /// Takes up the background export once it has ended.
+    fn take_export(&mut self) {
+        if self
+            .export_job
+            .as_ref()
+            .is_some_and(crate::worker::ExportJob::finished)
+        {
+            let job = self.export_job.take().expect("checked");
+            self.serve(job.join());
+        }
+    }
+
+    /// Serves an exported snapshot. A file just exported reads; if it did
+    /// not, or the export failed, the next record is exported in its place.
+    fn serve(&mut self, exported: Result<solo_store::Snapshot, solo_store::SnapshotError>) {
+        if let Ok(snapshot) = exported {
             let _ = self.server.as_mut().map(|s| s.add(snapshot));
         }
+    }
+
+    /// How many DKG computations the keystore is running off the node loop.
+    #[must_use]
+    pub fn keystore_busy(&self) -> usize {
+        self.services.borrow().keystore.busy()
+    }
+
+    /// Holds the keystore's background computations before they start
+    /// while `hold` is set (tests that need one to keep running); only in
+    /// builds with the `fault-injection` feature.
+    #[cfg(feature = "fault-injection")]
+    pub fn hold_keystore(&self, hold: bool) {
+        self.services.borrow().keystore.hold(hold);
+    }
+
+    /// The epoch of the snapshot being exported off the node loop, if one is.
+    #[must_use]
+    pub fn exporting(&self) -> Option<u64> {
+        self.export_job
+            .as_ref()
+            .map(crate::worker::ExportJob::epoch)
+    }
+
+    /// Holds background exports before they start while `hold` is set
+    /// (tests that need an export to keep running); only in builds with
+    /// the `fault-injection` feature.
+    #[cfg(feature = "fault-injection")]
+    pub fn hold_exports(&self, hold: bool) {
+        self.hold_exports
+            .store(hold, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The snapshot record of `epoch`, or of the latest completed epoch for
@@ -566,6 +661,47 @@ impl Node {
     ) -> Result<Option<solo_abi::chain::SnapshotRecord>, NodeError> {
         let params = epoch.map(|e| e.to_bytes()).unwrap_or_default();
         self.query_decoded(solo_abi::chain::query::SNAPSHOT, &params)
+    }
+
+    /// Turns the host's half of block catch-up (spec 09 §6a) on, as it is
+    /// by default, or off: off, the driver's sync requests and their
+    /// answers pass between it and the wire untouched, and an answer that
+    /// comes back after the driver entered another view is lost.
+    pub fn set_catch_up(&mut self, on: bool) {
+        self.catch_up.set(on);
+    }
+
+    /// How many sync requests the host lets be on the wire at once now
+    /// (spec 09 §6a): one, more while answers come back quickly.
+    #[must_use]
+    pub fn catch_up_depth(&self) -> usize {
+        self.catch_up.depth()
+    }
+
+    /// Hands an answer from the wire to the request it answers (spec 06
+    /// §4.1): one to a request of the host's catch-up (spec 09 §6a) waits
+    /// for the driver's request for those blocks, any other goes to the
+    /// driver as `Response`.
+    ///
+    /// # Errors
+    /// See [`NodeError`].
+    pub fn response(&mut self, request_id: u64, payload: Vec<u8>) -> Result<(), NodeError> {
+        let now = self.now_ms();
+        let mut out = Vec::new();
+        let routed = self
+            .catch_up
+            .on_response(request_id, payload, now, &mut out);
+        self.services.borrow_mut().outbound.extend(out);
+        match routed {
+            Some(input) => self.step(input),
+            None => Ok(()),
+        }
+    }
+
+    /// The highest height the host saw finalized: what it opened at, or
+    /// the last `FinalizeBlock`.
+    fn host_finalized(&self) -> u64 {
+        self.finalized.last().copied().unwrap_or(self.opened_at)
     }
 
     /// Runs the kernel, and every module it invokes, on `backend` from the
@@ -700,6 +836,8 @@ impl Node {
         topic: u16,
         payload: Vec<u8>,
     ) -> Result<(), NodeError> {
+        // A peer that speaks is one catch-up may ask (spec 09 §6a).
+        self.catch_up.heard(peer, self.now_ms());
         self.step(Input::NetworkMessage {
             peer,
             topic,
@@ -781,6 +919,7 @@ impl Node {
             }
             self.switch_kernel_if_due(&mut queue)?;
         }
+        self.catch_up.settle(self.host_finalized());
         self.collect_persist_writes();
         self.send_gate_signal();
         self.serve_latest();
@@ -913,11 +1052,15 @@ impl Node {
                 peer,
                 request_id,
                 payload,
-            } => self.outbound(Outbound::Request {
-                peer,
-                request_id,
-                payload,
-            }),
+            } => {
+                let now = self.now_ms();
+                let mut out = Vec::new();
+                let answer = self
+                    .catch_up
+                    .on_request(peer, request_id, payload, now, &mut out);
+                self.services.borrow_mut().outbound.extend(out);
+                answer
+            }
             Effect::Respond {
                 request_id,
                 payload,
@@ -1007,7 +1150,12 @@ impl Node {
     /// # Errors
     /// See [`NodeError`].
     pub fn tick(&mut self, now_ms: u64) -> Result<(), NodeError> {
-        self.services.borrow_mut().now_ms = now_ms;
+        {
+            let mut services = self.services.borrow_mut();
+            services.now_ms = now_ms;
+            // What the keystore computed in the background meanwhile.
+            services.keystore.drain();
+        }
         loop {
             let due = {
                 let s = self.services.borrow();
@@ -1021,6 +1169,9 @@ impl Node {
             self.services.borrow_mut().timers.remove(&timer_id);
             self.step(Input::TimerFired { timer_id, now_ms })?;
         }
+        let mut out = Vec::new();
+        self.catch_up.poll(now_ms, self.host_finalized(), &mut out);
+        self.services.borrow_mut().outbound.extend(out);
         Ok(())
     }
 

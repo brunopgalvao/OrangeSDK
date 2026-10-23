@@ -7,10 +7,10 @@ use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use k256::ecdsa::SigningKey;
-use solo_abi::Encode;
 use solo_abi::chain::{Allocation, GenesisParams};
 use solo_abi::codec::Seq;
 use solo_abi::types::Genesis;
+use solo_abi::{Decode, Encode};
 use solo_host::hash::keccak256;
 use solo_node::net::{Frame, MAX_FRAME, Transport, frame_bytes, take_frames};
 use solo_node::{Node, NodeConfig, Sim};
@@ -156,17 +156,37 @@ fn pump(
     start: Instant,
     epoch: u64,
     max: Duration,
+    done: impl FnMut(&mut [Node], &[Transport]) -> bool,
+) -> bool {
+    pump_throttled(nodes, transports, (start, epoch), max, None, done)
+}
+
+/// [`pump`] with the transport of node `slow.0` polled only every
+/// `slow.1`: a loaded peer, whose answers and blocks leave in bursts.
+fn pump_throttled(
+    nodes: &mut [Node],
+    transports: &mut [Transport],
+    (start, epoch): (Instant, u64),
+    max: Duration,
+    slow: Option<(usize, Duration)>,
     mut done: impl FnMut(&mut [Node], &[Transport]) -> bool,
 ) -> bool {
     let deadline = Instant::now() + max;
+    let mut polled = Instant::now();
     while Instant::now() < deadline {
         if done(nodes, transports) {
             return true;
         }
         let now = epoch + u64::try_from(start.elapsed().as_millis()).unwrap();
-        for (node, transport) in nodes.iter_mut().zip(transports.iter_mut()) {
+        let burst = slow.is_none_or(|(_, every)| polled.elapsed() >= every);
+        if burst {
+            polled = Instant::now();
+        }
+        for (i, (node, transport)) in nodes.iter_mut().zip(transports.iter_mut()).enumerate() {
             node.tick(now).unwrap();
-            transport.poll(node, now).unwrap();
+            if burst || slow.is_some_and(|(s, _)| s != i) {
+                transport.poll(node, now).unwrap();
+            }
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -274,6 +294,80 @@ fn validators_finalize_over_tcp_and_a_late_observer_syncs() {
     );
     let n = nodes[4].executed.len();
     assert_eq!(nodes[4].executed[..], nodes[0].executed[..n]);
+}
+
+/// One validator at 60 ms slots, loaded so that its transport runs only
+/// every 250 ms, and an observer that joins 60 blocks late, over real
+/// sockets on one thread. Each burst from the validator brings the
+/// observer blocks that move it into later views before the answer to its
+/// sync request, which its driver has abandoned by then (spec 08 §3); the
+/// host keeps the request (spec 09 §6a) and hands the answer to the next.
+#[test]
+fn an_observer_catches_up_with_a_loaded_60_ms_chain_over_tcp() {
+    let (observer, validator) = late_observer(true, Duration::from_mins(3));
+    assert!(observer + 2 >= validator, "{observer} of {validator}");
+}
+
+/// Runs [`an_observer_catches_up_with_a_loaded_60_ms_chain_over_tcp`] with
+/// the host's catch-up on or off for at most `max` after the observer
+/// joins; the blocks the observer and the validator finalized.
+fn late_observer(catch_up: bool, max: Duration) -> (usize, usize) {
+    let keys = keys(1);
+    let kernel = kernel_module();
+    let mut genesis = genesis(&keys);
+    let mut params = GenesisParams::from_bytes(&genesis.params).unwrap();
+    params.slot_ms = 60;
+    genesis.params = params.to_bytes();
+    let start = Instant::now();
+    let epoch = 1_000_000;
+    let config = |now_ms, key| NodeConfig {
+        now_ms,
+        key,
+        background: true,
+        ..NodeConfig::default()
+    };
+    let validator = Node::open(&kernel, &genesis, config(epoch, Some(keys[0].clone()))).unwrap();
+    let id = solo_node::validator_id(&keys[0]);
+    let mut transports = vec![Transport::bind("127.0.0.1:0", id, CHAIN_ID, vec![]).unwrap()];
+    let mut nodes = vec![validator];
+    nodes[0].start(None).unwrap();
+    let ahead = pump(
+        &mut nodes,
+        &mut transports,
+        start,
+        epoch,
+        Duration::from_mins(3),
+        |nodes, _| nodes[0].finalized.len() >= 60,
+    );
+    assert!(ahead);
+    let now = epoch + u64::try_from(start.elapsed().as_millis()).unwrap();
+    let mut observer = Node::open(&kernel, &genesis, config(now, None)).unwrap();
+    observer.set_catch_up(catch_up);
+    observer.start(None).unwrap();
+    nodes.push(observer);
+    let dial = vec![transports[0].local_addr().unwrap()];
+    transports.push(Transport::bind("127.0.0.1:0", [0xEE; 32], CHAIN_ID, dial).unwrap());
+    let caught = pump_throttled(
+        &mut nodes,
+        &mut transports,
+        (start, epoch),
+        max,
+        Some((0, Duration::from_millis(250))),
+        |nodes, _| nodes[1].finalized.len() + 2 >= nodes[0].finalized.len(),
+    );
+    if caught {
+        let n = nodes[1].executed.len();
+        assert_eq!(nodes[1].executed[..], nodes[0].executed[..n]);
+    }
+    (nodes[1].finalized.len(), nodes[0].finalized.len())
+}
+
+#[test]
+#[ignore = "shows the loop of a node without the host's catch-up; timing-dependent"]
+fn without_the_hosts_catch_up_a_loaded_chain_is_never_caught() {
+    let (observer, validator) = late_observer(false, Duration::from_secs(20));
+    eprintln!("observer {observer} of {validator}");
+    assert_eq!(observer, 0);
 }
 
 #[test]

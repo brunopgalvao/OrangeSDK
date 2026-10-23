@@ -72,6 +72,10 @@ pub struct Sim {
     pub now_ms: u64,
     /// Delivery latency applied to every message.
     pub latency_ms: u64,
+    /// Extra delay of every answer to a driver's request, on top of
+    /// `latency_ms`: a peer slow to serve the blocks a node catches up with
+    /// (spec 09 §6a), as a loaded machine is.
+    pub response_delay_ms: u64,
     queue: VecDeque<InFlight>,
     gossip: VecDeque<(u64, usize, Vec<u8>)>,
     /// Messages delivered so far.
@@ -157,6 +161,7 @@ impl Sim {
             stores: configs,
             now_ms: template.now_ms,
             latency_ms,
+            response_delay_ms: 0,
             queue: VecDeque::new(),
             gossip: VecDeque::new(),
             delivered: 0,
@@ -360,6 +365,7 @@ impl Sim {
             state_history: old.state_history,
             history_keys_per_block: old.history_keys_per_block,
             store: self.stores[index].clone(),
+            background: false,
         };
         // A disk store is held by one node at a time: the old one lets go
         // before the new one opens it.
@@ -441,13 +447,14 @@ impl Sim {
                         payload,
                     } => {
                         if let Some((to, their_id)) = self.serving.remove(&(i, request_id)) {
-                            self.enqueue(
+                            self.queue.push_back(InFlight {
+                                due_ms: self.now_ms + self.latency_ms + self.response_delay_ms,
                                 to,
-                                Wire::Response {
+                                wire: Wire::Response {
                                     request_id: their_id,
                                     payload,
                                 },
-                            );
+                            });
                         }
                     }
                     Outbound::Disseminate { .. } | Outbound::PeerScore { .. } => {}
@@ -511,11 +518,7 @@ impl Sim {
                 from,
                 topic,
                 payload,
-            } => Input::NetworkMessage {
-                peer: from,
-                topic,
-                payload,
-            },
+            } => return self.nodes[to].deliver(from, topic, payload),
             Wire::Request {
                 from,
                 request_id,
@@ -533,10 +536,7 @@ impl Sim {
             Wire::Response {
                 request_id,
                 payload,
-            } => Input::Response {
-                request_id,
-                payload,
-            },
+            } => return self.nodes[to].response(request_id, payload),
         };
         self.nodes[to].step(input)
     }

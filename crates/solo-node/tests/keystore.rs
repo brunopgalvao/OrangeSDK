@@ -35,8 +35,16 @@ struct Party {
 }
 
 impl Party {
+    /// The keystore's answer; one computing in the background is asked
+    /// again until its computations end, as the kernel does block by block.
     fn ask(&mut self, request: &KeystoreRequest) -> Option<Vec<u8>> {
-        self.store.handle(Some(&self.key), &request.to_bytes())
+        loop {
+            let answer = self.store.handle(Some(&self.key), &request.to_bytes());
+            if answer.is_some() || self.store.busy() == 0 {
+                return answer;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     fn dkg(&mut self, request: DkgRequest) -> Option<DkgReply> {
@@ -58,13 +66,19 @@ impl Party {
     }
 }
 
-fn parties(keys: &[SigningKey]) -> Vec<Party> {
+fn parties(keys: &[SigningKey], background: bool) -> Vec<Party> {
     keys.iter()
         .map(|key| Party {
             key: key.clone(),
-            store: Keystore::default(),
+            store: keystore(background),
         })
         .collect()
+}
+
+fn keystore(background: bool) -> Keystore {
+    let mut store = Keystore::default();
+    store.set_background(background);
+    store
 }
 
 fn base(recipients: &[SigningKey], dealers: u32, key_set: u64) -> DkgRequest {
@@ -217,8 +231,105 @@ fn verifies(group_key: &[u8], msg: &[u8], signature: &[u8]) -> bool {
 
 #[test]
 fn a_dkg_and_a_resharing_through_keystores() {
+    dkg_and_resharing(false);
+}
+
+/// Keystores that compute in the background answer every request with the
+/// same bytes as keystores that compute inside the call (spec 15 §6.4).
+#[test]
+fn keystores_in_the_background_answer_the_same() {
+    assert_eq!(dkg_and_resharing(true), dkg_and_resharing(false));
+}
+
+/// A DKG run held from starting is answered `None` while it computes and
+/// its answer once it has ended, then from what the keystore kept; a node
+/// that asks for nothing still takes the shares up when it drains.
+#[test]
+fn a_held_computation_is_answered_once_it_ends() {
+    let keys = keys(1);
+    let mut party = Party {
+        key: keys[0].clone(),
+        store: keystore(true),
+    };
+    let template = DkgRequest {
+        threshold: 1,
+        ..base(&keys, 1, 0)
+    };
+    let dealing = KeystoreRequest::Dkg(DkgRequest {
+        dealer: 1,
+        upto: 0,
+        ..template.clone()
+    });
+    party.store.hold(true);
+    assert_eq!(
+        party.store.handle(Some(&party.key), &dealing.to_bytes()),
+        None
+    );
+    assert_eq!(party.store.busy(), 1);
+    // Asked again while it computes: still nothing, and nothing new starts.
+    assert_eq!(
+        party.store.handle(Some(&party.key), &dealing.to_bytes()),
+        None
+    );
+    assert_eq!(party.store.busy(), 1);
+    party.store.hold(false);
+    let answer = party.ask(&dealing).unwrap();
+    assert_eq!(party.ask(&dealing).unwrap(), answer);
+    // The finished run's shares arrive with a drain.
+    let finish = KeystoreRequest::Dkg(DkgRequest {
+        recipient: 1,
+        transcript: Seq(vec![
+            DkgReply::from_bytes(&answer)
+                .map(|r| match r {
+                    DkgReply::Message(m) => m,
+                    _ => panic!("a dealing"),
+                })
+                .unwrap(),
+        ]),
+        upto: 3,
+        ..template
+    });
+    party.store.hold(true);
+    assert_eq!(
+        party.store.handle(Some(&party.key), &finish.to_bytes()),
+        None
+    );
+    party.store.hold(false);
+    while party.store.busy() > 0 {
+        party.store.drain();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(party.store.has_share(0));
+    // A keystore keeps the latest answers only: past the cap, the first
+    // is computed again.
+    for session in 0..=solo_node::keystore::KEPT_ANSWERS {
+        let request = KeystoreRequest::Dkg(DkgRequest {
+            session: [u8::try_from(session).unwrap(); 32],
+            dealer: 1,
+            upto: 0,
+            ..base(&keys, 1, 0)
+        });
+        party.ask(&request).unwrap();
+    }
+    party.store.hold(true);
+    assert_eq!(
+        party.store.handle(Some(&party.key), &dealing.to_bytes()),
+        None
+    );
+    party.store.hold(false);
+    // An inline keystore has nothing to hold or drain.
+    let mut inline = Keystore::default();
+    inline.hold(true);
+    inline.drain();
+    assert_eq!(inline.busy(), 0);
+}
+
+/// A DKG among four keystores and a resharing to a set with a fifth, in
+/// the background or not; every outcome, in order.
+#[allow(clippy::too_many_lines)]
+fn dkg_and_resharing(background: bool) -> Vec<KeySetVote> {
     let keys = keys(5);
-    let mut parties = parties(&keys);
+    let mut parties = parties(&keys, background);
     let first = &keys[..4];
     // Epoch 0: four dealers and recipients; dealer 4 misbehaves and is disqualified.
     let template = base(first, 4, 0);
@@ -253,7 +364,7 @@ fn a_dkg_and_a_resharing_through_keystores() {
     // A bad partial first, a duplicate index, a malformed and a zero-index partial: the
     // combiner falls back to checking each partial and still finds three good ones.
     let mut messy = all.clone();
-    messy[0].signature = all[1].signature.clone();
+    messy[0].signature.clone_from(&all[1].signature);
     messy.insert(1, all[2].clone());
     messy.insert(
         0,
@@ -271,7 +382,7 @@ fn a_dkg_and_a_resharing_through_keystores() {
     assert_eq!(combine(&vote.key_set, &msg, messy).unwrap(), signature);
     // Too few good partials, or a key set that does not decode: nothing.
     let mut short = all[..3].to_vec();
-    short[0].signature = all[1].signature.clone();
+    short[0].signature.clone_from(&all[1].signature);
     assert_eq!(combine(&vote.key_set, &msg, short), None);
     assert_eq!(combine(&vote.key_set[..95], &msg, all.clone()), None);
     // Epoch 1: the four shareholders reshare to a set with the fifth key in place of the
@@ -285,7 +396,7 @@ fn a_dkg_and_a_resharing_through_keystores() {
     // A keystore without a share of the key set being reshared cannot deal.
     let mut stranger = Party {
         key: keys[4].clone(),
-        store: Keystore::default(),
+        store: keystore(background),
     };
     assert_eq!(
         stranger.dkg(DkgRequest {
@@ -303,6 +414,7 @@ fn a_dkg_and_a_resharing_through_keystores() {
         combine(&reshared[0].key_set, &msg, fresh).unwrap(),
         signature
     );
+    [outcomes, reshared].concat()
 }
 
 #[test]
@@ -310,7 +422,7 @@ fn a_weighted_dkg_through_keystores() {
     // Three parties holding 1, 3 and 2 shares of a key with threshold 4; dealers weigh
     // their share counts.
     let keys = keys(3);
-    let mut parties = parties(&keys);
+    let mut parties = parties(&keys, false);
     let template = DkgRequest {
         threshold: 4,
         ..base(&keys, 3, 0)
@@ -392,9 +504,14 @@ fn a_weighted_dkg_through_keystores() {
 
 #[test]
 fn refused_requests() {
+    refused(false);
+    refused(true);
+}
+
+fn refused(background: bool) {
     let keys = keys(4);
     let key = &keys[0];
-    let mut store = Keystore::default();
+    let mut store = keystore(background);
     let ask = |store: &mut Keystore, key: Option<&SigningKey>, r: &KeystoreRequest| {
         store.handle(key, &r.to_bytes())
     };

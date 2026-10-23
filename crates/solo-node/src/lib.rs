@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod catchup;
 pub mod extension;
 pub mod keystore;
 pub mod mempool;
@@ -16,6 +17,7 @@ pub mod statesync;
 pub mod store;
 pub mod telemetry;
 pub mod upgrade;
+pub mod worker;
 
 pub use extension::{NodeExtension, NodeServices, Outbound, sign_recoverable, validator_id};
 pub use mempool::{MAX_TX_BYTES, Mempool, PoolError, PoolLimits, PoolTx};

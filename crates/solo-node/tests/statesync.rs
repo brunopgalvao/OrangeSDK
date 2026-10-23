@@ -409,6 +409,52 @@ fn a_server_serves_the_latest_epochs_and_answers_every_request() {
     ));
 }
 
+/// A node that runs its heavy work in the background exports off the loop
+/// that steps its driver: while an export is held from finishing, the
+/// validator goes on finalizing blocks; once it ends, the snapshot is
+/// served. One still running when the node goes is called off.
+#[test]
+fn a_background_export_leaves_consensus_running() {
+    let dir = scratch("background");
+    let genesis = chain();
+    let config = NodeConfig {
+        key: Some(keys(1)[0].clone()),
+        now_ms: 1_000,
+        store: StoreConfig::Disk(dir.to_path_buf()),
+        background: true,
+        ..NodeConfig::default()
+    };
+    let mut node = Node::open(v1(), &genesis, config).unwrap();
+    node.start(None).unwrap();
+    node.serve_snapshots(SMALL).unwrap();
+    node.hold_exports(true);
+    // Blocks until the first record is certified and its export starts.
+    support::run_until(&mut node, 40, &mut |n| n.exporting().is_some());
+    let epoch = node.exporting().unwrap();
+    let at = node.finalized.len();
+    support::run_until(&mut node, 40, &mut |n| n.finalized.len() >= at + 10);
+    // Ten blocks later the same export is still the one running, and
+    // nothing is served yet.
+    assert_eq!(node.exporting(), Some(epoch));
+    assert_eq!(node.snapshot_server().unwrap().newest(), None);
+    node.hold_exports(false);
+    support::run_until(&mut node, 400, &mut |n| {
+        n.snapshot_server().unwrap().newest().is_some()
+    });
+    assert!(node.snapshot_server().unwrap().newest() >= Some(epoch));
+    // The next export, held again, is called off when the node is dropped:
+    // it leaves no file and no scratch behind.
+    node.hold_exports(true);
+    support::run_until(&mut node, 40, &mut |n| {
+        n.exporting().is_some_and(|e| e > epoch)
+    });
+    let next = node.exporting().unwrap();
+    let path = node.snapshot_server().unwrap().path_for(next);
+    drop(node);
+    assert!(!path.exists());
+    assert!(!path.with_extension("runs").exists());
+}
+
 #[test]
 fn a_node_syncs_from_its_peers_and_starts() {
     let source = scratch("honest-source");

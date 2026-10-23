@@ -13,7 +13,7 @@ use solo_abi::chain::{
     SignedHash, SignedVote, SimplexState, SyncResponse, keys,
 };
 use solo_abi::codec::Seq;
-use solo_abi::types::{Genesis, Input};
+use solo_abi::types::Genesis;
 use solo_abi::{Decode, Encode};
 use solo_host::hash::keccak256;
 use solo_node::{Node, Outbound, Sim, validator_id};
@@ -1093,11 +1093,7 @@ fn equivocations_inside_certificates_are_detected() {
         }),
         threshold: vec![],
     };
-    node.step(Input::Response {
-        request_id,
-        payload: response.to_bytes(),
-    })
-    .unwrap();
+    node.response(request_id, response.to_bytes()).unwrap();
     assert_eq!(equivocations(node), 2);
     assert_eq!(node.simplex_state().unwrap().finalized_height, 1);
     let mut kinds: Vec<(u8, u64)> = node
