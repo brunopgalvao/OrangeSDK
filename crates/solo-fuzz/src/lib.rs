@@ -203,6 +203,59 @@ pub fn run(name: &str, cases: u64, mut case: impl FnMut(&mut Rng)) -> u64 {
     total
 }
 
+/// Inputs [`evolve`] keeps to mutate further.
+const CORPUS: usize = 512;
+
+/// Runs harness `name` as an evolving corpus: each case mutates an input
+/// of the corpus (or, one time in sixteen, tries plain random bytes) and
+/// hands it to `accept`; inputs `accept` takes join the corpus, so a decoder
+/// that refuses most random bytes is still driven deep into what it
+/// accepts. The corpus starts as the `seeds` that `accept` takes. Returns
+/// how many inputs were accepted.
+pub fn evolve(
+    name: &str,
+    cases: u64,
+    seeds: impl IntoIterator<Item = Vec<u8>>,
+    mut accept: impl FnMut(&[u8]) -> bool,
+) -> u64 {
+    let mut corpus: Vec<Vec<u8>> = seeds.into_iter().filter(|s| accept(s)).collect();
+    let mut accepted = 0;
+    run(name, cases, |r| {
+        let input = if corpus.is_empty() || r.chance(1, 16) {
+            let len = r.index(96);
+            r.bytes(len)
+        } else {
+            let base = r.index(corpus.len());
+            r.mutate(&corpus[base])
+        };
+        if accept(&input) {
+            accepted += 1;
+            if corpus.len() < CORPUS {
+                corpus.push(input);
+            } else {
+                let slot = r.index(CORPUS);
+                corpus[slot] = input;
+            }
+        }
+    });
+    accepted
+}
+
+/// Seeds for a decoder of an unknown layout: for every first byte below
+/// `tags`, that byte followed by up to `len` zero bytes.
+#[must_use]
+pub fn zero_seeds(tags: u8, len: usize) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for tag in 0..tags {
+        for n in 0..=len {
+            let mut s = vec![0; n + 1];
+            s[0] = tag;
+            out.push(s);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +329,16 @@ mod tests {
         let mut second = Vec::new();
         run("count", 5, |r| second.push(r.u64()));
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn evolve_grows_a_corpus_and_replaces_once_full() {
+        // Accepts inputs that start with 7: rare from random bytes, common
+        // once the seed is in the corpus.
+        let n = evolve("evolve", 4000, zero_seeds(8, 2), |b| b.first() == Some(&7));
+        assert!(n > 600, "{n}");
+        // With no seed accepted the corpus starts empty.
+        assert!(evolve("evolve-empty", 50, [vec![1]], |b| b.len() > 200) == 0);
     }
 
     #[test]

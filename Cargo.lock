@@ -2887,6 +2887,7 @@ name = "solo-abi"
 version = "0.0.1"
 dependencies = [
  "proptest",
+ "solo-fuzz",
 ]
 
 [[package]]
@@ -2967,6 +2968,7 @@ dependencies = [
  "k256",
  "serde_json",
  "solo-abi",
+ "solo-fuzz",
  "solo-rlp",
  "tiny-keccak",
 ]
@@ -3073,6 +3075,7 @@ name = "solo-rlp"
 version = "0.0.1"
 dependencies = [
  "proptest",
+ "solo-fuzz",
 ]
 
 [[package]]
