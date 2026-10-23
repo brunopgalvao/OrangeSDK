@@ -20,6 +20,8 @@ use crate::abi::{self, Value};
 pub const MINT: u8 = 1;
 /// Message kind: release a token that a burn of its wrapped token freed.
 pub const RELEASE: u8 = 2;
+/// Message kind: the sending gateway exists (spec 21 §5.7).
+pub const HELLO: u8 = 3;
 /// The token address that stands for a chain's native currency.
 pub const NATIVE: Address = [0; 20];
 /// Bytes of a token's name and symbol that a deposit carries.
@@ -59,6 +61,13 @@ pub enum TokenMessage {
         /// The amount.
         amount: u128,
     },
+    /// The sending gateway exists; `heard` says whether it has heard from
+    /// the receiving gateway, which answers with a `Hello` of its own if
+    /// not.
+    Hello {
+        /// Whether a message of the receiving gateway reached the sender.
+        heard: bool,
+    },
 }
 
 fn word_address(word: &[u8]) -> Address {
@@ -80,8 +89,9 @@ fn tail(payload: &[u8], at: usize) -> Option<Vec<u8>> {
 impl TokenMessage {
     /// The payload: `abi.encode(uint8 MINT, address origin, address from,
     /// address to, uint256 amount, string name, string symbol, uint8
-    /// decimals)` or `abi.encode(uint8 RELEASE, address token, address
-    /// from, address to, uint256 amount)`.
+    /// decimals)`, `abi.encode(uint8 RELEASE, address token, address
+    /// from, address to, uint256 amount)` or `abi.encode(uint8 HELLO, bool
+    /// heard)`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         match self {
@@ -115,6 +125,10 @@ impl TokenMessage {
                 Value::address(to),
                 Value::uint(*amount),
             ]),
+            TokenMessage::Hello { heard } => abi::encode(&[
+                Value::uint(u128::from(HELLO)),
+                Value::uint(u128::from(*heard)),
+            ]),
         }
     }
 
@@ -126,7 +140,11 @@ impl TokenMessage {
         let word = |i: usize| payload.get(i * 32..i * 32 + 32);
         let kind = word(0)?[31];
         let address = |i: usize| word(i).map(word_address);
-        let message = if kind == MINT {
+        let message = if kind == HELLO {
+            TokenMessage::Hello {
+                heard: word(1)?[31] != 0,
+            }
+        } else if kind == MINT {
             TokenMessage::Mint {
                 origin: address(1)?,
                 from: address(2)?,
@@ -211,6 +229,42 @@ pub fn set_mint_cap_calldata(origin: &Address, cap: u128) -> Vec<u8> {
         "setMintCap(address,uint256)",
         &[Value::address(origin), Value::uint(cap)],
     )
+}
+
+/// `setReleaseLimit(token, amount, window)`, by the owner: releases of the
+/// native `token` up to `amount` at once, refilling at `amount` per
+/// `window` seconds; a zero `amount` lifts the limit.
+#[must_use]
+pub fn set_release_limit_calldata(token: &Address, amount: u128, window: u64) -> Vec<u8> {
+    abi::call(
+        "setReleaseLimit(address,uint128,uint64)",
+        &[
+            Value::address(token),
+            Value::uint(amount),
+            Value::uint(u128::from(window)),
+        ],
+    )
+}
+
+/// `setMintLimit(origin, amount, window)`, by the owner: the same for mints
+/// of the wrapped token of `origin`.
+#[must_use]
+pub fn set_mint_limit_calldata(origin: &Address, amount: u128, window: u64) -> Vec<u8> {
+    abi::call(
+        "setMintLimit(address,uint128,uint64)",
+        &[
+            Value::address(origin),
+            Value::uint(amount),
+            Value::uint(u128::from(window)),
+        ],
+    )
+}
+
+/// `executeQueued(id)`: mints or releases queued transfer `id` once its
+/// time has come; anyone may send it.
+#[must_use]
+pub fn execute_queued_calldata(id: u64) -> Vec<u8> {
+    abi::call("executeQueued(uint256)", &[Value::uint(u128::from(id))])
 }
 
 /// The calldata of a gateway view that takes one address, such as
@@ -340,7 +394,11 @@ mod tests {
             to: [5; 20],
             amount: u128::MAX,
         };
-        for m in [mint(), release.clone()] {
+        let hellos = [
+            TokenMessage::Hello { heard: false },
+            TokenMessage::Hello { heard: true },
+        ];
+        for m in [mint(), release.clone()].into_iter().chain(hellos) {
             assert_eq!(TokenMessage::decode(&m.encode()), Some(m));
         }
         let payload = mint().encode();
@@ -370,8 +428,15 @@ mod tests {
             cases.push(huge);
         }
         let mut unknown = release.encode();
-        unknown[31] = 3;
+        unknown[31] = 4;
         cases.push(unknown);
+        // A hello is two words, its flag 0 or 1.
+        let hello = TokenMessage::Hello { heard: true }.encode();
+        assert_eq!(hello.len(), 2 * 32);
+        let mut flag = hello.clone();
+        flag[63] = 2;
+        cases.push(flag);
+        cases.push(hello[..32].to_vec());
         for case in cases {
             assert_eq!(TokenMessage::decode(&case), None);
         }
@@ -400,6 +465,9 @@ mod tests {
             &abi::selector("deposit(address,address,uint256)")
         );
         // Selectors as solc --hashes prints them, then the arguments in order.
+        let release_limit = [0x7c, 0x16, 0x39, 0x7c];
+        let mint_limit = [0x24, 0x0a, 0xf9, 0x77];
+        let execute_queued = [0x1e, 0xb2, 0x14, 0x9b];
         let two_addresses = [word(&[1; 20]), word(&[2; 20])].concat();
         let address_and_two = [word(&[1; 20]), word(&[2])].concat();
         for (calldata, selector, args) in [
@@ -422,6 +490,21 @@ mod tests {
                 set_mint_cap_calldata(&[1; 20], 2),
                 [0xc0, 0x6a, 0xbe, 0x77],
                 &address_and_two,
+            ),
+            (
+                set_release_limit_calldata(&[1; 20], 2, 3),
+                release_limit,
+                &[word(&[1; 20]), word(&[2]), word(&[3])].concat(),
+            ),
+            (
+                set_mint_limit_calldata(&[1; 20], 2, 3),
+                mint_limit,
+                &[word(&[1; 20]), word(&[2]), word(&[3])].concat(),
+            ),
+            (
+                execute_queued_calldata(9),
+                execute_queued,
+                &word(&[9]).to_vec(),
             ),
         ] {
             assert_eq!(calldata, [&selector[..], args].concat());

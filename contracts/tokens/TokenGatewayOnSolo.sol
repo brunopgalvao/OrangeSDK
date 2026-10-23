@@ -35,6 +35,8 @@ contract TokenGatewayOnSolo is TokenGateway, IEthereumMessageReceiver {
         outbox = outbox_;
         inbox = inbox_;
         ethereumChainId = ethereumChainId_;
+        // Tells the paired gateway this one exists (spec 21 §5.7).
+        _send(abi.encode(HELLO, false));
     }
 
     /// @notice A message from Ethereum, delivered by the inbox: only the paired gateway's count.

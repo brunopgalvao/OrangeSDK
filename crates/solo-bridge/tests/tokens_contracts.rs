@@ -4,9 +4,12 @@
 //! fee-taking and reentrant tokens are refused; deliveries are refused
 //! from anyone but the paired gateway through the inbox, wait while paused
 //! or over a mint cap, and a release whose transfer fails is owed and
-//! claimed later. A randomized run checks the value invariant after every
-//! step: what a gateway holds locked is exactly what the other side has
-//! minted plus what is in flight, so minted never exceeds locked. The gas
+//! claimed later; mints and releases over their rate limit wait in a queue
+//! until it allows them, and no gateway takes deposits before a message of
+//! its peer proves the peer exists. A randomized run checks the value
+//! invariant after every step: what a gateway holds locked is exactly what
+//! the other side has minted plus what is in flight or queued, so minted
+//! never exceeds locked. The gas
 //! of deposits against the stand-in is pinned here; spec 21 §8 states the
 //! gas through the real channels, which `tokens.rs` pins.
 
@@ -16,8 +19,8 @@ use revm::primitives::Log;
 use solo_bridge::abi::{self, Value};
 use solo_bridge::tokens::{
     EthereumGatewayConfig, NATIVE, SoloGatewayConfig, TokenMessage, address_view, claim_calldata,
-    claim_to_calldata, deposit_calldata, set_lock_cap_calldata, set_mint_cap_calldata,
-    wrapped_token,
+    claim_to_calldata, deposit_calldata, execute_queued_calldata, set_lock_cap_calldata,
+    set_mint_cap_calldata, set_mint_limit_calldata, set_release_limit_calldata, wrapped_token,
 };
 use solo_trie::keccak256;
 use support::eth::{ETH_CHAIN_ID, Eth, Outcome, init_code, selector, word_u64};
@@ -37,12 +40,13 @@ const ETHER: u128 = 1_000_000_000_000_000_000;
 const MESSAGE_GAS: u64 = 1_500_000;
 const BIG: u128 = 1 << 100;
 
-/// Gas of a `deposit` of ETH on `TokenGatewayOnEthereum`, the first one, as a transaction.
-const DEPOSIT_ETH_GAS: u64 = 95_051;
+/// Gas of a `deposit` of ETH on `TokenGatewayOnEthereum`, the first one, as a transaction. The
+/// stand-in's nonce is no longer zero: the gateways' `HELLO`s came first.
+const DEPOSIT_ETH_GAS: u64 = 78_113;
 /// Gas of the first `deposit` of an ERC-20 there.
-const DEPOSIT_TOKEN_GAS: u64 = 135_940;
+const DEPOSIT_TOKEN_GAS: u64 = 136_102;
 /// Gas of a `deposit` that burns a wrapped token on the other side.
-const WITHDRAW_GAS: u64 = 56_024;
+const WITHDRAW_GAS: u64 = 56_186;
 
 fn ok(outcome: &Outcome) {
     assert!(outcome.success, "{outcome:?}");
@@ -89,6 +93,23 @@ fn sent(messenger: [u8; 20], logs: &[Log]) -> Vec<Pending> {
         .collect()
 }
 
+/// The transfers gateways queued, as `(gateway, id, ready at)`.
+fn queued_in(logs: &[Log]) -> Vec<([u8; 20], u64, u64)> {
+    let topic = keccak256(b"Queued(uint256,uint64,uint8,address,address,uint256,uint64)");
+    logs.iter()
+        .filter(|l| l.data.topics()[0].0 == topic)
+        .map(|l| {
+            let id = word_u64(&l.data.topics()[1].0);
+            (l.address.0.0, id, word_u64(&l.data.data[4 * 32..5 * 32]))
+        })
+        .collect()
+}
+
+/// The `HELLO` a gateway sends when it is deployed (spec 21 §5.7).
+fn hello(heard: bool) -> Vec<u8> {
+    TokenMessage::Hello { heard }.encode()
+}
+
 /// Both gateways, the messenger, two test tokens (one on each side) and
 /// the messages in flight.
 struct World {
@@ -103,10 +124,40 @@ struct World {
     /// A token of the Solo side.
     stk: [u8; 20],
     pending: Vec<Pending>,
+    /// Transfers queued and not executed yet: `(gateway, id, ready at)`.
+    queued: Vec<([u8; 20], u64, u64)>,
 }
 
 impl World {
+    /// Both gateways, each having heard from the other, with every token
+    /// listed.
     fn new() -> World {
+        let mut w = World::unconfirmed();
+        w.handshake();
+        w
+    }
+
+    /// Delivers the two `HELLO`s the constructors sent, and the answers.
+    fn handshake(&mut self) {
+        let (on_eth, on_solo) = (self.on_eth, self.on_solo);
+        self.pending.push(Pending {
+            nonce: 0,
+            sender: on_eth,
+            recipient: on_solo,
+            payload: hello(false),
+        });
+        self.pending.push(Pending {
+            nonce: 1,
+            sender: on_solo,
+            recipient: on_eth,
+            payload: hello(false),
+        });
+        self.deliver_all();
+    }
+
+    /// Both gateways, deployed and listing every token, before any message
+    /// between them is delivered.
+    fn unconfirmed() -> World {
         let mut eth = Eth::new();
         let messenger = eth.deploy(DEPLOYER, &init_code("TestMessenger"), &[]);
         let on_solo_address = create_address(&DEPLOYER, 2);
@@ -145,6 +196,7 @@ impl World {
             tkn,
             stk,
             pending: Vec::new(),
+            queued: Vec::new(),
         };
         for (gateway, token) in [
             (on_eth, NATIVE),
@@ -168,8 +220,31 @@ impl World {
         if outcome.success {
             let messages = sent(self.messenger, &outcome.logs);
             self.pending.extend(messages);
+            self.queued.extend(queued_in(&outcome.logs));
         }
         outcome
+    }
+
+    /// Executes queued transfer `i` of [`World::queued`]; it stays queued
+    /// if that fails.
+    fn execute(&mut self, i: usize) -> Outcome {
+        let (gateway, id, _) = self.queued[i];
+        let o = self
+            .eth
+            .call(STRANGER, gateway, &execute_queued_calldata(id));
+        if o.success {
+            self.queued.remove(i);
+        }
+        self.record(o)
+    }
+
+    /// Lets time pass until every queued transfer is ready and executes them.
+    fn execute_all(&mut self) {
+        let last = self.queued.iter().map(|q| q.2).max().unwrap_or(0);
+        self.eth.advance(last.saturating_sub(self.eth.timestamp()));
+        while !self.queued.is_empty() {
+            ok(&self.execute(0));
+        }
     }
 
     fn deposit(
@@ -266,7 +341,8 @@ impl World {
 
     /// The value invariant of spec 21 §6 for the token `origin` native to
     /// the side of `home`, among `recipients`: locked equals minted plus in
-    /// flight, and the gateway holds what is locked plus what is owed.
+    /// flight plus queued to be minted, and the gateway holds what is
+    /// locked plus what is owed plus what is queued to be released.
     fn check(&mut self, home: [u8; 20], origin: [u8; 20], recipients: &[[u8; 20]]) {
         let away = if home == self.on_eth {
             self.on_solo
@@ -291,10 +367,15 @@ impl World {
                 _ => None,
             })
             .sum();
+        let mints_queued = self.gateway_view(away, "mintsQueued(address)", origin);
+        let releases_queued = self.gateway_view(home, "releasesQueued(address)", origin);
         assert!(minted <= locked, "minted {minted} > locked {locked}");
-        assert_eq!(locked, minted + in_flight);
+        assert_eq!(locked, minted + in_flight + mints_queued);
         let owed: u128 = recipients.iter().map(|r| self.owed(home, origin, *r)).sum();
-        assert_eq!(self.balance_of(origin, home), locked + owed);
+        assert_eq!(
+            self.balance_of(origin, home),
+            locked + owed + releases_queued
+        );
     }
 }
 
@@ -898,6 +979,271 @@ fn the_owner_governs_and_the_constructors_check_their_arguments() {
     }
 }
 
+#[test]
+fn no_gateway_takes_deposits_before_its_peer_is_heard_from() {
+    let mut w = World::unconfirmed();
+    let (on_eth, on_solo) = (w.on_eth, w.on_solo);
+    w.eth.fund(ALICE, 10 * ETHER);
+    let peer_live =
+        |w: &mut World, gateway: [u8; 20]| w.u128_view(gateway, &abi::call("peerLive()", &[]));
+    // Listed, but neither has heard from the other: deposits are refused,
+    // so nothing is locked for a peer that may not exist.
+    assert_eq!(
+        (peer_live(&mut w, on_eth), peer_live(&mut w, on_solo)),
+        (0, 0)
+    );
+    reverted_with(
+        &w.deposit(ALICE, on_eth, NATIVE, BOB, ETHER),
+        "PeerUnconfirmed()",
+    );
+    reverted_with(
+        &w.deposit(ALICE, on_solo, NATIVE, BOB, ETHER),
+        "PeerUnconfirmed()",
+    );
+    // The Solo gateway's HELLO was executed on Ethereum before the gateway
+    // there existed, and is gone; the owner may send another until the peer
+    // answers, nobody else.
+    reverted_with(
+        &w.eth.call(STRANGER, on_solo, &abi::call("hello()", &[])),
+        "NotOwner()",
+    );
+    let again = w.eth.call(OWNER, on_solo, &abi::call("hello()", &[]));
+    let again = w.record(again);
+    ok(&again);
+    assert_eq!(w.pending.len(), 1);
+    assert_eq!(w.pending[0].payload, hello(false));
+    w.pending.clear();
+    // The Ethereum gateway's HELLO reaches the Solo gateway, which now
+    // takes deposits and answers; the answer, which says it has heard,
+    // gets no answer of its own.
+    w.pending.push(Pending {
+        nonce: 0,
+        sender: on_eth,
+        recipient: on_solo,
+        payload: hello(false),
+    });
+    let delivered = w.deliver(0);
+    ok(&delivered);
+    let confirmed = keccak256(b"PeerConfirmed()");
+    assert!(
+        delivered
+            .logs
+            .iter()
+            .any(|l| l.data.topics()[0].0 == confirmed)
+    );
+    assert_eq!(peer_live(&mut w, on_solo), 1);
+    assert_eq!(w.pending.len(), 1);
+    assert_eq!(
+        TokenMessage::decode(&w.pending[0].payload),
+        Some(TokenMessage::Hello { heard: true })
+    );
+    reverted_with(
+        &w.eth.call(OWNER, on_solo, &abi::call("hello()", &[])),
+        "AlreadyConfirmed()",
+    );
+    reverted_with(
+        &w.deposit(ALICE, on_eth, NATIVE, BOB, ETHER),
+        "PeerUnconfirmed()",
+    );
+    ok(&w.deposit(ALICE, on_solo, NATIVE, BOB, ETHER));
+    w.deliver_all();
+    assert_eq!(peer_live(&mut w, on_eth), 1);
+    assert!(w.pending.is_empty());
+    ok(&w.deposit(ALICE, on_eth, NATIVE, BOB, ETHER));
+    w.deliver_all();
+    assert_eq!(w.balance_of(wrapped_of(on_solo, NATIVE), BOB), ETHER);
+    assert_eq!(w.balance_of(wrapped_of(on_eth, NATIVE), BOB), ETHER);
+    // Any message of the peer proves it: a gateway that hears a mint first
+    // takes deposits too.
+    let mut fresh = World::unconfirmed();
+    fresh.eth.fund(ALICE, 10 * ETHER);
+    let mint = TokenMessage::Mint {
+        origin: NATIVE,
+        from: ALICE,
+        to: BOB,
+        amount: 1,
+        name: b"Ether".to_vec(),
+        symbol: b"ETH".to_vec(),
+        decimals: 18,
+    };
+    fresh.pending.push(Pending {
+        nonce: 5,
+        sender: fresh.on_eth,
+        recipient: fresh.on_solo,
+        payload: mint.encode(),
+    });
+    ok(&fresh.deliver(0));
+    let solo = fresh.on_solo;
+    ok(&fresh.deposit(ALICE, solo, NATIVE, BOB, ETHER));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn transfers_over_the_rate_limit_wait_in_the_queue() {
+    let mut w = World::new();
+    let (on_eth, on_solo) = (w.on_eth, w.on_solo);
+    w.eth.fund(ALICE, 100 * ETHER);
+    let weth = wrapped_of(on_solo, NATIVE);
+    // Wrapped ETH mints on Solo at 10 ETH at once, refilling 10 ETH per 1 000 s.
+    reverted_with(
+        &w.eth.call(
+            STRANGER,
+            on_solo,
+            &set_mint_limit_calldata(&NATIVE, 10 * ETHER, 1_000),
+        ),
+        "NotOwner()",
+    );
+    for call in [
+        set_mint_limit_calldata(&NATIVE, 1, 0),
+        set_release_limit_calldata(&NATIVE, 1, 0),
+    ] {
+        reverted_with(&w.eth.call(OWNER, on_solo, &call), "BadWindow()");
+    }
+    ok(&w.eth.call(
+        OWNER,
+        on_solo,
+        &set_mint_limit_calldata(&NATIVE, 10 * ETHER, 1_000),
+    ));
+    // 4 ETH mints at once; 25 more ETH exceed the limit by 19, and wait
+    // until 1 900 s have refilled them.
+    ok(&w.deposit(ALICE, on_eth, NATIVE, BOB, 4 * ETHER));
+    ok(&w.deposit(ALICE, on_eth, NATIVE, CAROL, 25 * ETHER));
+    w.deliver_all();
+    let start = w.eth.timestamp();
+    assert_eq!(w.balance_of(weth, BOB), 4 * ETHER);
+    assert_eq!(w.balance_of(weth, CAROL), 0);
+    assert_eq!(w.queued, vec![(on_solo, 0, start + 1_900)]);
+    assert_eq!(
+        w.gateway_view(on_solo, "mintsQueued(address)", NATIVE),
+        25 * ETHER
+    );
+    w.check(on_eth, NATIVE, &[]);
+    let queued = w.eth.view(
+        RELAYER,
+        on_solo,
+        &abi::call("queued(uint256)", &[Value::uint(0)]),
+    );
+    assert_eq!(queued.output[12..32], NATIVE);
+    assert_eq!(word_u64(&queued.output[32..64]), 1);
+    assert_eq!(queued.output[5 * 32 + 12..6 * 32], CAROL);
+    assert_eq!(
+        u128::from_be_bytes(queued.output[6 * 32 + 16..7 * 32].try_into().unwrap()),
+        25 * ETHER
+    );
+    // Not before its time, not twice, not an id never queued, not while paused.
+    w.eth.advance(1_899);
+    let ready_at = abi::call(
+        "NotReady(uint64)",
+        &[Value::uint(u128::from(start + 1_900))],
+    );
+    let early = w.execute(0);
+    assert!(!early.success);
+    assert_eq!(early.output, ready_at);
+    w.eth.advance(1);
+    ok(&w.eth.call(GUARDIAN, on_solo, &abi::call("pause()", &[])));
+    reverted_with(&w.execute(0), "IsPaused()");
+    ok(&w.eth.call(OWNER, on_solo, &abi::call("unpause()", &[])));
+    let executed = w.execute(0);
+    ok(&executed);
+    let minted = keccak256(b"Minted(uint64,address,address,address,address,uint256)");
+    assert!(executed.logs.iter().any(|l| l.data.topics()[0].0 == minted));
+    assert_eq!(w.balance_of(weth, CAROL), 25 * ETHER);
+    reverted_with(
+        &w.eth.call(STRANGER, on_solo, &execute_queued_calldata(0)),
+        "NothingQueued()",
+    );
+    reverted_with(
+        &w.eth.call(STRANGER, on_solo, &execute_queued_calldata(7)),
+        "NothingQueued()",
+    );
+    w.check(on_eth, NATIVE, &[]);
+    // The limit is full now: 1 ETH waits 100 s. The mint cap counts what is
+    // queued: with 29 minted and 1 queued, a cap of 31 refuses 2 more.
+    ok(&w.deposit(ALICE, on_eth, NATIVE, BOB, ETHER));
+    ok(&w.deposit(ALICE, on_eth, NATIVE, BOB, 2 * ETHER));
+    ok(&w.deliver(0));
+    assert_eq!(w.queued[0].2, w.eth.timestamp() + 100);
+    ok(&w
+        .eth
+        .call(OWNER, on_solo, &set_mint_cap_calldata(&NATIVE, 31 * ETHER)));
+    reverted_with_address(&w.deliver(0), "CapExceeded(address)", &NATIVE);
+    ok(&w
+        .eth
+        .call(OWNER, on_solo, &set_mint_cap_calldata(&NATIVE, BIG)));
+    // Lifting the limit lets the next mint through at once; the queued one
+    // keeps its time. Setting it again starts from empty.
+    ok(&w
+        .eth
+        .call(OWNER, on_solo, &set_mint_limit_calldata(&NATIVE, 0, 0)));
+    ok(&w.deliver(0));
+    assert_eq!(w.queued.len(), 1);
+    assert_eq!(w.balance_of(weth, BOB), 6 * ETHER);
+    w.execute_all();
+    assert_eq!(w.balance_of(weth, BOB), 7 * ETHER);
+    w.check(on_eth, NATIVE, &[]);
+
+    // Releases of ETH on Ethereum at 5 ETH at once, refilling 5 ETH per
+    // 500 s; a change of the limit counts what the old one used.
+    ok(&w.eth.call(
+        OWNER,
+        on_eth,
+        &set_release_limit_calldata(&NATIVE, 8 * ETHER, 100),
+    ));
+    ok(&w.deposit(BOB, on_solo, weth, DAVE, 3 * ETHER));
+    w.deliver_all();
+    assert_eq!(w.eth.balance(DAVE), 3 * ETHER);
+    ok(&w.eth.call(
+        OWNER,
+        on_eth,
+        &set_release_limit_calldata(&NATIVE, 5 * ETHER, 500),
+    ));
+    ok(&w.deposit(BOB, on_solo, weth, DAVE, 3 * ETHER));
+    let receiver = w.eth.deploy(DEPLOYER, &init_code("TestReceiver"), &[]);
+    let rejecting = |on: bool| abi::call("setRejecting(bool)", &[Value::uint(u128::from(on))]);
+    ok(&w.eth.call(STRANGER, receiver, &rejecting(true)));
+    ok(&w.deposit(CAROL, on_solo, weth, receiver, 2 * ETHER));
+    w.deliver_all();
+    // 3 used and 3 more: 1 over, 100 s; then 2 more for the receiver, 300 s.
+    let now = w.eth.timestamp();
+    assert_eq!(
+        w.queued.iter().map(|q| q.2).collect::<Vec<_>>(),
+        [now + 100, now + 300]
+    );
+    assert_eq!(w.eth.balance(DAVE), 3 * ETHER);
+    assert_eq!(
+        w.gateway_view(on_eth, "releasesQueued(address)", NATIVE),
+        5 * ETHER
+    );
+    w.check(on_eth, NATIVE, &[receiver]);
+    // A queued release needs the gas a release does; one to a recipient
+    // that refuses is owed, as a delivered one would be.
+    w.eth.advance(300);
+    let data = execute_queued_calldata(w.queued[0].1);
+    reverted_with(
+        &w.eth.call_gas(STRANGER, on_eth, &data, 150_000),
+        "InsufficientGas()",
+    );
+    w.execute_all();
+    assert_eq!(w.eth.balance(DAVE), 6 * ETHER);
+    assert_eq!(w.owed(on_eth, NATIVE, receiver), 2 * ETHER);
+    assert_eq!(w.gateway_view(on_eth, "releasesQueued(address)", NATIVE), 0);
+    w.check(on_eth, NATIVE, &[receiver]);
+    // The limits as the gateway reports them.
+    let limit = w
+        .eth
+        .view(
+            RELAYER,
+            on_eth,
+            &address_view("releaseLimit(address)", &NATIVE),
+        )
+        .output;
+    assert_eq!(
+        u128::from_be_bytes(limit[16..32].try_into().unwrap()),
+        5 * ETHER
+    );
+    assert_eq!(word_u64(&limit[32..64]), 500);
+}
+
 /// A deterministic generator for the randomized run.
 struct Rng(u64);
 
@@ -942,10 +1288,24 @@ fn locked_always_covers_what_is_minted() {
         (on_solo, NATIVE),
         (on_solo, stk),
     ];
+    // Limits on every mint and release: what exceeds them waits in the queue.
+    for (gateway, token) in homes {
+        let other = if gateway == on_eth { on_solo } else { on_eth };
+        let limit = ETHER / 2;
+        ok(&w.eth.call(
+            OWNER,
+            gateway,
+            &set_release_limit_calldata(&token, limit, 300),
+        ));
+        ok(&w
+            .eth
+            .call(OWNER, other, &set_mint_limit_calldata(&token, limit, 300)));
+    }
     let mut rng = Rng(0x5EED_1234_ABCD_0001);
     let mut delivered = 0;
+    let mut executed = 0;
     for _ in 0..600 {
-        let op = rng.below(12);
+        let op = rng.below(14);
         let amount =
             u128::from(rng.below(5_000) + 1) * if rng.below(2) == 0 { 1 } else { ETHER / 1_000 };
         match op {
@@ -1007,6 +1367,13 @@ fn locked_always_covers_what_is_minted() {
                 w.eth
                     .call(STRANGER, gateway, &claim_calldata(&token, &receiver));
             }
+            12 => w.eth.advance(rng.below(600)),
+            13 if !w.queued.is_empty() => {
+                let i = usize::try_from(rng.below(w.queued.len() as u64)).unwrap();
+                if w.execute(i).success {
+                    executed += 1;
+                }
+            }
             _ => {
                 let (gateway, token) = rng.pick(&homes);
                 let other = if gateway == on_eth { on_solo } else { on_eth };
@@ -1032,6 +1399,7 @@ fn locked_always_covers_what_is_minted() {
         }
     }
     assert!(delivered > 50, "{delivered}");
+    assert!(executed >= 10, "{executed}");
     // Unpause, lift the caps, deliver everything, bridge everything back and claim what is owed:
     // nothing is left owed or in flight, both equalities still hold, and the only value still
     // locked and minted is what the test receiver holds of wrapped tokens it does not bridge back.
@@ -1051,6 +1419,7 @@ fn locked_always_covers_what_is_minted() {
         &abi::call("setRejecting(bool)", &[Value::uint(0)]),
     ));
     w.deliver_all();
+    w.execute_all();
     for (home, origin) in homes {
         let away = if home == on_eth { on_solo } else { on_eth };
         let wrapped = wrapped_of(away, origin);
@@ -1071,6 +1440,7 @@ fn locked_always_covers_what_is_minted() {
         }
     }
     w.deliver_all();
+    w.execute_all();
     for (home, origin) in homes {
         let recipients = if home == on_eth {
             &recipients_eth

@@ -45,6 +45,8 @@ contract TokenGatewayOnEthereum is TokenGateway, ISoloMessageRecipient {
         inbox = inbox_;
         soloChainId = soloChainId_;
         messageGas = messageGas_;
+        // Tells the paired gateway this one exists (spec 21 §5.7).
+        _send(abi.encode(HELLO, false));
     }
 
     /// @notice A message from Solo, delivered by the inbox: only the paired gateway's count, and

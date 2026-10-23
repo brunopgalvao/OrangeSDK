@@ -1,5 +1,7 @@
 //! The canonical token bridge end to end (spec 21) over both real message
-//! channels. On "Ethereum" (revm at Osaka) Alice locks ETH and an ERC-20 in
+//! channels. The gateways first hear from each other: the Solo gateway's
+//! `HELLO` crosses to Ethereum, and until it arrives the Ethereum gateway
+//! takes no deposits. On "Ethereum" (revm at Osaka) Alice locks ETH and an ERC-20 in
 //! `TokenGatewayOnEthereum`, which sends through `EthereumOutbox`; a
 //! synthetic beacon chain finalizes that state; on a Solo chain of four
 //! staking validators (simulated with `Sim`) the sync-committee light client
@@ -73,24 +75,25 @@ const UPDATE_GAS: u64 = 3_000_000;
 const DELIVER_GAS: u64 = 3_000_000;
 const BIG: u128 = 1 << 100;
 
-/// Transaction gas of the first `deposit` of ETH on Ethereum, through `EthereumOutbox`.
-const DEPOSIT_ETH_GAS: u64 = 118_426;
+/// Transaction gas of the first `deposit` of ETH on Ethereum, through `EthereumOutbox`, whose
+/// nonce the gateway's `HELLO` and its answer moved from zero.
+const DEPOSIT_ETH_GAS: u64 = 101_488;
 /// Of the first `deposit` of an ERC-20 there.
-const DEPOSIT_TOKEN_GAS: u64 = 159_315;
+const DEPOSIT_TOKEN_GAS: u64 = 159_477;
 /// Of the delivery on Solo whose mint creates wrapped ETH (the inbox's proofs included).
-const FIRST_MINT_GAS: u64 = 822_627;
+const FIRST_MINT_GAS: u64 = 832_796;
 /// Of a delivery on Solo whose wrapped token exists.
-const MINT_GAS: u64 = 103_352;
+const MINT_GAS: u64 = 109_718;
 /// Of a withdrawal on Solo: the burn and the send through the outbox.
-const BURN_GAS: u64 = 97_525;
+const BURN_GAS: u64 = 97_687;
 /// Of a deposit of Solo's currency on Solo.
-const LOCK_NATIVE_GAS: u64 = 117_482;
+const LOCK_NATIVE_GAS: u64 = 117_644;
 /// Of `SoloInbox.execute` releasing ETH through the gateway on Ethereum.
-const RELEASE_GAS: u64 = 77_846;
+const RELEASE_GAS: u64 = 80_361;
 /// Of a withdrawal on Ethereum: the burn and the send through `EthereumOutbox`.
-const ETH_BURN_GAS: u64 = 86_385;
+const ETH_BURN_GAS: u64 = 86_547;
 /// Of the delivery on Solo that releases Solo's currency.
-const NATIVE_RELEASE_GAS: u64 = 96_478;
+const NATIVE_RELEASE_GAS: u64 = 100_147;
 
 /// The Solo side: the simulated chain and its wallets' nonces.
 struct Solo {
@@ -286,6 +289,42 @@ fn genesis(
                 .collect()),
         }
         .to_bytes(),
+    }
+}
+
+/// Proves `messages`, sent on Solo at or before height `sent_at`, to
+/// `SoloInbox` on Ethereum: a light-client submission from a threshold
+/// certificate anchoring a height at or after the sends, then each
+/// message's outbox slot. Their delay runs from here.
+fn prove_on_ethereum(
+    solo: &mut Solo,
+    eth: &mut Eth,
+    contracts: ([u8; 20], [u8; 20]),
+    messages: &[SoloMessage],
+    sent_at: u64,
+) {
+    let (light_client, solo_inbox) = contracts;
+    let mut submission = None;
+    for _ in 0..20 {
+        let target = solo.sim.nodes[0].finalized_height().unwrap() + 2;
+        assert!(
+            solo.sim
+                .run_until(40 * SLOT_MS, |s| s.nodes[0].finalized_height().unwrap()
+                    >= target)
+                .unwrap()
+        );
+        submission = submission_covering(&mut solo.sim.nodes[0], sent_at).unwrap();
+        if submission.is_some() {
+            break;
+        }
+    }
+    let submission = submission.expect("a certificate anchors the sends");
+    ok(&eth.call(RELAYER, light_client, &submission.calldata()));
+    for m in messages {
+        let proof = slot_proof(&mut solo.sim.nodes[0], m.nonce, submission.anchor_height)
+            .unwrap()
+            .unwrap();
+        ok(&eth.call(RELAYER, solo_inbox, &proof.prove_calldata(m)));
     }
 }
 
@@ -517,6 +556,44 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
             &deposit_calldata(&token, &to, amount),
         )
     };
+    // But not before the Ethereum gateway has heard from its peer (spec 21 §5.7): the Solo
+    // gateway's constructor sent a HELLO, which crosses through the outbox, a certificate and
+    // `SoloInbox`; the Ethereum gateway answers it.
+    reverted_with(
+        &deposit(&mut eth, NATIVE, address(&bob), ETHER),
+        "PeerUnconfirmed()",
+    );
+    let hellos: Vec<SoloMessage> = sent_messages(CHAIN_ID, &created.logs.0)
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect();
+    assert_eq!(hellos.len(), 1);
+    assert_eq!(
+        TokenMessage::decode(&hellos[0].payload),
+        Some(TokenMessage::Hello { heard: false })
+    );
+    prove_on_ethereum(
+        &mut solo,
+        &mut eth,
+        (light_client, solo_inbox),
+        &hellos,
+        created.height,
+    );
+    eth.advance(DELAY);
+    let heard = eth.call(RELAYER, solo_inbox, &execute_calldata(&hellos[0]));
+    ok(&heard);
+    let answer = ethereum_messages(eth_outbox, &heard);
+    assert_eq!(
+        answer
+            .iter()
+            .map(|m| (m.nonce, TokenMessage::decode(&m.payload)))
+            .collect::<Vec<_>>(),
+        [(1, Some(TokenMessage::Hello { heard: true }))]
+    );
+    assert_eq!(
+        eth_u128(&mut eth, eth_gateway, &abi::call("peerLive()", &[])),
+        1
+    );
     let first = deposit(&mut eth, NATIVE, address(&bob), 4 * ETHER);
     ok(&first);
     let second = deposit(&mut eth, tkn, address(&bob), 700_000);
@@ -554,7 +631,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
         MALLORY,
         eth_outbox,
         &EthMessage {
-            nonce: 2,
+            nonce: 5,
             sender: MALLORY,
             recipient: solo_gateway,
             gas_limit: MESSAGE_GAS,
@@ -585,7 +662,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
     // takes the update, and its root is usable after the delay.
     let state = eth.state();
     // The state spec 21 §8's deliveries prove against.
-    assert_eq!(state.accounts.len(), 13);
+    assert_eq!(state.accounts.len(), 14);
     let update = beacon.update(20, &beacon.header(16, state.root(), [0; 32]), true, 21, 32);
     let applied = solo.send(
         &relayer,
@@ -635,7 +712,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
         DELIVER_GAS,
     );
     assert_eq!(r.status, 0);
-    assert!(!delivered(&mut solo, 0));
+    assert!(!delivered(&mut solo, 2));
     let unpause = abi::call("unpause()", &[]);
     assert_eq!(
         solo.send(&governance, Some(solo_gateway), 0, &unpause, 100_000)
@@ -651,7 +728,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
         DELIVER_GAS,
     );
     assert_eq!(minted.status, 1);
-    assert!(delivered(&mut solo, 0));
+    assert!(delivered(&mut solo, 2));
     assert_eq!(solo.balance_of(weth, address(&bob)), 4 * ETHER);
     let minted_again = solo.send(
         &relayer,
@@ -666,13 +743,10 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
         ("FIRST_MINT_GAS", minted.gas_used, FIRST_MINT_GAS),
         ("MINT_GAS", minted_again.gas_used, MINT_GAS),
     ]);
-    // Spec 21 §5.1 and §8: creating the wrapped token costs about 720 000 gas, mostly the code
+    // Spec 21 §5.1 and §8: creating the wrapped token costs about 723 000 gas, mostly the code
     // deposit of its 2 779-byte runtime.
     assert_eq!(runtime_code("BridgedToken").len(), 2_779);
-    assert_eq!(
-        (FIRST_MINT_GAS - MINT_GAS).div_ceil(10_000) * 10_000,
-        720_000
-    );
+    assert_eq!((FIRST_MINT_GAS - MINT_GAS) / 1_000, 723);
     // A replay is refused at admission.
     let replay = solo.raw(
         &relayer,
@@ -698,7 +772,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
         .status,
         0
     );
-    assert!(!delivered(&mut solo, 1));
+    assert!(!delivered(&mut solo, 3));
     assert_eq!(
         solo.send(
             &governance,
@@ -728,7 +802,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
         DELIVER_GAS,
     );
     assert_eq!(refused.status, 0);
-    assert!(!delivered(&mut solo, 3));
+    assert!(!delivered(&mut solo, 5));
     assert_eq!(solo.balance_of(weth, MALLORY), 0);
     assert_eq!(
         solo.u128_view(weth, &abi::call("totalSupply()", &[])),
@@ -818,28 +892,13 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
     let sent_at = receipts[3].height;
 
     // The relayer: a certificate anchoring a height at or after the sends, then the proofs.
-    let mut submission = None;
-    for _ in 0..20 {
-        let target = solo.sim.nodes[0].finalized_height().unwrap() + 2;
-        assert!(
-            solo.sim
-                .run_until(40 * SLOT_MS, |s| s.nodes[0].finalized_height().unwrap()
-                    >= target)
-                .unwrap()
-        );
-        submission = submission_covering(&mut solo.sim.nodes[0], sent_at).unwrap();
-        if submission.is_some() {
-            break;
-        }
-    }
-    let submission = submission.expect("a certificate anchors the sends");
-    ok(&eth.call(RELAYER, light_client, &submission.calldata()));
-    for m in &to_eth {
-        let proof = slot_proof(&mut solo.sim.nodes[0], m.nonce, submission.anchor_height)
-            .unwrap()
-            .unwrap();
-        ok(&eth.call(RELAYER, solo_inbox, &proof.prove_calldata(m)));
-    }
+    prove_on_ethereum(
+        &mut solo,
+        &mut eth,
+        (light_client, solo_inbox),
+        &to_eth,
+        sent_at,
+    );
     eth.advance(DELAY);
     let rejecting = |on: bool| abi::call("setRejecting(bool)", &[Value::uint(u128::from(on))]);
     ok(&eth.call(RELAYER, receiver, &rejecting(true)));
