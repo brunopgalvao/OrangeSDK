@@ -162,6 +162,32 @@ impl PublicKeySet {
         PublicKey(poly::evaluate_commitment(&self.commitment, index).into())
     }
 
+    /// The public key shares of indices `1..=count`, in order: exactly
+    /// [`Self::public_share`] of each, computed together (spec 12 §4.2).
+    ///
+    /// One by one, each share is `t` Horner steps, each a multiplication by
+    /// the index, so `count · t` of them. Together, once `count` is at least
+    /// half the threshold, the commitment polynomial is first rewritten in
+    /// the falling-factorial basis `x(x − 1)…(x − j + 1)` (about `t²/2`
+    /// multiplications by `j < t`), which gives its forward differences at
+    /// zero; from there each next share costs `t − 1` additions. Fewer
+    /// shares are evaluated one by one, which is then cheaper.
+    #[must_use]
+    pub fn public_shares(&self, count: u32) -> Vec<PublicKey> {
+        let t = self.commitment.len();
+        let points: Vec<G2Projective> = if (count as usize) < t.div_ceil(2) {
+            (1..=count)
+                .map(|x| poly::evaluate_commitment(&self.commitment, x))
+                .collect()
+        } else {
+            poly::evaluate_commitment_at_naturals(&self.commitment, count)
+        };
+        poly::normalize(&points)
+            .into_iter()
+            .map(PublicKey)
+            .collect()
+    }
+
     /// Whether `signature` is a valid group signature over `msg`.
     #[must_use]
     pub fn verify(&self, msg: &[u8], signature: &Signature) -> bool {

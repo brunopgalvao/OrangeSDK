@@ -158,8 +158,11 @@ impl Keystore {
                     } else {
                         shares.iter().sum()
                     };
-                    let public_shares = (1..=total)
-                        .map(|x| out.key_set.public_share(x).to_bytes().to_vec())
+                    let public_shares = out
+                        .key_set
+                        .public_shares(total)
+                        .iter()
+                        .map(|k| k.to_bytes().to_vec())
                         .collect();
                     if !out.shares.is_empty() {
                         self.shares.insert(r.key_set, out.shares);

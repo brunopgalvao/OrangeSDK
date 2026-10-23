@@ -1,7 +1,9 @@
 //! Timing of a recipient's share checks at the end of the dealing phase
 //! (spec 12 §5.1) and of finding the invalid partial signatures among those
-//! a combiner holds (spec 12 §4.1). Both checks are batched; this measures
-//! what they cost for the sizes the reference kernel deals (spec 15 §6.1).
+//! a combiner holds (spec 12 §4.1), and of computing every public key share
+//! of a run's outcome (spec 12 §4.2). The checks are batched and the shares
+//! computed together; this measures what each costs, against doing it one
+//! by one, for the sizes the reference kernel deals (spec 15 §6.1).
 //!
 //! `cargo test --release -p solo-bls --test batch_timing -- --ignored --nocapture`
 //!
@@ -149,6 +151,31 @@ fn finding_invalid_partials() {
         eprintln!(
             "threshold {t}, {} partials, 2 invalid: one by one {individually:?}, batched {in_batch:?}",
             partials.len()
+        );
+    }
+}
+
+#[test]
+#[ignore = "timing; run explicitly in release mode"]
+fn computing_every_public_key_share() {
+    // What every node computes for its `KeySetVote` at the end of a run
+    // (spec 15 §6.3): the public key share of each of the run's shares.
+    for (members, t, n) in [(64, 171u32, 256u32), (256, 683, 1024)] {
+        let secret = SecretKey::generate(&[11; 32], b"timing").unwrap();
+        let (set, _) = threshold::deal(&secret, t, n, &[5; 32]).unwrap();
+        let start = Instant::now();
+        let one_by_one: Vec<_> = (1..=n).map(|x| set.public_share(x)).collect();
+        let before = start.elapsed();
+        let mut after = Duration::MAX;
+        for _ in 0..3 {
+            let start = Instant::now();
+            let together = set.public_shares(n);
+            after = after.min(start.elapsed());
+            assert_eq!(together, one_by_one);
+        }
+        eprintln!(
+            "{members} members, {n} shares, threshold {t}: one by one {before:?}, together {after:?} ({:.1}x)",
+            before.as_secs_f64() / after.as_secs_f64()
         );
     }
 }

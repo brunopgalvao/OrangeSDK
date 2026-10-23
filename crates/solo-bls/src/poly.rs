@@ -89,6 +89,50 @@ pub(crate) fn evaluate_commitment(commitment: &[G2Affine], x: u32) -> G2Projecti
         })
 }
 
+/// The committed polynomial evaluated in the exponent at `1, 2, …, count`,
+/// by forward differences (spec 12 §4.2): the same points as
+/// [`evaluate_commitment`] at each.
+///
+/// `P(x) = Σ_k x^k · C_k` is rewritten by Horner's rule in the
+/// falling-factorial basis, `P(x) = Σ_j A_j · x(x − 1)…(x − j + 1)`, using
+/// `x · x^(j) = x^(j+1) + j · x^(j)` for the falling factorial `x^(j)`: a
+/// multiplication of each running coefficient by its small index per step.
+/// The forward differences of `P` at zero are then `Δ^j P(0) = j! · A_j`, and
+/// stepping the difference table from `x` to `x + 1` is `Δ^j P += Δ^(j+1) P`
+/// for every `j`, one addition each.
+pub(crate) fn evaluate_commitment_at_naturals(
+    commitment: &[G2Affine],
+    count: u32,
+) -> Vec<G2Projective> {
+    let t = commitment.len();
+    // Falling-factorial coefficients of the running Horner value.
+    let mut table = alloc::vec![G2Projective::identity(); t];
+    for (k, c) in commitment.iter().enumerate().rev() {
+        // Multiply by x: coefficient i becomes A_(i−1) + i · A_i, the
+        // highest first so that each reads the old values. Coefficient i is
+        // still the identity until step t − 1 − i, so the loop skips it.
+        for i in (1..t - k).rev() {
+            table[i] = point::mul_small(&table[i], i as u64) + table[i - 1];
+        }
+        table[0] = G2Projective::from(c);
+    }
+    // Δ^j P(0) = j! · A_j.
+    let mut factorial = Scalar::one();
+    for (j, entry) in table.iter_mut().enumerate().skip(2) {
+        factorial *= Scalar::from(j as u64);
+        *entry *= factorial;
+    }
+    let mut out = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        for j in 0..t - 1 {
+            let next = table[j + 1];
+            table[j] += next;
+        }
+        out.push(table[0]);
+    }
+    out
+}
+
 /// Whether `share` is the value at `x` of the polynomial behind `commitment`
 /// (the Feldman check).
 pub(crate) fn share_matches(commitment: &[G2Affine], x: u32, share: &Scalar) -> bool {
