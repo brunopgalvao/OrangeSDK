@@ -16,7 +16,7 @@ use solo_abi::chain::{
     Validator, ValidatorSet, call_status, reason,
 };
 use solo_abi::codec::Seq;
-use solo_abi::fees::{FEE_VAULT, FeeParams, FeeStatus, query as fee_query};
+use solo_abi::fees::{FEE_VAULT, FeeParams, FeeStatus, MAX_MIN_BASE_FEE, query as fee_query};
 use solo_abi::governance::{self as gov, Call, GOVERNANCE_ADDRESS, GovernanceParams, mode};
 use solo_abi::staking::{
     Delegation, DelegationEntry, GWEI, STAKING_ADDRESS, StakingAction, StakingParams,
@@ -691,6 +691,16 @@ fn the_treasury_takes_the_base_fee_and_governance_changes_the_parameters() {
             elasticity: 2,
             ..raised.clone()
         },
+        // A treasury at the staking address would lock every base fee there.
+        FeeParams {
+            treasury: STAKING_ADDRESS,
+            ..raised.clone()
+        },
+        // A floor above the bound, a wei over it.
+        FeeParams {
+            min_base_fee: MAX_MIN_BASE_FEE + 1,
+            ..raised.clone()
+        },
     ] {
         let submit = Call::Submit {
             target: GOVERNANCE_ADDRESS,
@@ -745,6 +755,48 @@ fn the_treasury_takes_the_base_fee_and_governance_changes_the_parameters() {
         chain.node.submit(&direct),
         Err(SubmitError::Rejected(reason::SYSTEM_ACTION))
     );
+}
+
+/// `kernel_init` traps on parameters that cannot work (spec 23 §2): a
+/// treasury at the staking address, a floor above the bound, factors out
+/// of range; the bound itself starts a chain.
+#[test]
+fn a_genesis_with_unworkable_fee_parameters_never_starts() {
+    let key = SigningKey::from_slice(&[0x42; 32]).unwrap();
+    let setup = |fees: FeeParams| Setup {
+        allocations: Vec::new(),
+        fees,
+        staking: StakingParams::default(),
+        governance: GovernanceParams::default(),
+        key: [0; 20],
+    };
+    let open = |fees: FeeParams| {
+        let genesis = genesis(std::slice::from_ref(&key), &[1], setup(fees));
+        Node::open(kernel_module(), &genesis, NodeConfig::default())
+    };
+    for bad in [
+        market(STAKING_ADDRESS),
+        FeeParams {
+            treasury: STAKING_ADDRESS,
+            ..FeeParams::default()
+        },
+        FeeParams {
+            min_base_fee: MAX_MIN_BASE_FEE + 1,
+            ..market([0; 20])
+        },
+        FeeParams {
+            denominator: 99,
+            ..market([0; 20])
+        },
+    ] {
+        assert!(open(bad.clone()).is_err(), "{bad:?}");
+    }
+    let node = open(FeeParams {
+        min_base_fee: MAX_MIN_BASE_FEE,
+        ..market([7; 20])
+    })
+    .unwrap();
+    assert_eq!(node.fee_status().base_fee, MAX_MIN_BASE_FEE);
 }
 
 // ---- The fee market on disk: restarts and snapshots (spec 22) ----
@@ -844,7 +896,10 @@ fn the_fee_market_survives_a_restart_and_travels_in_a_snapshot() {
     // A snapshot of the latest epoch carries the market as it stood there:
     // the epoch's end has just paid the pool out to the validator and its
     // delegator, so the balances it carries hold the rewards.
-    let snapshot = again.node.export_snapshot(None).unwrap();
+    let snapshot = again
+        .node
+        .export_snapshot(None, &store_dir("market.snap"))
+        .unwrap();
     let height = snapshot.header.height;
     let expected: FeeStatus = decoded(
         &again
@@ -975,6 +1030,78 @@ fn a_restarted_validator_signals_at_the_base_fee() {
     assert!(again.node.fee_status().base_fee >= FLOOR);
     again.mine();
     assert!(signal_epoch(&mut again.node).unwrap() > covered);
+}
+
+/// A validator's gate signal carries headroom (spec 13 §8.2): priced at
+/// the next base fee, it waits behind a block that fills up and raises
+/// the base fee, and still lands in the block after, paying that block's
+/// base fee and nothing over it. A signal priced at exactly the base fee
+/// it was built at would be left out of every take from then on, and its
+/// replacement refused as underpriced.
+#[test]
+fn a_signal_outlasts_a_rising_base_fee_and_pays_only_the_base_fee() {
+    let key = SigningKey::from_slice(&[0x42; 32]).unwrap();
+    let validator = Wallet::from_key(key.clone());
+    let alice = Wallet::new(1);
+    let setup = Setup {
+        allocations: vec![
+            funded(validator.address, 100 * ETHER),
+            funded(alice.address, 1_000 * ETHER),
+            predeploy(BURNER, BURNER_CODE.to_vec()),
+        ],
+        fees: market([0; 20]),
+        staking: StakingParams::default(),
+        governance: GovernanceParams::default(),
+        key: [0; 20],
+    };
+    let mut genesis = genesis(std::slice::from_ref(&key), &[1], setup);
+    let mut params = GenesisParams::from_bytes(&genesis.params).unwrap();
+    params.upgrades.epoch_blocks = 3;
+    genesis.params = params.to_bytes();
+    let mut chain = Chain::new(&genesis, &key);
+    // Up to a block after which the node has a signal waiting in its pool.
+    let pending = |node: &Node| {
+        node.mempool()
+            .iter()
+            .find(|tx| tx.sender == validator.address)
+            .map(|tx| (tx.hash, tx.fee_cap, tx.tip_cap))
+    };
+    let mut waiting = None;
+    for _ in 0..12 {
+        chain.mine();
+        waiting = pending(&chain.node);
+        if waiting.is_some() {
+            break;
+        }
+    }
+    let (hash, fee_cap, tip_cap) = waiting.expect("a signal waits");
+    let priced_at = chain.node.fee_status().base_fee;
+    assert_eq!((fee_cap, tip_cap), (2 * u128::from(priced_at), 0));
+    // A block filled by two burns that leave no room for the signal's gas
+    // limit: the base fee rises past what the signal was priced at.
+    let price = 4 * u128::from(FLOOR);
+    let full = chain.block(&[
+        alice.burn(price, TARGET),
+        alice.burn(price, TARGET - 50_000),
+    ]);
+    assert_eq!(full[0].gas_used + full[1].gas_used, 2 * TARGET - 50_000);
+    assert!(chain.node.receipt(&hash).unwrap().is_none());
+    let risen = chain.node.fee_status().base_fee;
+    assert!(risen > priced_at, "{risen} > {priced_at}");
+    let before = chain.balance(validator.address);
+    let header = chain.mine();
+    assert_eq!(header.base_fee, risen);
+    let receipt = chain
+        .node
+        .receipt(&hash)
+        .unwrap()
+        .expect("the signal landed");
+    assert_eq!(receipt.status, 1);
+    assert_eq!(receipt.effective_gas_price, u128::from(risen));
+    assert_eq!(
+        chain.balance(validator.address),
+        before - u128::from(receipt.gas_used) * u128::from(risen)
+    );
 }
 
 // ---- Four validators, delegators and the reward pool ----

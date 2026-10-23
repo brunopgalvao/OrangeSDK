@@ -195,6 +195,58 @@ impl DriverStore {
     }
 }
 
+/// The tables keyed by a height, little-endian after the prefix: the
+/// finalized proposal's hash, its vote certificate and its threshold
+/// certificate.
+const BY_HEIGHT: [&[u8]; 3] = [b"final/", b"cert/", b"bcert/"];
+
+/// The tables keyed by a view, little-endian after the prefix: block votes,
+/// finalize votes and threshold partials per `(view, hash)`, and the
+/// notarized hash per view.
+const BY_VIEW: [&[u8]; 4] = [b"votes/", b"fin/", b"part/", b"notar/"];
+
+/// The first hash each validator signed per kind and view: `sig/ ‖ kind ‖
+/// view ‖ validator`.
+const SIGNED: &[u8] = b"sig/";
+
+/// The `u64` that starts at `at` in `bytes`, little-endian.
+fn le64(bytes: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+}
+
+/// Deletes from `tables` what consensus no longer needs below `cutoff`, a
+/// finalized height (spec 22 §8.1): the proposals of heights below it, the
+/// hash and certificates of every finalized height below it, and the
+/// votes, partials, notarizations and first signatures of the views below
+/// the view of the proposal finalized at `cutoff`. Everything else (the
+/// driver state, the entry and tip certificates, evidence, the DKG pool)
+/// stays. Returns how many entries went.
+pub fn prune_tables(tables: &mut Tables, cutoff: u64) -> usize {
+    let view_at = tables
+        .get(&[b"final/".as_slice(), &cutoff.to_le_bytes()].concat())
+        .and_then(|hash| tables.get(&[b"prop/".as_slice(), hash].concat()))
+        .and_then(|proposal| le64(proposal, 0));
+    let before = tables.len();
+    tables.retain(|key, value| {
+        let below_view = |at: usize| view_at.is_some_and(|v| le64(key, at).is_some_and(|w| w < v));
+        if let Some(prefix) = BY_HEIGHT.iter().find(|p| key.starts_with(p)) {
+            return le64(key, prefix.len()).is_none_or(|h| h >= cutoff);
+        }
+        if key.starts_with(b"prop/") {
+            // A proposal's encoding starts with its view and its height.
+            return le64(value, 8).is_none_or(|h| h >= cutoff);
+        }
+        if let Some(prefix) = BY_VIEW.iter().find(|p| key.starts_with(p)) {
+            return !below_view(prefix.len());
+        }
+        if key.starts_with(SIGNED) {
+            return !below_view(SIGNED.len() + 1);
+        }
+        true
+    });
+    before - tables.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +262,64 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_vec(), v.to_vec()))
             .collect()
+    }
+
+    #[test]
+    fn pruning_keeps_what_consensus_still_needs() {
+        let at = |prefix: &[u8], n: u64| [prefix, &n.to_le_bytes()[..]].concat();
+        // Proposals: view and height first, as the encoding starts.
+        let proposal = |view: u64, height: u64| [view.to_le_bytes(), height.to_le_bytes()].concat();
+        let mut t = Tables::new();
+        for b in 1..=6u8 {
+            let (h, hash) = (u64::from(b), [b; 32]);
+            t.insert(at(b"final/", h), hash.to_vec());
+            t.insert(at(b"cert/", h), vec![1]);
+            t.insert(at(b"bcert/", h), vec![2]);
+            t.insert([b"prop/".as_slice(), &hash].concat(), proposal(10 * h, h));
+            t.insert([at(b"votes/", 10 * h), hash.to_vec()].concat(), vec![3]);
+            t.insert([at(b"fin/", 10 * h), hash.to_vec()].concat(), vec![3]);
+            t.insert([at(b"part/", 10 * h), hash.to_vec()].concat(), vec![3]);
+            t.insert(at(b"notar/", 10 * h), hash.to_vec());
+            t.insert(
+                [b"sig/".as_slice(), &[1], &(10 * h).to_le_bytes(), &[0; 4]].concat(),
+                vec![4],
+            );
+        }
+        // A proposal that lost its view at height 2, the driver's own keys,
+        // evidence, and keys too short to carry a height or a view.
+        t.insert(b"prop/fork".to_vec(), proposal(21, 2));
+        t.insert(b"simplex/state".to_vec(), vec![5]);
+        t.insert(b"evidence/x".to_vec(), vec![6]);
+        t.insert(b"final/x".to_vec(), vec![7]);
+        t.insert(b"prop/short".to_vec(), vec![8]);
+        t.insert(b"votes/x".to_vec(), vec![9]);
+        let all = t.len();
+        // Below height 4 and view 40 everything goes: three heights of nine
+        // entries each and the fork's proposal.
+        assert_eq!(prune_tables(&mut t, 4), 3 * 9 + 1);
+        assert_eq!(t.len(), all - 28);
+        for h in 4..=6u64 {
+            assert!(t.contains_key(&at(b"final/", h)));
+            assert!(t.contains_key(&at(b"notar/", 10 * h)));
+        }
+        assert!(!t.contains_key(&at(b"final/", 3)));
+        assert!(!t.contains_key(&at(b"notar/", 30)));
+        for kept in [
+            &b"simplex/state"[..],
+            b"evidence/x",
+            b"final/x",
+            b"prop/short",
+            b"votes/x",
+        ] {
+            assert!(t.contains_key(kept), "{kept:?}");
+        }
+        // Again at the same height: nothing more. At a height the tables do
+        // not hold, the view-keyed entries stay, the heights go.
+        assert_eq!(prune_tables(&mut t, 4), 0);
+        let mut gap = t.clone();
+        gap.remove(&at(b"final/", 5));
+        assert_eq!(prune_tables(&mut gap, 5), 4);
+        assert!(gap.contains_key(&at(b"notar/", 40)));
     }
 
     #[test]

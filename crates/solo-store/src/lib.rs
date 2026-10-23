@@ -22,5 +22,7 @@
 pub mod disk;
 pub mod snapshot;
 
-pub use disk::{CHAIN_FILE, CREATING_FILE, DiskStore, Entries, Fault, StoreError, StoreStats};
-pub use snapshot::{Snapshot, SnapshotError, SnapshotHeader, Trust};
+#[cfg(any(test, feature = "fault-injection"))]
+pub use disk::Fault;
+pub use disk::{CHAIN_FILE, CREATING_FILE, DiskStore, Entries, NotKept, StoreError, StoreStats};
+pub use snapshot::{EntryReader, ExportLimits, Snapshot, SnapshotError, SnapshotHeader, Trust};

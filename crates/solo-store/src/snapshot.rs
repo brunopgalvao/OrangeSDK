@@ -5,38 +5,47 @@
 //! (`snap/` + epoch: the height and the state commitment), and vouched for
 //! by a finality certificate: a certificate for a later proposal whose
 //! anchor root (spec 17 §4) a spec 10 proof of the record verifies against.
-//! A new node verifies the certificate under a key it trusts, the proof
-//! against the anchor, and the entries against the record's root, before
-//! it loads the state and syncs forward from there.
+//! The head block's proposal is linked to that proposal by the parent
+//! hashes of the proposals between them, which the file carries, so the
+//! same certificate vouches for it. A new node verifies the certificate
+//! under a key it trusts, the proof against the anchor, the links, and the
+//! entries against the record's root, before it loads the state and syncs
+//! forward from there.
 //!
 //! The file is `SOLOSNAP`, the format, the header's length and the encoded
 //! [`SnapshotHeader`], then the entries, each as `key length ‖ key ‖ value
-//! length ‖ value` with `u32` little-endian lengths, in key order.
+//! length ‖ value` with `u32` little-endian lengths, in ascending order of
+//! their paths (`keccak256` of the key, spec 10 §3). Path order lets every
+//! reader hash the entries into the trie as they stream past
+//! ([`solo_trie::SortedRoot`]): exporting, verifying and importing keep a
+//! bounded part of the state in memory whatever its size (spec 22 §7).
 
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use solo_abi::chain::consensus::{KIND_FINALIZE, signing_preimage};
 use solo_abi::chain::{Certificate, Proposal, SnapshotRecord, ValidatorSet, keys};
-use solo_abi::codec::{Decoder, Encoder};
+use solo_abi::codec::{Decoder, Encoder, Seq};
 use solo_abi::rotation::threshold_certificate;
 use solo_abi::{Decode, DecodeError, Encode};
 use solo_bls::PublicKey;
 use solo_bls::certificate::CertificateV2;
 use solo_host::Storage;
-use solo_trie::{Proof, Trie, keccak256};
+use solo_trie::{Hash, NODE_LEN, Proof, SortedRoot, keccak256};
 
-use crate::disk::{DiskStore, Entries, StoreError};
+use crate::disk::{DiskStore, NotKept, StoreError};
 
 /// The first eight bytes of a snapshot file.
 pub const MAGIC: &[u8; 8] = b"SOLOSNAP";
 
-/// The file format this release writes and reads.
-pub const FORMAT: u32 = 1;
+/// The file format this release writes and reads: 2, entries in path order
+/// and the links from the head to the anchoring proposal in the header.
+pub const FORMAT: u32 = 2;
 
 /// Node-local keys the kernel's block log uses (spec 22 §5), which an
 /// imported snapshot sets for the height it loads so that the driver finds
@@ -46,6 +55,30 @@ pub const LOG_PROPOSAL: &[u8] = b"local/log/prop/";
 pub const LOG_CERTIFICATE: &[u8] = b"local/log/cert/";
 /// The threshold certificate of a logged height.
 pub const LOG_THRESHOLD: &[u8] = b"local/log/bcert/";
+
+/// How an export sorts the entries into path order: in runs of at most
+/// `chunk_bytes` of entries in memory, each sorted and written to a
+/// temporary file beside the output, then merged `fan_in` runs at a time
+/// (spec 22 §7.1). Memory stays within `chunk_bytes` plus a read buffer per
+/// merged run, whatever the size of the state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportLimits {
+    /// The most bytes of entries (key, value and path) a run holds.
+    pub chunk_bytes: usize,
+    /// The most runs one merge reads at once; at least 2.
+    pub fan_in: usize,
+}
+
+impl Default for ExportLimits {
+    /// Runs of 64 MiB, merged 64 at a time: a 4 GiB state sorts in one
+    /// merge, a larger one in more.
+    fn default() -> ExportLimits {
+        ExportLimits {
+            chunk_bytes: 64 << 20,
+            fan_in: 64,
+        }
+    }
+}
 
 /// Everything in a snapshot but the entries.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -73,6 +106,10 @@ pub struct SnapshotHeader {
     pub head_certificate: Vec<u8>,
     /// The threshold certificate of block `height`, or empty.
     pub head_threshold: Vec<u8>,
+    /// The encoded finalized proposals of the heights between the head and
+    /// the anchoring proposal, lowest first: each names the one before as
+    /// its parent, the first the head, and the anchoring proposal the last.
+    pub links: Seq<Vec<u8>>,
 }
 
 impl Encode for SnapshotHeader {
@@ -88,6 +125,7 @@ impl Encode for SnapshotHeader {
         self.head_proposal.encode(e);
         self.head_certificate.encode(e);
         self.head_threshold.encode(e);
+        self.links.encode(e);
     }
 }
 
@@ -105,6 +143,7 @@ impl Decode for SnapshotHeader {
             head_proposal: d.get()?,
             head_certificate: d.get()?,
             head_threshold: d.get()?,
+            links: d.get()?,
         })
     }
 }
@@ -150,6 +189,20 @@ impl fmt::Display for SnapshotError {
 
 impl std::error::Error for SnapshotError {}
 
+impl From<StoreError> for SnapshotError {
+    fn from(e: StoreError) -> SnapshotError {
+        SnapshotError::Store(e.to_string())
+    }
+}
+
+impl From<NotKept> for SnapshotError {
+    fn from(NotKept(kept): NotKept) -> SnapshotError {
+        SnapshotError::Export(format!(
+            "the store no longer keeps the state of the record's block (it keeps {kept:?})"
+        ))
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn io_error(e: io::Error) -> SnapshotError {
     SnapshotError::Io(e.to_string())
@@ -162,34 +215,91 @@ fn too_long(_: std::num::TryFromIntError) -> SnapshotError {
     SnapshotError::Io("a length does not fit the format's u32".to_owned())
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn store_error(e: StoreError) -> SnapshotError {
-    SnapshotError::Store(e.to_string())
-}
-
 /// The driver's node-local tables, as [`crate::disk::DiskStore`]'s
 /// neighbour on disk holds them: `prop/`, `final/`, `cert/`, `bcert/`.
 pub type Tables = BTreeMap<Vec<u8>, Vec<u8>>;
 
-/// What vouches for a record: the anchoring proposal, its certificate and
-/// the proof of the record against the anchor root, all encoded.
-type Finality = (Vec<u8>, Vec<u8>, Vec<u8>);
+/// What vouches for a record: the anchoring proposal, its certificate, the
+/// proof of the record against the anchor root, all encoded, and the
+/// proposals linking the head to it.
+type Finality = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<Vec<u8>>);
 
-/// A snapshot: its header and the entries.
+/// A snapshot file: its header, read when it was opened, and its entries,
+/// which stay on disk and stream from it as they are read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     /// Everything but the entries.
     pub header: SnapshotHeader,
-    /// The committed state at `header.height`, in key order.
-    pub entries: Entries,
+    path: PathBuf,
+    /// Where the entries start in the file.
+    body: u64,
 }
 
-/// One length-prefixed part of an entry.
-fn read_part(file: &mut BufReader<File>, word: &mut [u8; 4]) -> Result<Vec<u8>, SnapshotError> {
-    file.read_exact(word).map_err(io_error)?;
-    let mut part = vec![0u8; u32::from_le_bytes(*word) as usize];
-    file.read_exact(&mut part).map_err(io_error)?;
+/// One length-prefixed part of an entry or a run record.
+fn read_part(file: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut word = [0u8; 4];
+    file.read_exact(&mut word)?;
+    let mut part = vec![0u8; u32::from_le_bytes(word) as usize];
+    file.read_exact(&mut part)?;
     Ok(part)
+}
+
+/// Writes `part` behind its `u32` length.
+fn write_part(out: &mut impl Write, part: &[u8]) -> Result<(), SnapshotError> {
+    let len = u32::try_from(part.len()).map_err(too_long)?;
+    out.write_all(&len.to_le_bytes()).map_err(io_error)?;
+    out.write_all(part).map_err(io_error)
+}
+
+/// The entries of a snapshot file, read one at a time: exactly as many as
+/// the header says, after which nothing may follow.
+#[derive(Debug)]
+pub struct EntryReader {
+    file: BufReader<File>,
+    left: u64,
+    done: bool,
+}
+
+impl Iterator for EntryReader {
+    type Item = Result<(Vec<u8>, Vec<u8>), SnapshotError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        if self.left == 0 {
+            self.done = true;
+            let mut rest = [0u8; 1];
+            let after = self.file.read(&mut rest).map_err(io_error);
+            return after
+                .and_then(|n| {
+                    if n == 0 {
+                        Ok(None)
+                    } else {
+                        Err(SnapshotError::Verify(
+                            "the entry count is wrong: bytes follow the last entry",
+                        ))
+                    }
+                })
+                .transpose();
+        }
+        self.left -= 1;
+        let entry = (|| {
+            let mut word = [0u8; 4];
+            if self.file.read(&mut word[..1]).map_err(io_error)? == 0 {
+                return Err(SnapshotError::Verify(
+                    "the entry count is wrong: the file ends early",
+                ));
+            }
+            self.file.read_exact(&mut word[1..]).map_err(io_error)?;
+            let mut key = vec![0u8; u32::from_le_bytes(word) as usize];
+            self.file.read_exact(&mut key).map_err(io_error)?;
+            let value = read_part(&mut self.file).map_err(io_error)?;
+            Ok((key, value))
+        })();
+        self.done = entry.is_err();
+        Some(entry)
+    }
 }
 
 /// The key of the snapshot record of `epoch`.
@@ -247,21 +357,199 @@ fn votes_certify(
     weight * 3 > total * 2
 }
 
+/// Which trust a certificate needs: the key set a threshold certificate
+/// names, or none for a vote certificate. An export links the head to the
+/// lowest proposal whose certificate needs the same trust as the latest's.
+fn trust_class(certificate: &[u8]) -> Option<u64> {
+    threshold_certificate(certificate).map(|c| c.key_id)
+}
+
+/// A temporary directory that goes when it is dropped, with whatever an
+/// export left in it.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A sorted run being merged: its reader and its next record.
+struct Run {
+    file: BufReader<File>,
+    next: Option<(Hash, Vec<u8>, Vec<u8>)>,
+}
+
+impl Run {
+    fn open(path: &Path) -> Result<Run, SnapshotError> {
+        let mut run = Run {
+            file: BufReader::new(File::open(path).map_err(io_error)?),
+            next: None,
+        };
+        run.advance()?;
+        Ok(run)
+    }
+
+    /// Reads the next record: `path ‖ key ‖ value`, the two parts length
+    /// prefixed; `None` at the end of the run.
+    fn advance(&mut self) -> Result<(), SnapshotError> {
+        let mut path = [0u8; 32];
+        self.next = if self.file.read(&mut path[..1]).map_err(io_error)? == 0 {
+            None
+        } else {
+            self.file.read_exact(&mut path[1..]).map_err(io_error)?;
+            let key = read_part(&mut self.file).map_err(io_error)?;
+            let value = read_part(&mut self.file).map_err(io_error)?;
+            Some((path, key, value))
+        };
+        Ok(())
+    }
+}
+
+/// Merges the sorted runs at `paths` in path order, handing each record to
+/// `sink`.
+fn merge_runs(
+    paths: &[PathBuf],
+    sink: &mut dyn FnMut(Hash, Vec<u8>, Vec<u8>) -> Result<(), SnapshotError>,
+) -> Result<(), SnapshotError> {
+    let mut runs = paths
+        .iter()
+        .map(|p| Run::open(p))
+        .collect::<Result<Vec<Run>, SnapshotError>>()?;
+    let mut heap = BinaryHeap::new();
+    for (i, run) in runs.iter().enumerate() {
+        if let Some((path, _, _)) = &run.next {
+            heap.push(Reverse((*path, i)));
+        }
+    }
+    while let Some(Reverse((_, i))) = heap.pop() {
+        let (path, key, value) = runs[i].next.take().expect("a record");
+        runs[i].advance()?;
+        if let Some((next, _, _)) = &runs[i].next {
+            heap.push(Reverse((*next, i)));
+        }
+        sink(path, key, value)?;
+    }
+    Ok(())
+}
+
+/// Writes one sorted run of `records` to `path`.
+fn write_run(
+    path: &Path,
+    records: &mut Vec<(Hash, Vec<u8>, Vec<u8>)>,
+) -> Result<(), SnapshotError> {
+    records.sort_unstable_by_key(|r| r.0);
+    let mut out = BufWriter::new(File::create(path).map_err(io_error)?);
+    for (p, key, value) in records.drain(..) {
+        out.write_all(&p).map_err(io_error)?;
+        write_part(&mut out, &key)?;
+        write_part(&mut out, &value)?;
+    }
+    out.flush().map_err(io_error)
+}
+
+/// Writes the entries of `version` from `store` to `out` in path order,
+/// sorting them through runs in `dir` within `limits`: the entry count and
+/// the root they hash to.
+fn sorted_entries(
+    store: &DiskStore,
+    version: u64,
+    dir: &Path,
+    out: &Path,
+    limits: ExportLimits,
+) -> Result<(u64, Hash), SnapshotError> {
+    let fan_in = limits.fan_in.max(2);
+    let mut runs: Vec<PathBuf> = Vec::new();
+    let mut records = Vec::new();
+    let mut held = 0usize;
+    store.each_entry_at(version, |key, value| {
+        held += 32 + key.len() + value.len();
+        records.push((keccak256(key), key.to_vec(), value.to_vec()));
+        if held >= limits.chunk_bytes {
+            let path = dir.join(format!("run-0-{}", runs.len()));
+            write_run(&path, &mut records)?;
+            runs.push(path);
+            held = 0;
+        }
+        Ok::<(), SnapshotError>(())
+    })?;
+    if !records.is_empty() || runs.is_empty() {
+        let path = dir.join(format!("run-0-{}", runs.len()));
+        write_run(&path, &mut records)?;
+        runs.push(path);
+    }
+    // Merge passes until one merge can read every run.
+    let mut pass = 0;
+    while runs.len() > fan_in {
+        pass += 1;
+        let mut merged = Vec::new();
+        for (i, group) in runs.chunks(fan_in).enumerate() {
+            let path = dir.join(format!("run-{pass}-{i}"));
+            let mut w = BufWriter::new(File::create(&path).map_err(io_error)?);
+            merge_runs(group, &mut |p, key, value| {
+                w.write_all(&p).map_err(io_error)?;
+                write_part(&mut w, &key)?;
+                write_part(&mut w, &value)
+            })?;
+            w.flush().map_err(io_error)?;
+            for done in group {
+                std::fs::remove_file(done).map_err(io_error)?;
+            }
+            merged.push(path);
+        }
+        runs = merged;
+    }
+    let mut w = BufWriter::new(File::create(out).map_err(io_error)?);
+    let mut root = SortedRoot::new(keccak256);
+    let mut none = |_: &Hash, _: &[u8; NODE_LEN]| {};
+    merge_runs(&runs, &mut |path, key, value| {
+        root.push(path, keccak256(&value), &mut none)
+            .map_err(|_| SnapshotError::Export("two keys share a path".to_owned()))?;
+        write_part(&mut w, &key)?;
+        write_part(&mut w, &value)
+    })?;
+    w.flush().map_err(io_error)?;
+    Ok((root.len(), root.finish(&mut none)))
+}
+
 impl Snapshot {
+    /// The file the snapshot is in.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Exports the snapshot of `epoch` (the latest recorded, for `None`)
-    /// from a node's store and driver tables: the state at the record's
-    /// height, a certificate whose proposal anchors a later height the store
-    /// still keeps the trie of, with the proof of the record against it,
-    /// and the head block's proposal and certificates.
+    /// from a node's store and driver tables to the file `out`, within the
+    /// default [`ExportLimits`]: the state at the record's height, a
+    /// certificate whose proposal anchors a later height the store still
+    /// keeps the trie of, with the proof of the record against it, the
+    /// head block's proposal and certificates, and the proposals between.
     ///
     /// # Errors
     /// [`SnapshotError::Export`] when the chain has no such record, the
-    /// store no longer keeps the height, or no certified proposal anchors a
-    /// kept height above it.
+    /// store no longer keeps the height, no certified proposal anchors a
+    /// kept height above it, or the tables lack a proposal between;
+    /// [`SnapshotError::Io`] when the file cannot be written.
     pub fn export(
         store: &DiskStore,
         tables: &Tables,
         epoch: Option<u64>,
+        out: &Path,
+    ) -> Result<Snapshot, SnapshotError> {
+        Self::export_within(store, tables, epoch, out, ExportLimits::default())
+    }
+
+    /// [`Snapshot::export`] within `limits`.
+    ///
+    /// # Errors
+    /// As [`Snapshot::export`].
+    pub fn export_within(
+        store: &DiskStore,
+        tables: &Tables,
+        epoch: Option<u64>,
+        out: &Path,
+        limits: ExportLimits,
     ) -> Result<Snapshot, SnapshotError> {
         let chain_id = store
             .get(keys::CHAIN_ID)
@@ -284,20 +572,15 @@ impl Snapshot {
                     "the chain has no snapshot record for epoch {epoch}"
                 ))
             })?;
-        let entries = store.entries_at(record.height).map_err(|kept| {
-            SnapshotError::Export(format!(
-                "the store no longer keeps the state of block {} (it keeps {:?})",
-                record.height, kept
-            ))
-        })?;
+        let scratch = Scratch(out.with_extension("runs"));
+        let _ = std::fs::remove_dir_all(&scratch.0);
+        std::fs::create_dir_all(&scratch.0).map_err(io_error)?;
+        let body = scratch.0.join("entries");
+        let (count, root) = sorted_entries(store, record.height, &scratch.0, &body, limits)?;
         // The record is the root as the next block began; a kernel switch
         // between the two blocks wrote into it after the version was sealed
         // (spec 22 §7.1), and a file of these entries would not verify.
-        let mut trie = Trie::new();
-        for (key, value) in &entries {
-            trie.insert(key, value);
-        }
-        if trie.root() != record.state_root {
+        if root != record.state_root {
             return Err(SnapshotError::Export(format!(
                 "the state sealed at block {} does not hash to epoch {epoch}'s record: a kernel switch after that block wrote into it; export another epoch",
                 record.height
@@ -328,31 +611,43 @@ impl Snapshot {
         // A verifier bounds the head certificate's view by the anchoring
         // proposal's (spec 22 §7.2).
         let head_view = Certificate::from_bytes(&head_certificate).map_or(u64::MAX, |c| c.view);
-        let (anchor_proposal, certificate, record_proof) =
+        let (anchor_proposal, certificate, record_proof, links) =
             Self::finality(store, tables, &record, epoch, head_view)?;
+        let header = SnapshotHeader {
+            chain_id,
+            epoch,
+            height: record.height,
+            state_root: record.state_root,
+            entries: count,
+            anchor_proposal,
+            certificate,
+            record_proof,
+            head_proposal,
+            head_certificate,
+            head_threshold: head(b"bcert/").unwrap_or_default(),
+            links: Seq(links),
+        };
+        let partial = scratch.0.join("snapshot");
+        let mut w = BufWriter::new(File::create(&partial).map_err(io_error)?);
+        let body_at = Self::write_header(&mut w, &header)?;
+        io::copy(&mut File::open(&body).map_err(io_error)?, &mut w).map_err(io_error)?;
+        w.flush().map_err(io_error)?;
+        drop(w);
+        std::fs::rename(&partial, out).map_err(io_error)?;
         Ok(Snapshot {
-            header: SnapshotHeader {
-                chain_id,
-                epoch,
-                height: record.height,
-                state_root: record.state_root,
-                entries: entries.len() as u64,
-                anchor_proposal,
-                certificate,
-                record_proof,
-                head_proposal,
-                head_certificate,
-                head_threshold: head(b"bcert/").unwrap_or_default(),
-            },
-            entries,
+            header,
+            path: out.to_path_buf(),
+            body: body_at,
         })
     }
 
-    /// The latest certified proposal whose anchor names a height above the
+    /// The certified proposal whose anchor names a height above the
     /// record's that the store keeps the trie of, in a view at or above
     /// `head_view`, its certificate (the threshold certificate when the
-    /// tables hold one, else the votes) and the proof of the record against
-    /// the anchor root.
+    /// tables hold one, else the votes), the proof of the record against
+    /// the anchor root, and the finalized proposals between the head and
+    /// it. Of the candidates whose certificate needs the trust the latest
+    /// one's needs, the lowest is taken, so that the links are few.
     fn finality(
         store: &DiskStore,
         tables: &Tables,
@@ -361,17 +656,20 @@ impl Snapshot {
         head_view: u64,
     ) -> Result<Finality, SnapshotError> {
         let key = record_key(epoch);
-        let finalized = tables
+        let finalized = |height: u64| tables.get(&height_key(b"final/", height));
+        let mut candidates = Vec::new();
+        // Heights are little-endian in the keys: their byte order is not
+        // their order.
+        let mut heights: Vec<u64> = tables
             .range(b"final/".to_vec()..b"final0".to_vec())
-            .filter_map(|(k, hash)| {
-                let height = u64::from_le_bytes(k.get(6..14)?.try_into().ok()?);
-                Some((height, hash.clone()))
-            });
-        for (height, hash) in finalized.rev() {
-            if height <= record.height {
-                break;
-            }
-            let Some(bytes) = tables.get(&[b"prop/".as_slice(), &hash].concat()) else {
+            .filter_map(|(k, _)| Some(u64::from_le_bytes(k.get(6..14)?.try_into().ok()?)))
+            .filter(|h| *h > record.height)
+            .collect();
+        heights.sort_unstable();
+        for height in heights {
+            let Some(bytes) = finalized(height)
+                .and_then(|hash| tables.get(&[b"prop/".as_slice(), hash].concat()))
+            else {
                 continue;
             };
             let Ok(proposal) = Proposal::from_bytes(bytes) else {
@@ -392,46 +690,84 @@ impl Snapshot {
             let Some(certificate) = certificate else {
                 continue;
             };
-            return Ok((
-                bytes.clone(),
-                certificate.clone(),
-                trie.prove(&key).encode(),
-            ));
+            candidates.push((height, bytes, certificate, trie, proposal));
         }
-        Err(SnapshotError::Export(format!(
-            "no certified proposal anchors a kept height above block {}",
-            record.height
-        )))
+        let class = candidates
+            .last()
+            .map(|(_, _, certificate, _, _)| trust_class(certificate))
+            .ok_or_else(|| {
+                SnapshotError::Export(format!(
+                    "no certified proposal anchors a kept height above block {}",
+                    record.height
+                ))
+            })?;
+        let (height, bytes, certificate, trie, _) = candidates
+            .into_iter()
+            .find(|(_, _, certificate, _, _)| trust_class(certificate) == class)
+            .expect("the latest candidate is one");
+        let mut links = Vec::new();
+        for h in record.height + 1..height {
+            let link = finalized(h)
+                .and_then(|hash| tables.get(&[b"prop/".as_slice(), hash].concat()))
+                .ok_or_else(|| {
+                    SnapshotError::Export(format!(
+                        "the driver tables do not hold the proposal of block {h}"
+                    ))
+                })?;
+            links.push(link.clone());
+        }
+        Ok((
+            bytes.clone(),
+            certificate.clone(),
+            trie.prove(&key).encode(),
+            links,
+        ))
     }
 
-    /// Writes the snapshot to `path`.
-    ///
-    /// # Errors
-    /// What the file system reports.
-    pub fn write(&self, path: &Path) -> Result<(), SnapshotError> {
-        let mut out = BufWriter::new(File::create(path).map_err(io_error)?);
-        let header = self.header.to_bytes();
+    /// Writes the magic, the format and `header` to `out`; the offset at
+    /// which the entries follow.
+    fn write_header(out: &mut impl Write, header: &SnapshotHeader) -> Result<u64, SnapshotError> {
+        let header = header.to_bytes();
         out.write_all(MAGIC).map_err(io_error)?;
         out.write_all(&FORMAT.to_le_bytes()).map_err(io_error)?;
         let len = u32::try_from(header.len()).map_err(too_long)?;
         out.write_all(&len.to_le_bytes()).map_err(io_error)?;
         out.write_all(&header).map_err(io_error)?;
-        for (key, value) in &self.entries {
-            for part in [key, value] {
-                let len = u32::try_from(part.len()).map_err(too_long)?;
-                out.write_all(&len.to_le_bytes()).map_err(io_error)?;
-                out.write_all(part).map_err(io_error)?;
-            }
-        }
-        out.flush().map_err(io_error)
+        Ok(16 + header.len() as u64)
     }
 
-    /// Reads a snapshot from `path`.
+    /// Writes a snapshot file at `path` from its parts, the entries in the
+    /// order given: what tools and tests that build or alter a snapshot
+    /// use. Nothing is checked; [`Snapshot::verify`] checks.
+    ///
+    /// # Errors
+    /// What the file system reports.
+    pub fn write(
+        path: &Path,
+        header: &SnapshotHeader,
+        entries: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+    ) -> Result<Snapshot, SnapshotError> {
+        let mut out = BufWriter::new(File::create(path).map_err(io_error)?);
+        let body = Self::write_header(&mut out, header)?;
+        for (key, value) in entries {
+            write_part(&mut out, &key)?;
+            write_part(&mut out, &value)?;
+        }
+        out.flush().map_err(io_error)?;
+        Ok(Snapshot {
+            header: header.clone(),
+            path: path.to_path_buf(),
+            body,
+        })
+    }
+
+    /// Opens the snapshot at `path`, reading its header; the entries are
+    /// read when [`Snapshot::entries`] streams them.
     ///
     /// # Errors
     /// [`SnapshotError::Io`] when the file cannot be read,
     /// [`SnapshotError::Format`] when it is not a snapshot file.
-    pub fn read(path: &Path) -> Result<Snapshot, SnapshotError> {
+    pub fn open(path: &Path) -> Result<Snapshot, SnapshotError> {
         let mut file = BufReader::new(File::open(path).map_err(io_error)?);
         let mut magic = [0u8; 8];
         let mut word = [0u8; 4];
@@ -443,34 +779,42 @@ impl Snapshot {
         if u32::from_le_bytes(word) != FORMAT {
             return Err(SnapshotError::Format("another format"));
         }
-        file.read_exact(&mut word).map_err(io_error)?;
-        let mut header = vec![0u8; u32::from_le_bytes(word) as usize];
-        file.read_exact(&mut header).map_err(io_error)?;
+        let header = read_part(&mut file).map_err(io_error)?;
+        let body = 16 + header.len() as u64;
         let header = SnapshotHeader::from_bytes(&header)
             .ok()
             .ok_or(SnapshotError::Format("the header does not decode"))?;
-        let count = usize::try_from(header.entries)
-            .ok()
-            .ok_or(SnapshotError::Format("too many entries"))?;
-        let mut entries = Vec::with_capacity(count.min(1 << 20));
-        for _ in 0..count {
-            let key = read_part(&mut file, &mut word)?;
-            let value = read_part(&mut file, &mut word)?;
-            entries.push((key, value));
-        }
-        let mut rest = [0u8; 1];
-        if file.read(&mut rest).map_err(io_error)? != 0 {
-            return Err(SnapshotError::Format("bytes after the entries"));
-        }
-        Ok(Snapshot { header, entries })
+        Ok(Snapshot {
+            header,
+            path: path.to_path_buf(),
+            body,
+        })
     }
 
-    /// Verifies the snapshot for `chain_id` under `trust` (spec 22 §7): the
-    /// certificate for the anchoring proposal, the proof of the record
-    /// against its anchor root, and the entries against the record's root.
+    /// The entries, streamed from the file: as many as the header says,
+    /// each read when it is asked for.
     ///
     /// # Errors
-    /// [`SnapshotError::Verify`] naming the first check that fails.
+    /// [`SnapshotError::Io`] when the file cannot be opened.
+    pub fn entries(&self) -> Result<EntryReader, SnapshotError> {
+        let mut file = BufReader::new(File::open(&self.path).map_err(io_error)?);
+        io::copy(&mut (&mut file).take(self.body), &mut io::sink()).map_err(io_error)?;
+        Ok(EntryReader {
+            file,
+            left: self.header.entries,
+            done: false,
+        })
+    }
+
+    /// Verifies the snapshot for `chain_id` under `trust` (spec 22 §7.2):
+    /// the certificate for the anchoring proposal, the proof of the record
+    /// against its anchor root, the entries against the record's root as
+    /// they stream from the file, and the head linked to the anchoring
+    /// proposal.
+    ///
+    /// # Errors
+    /// [`SnapshotError::Verify`] naming the first check that fails, or what
+    /// reading the file reports.
     pub fn verify(&self, chain_id: u64, trust: &Trust) -> Result<(), SnapshotError> {
         let h = &self.header;
         if h.chain_id != chain_id {
@@ -502,20 +846,17 @@ impl Snapshot {
                 "the record's proof does not verify against the anchor root",
             ));
         }
-        if self.entries.len() as u64 != h.entries {
-            return Err(SnapshotError::Verify("the entry count is wrong"));
-        }
-        let mut trie = Trie::new();
-        for (i, (key, value)) in self.entries.iter().enumerate() {
-            if !solo_host::storage::committed(key) {
+        let mut root = SortedRoot::new(keccak256);
+        let mut none = |_: &Hash, _: &[u8; NODE_LEN]| {};
+        for entry in self.entries()? {
+            let (key, value) = entry?;
+            if !solo_host::storage::committed(&key) {
                 return Err(SnapshotError::Verify("an entry is node-local"));
             }
-            if i > 0 && self.entries[i - 1].0 >= *key {
-                return Err(SnapshotError::Verify("the entries are not in key order"));
-            }
-            trie.insert(key, value);
+            root.push(keccak256(&key), keccak256(&value), &mut none)
+                .map_err(|_| SnapshotError::Verify("the entries are not in path order"))?;
         }
-        if trie.root() != h.state_root {
+        if root.finish(&mut none) != h.state_root {
             return Err(SnapshotError::Verify(
                 "the entries do not hash to the record's root",
             ));
@@ -525,20 +866,39 @@ impl Snapshot {
 
     /// Checks the head block's proposal and certificate (spec 22 §7.2, 6),
     /// which seed the importing driver: its tip, entry certificate and
-    /// view. The trust does not vouch for them, so the certificate's view
-    /// is bounded by the anchoring proposal's, which it does vouch for: a
-    /// forged head cannot move a node past the views the chain has had.
-    /// The certificate may name a descendant that finalized the head, such
-    /// as a suffix proposal (spec 08 §3a); under the genesis set its votes
-    /// must also verify.
+    /// view. The head proposal is the trust's through the links: each link
+    /// names the one before it as its parent, the first the head, and the
+    /// anchoring proposal, which the certificate vouches for, the last. The
+    /// head certificate's view is bounded by the anchoring proposal's: a
+    /// forged one cannot move a node past the views the chain has had. It
+    /// may name a descendant that finalized the head, such as a suffix
+    /// proposal (spec 08 §3a); under the genesis set its votes must verify.
     fn verify_head(
         h: &SnapshotHeader,
         anchoring: &Proposal,
         chain_id: u64,
         trust: &Trust,
     ) -> Result<(), SnapshotError> {
-        if Proposal::from_bytes(&h.head_proposal).map(|p| p.height) != Ok(h.height) {
-            return Err(SnapshotError::Verify("the head proposal is not block's"));
+        let head = Proposal::from_bytes(&h.head_proposal)
+            .ok()
+            .filter(|p| p.height == h.height)
+            .ok_or(SnapshotError::Verify("the head proposal is not block's"))?;
+        let mut parent = (head.height, keccak256(&h.head_proposal));
+        for link in &h.links.0 {
+            let p = Proposal::from_bytes(link)
+                .ok()
+                .ok_or(SnapshotError::Verify("a link does not decode"))?;
+            if (p.height, p.parent) != (parent.0 + 1, parent.1) {
+                return Err(SnapshotError::Verify(
+                    "the links do not join the head to the anchoring proposal",
+                ));
+            }
+            parent = (p.height, keccak256(link));
+        }
+        if (anchoring.height, anchoring.parent) != (parent.0 + 1, parent.1) {
+            return Err(SnapshotError::Verify(
+                "the links do not join the head to the anchoring proposal",
+            ));
         }
         let certificate = Certificate::from_bytes(&h.head_certificate)
             .ok()
@@ -632,26 +992,24 @@ impl Snapshot {
     }
 
     /// Loads the snapshot into `store`, which holds the genesis alone, after
-    /// [`Snapshot::verify`] passed.
+    /// [`Snapshot::verify`] passed: the entries stream from the file into
+    /// the store's one transaction ([`DiskStore::load`]), which checks
+    /// their order and root again before it commits.
     ///
     /// # Errors
-    /// What the store reports.
+    /// What reading the file or the store reports.
     pub fn import(&self, store: &mut DiskStore) -> Result<(), SnapshotError> {
-        store
-            .load(
-                self.header.height,
-                &self.header.state_root,
-                &self.entries,
-                &self.local_keys(),
-            )
-            .map_err(store_error)
+        store.load(
+            self.header.height,
+            &self.header.state_root,
+            self.entries()?,
+            &self.local_keys(),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use solo_abi::chain::{Certificate, Signature, SignedVote};
     use solo_abi::codec::Seq;
 
@@ -725,21 +1083,36 @@ mod tests {
         (s, root2, committed.root())
     }
 
+    /// Exports from `s` to a file named after `name`.
+    fn export(
+        s: &DiskStore,
+        tables: &Tables,
+        epoch: Option<u64>,
+        name: &str,
+    ) -> Result<Snapshot, SnapshotError> {
+        let dir = scratch(&format!("out-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        Snapshot::export(s, tables, epoch, &dir.join("x.snap"))
+    }
+
+    fn entries(snapshot: &Snapshot) -> Vec<(Vec<u8>, Vec<u8>)> {
+        snapshot.entries().unwrap().map(Result::unwrap).collect()
+    }
+
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn export_names_what_the_store_or_the_tables_lack() {
         let (s, root2, root3) = store("export");
         let why = |r: Result<Snapshot, SnapshotError>| r.unwrap_err().to_string();
         // No chain, no record, no epoch: each named.
         let empty = DiskStore::open(&scratch("empty")).unwrap();
-        assert!(why(Snapshot::export(&empty, &Tables::new(), None)).contains("no chain"));
+        assert!(why(export(&empty, &Tables::new(), None, "a")).contains("no chain"));
         let mut fresh = DiskStore::open(&scratch("fresh")).unwrap();
         fresh.set(keys::CHAIN_ID, &7u64.to_bytes());
         fresh.seal(0, None).unwrap();
+        assert!(why(export(&fresh, &Tables::new(), None, "b")).contains("recorded no snapshot"));
         assert!(
-            why(Snapshot::export(&fresh, &Tables::new(), None)).contains("recorded no snapshot")
-        );
-        assert!(
-            why(Snapshot::export(&s, &Tables::new(), Some(5)))
+            why(export(&s, &Tables::new(), Some(5), "c"))
                 .contains("no snapshot record for epoch 5")
         );
         // A record whose root is not the sealed state's: what a kernel
@@ -757,40 +1130,44 @@ mod tests {
         switched.set(keys::SNAPSHOT_LATEST, &0u64.to_bytes());
         switched.seal(2, None).unwrap();
         assert!(
-            why(Snapshot::export(&switched, &Tables::new(), None))
+            why(export(&switched, &Tables::new(), None, "d"))
                 .contains("a kernel switch after that block wrote into it")
         );
         // The head block's entries, missing one by one.
         let mut tables = Tables::new();
-        assert!(why(Snapshot::export(&s, &tables, None)).contains("do not hold block 1"));
+        assert!(why(export(&s, &tables, None, "e")).contains("do not hold block 1"));
         let head = proposal(1, 0, [0; 32]);
         finalize(&mut tables, &head, true);
         let hash = keccak256(&head.to_bytes());
         tables.remove(&[b"prop/".as_slice(), &hash].concat());
-        assert!(why(Snapshot::export(&s, &tables, None)).contains("the proposal of block 1"));
+        assert!(why(export(&s, &tables, None, "f")).contains("the proposal of block 1"));
         finalize(&mut tables, &head, false);
         tables.remove(&height_key(b"cert/", 1));
-        assert!(why(Snapshot::export(&s, &tables, None)).contains("the certificate of block 1"));
+        assert!(why(export(&s, &tables, None, "g")).contains("the certificate of block 1"));
         finalize(&mut tables, &head, true);
         // Nothing certified above the record.
-        assert!(why(Snapshot::export(&s, &tables, None)).contains("no certified proposal"));
+        assert!(why(export(&s, &tables, None, "h")).contains("no certified proposal"));
         // Candidates that do not do: one that anchors the record's height,
         // one anchoring a version with no trie, one with another root, one
-        // without a certificate, one whose proposal is missing, one whose
-        // proposal does not decode.
+        // without a certificate; above them heights whose proposal is
+        // missing or does not decode, and a key too short for a height.
         finalize(&mut tables, &proposal(2, 1, root2), true);
         finalize(&mut tables, &proposal(3, 9, root3), true);
         finalize(&mut tables, &proposal(4, 2, [9; 32]), true);
         finalize(&mut tables, &proposal(5, 2, root2), false);
-        tables.insert(height_key(b"final/", 6), vec![1; 32]);
-        tables.insert(height_key(b"final/", 7), vec![2; 32]);
+        tables.insert(height_key(b"final/", 20), vec![1; 32]);
+        tables.insert(height_key(b"final/", 21), vec![2; 32]);
         tables.insert([b"prop/".as_slice(), &[2; 32]].concat(), vec![0xFF]);
         tables.insert(b"final/short".to_vec(), vec![3; 32]);
-        assert!(why(Snapshot::export(&s, &tables, None)).contains("no certified proposal"));
-        // A good candidate.
+        assert!(why(export(&s, &tables, None, "i")).contains("no certified proposal"));
+        // A good candidate at 8, but the tables lack the proposals of 6 and 7
+        // between it and the head.
         finalize(&mut tables, &proposal(8, 3, root3), true);
         tables.insert(height_key(b"bcert/", 1), vec![2; 97]);
-        let snapshot = Snapshot::export(&s, &tables, None).unwrap();
+        assert!(why(export(&s, &tables, None, "j")).contains("the proposal of block 6"));
+        finalize(&mut tables, &proposal(6, 0, [0; 32]), false);
+        finalize(&mut tables, &proposal(7, 0, [0; 32]), false);
+        let snapshot = export(&s, &tables, None, "k").unwrap();
         assert_eq!(
             (
                 snapshot.header.chain_id,
@@ -800,32 +1177,48 @@ mod tests {
             (7, 0, 1)
         );
         assert_eq!(snapshot.header.head_threshold, vec![2; 97]);
+        assert_eq!(snapshot.header.links.0.len(), 6);
+        assert_eq!(snapshot.header.links.0[0], proposal(2, 1, root2).to_bytes());
+        assert_eq!(
+            snapshot.header.links.0[5],
+            proposal(7, 0, [0; 32]).to_bytes()
+        );
         // A later candidate in a view below the head certificate's is
-        // passed over: a verifier bounds that view by the candidate's.
+        // passed over: a verifier bounds that view by the candidate's. One
+        // past 255, whose key sorts before the others', still counts as
+        // later; with the same trust as 8, 8 is taken, the links fewer.
         let mut low = proposal(9, 3, root3);
         low.view = 0;
         finalize(&mut tables, &low, true);
-        let snapshot = Snapshot::export(&s, &tables, None).unwrap();
+        finalize(&mut tables, &proposal(300, 3, root3), true);
+        let snapshot = export(&s, &tables, None, "l").unwrap();
         assert_eq!(
             snapshot.header.anchor_proposal,
             proposal(8, 3, root3).to_bytes()
         );
-        assert_eq!(
-            snapshot.entries,
-            vec![
-                (b"acct/a".to_vec(), b"1".to_vec()),
-                (keys::CHAIN_ID.to_vec(), 7u64.to_bytes())
-            ]
-        );
-        // The threshold certificate is preferred when the tables hold one.
-        tables.insert(height_key(b"bcert/", 8), vec![2; 97]);
-        let snapshot = Snapshot::export(&s, &tables, Some(0)).unwrap();
+        let mut expected = vec![
+            (b"acct/a".to_vec(), b"1".to_vec()),
+            (keys::CHAIN_ID.to_vec(), 7u64.to_bytes()),
+        ];
+        expected.sort_by_key(|(k, _)| keccak256(k));
+        assert_eq!(entries(&snapshot), expected);
+        assert_eq!(snapshot.header.entries, 2);
+        // When the latest candidate has a threshold certificate, the lowest
+        // with one of the same key set is taken over a lower one with votes.
+        tables.insert(height_key(b"bcert/", 300), vec![2; 97]);
+        finalize(&mut tables, &proposal(10, 3, root3), true);
+        tables.insert(height_key(b"bcert/", 10), vec![2; 97]);
+        let snapshot = export(&s, &tables, Some(0), "m").unwrap();
         assert_eq!(snapshot.header.certificate, vec![2; 97]);
+        assert_eq!(
+            snapshot.header.anchor_proposal,
+            proposal(10, 3, root3).to_bytes()
+        );
         assert_eq!(snapshot.local_keys().len(), 4);
         // The state of the record's height must still be kept.
         let (mut pruned, _, _) = store("pruned");
         pruned.prune(3).unwrap();
-        assert!(why(Snapshot::export(&pruned, &tables, None)).contains("no longer keeps"));
+        assert!(why(export(&pruned, &tables, None, "n")).contains("no longer keeps"));
         // Errors read as sentences.
         for e in [
             SnapshotError::Io("x".into()),
@@ -837,21 +1230,86 @@ mod tests {
             assert!(e.to_string().starts_with("snapshot"), "{e}");
         }
         assert_eq!(
-            store_error(StoreError::Injected).to_string(),
+            SnapshotError::from(StoreError::Injected).to_string(),
             "snapshot: chain store: injected fault"
         );
     }
 
     #[test]
-    fn a_file_too_large_for_the_format_is_refused() {
-        let snapshot = Snapshot {
-            header: SnapshotHeader::default(),
-            entries: Vec::new(),
+    fn an_export_sorts_through_many_runs_to_the_same_file() {
+        // A state of 306 entries, exported in one run and in runs of one
+        // entry merged two at a time (nine merge passes): the files are the
+        // same byte for byte, and the scratch runs are gone.
+        let (mut s, _, _) = store("runs");
+        for i in 0..300u32 {
+            s.set(
+                &[b"acct/x".as_slice(), &i.to_be_bytes()].concat(),
+                &i.to_le_bytes(),
+            );
+        }
+        s.seal(4, None).unwrap();
+        let record = SnapshotRecord {
+            height: 4,
+            state_root: s.state_trie().root(),
         };
+        s.set(&record_key(1), &record.to_bytes());
+        let committed = s.state_trie();
+        s.seal(5, Some(&committed)).unwrap();
+        let mut tables = Tables::new();
+        let head = proposal(4, 0, [0; 32]);
+        finalize(&mut tables, &head, true);
+        let mut anchoring = proposal(6, 5, committed.root());
+        anchoring.parent = keccak256(&head.to_bytes());
+        // Heights 5 has no proposal of its own here; one links them.
+        let mut five = proposal(5, 0, [0; 32]);
+        five.parent = keccak256(&head.to_bytes());
+        finalize(&mut tables, &five, false);
+        anchoring.parent = keccak256(&five.to_bytes());
+        finalize(&mut tables, &anchoring, true);
+        let dir = scratch("runs-out");
+        std::fs::create_dir_all(&dir).unwrap();
+        let one = Snapshot::export(&s, &tables, Some(1), &dir.join("one.snap")).unwrap();
+        let limits = ExportLimits {
+            chunk_bytes: 1,
+            fan_in: 2,
+        };
+        let many =
+            Snapshot::export_within(&s, &tables, Some(1), &dir.join("many.snap"), limits).unwrap();
+        assert_eq!(one.header, many.header);
+        assert_eq!(one.header.entries, 306);
+        assert_eq!(
+            std::fs::read(one.path()).unwrap(),
+            std::fs::read(many.path()).unwrap()
+        );
+        let left = || std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(left(), 2, "only the two files remain");
+        assert_eq!(ExportLimits::default().chunk_bytes, 64 << 20);
+        // The entries stream in path order and hash to the record's root.
+        let mut root = SortedRoot::new(keccak256);
+        for (k, v) in entries(&many) {
+            root.push(keccak256(&k), keccak256(&v), &mut |_, _| {})
+                .unwrap();
+        }
+        assert_eq!(root.finish(&mut |_, _| {}), record.state_root);
+        // An export under a path that is a file fails at the file system.
+        let missing = one.path().join("x.snap");
+        assert!(matches!(
+            Snapshot::export(&s, &tables, Some(1), &missing),
+            Err(SnapshotError::Io(_))
+        ));
+        assert_eq!(left(), 2);
+    }
+
+    #[test]
+    fn a_file_too_large_for_the_format_is_refused() {
+        let header = SnapshotHeader::default();
         // The header always fits; an entry longer than u32 cannot be built
         // in a test, so the error paths of `write` end at the file system.
         let path = scratch("write").join("missing-dir").join("x.snap");
-        assert!(matches!(snapshot.write(&path), Err(SnapshotError::Io(_))));
+        assert!(matches!(
+            Snapshot::write(&path, &header, Vec::new()),
+            Err(SnapshotError::Io(_))
+        ));
         assert_eq!(
             too_long(u32::try_from(u64::MAX).unwrap_err()).to_string(),
             "snapshot file: a length does not fit the format's u32"
@@ -859,8 +1317,13 @@ mod tests {
         let dir = scratch("write-ok");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("empty.snap");
-        snapshot.write(&path).unwrap();
-        assert_eq!(Snapshot::read(&path).unwrap(), snapshot);
+        let written = Snapshot::write(&path, &header, Vec::new()).unwrap();
+        assert_eq!(Snapshot::open(&path).unwrap(), written);
+        assert!(entries(&written).is_empty());
+        // A reader that is done stays done.
+        let mut reader = written.entries().unwrap();
+        assert!(reader.next().is_none());
+        assert!(reader.next().is_none());
         // A vote certificate's checks, one by one.
         let hash = [5; 32];
         let set = ValidatorSet {

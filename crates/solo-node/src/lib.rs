@@ -20,8 +20,8 @@ pub use extension::{NodeExtension, NodeServices, Outbound, sign_recoverable, val
 pub use mempool::{MAX_TX_BYTES, Mempool, PoolError, PoolLimits, PoolTx};
 pub use net::Transport;
 pub use node::{
-    ARCHIVE, BLOCK_KERNEL_GAS, HISTORY_KEYS_PER_BLOCK, Node, NodeConfig, NodeError, STATE_HISTORY,
-    SubmitError,
+    ARCHIVE, BLOCK_KERNEL_GAS, DRIVER_RETENTION, HISTORY_KEYS_PER_BLOCK, Node, NodeConfig,
+    NodeError, PRUNE_EVERY, STATE_HISTORY, SubmitError,
 };
 pub use sim::Sim;
 pub use state::{ChainState, StoreConfig};

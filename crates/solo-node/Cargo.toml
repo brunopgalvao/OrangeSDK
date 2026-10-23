@@ -19,7 +19,14 @@ solo-bls = { path = "../solo-bls" }
 solo-rlp = { path = "../solo-rlp" }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
+[features]
+# `Node::inject_store_fault`, over the store's own `fault-injection`: the
+# crash-recovery tests drop a block's write on purpose. The tests below turn
+# it on; no release build has it.
+fault-injection = ["solo-store/fault-injection"]
+
 [dev-dependencies]
+solo-node = { path = ".", features = ["fault-injection"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 solo-recompile = { path = "../solo-recompile" }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }

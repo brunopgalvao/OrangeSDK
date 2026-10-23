@@ -3037,6 +3037,7 @@ dependencies = [
  "solo-ethlc",
  "solo-host",
  "solo-metrics",
+ "solo-node",
  "solo-recompile",
  "solo-rlp",
  "solo-store",

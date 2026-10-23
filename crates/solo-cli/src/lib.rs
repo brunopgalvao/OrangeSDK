@@ -559,7 +559,7 @@ fn chain_store_arguments(
             return Err("--snapshot needs --data-dir, where the snapshot is loaded".into());
         }
         Some(path) => Some(
-            solo_store::Snapshot::read(std::path::Path::new(&path))
+            solo_store::Snapshot::open(std::path::Path::new(&path))
                 .map_err(|e| format!("{path}: {e}"))?,
         ),
         None => None,

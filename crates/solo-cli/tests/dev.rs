@@ -19,10 +19,12 @@ const HELLO: &str = concat!(
 );
 
 /// A kernel gas budget that lets the driver start (79 399) but not produce a block
-/// (275 032) with the pinned kernel fixture, bisected on 2026-10-23 in-process (the
+/// (275 039) with the pinned kernel fixture, bisected on 2026-10-23 in-process (the
 /// dev key, this genesis, 40 slots of 60 ms) after the block log and snapshot record
-/// of spec 22 and the fee market of spec 23 both landed in the kernel; rebuilding the
-/// fixture may move both numbers.
+/// of spec 22 and the fee market of spec 23 both landed in the kernel, and again
+/// after the fee market's bounds and the payout that leaves jailed validators out
+/// (spec 23 §2, spec 15 §10.2) rebuilt it: the same two numbers from the fixture
+/// before and after that rebuild. Rebuilding the fixture may move both.
 const STARVED_GAS: &str = "100000";
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4,
@@ -846,7 +848,7 @@ fn snapshots_export_verify_import_and_start_a_node() {
     // A node started over it resumes at the snapshot's height (a validator
     // alone proposes and executes the next block in the step that starts
     // it) and goes on.
-    let height = solo_store::Snapshot::read(std::path::Path::new(&file))
+    let height = solo_store::Snapshot::open(std::path::Path::new(&file))
         .unwrap()
         .header
         .height;
@@ -893,13 +895,13 @@ fn snapshots_export_verify_import_and_start_a_node() {
         solo_node::NodeConfig::default(),
     )
     .unwrap();
-    let loaded = solo_store::Snapshot::read(std::path::Path::new(&file)).unwrap();
+    let loaded = solo_store::Snapshot::open(std::path::Path::new(&file)).unwrap();
     assert_eq!(
         snapshot::import_into(&mut memory, &loaded).unwrap_err(),
         "a snapshot loads into a chain store on disk"
     );
     // A threshold certificate is named as one.
-    let mut threshold = solo_store::Snapshot::read(std::path::Path::new(&file)).unwrap();
+    let mut threshold = solo_store::Snapshot::open(std::path::Path::new(&file)).unwrap();
     threshold.header.certificate = vec![2; 97];
     assert!(snapshot::describe(&threshold).ends_with(", threshold certificate"));
 }

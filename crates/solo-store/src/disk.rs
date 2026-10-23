@@ -32,13 +32,21 @@ use redb::{
 };
 use solo_host::storage::committed;
 use solo_host::{Storage, Writes};
-use solo_trie::{BRANCH_TAG, EMPTY, Hash, NODE_LEN, NodeSource, PathNode, Trie, node_halves};
+use solo_trie::{
+    BRANCH_TAG, EMPTY, Hash, NODE_LEN, NodeSource, PathNode, SortedRoot, Trie, node_halves,
+};
 
 /// The file under the data directory that holds the chain store.
 pub const CHAIN_FILE: &str = "chain.redb";
 
-/// Entries of the state in key order: what a scan or a snapshot holds.
+/// Entries of the state in key order: what a scan holds.
 pub type Entries = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// A version the store does not keep: reading as it, or listing its
+/// entries, needs history the store has pruned or never had. Holds the
+/// versions it keeps, oldest and latest, `None` before the first seal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotKept(pub Option<(u64, u64)>);
 
 /// Where a new store file is laid out before it is renamed to [`CHAIN_FILE`].
 pub const CREATING_FILE: &str = "chain.redb.new";
@@ -66,7 +74,9 @@ pub enum StoreError {
     Format(u32),
     /// The file's contents contradict each other.
     Corrupt(&'static str),
-    /// A fault injected by [`DiskStore::inject`] (tests of crash recovery).
+    /// A fault injected by `DiskStore::inject` (tests of crash recovery,
+    /// built only with the `fault-injection` feature).
+    #[cfg(any(test, feature = "fault-injection"))]
     Injected,
 }
 
@@ -79,6 +89,7 @@ impl fmt::Display for StoreError {
                 "chain store: format {found}, this release reads format {FORMAT}"
             ),
             StoreError::Corrupt(what) => write!(f, "chain store is corrupt: {what}"),
+            #[cfg(any(test, feature = "fault-injection"))]
             StoreError::Injected => write!(f, "chain store: injected fault"),
         }
     }
@@ -106,7 +117,10 @@ fn read<T>(r: Result<T, redb::StorageError>) -> T {
     r.expect("chain store read")
 }
 
-/// A fault to inject into the next write, for tests of crash recovery.
+/// A fault to inject into the next write, for tests of crash recovery: not
+/// part of a release build, only of this crate's tests and of builds with
+/// the `fault-injection` feature, which other crates' tests enable.
+#[cfg(any(test, feature = "fault-injection"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
     /// The next transaction is built and then dropped instead of committed,
@@ -411,6 +425,7 @@ pub struct DiskStore {
     kernel: Option<Hash>,
     genesis: Option<Hash>,
     stats: StoreStats,
+    #[cfg(any(test, feature = "fault-injection"))]
     fault: Option<Fault>,
 }
 
@@ -520,6 +535,7 @@ impl DiskStore {
                 nodes,
                 ..StoreStats::default()
             },
+            #[cfg(any(test, feature = "fault-injection"))]
             fault: None,
         })
     }
@@ -649,6 +665,7 @@ impl DiskStore {
     }
 
     /// Injects `fault` into the next commit (tests of crash recovery).
+    #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject(&mut self, fault: Fault) {
         self.fault = Some(fault);
     }
@@ -946,6 +963,7 @@ impl DiskStore {
                 nodes.len().map_err(redb::Error::from).map_err(db)?,
             )
         };
+        #[cfg(any(test, feature = "fault-injection"))]
         if self.fault.take() == Some(Fault::DropNextCommit) {
             drop(txn);
             return Err(StoreError::Injected);
@@ -1057,100 +1075,286 @@ impl DiskStore {
     }
 
     /// The committed entries as they were when `version` was sealed, in key
-    /// order, without `local/` keys: what a snapshot of that version holds.
+    /// order, without `local/` keys, collected: [`DiskStore::each_entry_at`]
+    /// for a caller that wants them all at once.
     ///
     /// # Errors
     /// The versions the store can read as, when `version` is not among them.
-    pub fn entries_at(&self, version: u64) -> Result<Entries, Option<(u64, u64)>> {
+    pub fn entries_at(&self, version: u64) -> Result<Entries, NotKept> {
+        let mut entries = Vec::new();
+        self.each_entry_at(version, |key, value| {
+            entries.push((key.to_vec(), value.to_vec()));
+            Ok::<(), NotKept>(())
+        })?;
+        Ok(entries)
+    }
+
+    /// Calls `f` with every committed entry as it was when `version` was
+    /// sealed, in key order, without `local/` keys: what a snapshot of that
+    /// version holds. The entries stream from the file: the state table and
+    /// the history rows written after `version` are walked side by side,
+    /// so the memory used does not grow with the state (spec 22 §7.1).
+    ///
+    /// # Errors
+    /// [`NotKept`] when `version` is not among the versions the store can
+    /// read as; the first error `f` returns, which ends the walk.
+    ///
+    /// # Panics
+    /// Never: an entry is taken only from a walk that was just seen to
+    /// hold one.
+    pub fn each_entry_at<E: From<NotKept>>(
+        &self,
+        version: u64,
+        mut f: impl FnMut(&[u8], &[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
         if !(self.sealed && (self.oldest..=self.latest).contains(&version)) {
-            return Err(self.versions());
+            return Err(NotKept(self.versions()).into());
         }
-        let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-        for row in read(self.reader().state.iter()) {
+        // The state as it is: the table, overlaid by the pending writes.
+        let table = read(self.reader().state.iter()).map(|row| {
             let (key, value) = read(row);
-            if committed(key.value()) {
-                merged.insert(key.value().to_vec(), Some(value.value().to_vec()));
-            }
-        }
-        for (key, value) in &self.pending {
-            if committed(key) {
-                merged.insert(key.clone(), value.clone());
-            }
-        }
-        let mut rewound = BTreeSet::new();
-        for row in read(self.reader().history.iter()) {
+            (key.value().to_vec(), Some(value.value().to_vec()))
+        });
+        let pending = self.pending.iter().map(|(k, v)| (k.clone(), v.clone()));
+        let mut current = merge(table, pending, |a, b| a.0.cmp(&b.0))
+            .filter(|(key, _)| committed(key))
+            .peekable();
+        // The keys written since `version`: their value then is in history.
+        let written = read(self.reader().history.iter()).filter_map(|row| {
             let (key, _) = read(row);
-            let (key, written_at) = key.value();
-            if written_at > version {
-                rewound.insert(key.to_vec());
+            let (key, at) = key.value();
+            (at > version).then(|| key.to_vec())
+        });
+        let mut rewound = merge(written, self.pending_old.keys().cloned(), Ord::cmp).peekable();
+        loop {
+            let next_current = current.peek().map(|(k, _)| k.clone());
+            let next_rewound = rewound.peek().cloned();
+            let from_current = match (&next_current, &next_rewound) {
+                (None, None) => return Ok(()),
+                (Some(c), Some(r)) => c < r,
+                (c, _) => c.is_some(),
+            };
+            let (key, value) = if from_current {
+                current.next().expect("peeked")
+            } else {
+                // Every row of the key goes; the value as of `version`
+                // starts from the current one when the state has it.
+                let r = next_rewound.expect("peeked");
+                while rewound.peek() == Some(&r) {
+                    rewound.next();
+                }
+                let now = if next_current.as_ref() == Some(&r) {
+                    current.next().and_then(|(_, v)| v)
+                } else {
+                    None
+                };
+                let then = self.value_at(&r, version, now);
+                (r, then)
+            };
+            if let Some(value) = value {
+                f(&key, &value)?;
             }
         }
-        rewound.extend(self.pending_old.keys().cloned());
-        for key in rewound {
-            let current = merged.get(&key).cloned().flatten();
-            let then = self.value_at(&key, version, current);
-            merged.insert(key, then);
-        }
-        Ok(merged
-            .into_iter()
-            .filter_map(|(k, v)| v.map(|v| (k, v)))
-            .collect())
     }
 
     /// Replaces the state with `entries`, the whole committed state of
-    /// version `version`, plus `local`, the node-local keys to set beside
-    /// them: what importing a snapshot does. The store must hold the genesis
-    /// alone (version 0 sealed, nothing else), so that the genesis root is
-    /// known; the entries' trie is built and must hash to `root`, and the
-    /// genesis version is pruned, leaving `version` as the oldest.
+    /// version `version` in ascending path order (`keccak256` of the key),
+    /// plus `local`, the node-local keys to set beside them: what importing
+    /// a snapshot does. The store must hold the genesis alone (version 0
+    /// sealed, nothing else), so that the genesis root is known; the
+    /// genesis is replaced, leaving `version` as the oldest and latest
+    /// version, with no header root.
+    ///
+    /// The entries stream through one transaction: each is written as it
+    /// arrives and hashed into the trie with [`SortedRoot`], whose nodes
+    /// are written as they complete, so the memory used is bounded by the
+    /// trie's depth and the engine's page cache, not by the state (spec 22
+    /// §7.3). The transaction commits only once every entry is in, they
+    /// were in order and they hash to `root`; anything else leaves the
+    /// store as it was.
     ///
     /// # Errors
-    /// [`StoreError::Corrupt`] when the store holds more than the genesis or
-    /// the entries do not hash to `root`; otherwise when the database refuses.
-    pub fn load(
+    /// [`StoreError::Corrupt`] when the store holds more than the genesis,
+    /// an entry is node-local, the entries are out of path order or do not
+    /// hash to `root`; the first error the entries yield; otherwise when
+    /// the database refuses.
+    #[allow(clippy::too_many_lines)]
+    pub fn load<E: From<StoreError>>(
         &mut self,
         version: u64,
         root: &Hash,
-        entries: &[(Vec<u8>, Vec<u8>)],
+        entries: impl IntoIterator<Item = Result<(Vec<u8>, Vec<u8>), E>>,
         local: &[(Vec<u8>, Vec<u8>)],
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), E> {
         if !self.sealed || self.latest != 0 || !self.pending.is_empty() || version == 0 {
-            return Err(StoreError::Corrupt(
-                "a snapshot loads over the genesis alone",
-            ));
+            return Err(StoreError::Corrupt("a snapshot loads over the genesis alone").into());
         }
-        let mut trie = Trie::new();
-        for (key, value) in entries {
-            if !committed(key) {
-                return Err(StoreError::Corrupt(
-                    "a snapshot holds committed entries only",
-                ));
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(redb::Error::from)
+            .map_err(db)?;
+        let (count, bytes, nodes_written, node_count) = {
+            let open = |e: redb::TableError| db(redb::Error::from(e));
+            let mut state = txn.open_table(STATE).map_err(open)?;
+            let mut nodes = txn.open_table(NODES).map_err(open)?;
+            let mut versions = txn.open_table(VERSIONS).map_err(open)?;
+            let gone = |e: redb::StorageError| db(redb::Error::from(e));
+            // The genesis goes: its rows, its history and its trie, which
+            // its version row and the current root hold.
+            state.retain(|_, _| false).map_err(gone)?;
+            txn.open_table(HISTORY)
+                .map_err(open)?
+                .retain(|_, _| false)
+                .map_err(gone)?;
+            txn.open_table(WRITTEN)
+                .map_err(open)?
+                .retain(|_, ()| false)
+                .map_err(gone)?;
+            let roots: Vec<Hash> = versions
+                .iter()
+                .map_err(gone)?
+                .filter_map(|row| VersionRow::decode(read(row).1.value()).and_then(|r| r.root))
+                .collect();
+            for root in roots.iter().chain([&self.current]) {
+                release(&mut nodes, root)?;
             }
-            trie.insert(key, value);
-        }
-        if trie.root() != *root {
-            return Err(StoreError::Corrupt(
-                "the snapshot's entries do not hash to its root",
-            ));
-        }
-        for (key, _) in self.scan(&[]) {
-            self.pending.insert(key, None);
-        }
-        for (key, value) in entries.iter().chain(local) {
-            self.pending.insert(key.clone(), Some(value.clone()));
-        }
-        self.trie = trie;
-        self.commit(Some(version), None)?;
-        self.prune(version)?;
+            versions.retain(|_, _| false).map_err(gone)?;
+            let mut builder = SortedRoot::new(solo_trie::keccak256);
+            // The nodes one entry completes, at most one per bit of a path
+            // and its leaf, written before the next entry.
+            let mut done: Vec<(Hash, [u8; NODE_LEN])> = Vec::new();
+            let mut nodes_written = 0u64;
+            let mut bytes = 0u64;
+            for entry in entries {
+                let (key, value) = entry?;
+                if !committed(&key) {
+                    return Err(
+                        StoreError::Corrupt("a snapshot holds committed entries only").into(),
+                    );
+                }
+                bytes += (key.len() + value.len()) as u64;
+                state
+                    .insert(key.as_slice(), value.as_slice())
+                    .map_err(gone)?;
+                builder
+                    .push(
+                        solo_trie::keccak256(&key),
+                        solo_trie::keccak256(&value),
+                        &mut |hash, preimage| done.push((*hash, *preimage)),
+                    )
+                    .map_err(|_| {
+                        StoreError::Corrupt("the snapshot's entries are not in path order")
+                    })?;
+                for (hash, preimage) in done.drain(..) {
+                    adopt(&mut nodes, &hash, &preimage)?;
+                    nodes_written += 1;
+                }
+            }
+            let count = builder.len();
+            let built = builder.finish(&mut |hash, preimage| done.push((*hash, *preimage)));
+            for (hash, preimage) in done.drain(..) {
+                adopt(&mut nodes, &hash, &preimage)?;
+                nodes_written += 1;
+            }
+            if built != *root {
+                return Err(
+                    StoreError::Corrupt("the snapshot's entries do not hash to its root").into(),
+                );
+            }
+            for (key, value) in local {
+                state
+                    .insert(key.as_slice(), value.as_slice())
+                    .map_err(gone)?;
+            }
+            let row = VersionRow {
+                root: None,
+                written: 0,
+                entries: count,
+            };
+            versions
+                .insert(version, row.encode().as_slice())
+                .map_err(gone)?;
+            let mut meta = txn.open_table(META).map_err(open)?;
+            for (name, value) in [
+                ("latest", version.to_le_bytes().as_slice()),
+                ("oldest", version.to_le_bytes().as_slice()),
+                ("current", root.as_slice()),
+                ("entries", count.to_le_bytes().as_slice()),
+            ] {
+                meta.insert(name, value).map_err(gone)?;
+            }
+            (
+                count,
+                bytes + nodes_written * (32 + 4 + NODE_LEN as u64),
+                nodes_written,
+                nodes.len().map_err(gone)?,
+            )
+        };
+        txn.commit().map_err(redb::Error::from).map_err(db)?;
+        self.reader = Some(Reader::open(&self.db, &self.nodes)?);
+        self.current = *root;
+        self.entries = count;
+        self.oldest = version;
+        self.latest = version;
+        self.pending_old.clear();
         // Later paths load from the file rather than keep the whole state.
         self.trie = Trie::from_root(
             *root,
-            entries.len(),
+            usize::try_from(count).unwrap_or(usize::MAX),
             solo_trie::keccak256,
             self.nodes.clone(),
         );
+        self.stats.write_bytes += bytes;
+        self.stats.last_commit_bytes = bytes;
+        self.stats.commits += 1;
+        self.stats.nodes_written += nodes_written;
+        self.stats.nodes = node_count;
+        self.stats.versions = 1;
+        self.stats.size_bytes = std::fs::metadata(&self.path).map_or(0, |m| m.len());
         Ok(())
     }
+}
+
+/// One more parent or root names the node `hash` with `preimage`: its row
+/// is written with one reference, or its count goes up when it is there.
+fn adopt(
+    table: &mut NodesTable<'_>,
+    hash: &Hash,
+    preimage: &[u8; NODE_LEN],
+) -> Result<(), StoreError> {
+    let refs = table
+        .get(hash)
+        .map_err(redb::Error::from)
+        .map_err(db)?
+        .map_or(0, |row| node_refs(row.value()));
+    table
+        .insert(hash, node_row(refs + 1, preimage).as_slice())
+        .map_err(redb::Error::from)
+        .map_err(db)?;
+    Ok(())
+}
+
+/// Merges two iterators sorted by `cmp` into one, `b` first on a tie.
+fn merge<T, A: Iterator<Item = T>, B: Iterator<Item = T>>(
+    a: A,
+    b: B,
+    cmp: impl Fn(&T, &T) -> std::cmp::Ordering,
+) -> impl Iterator<Item = T> {
+    let mut a = a.peekable();
+    let mut b = b.peekable();
+    std::iter::from_fn(move || match (a.peek(), b.peek()) {
+        (Some(x), Some(y)) => match cmp(x, y) {
+            std::cmp::Ordering::Less => a.next(),
+            std::cmp::Ordering::Equal => {
+                a.next();
+                b.next()
+            }
+            std::cmp::Ordering::Greater => b.next(),
+        },
+        (Some(_), None) => a.next(),
+        (None, _) => b.next(),
+    })
 }
 
 impl Drop for DiskStore {
@@ -1544,7 +1748,7 @@ mod tests {
             s.entries_at(0).unwrap(),
             vec![(b"k".to_vec(), b"genesis".to_vec())]
         );
-        assert_eq!(s.entries_at(2), Err(Some((0, 1))));
+        assert_eq!(s.entries_at(2), Err(NotKept(Some((0, 1)))));
         // A flush that only touches local keys seals nothing.
         s.flush().unwrap();
         assert_eq!(s.versions(), Some((0, 1)));
@@ -1824,11 +2028,23 @@ mod tests {
         assert!(matches!(DiskStore::open(&blocked), Err(StoreError::Db(_))));
     }
 
+    /// Entries as a store loads them, each one or the error in its place.
+    type Streamed = Vec<Result<(Vec<u8>, Vec<u8>), StoreError>>;
+
+    /// `entries` in path order, each as a loaded stream yields it.
+    fn by_path(entries: &[(Vec<u8>, Vec<u8>)]) -> Streamed {
+        let mut sorted = entries.to_vec();
+        sorted.sort_by_key(|(k, _)| solo_trie::keccak256(k));
+        sorted.into_iter().map(Ok).collect()
+    }
+
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn loading_a_snapshot_replaces_the_genesis() {
         let dir = scratch("load");
         let mut s = DiskStore::open(&dir).unwrap();
         s.set(b"acct/genesis", b"g");
+        s.set(b"acct/1", b"one");
         s.set(b"local/finalized", b"0");
         let entries = vec![
             (b"acct/1".to_vec(), b"one".to_vec()),
@@ -1837,27 +2053,40 @@ mod tests {
         ];
         let root = rebuilt(&entries);
         let local = vec![(b"local/finalized".to_vec(), b"7".to_vec())];
+        let refused = |r: Result<(), StoreError>, why: &str| {
+            assert!(
+                matches!(&r, Err(StoreError::Corrupt(reason)) if reason.contains(why)),
+                "{why}: {r:?}"
+            );
+        };
         // Only over the genesis alone.
-        assert!(matches!(
-            s.load(7, &root, &entries, &local),
-            Err(StoreError::Corrupt(_))
-        ));
+        refused(s.load(7, &root, by_path(&entries), &local), "genesis alone");
         s.seal(0, None).unwrap();
         let genesis = s.genesis_root().unwrap();
-        assert!(matches!(
-            s.load(0, &root, &entries, &local),
-            Err(StoreError::Corrupt(_))
-        ));
-        assert!(matches!(
-            s.load(7, &[1; 32], &entries, &local),
-            Err(StoreError::Corrupt(_))
-        ));
-        assert!(matches!(
-            s.load(7, &root, &[(b"local/x".to_vec(), vec![])], &local),
-            Err(StoreError::Corrupt(_))
-        ));
-        s.load(7, &root, &entries, &local).unwrap();
+        refused(s.load(0, &root, by_path(&entries), &local), "genesis alone");
+        // Whatever fails leaves the genesis as it was: a wrong root, a
+        // node-local entry, entries out of path order, an entry the stream
+        // could not read.
+        refused(
+            s.load(7, &[1; 32], by_path(&entries), &local),
+            "do not hash",
+        );
+        refused(
+            s.load(7, &root, vec![Ok((b"local/x".to_vec(), vec![]))], &local),
+            "committed entries only",
+        );
+        let mut reversed = by_path(&entries);
+        reversed.reverse();
+        refused(s.load(7, &root, reversed, &local), "path order");
+        let mut broken = by_path(&entries);
+        broken.insert(1, Err(StoreError::Injected));
+        assert_eq!(s.load(7, &root, broken, &local), Err(StoreError::Injected));
+        assert_eq!(s.versions(), Some((0, 0)));
+        assert_eq!(s.get(b"acct/genesis"), Some(b"g".to_vec()));
+        assert_eq!(s.state_trie().root(), genesis);
+        s.load(7, &root, by_path(&entries), &local).unwrap();
         assert_eq!(s.versions(), Some((7, 7)));
+        assert_eq!(s.head(), 7);
         assert_eq!(s.genesis_root(), Some(genesis));
         assert_eq!(s.state_trie().root(), root);
         assert_eq!(s.get(b"acct/genesis"), None);
@@ -1865,14 +2094,26 @@ mod tests {
         assert_eq!(s.entries_at(7).unwrap(), entries);
         assert!(s.trie_at(7).is_none());
         assert!(s.trie_at(0).is_none());
-        assert!(matches!(
-            s.load(8, &root, &entries, &local),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert_eq!(s.history_keys(), 0);
+        // The file holds the snapshot's trie and nothing of the genesis's:
+        // a node per leaf and branch, each named once.
+        let mut trie = Trie::new();
+        for (k, v) in &entries {
+            trie.insert(k, v);
+        }
+        let mut on_paths = BTreeSet::new();
+        for (k, _) in &entries {
+            on_paths.extend(trie.path_nodes(k).iter().map(|n| n.hash));
+        }
+        assert_eq!(s.stats().nodes, on_paths.len() as u64);
+        assert_eq!(s.stats().versions, 1);
+        assert!(s.stats().nodes_written >= s.stats().nodes);
+        refused(s.load(8, &root, by_path(&entries), &local), "genesis alone");
         // A block on top proves against its own root after a restart.
         drop(s);
         let mut o = Overlay::new(DiskStore::open(&dir).unwrap());
         assert_eq!(o.base().state_trie().root(), root);
+        assert_eq!(o.base().versions(), Some((7, 7)));
         let r8 = block(
             &mut o,
             8,
@@ -1886,6 +2127,65 @@ mod tests {
         );
         o.base_mut().set_view(Some(7)).unwrap();
         assert_eq!(o.base().get(b"acct/1"), Some(b"one".to_vec()));
+        o.base_mut().set_view(None).unwrap();
+        // Pruning the loaded version releases nothing the current state
+        // needs: every key still proves.
+        o.base_mut().prune(8).unwrap();
+        let current = o.base().state_trie();
+        for key in [&b"acct/1"[..], b"acct/2", b"meta/height"] {
+            assert!(current.get(key).is_some());
+        }
+        // An empty snapshot loads too, to the empty root.
+        let mut empty = DiskStore::open(&scratch("load-empty")).unwrap();
+        empty.set(b"acct/genesis", b"g");
+        empty.seal(0, None).unwrap();
+        empty
+            .load::<StoreError>(3, &EMPTY, Vec::new(), &[])
+            .unwrap();
+        assert_eq!(empty.state_trie().root(), EMPTY);
+        assert_eq!(empty.stats().nodes, 0);
+    }
+
+    #[test]
+    fn entries_stream_in_key_order_as_of_any_kept_version() {
+        let dir = scratch("each");
+        let mut o = Overlay::new(DiskStore::open(&dir).unwrap());
+        o.base_mut().set(b"a", b"0");
+        o.base_mut().set(b"c", b"0");
+        o.base_mut().set(b"local/x", b"0");
+        o.base_mut().seal(0, None).unwrap();
+        block(&mut o, 1, &[(b"b", Some(b"1")), (b"c", None)], &[]);
+        block(&mut o, 2, &[(b"a", Some(b"2")), (b"d", Some(b"2"))], &[]);
+        // Pending, unsealed: a deletion, a new key and a rewrite.
+        o.base_mut().delete(b"b");
+        o.base_mut().set(b"e", b"3");
+        o.base_mut().set(b"a", b"3");
+        let s = o.base();
+        let pairs = |v: &[(&[u8], &[u8])]| -> Entries {
+            v.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect()
+        };
+        assert_eq!(
+            s.entries_at(0).unwrap(),
+            pairs(&[(b"a", b"0"), (b"c", b"0")])
+        );
+        assert_eq!(
+            s.entries_at(1).unwrap(),
+            pairs(&[(b"a", b"0"), (b"b", b"1")])
+        );
+        assert_eq!(
+            s.entries_at(2).unwrap(),
+            pairs(&[(b"a", b"2"), (b"b", b"1"), (b"d", b"2")])
+        );
+        assert_eq!(s.entries_at(3), Err(NotKept(Some((0, 2)))));
+        // The walk stops at the first error its callback returns.
+        let mut seen = 0;
+        let stopped = s.each_entry_at(2, |_, _| {
+            seen += 1;
+            Err(NotKept(None))
+        });
+        assert_eq!((stopped, seen), (Err(NotKept(None)), 1));
+        let fresh = DiskStore::open(&scratch("each-fresh")).unwrap();
+        assert_eq!(fresh.entries_at(0), Err(NotKept(None)));
     }
 
     #[test]

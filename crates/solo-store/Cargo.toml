@@ -16,5 +16,10 @@ solo-trie = { path = "../solo-trie" }
 redb = "4.4"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
+[features]
+# `Fault` and `DiskStore::inject`: a commit dropped on purpose, for the
+# crash-recovery tests of crates above this one. Never in a release build.
+fault-injection = []
+
 [lints]
 workspace = true

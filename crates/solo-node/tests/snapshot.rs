@@ -21,8 +21,10 @@ use solo_abi::types::Genesis;
 use solo_abi::{Decode, Encode};
 use solo_host::hash::keccak256;
 use solo_node::keystore::encryption_key;
-use solo_node::{Node, NodeConfig, NodeError, Sim, StoreConfig, validator_id};
-use solo_store::{Snapshot, SnapshotError, Trust};
+use solo_node::{
+    ARCHIVE, Node, NodeConfig, NodeError, STATE_HISTORY, Sim, StoreConfig, validator_id,
+};
+use solo_store::{Entries, Snapshot, SnapshotError, Trust};
 use support::{CHAIN_ID, ETHER, SLOT_MS, Wallet, alice, genesis, include, keys, v1};
 
 fn scratch(name: &str) -> PathBuf {
@@ -109,6 +111,11 @@ fn exporter(dir: &Path) -> (Node, Genesis, Wallet) {
     (node, genesis, bob)
 }
 
+/// The entries of `snapshot`, read from its file.
+fn entries_of(snapshot: &Snapshot) -> Entries {
+    snapshot.entries().unwrap().map(Result::unwrap).collect()
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn a_snapshot_exports_verifies_round_trips_and_refuses_forgeries() {
@@ -118,84 +125,117 @@ fn a_snapshot_exports_verifies_round_trips_and_refuses_forgeries() {
     // A node in memory has nothing to export from.
     let memory = Node::new(v1(), &genesis(&keys(1), epochs_of_four(), 10), 0).unwrap();
     assert!(matches!(
-        memory.export_snapshot(None),
+        memory.export_snapshot(None, &dir.join("memory.snap")),
         Err(NodeError::Store(_))
     ));
     // The latest epoch, and a named one.
-    let snapshot = node.export_snapshot(None).unwrap();
-    let first = node.export_snapshot(Some(0)).unwrap();
+    let path = dir.join("epoch.snap");
+    let snapshot = node.export_snapshot(None, &path).unwrap();
+    let first = node
+        .export_snapshot(Some(0), &dir.join("first.snap"))
+        .unwrap();
     assert_eq!((first.header.epoch, first.header.height), (0, 4));
     assert!(snapshot.header.height >= 8 && snapshot.header.height % 4 == 0);
     assert_eq!(snapshot.header.chain_id, CHAIN_ID);
-    assert_eq!(snapshot.header.entries, snapshot.entries.len() as u64);
+    let entries = entries_of(&snapshot);
+    assert_eq!(snapshot.header.entries, entries.len() as u64);
     assert!(snapshot.header.head_threshold.is_empty());
     snapshot.verify(CHAIN_ID, &trust).unwrap();
     first.verify(CHAIN_ID, &trust).unwrap();
+    // The head is linked to the anchoring proposal by the proposals of the
+    // heights between, the fewest the tables allow.
+    let anchoring = Proposal::from_bytes(&snapshot.header.anchor_proposal).unwrap();
+    assert_eq!(
+        snapshot.header.links.0.len() as u64,
+        anchoring.height - snapshot.header.height - 1
+    );
     // The entries are the committed state after the record's height, which
-    // holds the record of the epoch before and Bob's balance then.
+    // holds the record of the epoch before and Bob's balance then, in path
+    // order.
     let height = snapshot.header.height;
     let balance_then = u128::from(height) * ETHER;
-    let account = snapshot
-        .entries
+    let account = entries
         .iter()
         .find(|(k, _)| *k == [b"acct/".as_slice(), &bob.address].concat())
         .map(|(_, v)| solo_abi::chain::Account::from_bytes(v).unwrap())
         .unwrap();
     assert_eq!(account.balance, balance_then);
+    assert!(entries.iter().all(|(k, _)| !k.starts_with(b"local/")));
     assert!(
-        snapshot
-            .entries
-            .iter()
-            .all(|(k, _)| !k.starts_with(b"local/"))
+        entries
+            .windows(2)
+            .all(|w| keccak256(&w[0].0) < keccak256(&w[1].0))
     );
-    let unknown = node.export_snapshot(Some(9)).unwrap_err();
+    let unknown = node
+        .export_snapshot(Some(9), &dir.join("nine.snap"))
+        .unwrap_err();
     assert!(
         unknown.to_string().contains("no snapshot record"),
         "{unknown}"
     );
     // The file round-trips.
-    let path = dir.join("epoch.snap");
-    snapshot.write(&path).unwrap();
-    let read = Snapshot::read(&path).unwrap();
+    let read = Snapshot::open(&path).unwrap();
     assert_eq!(read, snapshot);
+    assert_eq!(read.path(), path.as_path());
     read.verify(CHAIN_ID, &trust).unwrap();
     // Files that are not snapshots.
     let bad = dir.join("bad.snap");
     std::fs::write(&bad, b"not a snapshot").unwrap();
     assert_eq!(
-        Snapshot::read(&bad),
+        Snapshot::open(&bad),
         Err(SnapshotError::Format("wrong magic"))
     );
     let mut bytes = std::fs::read(&path).unwrap();
     bytes[8] = 9;
     std::fs::write(&bad, &bytes).unwrap();
     assert_eq!(
-        Snapshot::read(&bad),
+        Snapshot::open(&bad),
         Err(SnapshotError::Format("another format"))
-    );
-    let mut bytes = std::fs::read(&path).unwrap();
-    bytes.push(0);
-    std::fs::write(&bad, &bytes).unwrap();
-    assert_eq!(
-        Snapshot::read(&bad),
-        Err(SnapshotError::Format("bytes after the entries"))
     );
     let mut bytes = std::fs::read(&path).unwrap();
     bytes.truncate(40);
     std::fs::write(&bad, &bytes).unwrap();
-    assert!(matches!(Snapshot::read(&bad), Err(SnapshotError::Io(_))));
+    assert!(matches!(Snapshot::open(&bad), Err(SnapshotError::Io(_))));
     let mut bytes = std::fs::read(&path).unwrap();
     bytes[12..16].copy_from_slice(&[0, 0, 0, 0]);
     std::fs::write(&bad, &bytes).unwrap();
     assert_eq!(
-        Snapshot::read(&bad),
+        Snapshot::open(&bad),
         Err(SnapshotError::Format("the header does not decode"))
     );
     assert!(matches!(
-        Snapshot::read(&dir.join("missing.snap")),
+        Snapshot::open(&dir.join("missing.snap")),
         Err(SnapshotError::Io(_))
     ));
-    assert!(matches!(snapshot.write(&dir), Err(SnapshotError::Io(_))));
+    // A file whose entries are cut short, or run on, is found out as its
+    // entries stream: they are as many as the header says, then nothing.
+    let refused_file = |bytes: &[u8], why: &str| {
+        std::fs::write(&bad, bytes).unwrap();
+        let err = Snapshot::open(&bad)
+            .unwrap()
+            .verify(CHAIN_ID, &trust)
+            .unwrap_err();
+        assert!(err.to_string().contains(why), "{why}: {err}");
+    };
+    let whole = std::fs::read(&path).unwrap();
+    refused_file(
+        &[whole.as_slice(), &[0]].concat(),
+        "bytes follow the last entry",
+    );
+    refused_file(&whole[..whole.len() - 3], "snapshot file: ");
+    let last = &entries[entries.len() - 1];
+    let cut = whole.len() - 8 - last.0.len() - last.1.len();
+    refused_file(&whole[..cut], "the file ends early");
+    // A file removed after it was opened cannot stream its entries.
+    let gone = Snapshot::open(&path).unwrap();
+    let moved = dir.join("moved.snap");
+    std::fs::rename(&path, &moved).unwrap();
+    assert!(matches!(gone.entries(), Err(SnapshotError::Io(_))));
+    assert!(matches!(
+        gone.verify(CHAIN_ID, &trust),
+        Err(SnapshotError::Io(_))
+    ));
+    std::fs::rename(&moved, &path).unwrap();
     // Forgeries: each is refused for its own reason.
     let refused = |forge: &dyn Fn(&mut Snapshot), why: &str| {
         let mut forged = snapshot.clone();
@@ -206,6 +246,15 @@ fn a_snapshot_exports_verifies_round_trips_and_refuses_forgeries() {
             "{why}: {err}"
         );
     };
+    // Forged entries are written to a file of their own.
+    let forged_entries = |name: &str, f: &dyn Fn(&mut Entries)| {
+        let mut altered = entries.clone();
+        f(&mut altered);
+        let mut header = snapshot.header.clone();
+        header.entries = altered.len() as u64;
+        Snapshot::write(&dir.join(name), &header, altered).unwrap()
+    };
+    let rewrite = |forged: &mut Snapshot, made: Snapshot| *forged = made;
     refused(&|s| s.header.chain_id += 1, "another chain");
     refused(
         &|s| s.header.anchor_proposal.clear(),
@@ -213,7 +262,7 @@ fn a_snapshot_exports_verifies_round_trips_and_refuses_forgeries() {
     );
     refused(
         &|s| {
-            let mut p = solo_abi::chain::Proposal::from_bytes(&s.header.anchor_proposal).unwrap();
+            let mut p = Proposal::from_bytes(&s.header.anchor_proposal).unwrap();
             p.anchor_height = s.header.height;
             s.header.anchor_proposal = p.to_bytes();
         },
@@ -221,7 +270,7 @@ fn a_snapshot_exports_verifies_round_trips_and_refuses_forgeries() {
     );
     refused(
         &|s| {
-            let mut c = solo_abi::chain::Certificate::from_bytes(&s.header.certificate).unwrap();
+            let mut c = Certificate::from_bytes(&s.header.certificate).unwrap();
             c.votes.0[0].signature.0[0] ^= 1;
             s.header.certificate = c.to_bytes();
         },
@@ -261,14 +310,51 @@ fn a_snapshot_exports_verifies_round_trips_and_refuses_forgeries() {
     );
     refused(&|s| s.header.record_proof.clear(), "proof does not decode");
     refused(&|s| s.header.state_root[0] ^= 1, "proof does not verify");
-    refused(&|s| s.header.entries += 1, "entry count is wrong");
     refused(
-        &|s| s.entries[0].1.push(0),
+        &|s| {
+            rewrite(s, forged_entries("value.snap", &|l| l[0].1.push(0)));
+        },
         "do not hash to the record's root",
     );
-    refused(&|s| s.entries[0].0 = b"local/x".to_vec(), "node-local");
-    refused(&|s| s.entries.swap(0, 1), "not in key order");
+    refused(
+        &|s| {
+            rewrite(
+                s,
+                forged_entries("local.snap", &|l| l[0].0 = b"local/x".to_vec()),
+            );
+        },
+        "node-local",
+    );
+    refused(
+        &|s| rewrite(s, forged_entries("order.snap", &|l| l.swap(0, 1))),
+        "not in path order",
+    );
+    refused(
+        &|s| rewrite(s, forged_entries("fewer.snap", &|l| drop(l.pop()))),
+        "do not hash to the record's root",
+    );
+    // The head: its proposal, the links that join it to the anchoring
+    // proposal, its certificate.
     refused(&|s| s.header.head_proposal.clear(), "head proposal");
+    refused(
+        &|s| {
+            let mut p = Proposal::from_bytes(&s.header.head_proposal).unwrap();
+            p.timestamp_ms += 1;
+            s.header.head_proposal = p.to_bytes();
+        },
+        "do not join the head to the anchoring proposal",
+    );
+    refused(
+        &|s| s.header.links.0.push(s.header.head_proposal.clone()),
+        "do not join the head",
+    );
+    refused(
+        &|s| s.header.links.0.push(vec![0xFF]),
+        "a link does not decode",
+    );
+    // Without its links the head does not reach the anchoring proposal.
+    assert!(!snapshot.header.links.0.is_empty());
+    refused(&|s| s.header.links.0.clear(), "do not join the head");
     refused(&|s| s.header.head_certificate.clear(), "head certificate");
     // A head certificate from a view the anchoring proposal does not reach
     // would move the importing node past the chain's views; under the
@@ -350,15 +436,115 @@ fn a_snapshot_exports_verifies_round_trips_and_refuses_forgeries() {
             &alice().tx(nonce, bob.address, ETHER, 21_000, &[]),
         );
     }
-    let err = short.export_snapshot(None).unwrap_err();
+    let err = short
+        .export_snapshot(None, &dir.join("short.snap"))
+        .unwrap_err();
     assert!(err.to_string().contains("no longer keeps"), "{err}");
+}
+
+/// The finalized heights the driver's tables of `node` hold.
+fn table_heights(node: &Node) -> Vec<u64> {
+    node.persisted()
+        .keys()
+        .filter_map(|k| k.strip_prefix(b"final/"))
+        .map(|h| u64::from_le_bytes(h.try_into().unwrap()))
+        .collect()
+}
+
+/// A single validator in epochs of four blocks over `store`, run until it
+/// has finalized block 70, with `retention` heights of driver tables.
+fn pruning(store: StoreConfig, state_history: usize, retention: u64) -> Node {
+    let validators = keys(1);
+    let config = NodeConfig {
+        key: Some(validators[0].clone()),
+        now_ms: 1_000,
+        state_history,
+        store,
+        ..NodeConfig::default()
+    };
+    let mut node = Node::open(v1(), &genesis(&validators, epochs_of_four(), 10), config).unwrap();
+    assert_eq!(node.driver_retention, solo_node::DRIVER_RETENTION);
+    node.driver_retention = retention;
+    node.start(None).unwrap();
+    support::run_until(&mut node, 400, &mut |n| n.finalized_height().unwrap() >= 70);
+    node
+}
+
+#[test]
+fn driver_tables_are_pruned_below_the_retention_and_the_latest_snapshot() {
+    assert_eq!(
+        (solo_node::DRIVER_RETENTION, solo_node::PRUNE_EVERY),
+        (1_024, 64)
+    );
+    // With no retention at all, the pass at height 64 prunes below the
+    // latest snapshot record's height, 60: the latest snapshot still exports
+    // and verifies, its head and links still in the tables.
+    let dir = scratch("prune");
+    let mut node = pruning(StoreConfig::Disk(dir.clone()), STATE_HISTORY, 0);
+    let heights = table_heights(&node);
+    assert_eq!(heights.iter().min(), Some(&60), "{heights:?}");
+    assert!(heights.contains(&70));
+    let tables = node.persisted();
+    assert!(
+        tables
+            .iter()
+            .filter(|(k, _)| k.starts_with(b"prop/"))
+            .all(|(_, v)| Proposal::from_bytes(v).unwrap().height >= 60)
+    );
+    let snapshot = node
+        .export_snapshot(None, &dir.join("latest.snap"))
+        .unwrap();
+    assert_eq!(snapshot.header.height, 68);
+    snapshot
+        .verify(CHAIN_ID, &Trust::Genesis(validator_set(&keys(1))))
+        .unwrap();
+    // The epoch before the pass's floor is gone from the tables, so it no
+    // longer exports.
+    let err = node
+        .export_snapshot(Some(10), &dir.join("old.snap"))
+        .unwrap_err();
+    assert!(err.to_string().contains("do not hold block 44"), "{err}");
+    // A restart over its stores goes on from there.
+    let (persisted, resumed, now) = (
+        node.persisted(),
+        node.persisted_driver_state.clone(),
+        node.now_ms(),
+    );
+    let head = node.block_number().unwrap();
+    drop(node);
+    let mut again = Node::open(
+        v1(),
+        &genesis(&keys(1), epochs_of_four(), 10),
+        NodeConfig {
+            key: Some(keys(1)[0].clone()),
+            persisted,
+            now_ms: now,
+            store: StoreConfig::Disk(dir),
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    again.start(resumed).unwrap();
+    support::run_until(&mut again, 40, &mut |n| {
+        n.finalized_height().unwrap() >= head + 4
+    });
+    // A node in memory, whose restart replays its finalized blocks from its
+    // tables, and an archive node keep every height.
+    for node in [
+        pruning(StoreConfig::Memory, STATE_HISTORY, 0),
+        pruning(StoreConfig::Disk(scratch("prune-archive")), ARCHIVE, 0),
+    ] {
+        assert_eq!(table_heights(&node).iter().min(), Some(&1));
+    }
 }
 
 #[test]
 fn a_fresh_node_imports_a_snapshot_serves_it_and_syncs_forward() {
     let dir = scratch("import-source");
     let (mut node, genesis, bob) = exporter(&dir);
-    let snapshot = node.export_snapshot(None).unwrap();
+    let snapshot = node
+        .export_snapshot(None, &dir.join("import.snap"))
+        .unwrap();
     let height = snapshot.header.height;
     let head_hash = node.block_by_number(height).unwrap().unwrap();
     let now = node.now_ms();
@@ -479,7 +665,9 @@ fn a_validator_joins_a_network_from_a_snapshot() {
             >= 10)
             .unwrap()
     );
-    let snapshot = sim.nodes[0].export_snapshot(None).unwrap();
+    let snapshot = sim.nodes[0]
+        .export_snapshot(None, &scratch("join.snap"))
+        .unwrap();
     snapshot
         .verify(CHAIN_ID, &Trust::Genesis(validator_set(&validators)))
         .unwrap();
@@ -590,7 +778,9 @@ fn a_threshold_certificate_vouches_for_a_staking_chains_snapshot() {
         })
         .unwrap();
     assert!(certified, "{:?}", sim.finalized_heights().unwrap());
-    let snapshot = sim.nodes[0].export_snapshot(None).unwrap();
+    let snapshot = sim.nodes[0]
+        .export_snapshot(None, &scratch("threshold.snap"))
+        .unwrap();
     let certificate = &snapshot.header.certificate;
     assert_eq!(certificate.len(), 97);
     let key_id = u64::from_be_bytes(certificate[1..9].try_into().unwrap());

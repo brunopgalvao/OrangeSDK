@@ -68,7 +68,7 @@ fn genesis_argument(args: &[String]) -> Result<Genesis, String> {
 /// Reads the snapshot file `--snapshot` names.
 fn snapshot_argument(args: &[String]) -> Result<Snapshot, String> {
     let path = arg(args, "--snapshot").ok_or("--snapshot is required")?;
-    Snapshot::read(Path::new(&path)).map_err(|e| format!("{path}: {e}"))
+    Snapshot::open(Path::new(&path)).map_err(|e| format!("{path}: {e}"))
 }
 
 /// What a verified snapshot holds, one line per fact.
@@ -111,9 +111,7 @@ fn export(args: &[String]) -> Result<String, String> {
     let mut driver =
         solo_node::DriverStore::open(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let (tables, _) = driver.take_loaded();
-    let snapshot = Snapshot::export(&store, &tables, epoch).map_err(|e| e.to_string())?;
-    snapshot
-        .write(Path::new(&out))
+    let snapshot = Snapshot::export(&store, &tables, epoch, Path::new(&out))
         .map_err(|e| format!("{out}: {e}"))?;
     Ok(format!("{} written to {out}", describe(&snapshot)))
 }

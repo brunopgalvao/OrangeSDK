@@ -91,6 +91,18 @@ pub const STATE_HISTORY: usize = 1024;
 /// however many keys they write.
 pub const ARCHIVE: usize = usize::MAX;
 
+/// How many finalized heights below its finalized head a node whose chain
+/// state is on disk keeps the driver's tables for, by default (spec 22
+/// §8.1): what a peer that fell behind by up to that much syncs from it.
+/// Below that, and below the latest snapshot record's height, the tables
+/// are pruned; a peer further behind joins from a snapshot.
+pub const DRIVER_RETENTION: u64 = 1024;
+
+/// Every how many finalized heights the driver's tables are pruned: often
+/// enough that they stay within a few dozen heights of the retention, and
+/// rarely enough that the pass over them costs nothing per block.
+pub const PRUNE_EVERY: u64 = 64;
+
 /// Key writes of history a node keeps per block of its window, by default
 /// (spec 20 §5.1). A node keeps at most `state_history` times this many:
 /// when the blocks of its window wrote more committed keys than that in
@@ -213,6 +225,11 @@ pub struct Node {
     /// [`HISTORY_KEYS_PER_BLOCK`]. A change applies from the next executed
     /// block.
     pub history_keys_per_block: usize,
+    /// Finalized heights below the head whose driver tables a node on disk
+    /// keeps; see [`DRIVER_RETENTION`]. An archive node, or one whose chain
+    /// state is in memory and whose restart replays its finalized blocks
+    /// from these tables (spec 08 §7), keeps them all.
+    pub driver_retention: u64,
     /// The executed height the node opened at: 0 from genesis, the store's
     /// head on a resume (spec 22 §5). Finalized at least that far.
     pub(crate) opened_at: u64,
@@ -293,6 +310,7 @@ impl Node {
             tx_gossip: Vec::new(),
             state_history: config.state_history.max(1),
             history_keys_per_block: config.history_keys_per_block,
+            driver_retention: DRIVER_RETENTION,
             opened_at: 0,
             fees: FeeStatus::default(),
             genesis_base_fee: 0,
@@ -392,18 +410,50 @@ impl Node {
         Ok(())
     }
 
+    /// Prunes the driver's tables below what consensus can still need once
+    /// `finalized` is final (spec 22 §8.1): `driver_retention` heights
+    /// below it, and never at or above the latest snapshot record's height,
+    /// so that the latest snapshot exports and a node joining from it syncs
+    /// from this one. Only a node whose chain state is on disk and that is
+    /// no archive prunes: a restart over its stores executes nothing again,
+    /// while one in memory replays its finalized blocks from these tables.
+    /// The journal on disk sheds them at its next compaction; until then a
+    /// restart reads them back, and the next pass prunes them again.
+    fn prune_tables(&mut self, finalized: u64) {
+        let Some(store) = self.chain_store() else {
+            return;
+        };
+        if self.state_history == ARCHIVE {
+            return;
+        }
+        let latest = store
+            .get(solo_abi::chain::keys::SNAPSHOT_LATEST)
+            .and_then(|e| u64::from_bytes(&e).ok())
+            .and_then(|e| store.get(&solo_store::snapshot::record_key(e)))
+            .and_then(|r| solo_abi::chain::SnapshotRecord::from_bytes(&r).ok())
+            .map_or(0, |r| r.height);
+        let cutoff = finalized.saturating_sub(self.driver_retention).min(latest);
+        if cutoff != 0 {
+            crate::store::prune_tables(&mut self.services.borrow_mut().persisted, cutoff);
+        }
+    }
+
     /// Exports the snapshot of `epoch` (the latest, for `None`) from this
-    /// node's chain store and driver tables (spec 22 §6).
+    /// node's chain store and driver tables to the file `out` (spec 22 §7.1).
     ///
     /// # Errors
     /// [`NodeError::Store`] when the state is not on disk, and
     /// [`solo_store::SnapshotError`]'s reasons as a store error otherwise.
-    pub fn export_snapshot(&self, epoch: Option<u64>) -> Result<solo_store::Snapshot, NodeError> {
+    pub fn export_snapshot(
+        &self,
+        epoch: Option<u64>,
+        out: &std::path::Path,
+    ) -> Result<solo_store::Snapshot, NodeError> {
         let store = self.chain_store().ok_or_else(|| {
             NodeError::Store("a snapshot exports from a chain store on disk".to_owned())
         })?;
         let tables = self.persisted();
-        solo_store::Snapshot::export(store, &tables, epoch)
+        solo_store::Snapshot::export(store, &tables, epoch, out)
             .map_err(|e| NodeError::Store(e.to_string()))
     }
 
@@ -736,6 +786,9 @@ impl Node {
                 self.call_unit(exports::FINALIZE_BLOCK, &args)?;
                 self.exec.state_mut().base_mut().flush()?;
                 self.finalized.push(height);
+                if height.is_multiple_of(PRUNE_EVERY) {
+                    self.prune_tables(height);
+                }
                 self.telemetry.block_finalized(height);
                 None
             }
@@ -1269,7 +1322,10 @@ impl Node {
     }
 
     /// Injects `fault` into the chain store's next write (tests of crash
-    /// recovery, spec 22 §4); nothing happens to a node in memory.
+    /// recovery, spec 22 §4); nothing happens to a node in memory. Only in
+    /// builds with the `fault-injection` feature, which this crate's tests
+    /// turn on; a release build has no way to drop a block's write.
+    #[cfg(feature = "fault-injection")]
     pub fn inject_store_fault(&mut self, fault: solo_store::Fault) {
         self.exec.state_mut().base_mut().inject(fault);
     }

@@ -19,9 +19,11 @@
 extern crate alloc;
 
 mod proof;
+mod sorted;
 mod trie;
 
 pub use proof::{Proof, ProofError, TERMINAL_EMPTY, TERMINAL_LEAF, Terminal};
+pub use sorted::{OutOfOrder, SortedRoot};
 pub use trie::{NodeSource, PathNode, Trie};
 
 /// A 32-byte digest: a path, a value hash or a node hash.

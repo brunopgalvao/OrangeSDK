@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use solo_host::{MemStorage, Storage, Writes};
-use solo_store::{DiskStore, Fault, StoreError, StoreStats};
+#[cfg(feature = "fault-injection")]
+use solo_store::Fault;
+use solo_store::{DiskStore, StoreError, StoreStats};
 use solo_trie::Trie;
 
 /// Where [`crate::Node::open`] keeps the chain state.
@@ -88,6 +90,8 @@ impl ChainState {
     }
 
     /// Injects `fault` into the disk store's next commit; nothing in memory.
+    /// Only in builds with the `fault-injection` feature, for tests.
+    #[cfg(feature = "fault-injection")]
     pub fn inject(&mut self, fault: Fault) {
         if let ChainState::Disk(d) = self {
             d.inject(fault);
