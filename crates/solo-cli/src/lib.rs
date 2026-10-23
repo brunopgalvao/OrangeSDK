@@ -738,6 +738,42 @@ fn report_switches(node: &solo_node::Node, seen: &mut usize) {
     *seen = node.upgrades().switches.len();
 }
 
+/// Refuses options the command would otherwise ignore without a word:
+/// `solo dev` runs no transport, so it has no peers to fetch a snapshot
+/// from, serve one to, listen for or dial, and it always signs with the
+/// development key; `--trust-key` only says which snapshot to believe, so
+/// it needs `--snapshot` or `--sync-from-peers`.
+fn check_options(args: &[String], command: &str) -> Result<(), CliError> {
+    if command == "dev" {
+        for flag in [
+            "--sync-from-peers",
+            "--serve-snapshots",
+            "--peer",
+            "--listen",
+            "--key",
+            "--key-file",
+        ] {
+            if args.iter().any(|a| a == flag) {
+                let why = if flag.starts_with("--key") {
+                    "it always signs with the development key"
+                } else {
+                    "it runs no peer-to-peer transport"
+                };
+                return Err(format!("solo dev does not take {flag}: {why}; use solo node").into());
+            }
+        }
+    }
+    let verifies = ["--snapshot", "--sync-from-peers"];
+    if args.iter().any(|a| a == "--trust-key")
+        && !args.iter().any(|a| verifies.contains(&a.as_str()))
+    {
+        return Err(
+            "--trust-key verifies a snapshot: give it with --snapshot or --sync-from-peers".into(),
+        );
+    }
+    Ok(())
+}
+
 /// The genesis `--genesis` names. A `solo dev` chain in memory only, whose
 /// genesis names no time, starts now; with a data directory the genesis is
 /// the file's, so that a restart and the snapshot commands, which read the
@@ -770,6 +806,7 @@ pub(crate) fn run_inner(
     if command != "dev" && command != "node" {
         return Err(USAGE.into());
     }
+    check_options(args, command)?;
     let kernel = load_kernel(&arg(args, "--kernel").ok_or("--kernel is required")?)?;
     let genesis = genesis_argument(args, command)?;
     let rpc_arg = arg(args, "--rpc");
@@ -799,6 +836,9 @@ pub(crate) fn run_inner(
             query_gas,
             state_history,
             store: chain_store,
+            // Exports and DKG computations stay off the loop that answers
+            // peers and keeps the clock (spec 22 §7.4, spec 15 §6.4).
+            background: true,
             ..solo_node::NodeConfig::default()
         },
     )?;

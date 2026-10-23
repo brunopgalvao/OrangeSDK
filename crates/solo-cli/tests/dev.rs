@@ -668,6 +668,46 @@ fn node_command_runs_a_multi_validator_chain() {
     assert!(blocks.iter().all(|b| *b >= 3), "{blocks:?}");
 }
 
+/// Options a command would ignore are refused before anything opens:
+/// `solo dev` has no transport and one key, and a trust key without a
+/// snapshot to verify trusts nothing.
+#[test]
+fn options_a_command_would_ignore_are_refused() {
+    let dev = |extra: &[&str]| {
+        let mut list = vec!["dev", "--kernel", KERNEL, "--genesis", "unread.json"];
+        list.extend_from_slice(extra);
+        run(&args(&list)).unwrap_err()
+    };
+    assert_eq!(
+        dev(&["--data-dir", "d", "--sync-from-peers"]),
+        "solo dev does not take --sync-from-peers: it runs no peer-to-peer transport; use solo node"
+    );
+    for flag in ["--serve-snapshots", "--peer", "--listen"] {
+        assert!(
+            dev(&[flag]).contains("runs no peer-to-peer transport"),
+            "{flag}"
+        );
+    }
+    assert_eq!(
+        dev(&["--key-file", "k"]),
+        "solo dev does not take --key-file: it always signs with the development key; use solo node"
+    );
+    assert!(dev(&["--key", "k"]).contains("development key"));
+    let node = run(&args(&[
+        "node",
+        "--kernel",
+        KERNEL,
+        "--genesis",
+        "unread.json",
+        "--trust-key",
+        "0x00",
+    ]));
+    assert_eq!(
+        node.unwrap_err(),
+        "--trust-key verifies a snapshot: give it with --snapshot or --sync-from-peers"
+    );
+}
+
 #[test]
 fn node_command_errors() {
     let good = genesis_file("node-errors.json", GENESIS);
