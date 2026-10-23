@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-Every block of the reference kernel has a base fee per gas that follows demand under EIP-1559's rule, scaled to slot time: a block that uses more than the gas target raises the next block's base fee by at most one hundredth, one that uses less lowers it as much, and a floor keeps it above zero. A transaction pays the base fee on the gas it uses and a priority fee on top. The base fee is burned, or credited to a treasury when the chain says so; the priority fee goes to the stakers through the staking address's reward pool (15 §10). The parameters are set at genesis and changed through governance (13 §9). Codex ADR 0038 records the decisions.
+Every block of the reference kernel has a base fee per gas that follows demand under EIP-1559's rule, scaled to slot time: a block that uses more than the gas target raises the next block's base fee by at most one hundredth, one that uses less lowers it as much, and a floor keeps it above zero. A transaction pays the base fee on the gas it uses and a priority fee on top. The base fee is burned, or credited to a treasury when the chain says so; the priority fee goes to the stakers through the staking address's reward pool (15 §10). The parameters are set at genesis and changed through governance (13 §9). Codex ADR 0038 records the decisions; codex ADR 0039 the bounds on the floor and the treasury, the payout that leaves jailed validators out, the headroom of gate signals and the take's order by the current tip.
 
 The EVM's gas schedule and the kernel's VM gas schedule (04, 19) do not change: this document prices EVM gas in wei, it does not reprice work.
 
@@ -16,10 +16,12 @@ struct FeeParams { denominator: u64, elasticity: u64, min_base_fee: u64, treasur
 
 - `denominator`: EIP-1559's base fee change denominator, between `MIN_DENOMINATOR = 100` and `MAX_DENOMINATOR = 125`: a full block raises the next base fee by a `denominator`th (1% at 100, 0.8% at 125), an empty one lowers it as much. Zero turns the market *off*: every block's base fee is `min_base_fee`.
 - `elasticity`: EIP-1559's elasticity multiplier, between `MIN_ELASTICITY = 2` and `MAX_ELASTICITY = 4`: the gas target is the block gas limit over it. Zero with a zero denominator.
-- `min_base_fee`: the floor, in wei per gas. The base fee of every block while the market is off.
-- `treasury`: the account the base fee is credited to; the zero address burns it.
+- `min_base_fee`: the floor, in wei per gas, at most `MAX_MIN_BASE_FEE` = 10^12 (1 000 gwei, a thousand times the production default). The base fee of every block while the market is off.
+- `treasury`: the account the base fee is credited to; the zero address burns it. Never the staking address (15 §3): its balance is the stakes and the reward pool, and nothing pays out what else reaches it, so a base fee credited there would be locked for good.
 
-Parameters are *workable* when the market is off with both factors zero, or on with both within their ranges. `kernel_init` traps on parameters that are not, so the chain never starts with them, and the `solo` command refuses such a genesis before a node does.
+Parameters are *workable* when the floor is at most `MAX_MIN_BASE_FEE`, the treasury is not the staking address, and the market is off with both factors zero, or on with both within their ranges (`solo_abi::fees::FeeParams::workable`). `kernel_init` traps on parameters that are not, so the chain never starts with them, and the `solo` command refuses such a genesis before a node does, naming the field.
+
+The floor's bound keeps the chain able to lower it. Governance transactions pay the base fee like any other, and the base fee never falls below the floor, so a floor set higher than the governance account (or, under the stake track, the proposers and voters) can pay for would leave the chain without the transaction that would lower it. At the bound a `setFeeParams` submission of about 200 000 gas costs 0.2 of the native token at the base fee, and a full block's base fee is at most `30 000 000 · 10^12` wei per block at the floor: high enough for any chain that prices in a token worth less than Ethereum's, low enough that a typo or a hostile proposal cannot price governance out.
 
 Ethereum changes its base fee by at most 12.5% per 12-second block. At slots of 400 to 500 ms the same per-block factor would let the fee move by orders of magnitude in seconds; a denominator of 100 to 125 bounds a block's change to 1% or less, which is still several times Ethereum's rate per second. The ranges are the bounds the research behind the design settled on; a chain sets its own values within them.
 
@@ -71,17 +73,17 @@ The EVM charges the sender `gas_used · p`, credits the block beneficiary `gas_u
 - the **priority fee** reaches the **fee vault**, `0x0000000000000000000000000000000000004645` (`FEE_VAULT`), the beneficiary of every block on a chain with staking (15 §2: `epoch_blocks > 0`); it is `COINBASE`, and what a contract sends `block.coinbase` lands there too. At the end of the block, after the module hooks (16 §7) and the governance bookkeeping (13 §9.3) and before the staking bookkeeping (15 §4, §10), the kernel moves the vault's whole balance to the staking address and adds it to the reward pool, `stake/pool`, and deletes the vault's account, which holds nothing else. Every wei the vault received in a block is in the pool when the block ends, so the pool's growth over an epoch is exactly the priority fees, and coinbase transfers, of its blocks. On a chain without staking the beneficiary is the zero address, where fees went before this document, and no sweep runs;
 - the **surcharges** the kernel adds to a transaction's gas (`REPORT_GAS`, 15 §3.4; `GOVERNANCE_GAS`, 13 §9.9) are charged as the EVM charges gas: the sender pays `surcharge · p`, the beneficiary gets `surcharge · (p − base_fee)`, and the base part is burned or, with a treasury, credited with the rest of the transaction's base fee, since the treasury's credit counts the transaction's whole `gas_used`, surcharge included.
 
-So for every transaction that ran: `sender paid = treasury or burn + beneficiary`, exactly, and the supply shrinks by exactly the burned base fee. Within a block the staking address's balance is at least the bonded and unbonding stake plus the pool (15 §10.2); a `treasury` set to the staking address adds to its balance and not to the pool, so that base fee is locked there, and governance names another account; the vault's balance is what the block's transactions have paid so far.
+So for every transaction that ran: `sender paid = treasury or burn + beneficiary`, exactly, and the supply shrinks by exactly the burned base fee. Within a block the staking address's balance is at least the bonded and unbonding stake plus the pool (15 §10.2), and the treasury is never the staking address (§2), whose balance would lock what it received; the vault's balance is what the block's transactions have paid so far.
 
 ## 5. Governance
 
-`setFeeParams(uint64 denominator, uint64 elasticity, uint64 minBaseFee, address treasury)` (selector `0x92106b6c`) is an action governance applies to itself (13 §9.2): `submit` carries it with the governance address as target, under the key track it executes at once, under the stake track it is a normal-track proposal. It fails, reverting the submission or leaving the executed proposal without effect, unless the parameters are workable (§2); otherwise it records them under `fees/params`, from the next block on (§3), and emits
+`setFeeParams(uint64 denominator, uint64 elasticity, uint64 minBaseFee, address treasury)` (selector `0x92106b6c`) is an action governance applies to itself (13 §9.2): `submit` carries it with the governance address as target, under the key track it executes at once, under the stake track it is a normal-track proposal. It fails, reverting the submission or leaving the executed proposal without effect, unless the parameters are workable (§2): a floor above `MAX_MIN_BASE_FEE` or a treasury at the staking address fails like factors out of range; otherwise it records them under `fees/params`, from the next block on (§3), and emits
 
 ```solidity
 event FeeParamsSet(uint64 denominator, uint64 elasticity, uint64 minBaseFee, address treasury);
 ```
 
-`solo gov set-fee-params <denominator> <elasticity> <minBaseFee wei> <treasury address|burn>` prints the call.
+`solo gov set-fee-params <denominator> <elasticity> <minBaseFee wei> <treasury address|burn>` prints the call, and refuses parameters that are not workable, naming the field.
 
 ## 6. State
 
@@ -94,7 +96,7 @@ Both committed (10 §2). The base fee of each block is in its header record (20 
 
 ## 7. Queries and RPC
 
-The query `fees` takes nothing and returns `FeeStatus { params: FeeParams, base_fee: u64, pool: u128 }`: the parameters in force, the base fee of the next block (§3) and the reward pool. The node reads it at open and after every block it executes, and uses the base fee for admission's complement, the pool's take (14 §3), for its own gate signals (13 §8.2: a signal is sent at the next block's base fee, so a validator's account on a chain whose floor is above zero holds the funds for `SIGNAL_GAS` at the base fee) and for the RPC.
+The query `fees` takes nothing and returns `FeeStatus { params: FeeParams, base_fee: u64, pool: u128 }`: the parameters in force, the base fee of the next block (§3) and the reward pool. The node reads it at open and after every block it executes, and uses the base fee for admission's complement, the pool's take (14 §3), for its own gate signals (13 §8.2: a signal is a dynamic-fee transaction whose fee cap is twice the next block's base fee and whose priority fee is zero, so it pays the base fee of the block that includes it while that rises up to twice the one it was priced at; a validator's account on a chain whose floor is above zero holds the funds for `SIGNAL_GAS` at the fee cap) and for the RPC.
 
 The JSON-RPC follows geth:
 
@@ -109,7 +111,7 @@ The suggested tip is geth's `SuggestTipCap` over Solo's blocks. Of each of the `
 
 ## 8. The pool (14 §3)
 
-The reference host's take leaves out a sender whose next pending transaction's fee cap is below the next block's base fee, with the rest of that sender's run behind it, as it leaves out one that does not fit; the transactions stay in the pool for a block whose base fee is lower, as geth keeps them, and count towards its limits (14 §4). A transaction an unexecuted block carries is skipped whatever its price: that block decides. Admission (§3.1) refuses a newcomer below the base fee of the next block, so the pool holds such transactions only after the base fee rose past them.
+The reference host's take orders senders by the tip their next pending transaction pays under the next block's base fee, `min(tip cap, fee cap − base fee)` (§3.1), computed at each take rather than at admission, since the base fee moves between them (14 §3). It leaves out a sender whose next pending transaction's fee cap is below the next block's base fee, with the rest of that sender's run behind it, as it leaves out one that does not fit; the transactions stay in the pool for a block whose base fee is lower, as geth keeps them, and count towards its limits (14 §4). A transaction an unexecuted block carries is skipped whatever its price: that block decides. Admission (§3.1) refuses a newcomer below the base fee of the next block, so the pool holds such transactions only after the base fee rose past them.
 
 ## 9. Rationale (non-normative)
 
@@ -122,7 +124,7 @@ The reference host's take leaves out a sender whose next pending transaction's f
 ## 10. Limits of this version
 
 - The block gas limit is fixed (`BLOCK_GAS_LIMIT`); only the base fee moves.
-- `min_base_fee` has no upper bound: governance transactions pay the base fee like any other, so a floor set higher than the governance account can pay for leaves the chain without the transaction that would lower it. Governance checks a new floor against its own balance before it sets one.
+- `min_base_fee` is bounded (§2), but not by what the governance account holds: a floor at the bound still leaves governance without the transaction that would lower it if its accounts hold less than the transaction's gas at that floor. Governance checks a new floor against its own balance before it sets one.
 - A proposal is not run before it is made (20 §7): a transaction priced exactly at the base fee of the block the take was made for can land in a later block whose base fee rose past it, and is then recorded as failed instead of left out as a geth builder would.
 - The tip oracle reads receipts block by block on the thread that drives consensus; a node with many transactions per block pays for the first `eth_gasPrice` after each head.
 - The genesis block has no header (20 §7), so its base fee is the floor the RPC fills in, not a value any hash commits to.

@@ -756,6 +756,13 @@ fn an_equivocator_is_slashed_once_and_excluded() {
         balance(&mut sim.nodes[1], [0; 20])
             >= zero_before + u128::from(STAKE) * GWEI / 10 + delegated / 10
     );
+    // Still in epoch 0, whose end pays the pool out: everyone's balance now.
+    assert!(sim.nodes[1].block_number().unwrap() < 16);
+    assert!(pool > 0);
+    let before: Vec<u128> = keys
+        .iter()
+        .map(|k| balance(&mut sim.nodes[1], address(k)))
+        .collect();
     // A jailed validator can no longer bond or re-register, and the next set leaves it out.
     let rebond = action(&keys[4], 0, GWEI, &StakingAction::Bond);
     assert_eq!(
@@ -782,6 +789,20 @@ fn an_equivocator_is_slashed_once_and_excluded() {
     assert_eq!(next.len(), 4);
     assert!(!next.contains(&byzantine));
     assert_eq!(record_of(&mut sim.nodes[0], &keys[4]).stake, r.stake);
+    // The pool of epoch 0 went to the four members that were not jailed, a
+    // quarter each, their weights being equal (spec 15 §10.2): the jailed
+    // member and the delegation behind it got nothing, though it was in
+    // the set of epoch 0 all along.
+    let share = pool / 4;
+    for (i, k) in keys.iter().enumerate().take(4) {
+        assert_eq!(
+            balance(&mut sim.nodes[1], address(k)),
+            before[i] + share,
+            "validator {i}"
+        );
+    }
+    assert_eq!(balance(&mut sim.nodes[1], address(&keys[4])), before[4]);
+    assert_eq!(status(&mut sim.nodes[1]).pool, pool - 4 * share);
 }
 
 /// Waits until every live node in `nodes` has adopted a key set with id `id`.

@@ -130,11 +130,8 @@ pub fn parse(args: &[String]) -> Result<Call, String> {
                     text => address(text, "treasury")?,
                 },
             };
-            if !params.workable() {
-                return Err(
-                    "gov: denominator must be 0 (the market off, with elasticity 0) or 100 to 125 with elasticity 2 to 4 (spec 23 §2)"
-                        .to_owned(),
-                );
+            if let Some(why) = crate::fees::unworkable(&params, "") {
+                return Err(format!("gov: {why}"));
             }
             action(Call::SetFeeParams { params })
         }

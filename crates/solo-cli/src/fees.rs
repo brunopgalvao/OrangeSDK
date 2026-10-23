@@ -11,11 +11,15 @@
 //! 2, a floor of one gwei and a burned base fee. `denominator` is 0 (the
 //! market off, with `elasticity` 0) or 100 to 125, and `elasticity` 2 to
 //! 4, as the kernel's `kernel_init` requires; `minBaseFee` is in wei, as a
-//! balance is written in `alloc`; `treasury` names the account the base
-//! fee is credited to, and is absent, or the zero address, when it is burned.
+//! balance is written in `alloc`, at most 1 000 gwei; `treasury` names the
+//! account the base fee is credited to, never the staking address, and is
+//! absent, or the zero address, when it is burned.
 
 use serde_json::{Map, Value, json};
-use solo_abi::fees::{DEFAULT_DENOMINATOR, DEFAULT_ELASTICITY, DEFAULT_MIN_BASE_FEE, FeeParams};
+use solo_abi::fees::{
+    DEFAULT_DENOMINATOR, DEFAULT_ELASTICITY, DEFAULT_MIN_BASE_FEE, FeeParams, MAX_MIN_BASE_FEE,
+};
+use solo_abi::staking::STAKING_ADDRESS;
 
 fn number(fields: &Map<String, Value>, name: &str) -> Result<u64, String> {
     match fields.get(name) {
@@ -60,13 +64,32 @@ pub fn parse_fees(v: &Value) -> Result<FeeParams, String> {
     };
     // The kernel refuses to start with parameters that cannot work (spec 23
     // §2); say so here, before a node traps in `kernel_init`.
-    if !params.workable() {
-        return Err(
-            "genesis: fees.denominator must be 0 (the market off, with fees.elasticity 0) or 100 to 125 with fees.elasticity 2 to 4 (spec 23 §2)"
-                .to_owned(),
-        );
+    match unworkable(&params, "fees.") {
+        Some(why) => Err(format!("genesis: {why}")),
+        None => Ok(params),
     }
-    Ok(params)
+}
+
+/// Why `params` cannot work (spec 23 §2), naming each field behind
+/// `prefix`; `None` when they can.
+#[must_use]
+pub fn unworkable(params: &FeeParams, prefix: &str) -> Option<String> {
+    if params.workable() {
+        return None;
+    }
+    Some(if params.min_base_fee > MAX_MIN_BASE_FEE {
+        format!(
+            "{prefix}minBaseFee must be at most {MAX_MIN_BASE_FEE} wei (1 000 gwei, spec 23 §2)"
+        )
+    } else if params.treasury == STAKING_ADDRESS {
+        format!(
+            "{prefix}treasury must not be the staking address, where nothing pays a base fee out (spec 23 §2)"
+        )
+    } else {
+        format!(
+            "{prefix}denominator must be 0 (the market off, with {prefix}elasticity 0) or 100 to 125 with {prefix}elasticity 2 to 4 (spec 23 §2)"
+        )
+    })
 }
 
 /// The `fees` object of the production defaults, which `solo devnet init`
@@ -156,6 +179,14 @@ mod tests {
             (
                 json!({"fees": {"elasticity": 2}}),
                 "fees.denominator must be 0",
+            ),
+            (
+                json!({"fees": {"minBaseFee": "1000000000001"}}),
+                "fees.minBaseFee must be at most 1000000000000 wei",
+            ),
+            (
+                json!({"fees": {"treasury": "0x0000000000000000000000000000000000005354"}}),
+                "fees.treasury must not be the staking address",
             ),
         ];
         for (v, message) in cases {

@@ -284,10 +284,17 @@ impl Upgrades {
     }
 }
 
-/// The legacy EIP-155 transaction with which a validator's host signals
-/// `features`: to the upgrade address, no value, at `gas_price`, the base
-/// fee of the next block (spec 23 §3), so that on a chain whose base fee is
-/// above zero a validator's account pays for its signals.
+/// How many times the next block's base fee a signal's fee cap allows
+/// (spec 13 §8.2): the headroom wallets give a dynamic-fee transaction, so
+/// that a signal sent before the base fee rose still pays it.
+pub const SIGNAL_FEE_HEADROOM: u128 = 2;
+
+/// The EIP-1559 dynamic-fee transaction with which a validator's host
+/// signals `features`: to the upgrade address, no value, a maximum fee per
+/// gas of [`SIGNAL_FEE_HEADROOM`] times `next_base_fee`, the base fee of the
+/// next block (spec 23 §3), and no priority fee. The sender pays the base
+/// fee of the block that includes it, never more, and the signal stays
+/// payable while the base fee rises up to twice the one it was priced at.
 ///
 /// # Panics
 /// Never: signing a 32-byte digest with a valid key cannot fail.
@@ -297,36 +304,29 @@ pub fn signal_tx(
     chain_id: u64,
     nonce: u64,
     features: u64,
-    gas_price: u128,
+    next_base_fee: u64,
 ) -> Vec<u8> {
     let data = Action::Signal { features }.encode();
-    let fields = |out: &mut Vec<u8>| {
-        encode_uint(u128::from(nonce), out);
-        encode_uint(gas_price, out);
-        encode_uint(u128::from(SIGNAL_GAS), out);
-        encode_bytes(&UPGRADE_ADDRESS, out);
-        encode_uint(0, out);
-        encode_bytes(&data, out);
-    };
-    let mut unsigned = Vec::new();
-    fields(&mut unsigned);
-    encode_uint(u128::from(chain_id), &mut unsigned);
-    encode_uint(0, &mut unsigned);
-    encode_uint(0, &mut unsigned);
-    let mut list = Vec::new();
-    encode_list(&unsigned, &mut list);
-    let sig = sign_recoverable(key, &keccak256(&list)).expect("a digest signs");
+    let max_fee = u128::from(next_base_fee) * SIGNAL_FEE_HEADROOM;
+    let mut fields = Vec::new();
+    encode_uint(u128::from(chain_id), &mut fields);
+    encode_uint(u128::from(nonce), &mut fields);
+    encode_uint(0, &mut fields);
+    encode_uint(max_fee, &mut fields);
+    encode_uint(u128::from(SIGNAL_GAS), &mut fields);
+    encode_bytes(&UPGRADE_ADDRESS, &mut fields);
+    encode_uint(0, &mut fields);
+    encode_bytes(&data, &mut fields);
+    encode_list(&[], &mut fields);
+    let mut unsigned = vec![2u8];
+    encode_list(&fields, &mut unsigned);
+    let sig = sign_recoverable(key, &keccak256(&unsigned)).expect("a digest signs");
     let strip = |b: &[u8]| b[b.iter().take_while(|x| **x == 0).count()..].to_vec();
-    let mut signed = Vec::new();
-    fields(&mut signed);
-    encode_uint(
-        u128::from(chain_id) * 2 + 35 + u128::from(sig[64]),
-        &mut signed,
-    );
-    encode_bytes(&strip(&sig[..32]), &mut signed);
-    encode_bytes(&strip(&sig[32..64]), &mut signed);
-    let mut out = Vec::new();
-    encode_list(&signed, &mut out);
+    encode_uint(u128::from(sig[64]), &mut fields);
+    encode_bytes(&strip(&sig[..32]), &mut fields);
+    encode_bytes(&strip(&sig[32..64]), &mut fields);
+    let mut out = vec![2u8];
+    encode_list(&fields, &mut out);
     out
 }
 
@@ -649,8 +649,8 @@ impl Node {
         let address: [u8; 20] = id[12..].try_into().expect("20 bytes");
         let nonce = self.account(&address)?.nonce;
         let chain_id = self.chain_id()?;
-        let gas_price = u128::from(self.fee_status().base_fee);
-        Ok(Some(signal_tx(&key, chain_id, nonce, features, gas_price)))
+        let base_fee = self.fee_status().base_fee;
+        Ok(Some(signal_tx(&key, chain_id, nonce, features, base_fee)))
     }
 
     /// Submits the signal transaction the last executed block called for.

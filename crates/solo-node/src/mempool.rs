@@ -159,6 +159,14 @@ impl PoolTx {
         })
     }
 
+    /// What it tips per gas under `base_fee` (spec 23 §3.1): its tip cap,
+    /// or what its fee cap leaves over the base fee when that is less;
+    /// zero below the base fee.
+    #[must_use]
+    pub fn tip_at(&self, base_fee: u128) -> u128 {
+        self.tip_cap.min(self.fee_cap.saturating_sub(base_fee))
+    }
+
     /// Whether `self` may replace `old`: both fee fields at least
     /// [`PRICE_BUMP`] percent higher, rounding the threshold down as geth does.
     #[must_use]
@@ -614,7 +622,9 @@ impl Mempool {
 
     /// Pending transactions in an order a block can execute, within
     /// `max_bytes` and `max_gas` (spec 14 §3): each sender's by nonce, the
-    /// senders interleaved by priority, then arrival. A sender whose next
+    /// senders interleaved by the tip each next transaction pays under
+    /// `base_fee` ([`PoolTx::tip_at`], computed now, not at admission, so
+    /// that a base fee that moved since reorders them), then arrival. A sender whose next
     /// transaction does not fit, whose balance would not cover it after
     /// the ones before it, or whose fee cap is below `base_fee`, the next
     /// block's base fee (spec 23 §3), contributes nothing more. A
@@ -652,7 +662,7 @@ impl Mempool {
         let mut heap = BinaryHeap::new();
         let push = |heap: &mut BinaryHeap<_>, run: usize, at: usize| {
             if let Some(tx) = runs[run].0.get(at) {
-                heap.push((tx.priority, Reverse(tx.arrival), run, at));
+                heap.push((tx.tip_at(base_fee), Reverse(tx.arrival), run, at));
             }
         };
         for run in 0..runs.len() {

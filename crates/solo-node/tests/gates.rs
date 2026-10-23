@@ -15,10 +15,10 @@ use solo_host::hash::keccak256;
 use solo_host::{Executor, Flags, ModuleCache};
 use solo_node::ChainState;
 use solo_node::upgrade::{
-    BLS12381_FAST_AGGREGATE_VERIFY, GATED, PRECOMPILE_HANDLE, SECP256K1_VERIFY, SUPPORTED, gated,
-    precompile, signal_tx,
+    BLS12381_FAST_AGGREGATE_VERIFY, GATED, PRECOMPILE_HANDLE, SECP256K1_VERIFY,
+    SIGNAL_FEE_HEADROOM, SUPPORTED, gated, precompile, signal_tx,
 };
-use solo_node::{GatedExtension, Node, NodeConfig, NodeExtension, NodeServices};
+use solo_node::{GatedExtension, Node, NodeConfig, NodeExtension, NodeServices, validator_id};
 use solo_upgrade::{Action, gate};
 use solo_vm::builder::ModuleBuilder;
 use solo_vm::host::Capability;
@@ -425,17 +425,35 @@ fn a_validator_signals_and_its_gate_activates_an_epoch_after_locking_in() {
 }
 
 #[test]
-fn a_signal_is_a_legacy_transaction_to_the_upgrade_address() {
+fn a_signal_is_a_dynamic_fee_transaction_to_the_upgrade_address() {
     let key = SigningKey::from_slice(&[0x11; 32]).unwrap();
-    let raw = signal_tx(&key, 1337, 4, 0b101, 0);
-    let again = signal_tx(&key, 1337, 4, 0b101, 0);
+    let raw = signal_tx(&key, 1337, 4, 0b101, 7);
+    let again = signal_tx(&key, 1337, 4, 0b101, 7);
     assert_eq!(
         raw, again,
         "deterministic signatures make resubmission idempotent"
     );
-    assert_ne!(raw, signal_tx(&key, 1337, 5, 0b101, 0));
-    assert_ne!(raw, signal_tx(&key, 1337, 4, 0b101, 1));
+    assert_ne!(raw, signal_tx(&key, 1337, 5, 0b101, 7));
+    assert_ne!(raw, signal_tx(&key, 1337, 4, 0b101, 8));
     let data = Action::Signal { features: 0b101 }.encode();
-    assert!(raw.windows(data.len()).any(|w| w == data.as_slice()));
-    assert!(raw.windows(20).any(|w| w == solo_upgrade::UPGRADE_ADDRESS));
+    // A fee cap of twice the base fee it was priced at and no tip: the
+    // sender pays the base fee of the block that includes it (spec 13 §8.2).
+    let tx = solo_eth::decode(&raw).unwrap();
+    assert_eq!(tx.tx_type, 2);
+    assert_eq!(tx.chain_id, Some(1337));
+    assert_eq!(tx.nonce, 4);
+    assert_eq!(tx.gas_price, 14);
+    assert_eq!(tx.priority_fee, Some(0));
+    assert_eq!(tx.gas_limit, solo_upgrade::SIGNAL_GAS);
+    assert_eq!(tx.to, Some(solo_upgrade::UPGRADE_ADDRESS));
+    assert_eq!((tx.value, tx.input), (0, data));
+    assert_eq!(SIGNAL_FEE_HEADROOM, 2);
+    let pool = solo_node::PoolTx::parse(&raw).unwrap();
+    assert_eq!(
+        pool.sender,
+        <[u8; 20]>::try_from(&validator_id(&key)[12..]).unwrap()
+    );
+    // At the largest base fee its fee cap still fits 128 bits.
+    let top = solo_eth::decode(&signal_tx(&key, 1337, 4, 0b101, u64::MAX)).unwrap();
+    assert_eq!(top.gas_price, u128::from(u64::MAX) * 2);
 }

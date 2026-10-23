@@ -6,6 +6,7 @@
 //! can compute a different base fee from the same header.
 
 use crate::codec::{Decode, DecodeError, Decoder, Encode, Encoder};
+use crate::staking::STAKING_ADDRESS;
 use crate::types::Address;
 
 macro_rules! record {
@@ -53,6 +54,13 @@ pub const DEFAULT_DENOMINATOR: u64 = 125;
 pub const DEFAULT_ELASTICITY: u64 = 2;
 /// The default floor of the base fee: one gwei.
 pub const DEFAULT_MIN_BASE_FEE: u64 = 1_000_000_000;
+/// The highest floor the kernel accepts: 1 000 gwei, a thousand times the
+/// default (spec 23 §2). Governance pays the base fee like any sender, so a
+/// floor it cannot pay for would leave the chain without the transaction
+/// that lowers it; the bound keeps that out of reach of a typo or a hostile
+/// proposal, a `setFeeParams` at the bound costing its sender about
+/// 0.1 native token per 100 000 gas.
+pub const MAX_MIN_BASE_FEE: u64 = 1_000_000_000_000;
 
 record! {
     /// The fee market's parameters (spec 23 §2), `GenesisParams::fees` at
@@ -94,12 +102,17 @@ impl FeeParams {
         self.denominator != 0
     }
 
-    /// Whether the parameters can work (spec 23 §2): the market off with
-    /// both factors zero, or on with the denominator within 100 to 125 and
-    /// the elasticity within 2 to 4. `kernel_init` traps on anything else
-    /// and `setFeeParams` fails.
+    /// Whether the parameters can work (spec 23 §2): a floor of at most
+    /// [`MAX_MIN_BASE_FEE`], a treasury other than the staking address
+    /// (whose balance nothing pays out, so a base fee credited there would
+    /// be locked), and the market off with both factors zero, or on with
+    /// the denominator within 100 to 125 and the elasticity within 2 to 4.
+    /// `kernel_init` traps on anything else and `setFeeParams` fails.
     #[must_use]
-    pub const fn workable(&self) -> bool {
+    pub fn workable(&self) -> bool {
+        if self.min_base_fee > MAX_MIN_BASE_FEE || self.treasury == STAKING_ADDRESS {
+            return false;
+        }
         if self.denominator == 0 {
             return self.elasticity == 0;
         }
@@ -293,6 +306,24 @@ mod tests {
         assert!(!with(100, 1).workable());
         assert!(!with(100, 5).workable());
         assert!(!with(100, 0).workable());
+        // The floor's bound and the staking address as treasury, market on
+        // or off.
+        for base in [FeeParams::default(), FeeParams::production()] {
+            let floor = |min_base_fee| FeeParams {
+                min_base_fee,
+                ..base.clone()
+            };
+            assert!(floor(MAX_MIN_BASE_FEE).workable());
+            assert!(!floor(MAX_MIN_BASE_FEE + 1).workable());
+            assert!(!floor(u64::MAX).workable());
+            let treasury = |treasury| FeeParams {
+                treasury,
+                ..base.clone()
+            };
+            assert!(treasury([7; 20]).workable());
+            assert!(!treasury(STAKING_ADDRESS).workable());
+        }
+        assert_eq!(MAX_MIN_BASE_FEE, 1_000 * DEFAULT_MIN_BASE_FEE);
         assert!(!FeeParams::default().market_on());
         assert!(with(100, 2).market_on());
         assert_eq!(FeeParams::default().gas_target(LIMIT), LIMIT);

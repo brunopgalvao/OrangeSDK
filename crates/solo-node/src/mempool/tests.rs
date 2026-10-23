@@ -388,11 +388,47 @@ fn take_leaves_out_senders_priced_below_the_base_fee() {
     assert_eq!(pool.len(), 4);
     // A transaction an unexecuted block carries is skipped whatever its
     // price: the block that carries it decides, and the one behind it is
-    // taken (in its sender's turn, which the skipped one's priority sets).
+    // taken (in its sender's turn, which the skipped one's tip sets: none
+    // under a base fee of 10, tied with sender 2's and ahead by arrival).
     assert_eq!(
         nonces(&pool, &pool.take(usize::MAX, u64::MAX, &[a0.hash], 10)),
-        [(3, 0), (2, 0), (1, 1)]
+        [(3, 0), (1, 1), (2, 0)]
     );
+}
+
+#[test]
+fn take_orders_by_the_tip_under_the_base_fee_of_the_take() {
+    // Admitted under a base fee of 0, a legacy transaction at 30 reported
+    // the higher priority; a dynamic-fee one with a fee cap of 100 and a tip
+    // cap of 20, the lower.
+    let mut pool = Mempool::default();
+    let legacy = tx(1, 0, 30);
+    let dynamic = PoolTx {
+        fee_cap: 100,
+        ..tx(2, 0, 20)
+    };
+    add(&mut pool, &legacy).unwrap();
+    add(&mut pool, &dynamic).unwrap();
+    assert_eq!((legacy.priority, dynamic.priority), (30, 20));
+    assert_eq!(
+        nonces(&pool, &pool.take(usize::MAX, u64::MAX, &[], 0)),
+        [(1, 0), (2, 0)]
+    );
+    // Under a base fee of 15 the legacy one tips 15 and the dynamic-fee one
+    // still 20: the take orders by the tips paid now, not those at
+    // admission.
+    assert_eq!((legacy.tip_at(15), dynamic.tip_at(15)), (15, 20));
+    assert_eq!(
+        nonces(&pool, &pool.take(usize::MAX, u64::MAX, &[], 15)),
+        [(2, 0), (1, 0)]
+    );
+    // Equal tips go by arrival; below the base fee there is no tip.
+    assert_eq!((legacy.tip_at(10), dynamic.tip_at(10)), (20, 20));
+    assert_eq!(
+        nonces(&pool, &pool.take(usize::MAX, u64::MAX, &[], 10)),
+        [(1, 0), (2, 0)]
+    );
+    assert_eq!(legacy.tip_at(31), 0);
 }
 
 #[test]

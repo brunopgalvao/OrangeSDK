@@ -264,6 +264,20 @@ fn gov_names_every_mistake() {
             "denominator must be 0 (the market off, with elasticity 0) or 100 to 125",
         ),
         (
+            vec!["set-fee-params", "125", "2", "1000000000001", "burn"],
+            "minBaseFee must be at most 1000000000000 wei",
+        ),
+        (
+            vec![
+                "set-fee-params",
+                "125",
+                "2",
+                "1",
+                "0x0000000000000000000000000000000000005354",
+            ],
+            "treasury must not be the staking address",
+        ),
+        (
             vec!["set-fee-params", "x", "2", "1", "burn"],
             "denominator must be a number",
         ),

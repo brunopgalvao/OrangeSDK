@@ -700,28 +700,39 @@ fn prune(next: &ValidatorSet) {
 }
 
 /// Pays the reward pool out to the set of epoch `epoch`, which is ending
-/// (spec 15 §10.2): each validator's share is pro rata to its weight, and
-/// within it each delegator's to its bonded stake over the validator's
-/// total, the validator keeping the rest. Every division rounds down and
-/// what rounding leaves stays in the pool for the next epoch, so the
-/// credits and the pool together always equal what was collected.
+/// (spec 15 §10.2): to its members that are not jailed, each share pro
+/// rata to the member's weight among theirs, and within it each
+/// delegator's to its bonded stake over the validator's total, the
+/// validator keeping the rest. A member jailed during the epoch (every
+/// slashed validator is) earns nothing, nor do its delegators: the others
+/// share the pool. Every division rounds down and what rounding leaves
+/// stays in the pool for the next epoch, so the credits and the pool
+/// together always equal what was collected.
 fn distribute(epoch: u64) {
     let pool = pool();
     if pool == 0 {
         return;
     }
     let Some(set) = set_of(epoch) else { return };
-    let total: u128 = set.validators.0.iter().map(|v| u128::from(v.weight)).sum();
+    let paid_to: Vec<(&Validator, StakeRecord)> = set
+        .validators
+        .0
+        .iter()
+        .filter_map(|v| match record(&v.id) {
+            Some(r) if r.jailed => None,
+            r => Some((v, r.unwrap_or_default())),
+        })
+        .collect();
+    let total: u128 = paid_to.iter().map(|(v, _)| u128::from(v.weight)).sum();
     if total == 0 {
         return;
     }
     let mut paid = 0u128;
-    for v in &set.validators.0 {
+    for (v, r) in paid_to {
         let share = mul_div(pool, u128::from(v.weight), total);
         if share == 0 {
             continue;
         }
-        let r = record(&v.id).unwrap_or_default();
         let stakes = r.stake + r.delegated;
         let mut rest = share;
         if stakes != 0 {
