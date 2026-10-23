@@ -9,8 +9,9 @@
 //! - `SOLO_FUZZ_SEED=<n>` starts every harness from another seed, so repeated
 //!   long runs explore different cases.
 //!
-//! A failing case names its harness, index and seed on the panic output; the
-//! same `SOLO_FUZZ_SEED` and a scale that reaches the index reproduce it.
+//! A failing case names its harness, index and seed on the panic output;
+//! `SOLO_FUZZ_CASE=<index>` (with the same `SOLO_FUZZ_SEED`) runs that case
+//! alone.
 
 #![forbid(unsafe_code)]
 
@@ -151,6 +152,12 @@ pub fn parse_seed(value: Option<&str>) -> u64 {
         .unwrap_or(0)
 }
 
+/// The single case `SOLO_FUZZ_CASE` asks for, if any.
+#[must_use]
+pub fn parse_case(value: Option<&str>) -> Option<u64> {
+    value.and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
@@ -178,19 +185,30 @@ impl Drop for Reporter<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {
             eprintln!(
-                "solo-fuzz: harness {} failed at case {} (seed {:#x}); rerun with SOLO_FUZZ_SEED={} and a SOLO_FUZZ_SCALE that reaches the case",
-                self.name, self.index, self.seed, self.base
+                "solo-fuzz: harness {} failed at case {} (seed {:#x}); rerun it alone with SOLO_FUZZ_SEED={} SOLO_FUZZ_CASE={}",
+                self.name, self.index, self.seed, self.base, self.index
             );
         }
     }
 }
 
 /// Runs `cases` times `SOLO_FUZZ_SCALE` cases of harness `name`, each with
-/// its own generator, and returns how many ran.
-pub fn run(name: &str, cases: u64, mut case: impl FnMut(&mut Rng)) -> u64 {
+/// its own generator, or only case `SOLO_FUZZ_CASE`, and returns how many
+/// ran.
+pub fn run(name: &str, cases: u64, case: impl FnMut(&mut Rng)) -> u64 {
     let total = cases.saturating_mul(parse_scale(env("SOLO_FUZZ_SCALE").as_deref()));
+    let only = parse_case(env("SOLO_FUZZ_CASE").as_deref());
+    run_cases(name, total, only, case)
+}
+
+fn run_cases(name: &str, total: u64, only: Option<u64>, mut case: impl FnMut(&mut Rng)) -> u64 {
     let base = parse_seed(env("SOLO_FUZZ_SEED").as_deref());
-    for index in 0..total {
+    let indices = match only {
+        Some(i) => i..i + 1,
+        None => 0..total,
+    };
+    let ran = indices.end - indices.start;
+    for index in indices {
         let seed = case_seed(name, base, index);
         let _reporter = Reporter {
             name,
@@ -200,7 +218,7 @@ pub fn run(name: &str, cases: u64, mut case: impl FnMut(&mut Rng)) -> u64 {
         };
         case(&mut Rng::new(seed));
     }
-    total
+    ran
 }
 
 /// Inputs [`evolve`] keeps to mutate further.
@@ -316,6 +334,8 @@ mod tests {
         assert_eq!(parse_scale(Some(" 40 ")), 40);
         assert_eq!(parse_seed(None), 0);
         assert_eq!(parse_seed(Some("9")), 9);
+        assert_eq!(parse_case(None), None);
+        assert_eq!(parse_case(Some("12")), Some(12));
         assert_ne!(case_seed("a", 0, 0), case_seed("b", 0, 0));
         assert_ne!(case_seed("a", 0, 0), case_seed("a", 0, 1));
         assert_ne!(case_seed("a", 0, 0), case_seed("a", 1, 0));
@@ -329,6 +349,10 @@ mod tests {
         let mut second = Vec::new();
         run("count", 5, |r| second.push(r.u64()));
         assert_eq!(first, second);
+        // One case alone draws what it drew in the full run.
+        let mut alone = Vec::new();
+        assert_eq!(run_cases("count", 5, Some(3), |r| alone.push(r.u64())), 1);
+        assert_eq!(alone, [first[3]]);
     }
 
     #[test]
