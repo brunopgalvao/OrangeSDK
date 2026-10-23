@@ -17,8 +17,10 @@ use solo_abi::Decode;
 use solo_abi::chain::GenesisParams;
 use solo_cli::client;
 use solo_cli::devnet::{Conditions, Devnet, FUNDED, MANIFEST};
+use solo_cli::upgrade::PROPOSE_GAS;
 use solo_cli::{USAGE, parse_genesis, parse_key, run};
 use solo_rpc::methods::data;
+use solo_upgrade::Action;
 
 const SOLO: &str = env!("CARGO_BIN_EXE_solo");
 const KERNEL: &str = concat!(
@@ -966,6 +968,28 @@ fn up_stops_only_what_it_started_and_stop_falls_back_on_the_pid_file() {
     assert!(ok(&["devnet", "status", "--dir", d]).contains("node 1  down"));
 }
 
+/// Sends `action` from the governance key and returns its receipt.
+fn send_action(rpc: &str, key: &k256::ecdsa::SigningKey, action: &Action) -> serde_json::Value {
+    let ask = |method: &str, params: serde_json::Value| {
+        client::quantity(&client::call(rpc, method, &params).unwrap()).unwrap()
+    };
+    let chain_id = ask("eth_chainId", serde_json::json!([]));
+    let gas_price = u128::from(ask("eth_gasPrice", serde_json::json!([])));
+    let nonce = ask(
+        "eth_getTransactionCount",
+        serde_json::json!([data(&client::address(key)), "pending"]),
+    );
+    let raw = solo_cli::upgrade::action_tx(key, chain_id, nonce, gas_price, PROPOSE_GAS, action);
+    let hash = client::call(
+        rpc,
+        "eth_sendRawTransaction",
+        &serde_json::json!([data(&raw)]),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_mins(2);
+    client::wait_receipt(rpc, hash.as_str().unwrap(), "action", deadline).unwrap()
+}
+
 /// A running `solo devnet up`, taken down when dropped.
 struct Up {
     dir: PathBuf,
@@ -1175,10 +1199,11 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
         let text = err(&args);
         assert!(text.contains(message), "{args:?}: {text}");
     }
-    // The upgrade itself, then a second proposal while it is pending: 30
-    // blocks of delay leave the second command, a process of its own, the
-    // time to ask before the switch, however loaded the machine (with 3 it
-    // sometimes asked after it, and staged into the new kernel).
+    // The upgrade itself, then a second proposal while it is pending. The
+    // first activation height is out of reach, so the second command, a
+    // process of its own, and the status after it find the upgrade pending
+    // however loaded the machine (with a short delay the chain sometimes
+    // switched first, and the second command staged into the new kernel).
     let upgrade = [
         "upgrade",
         "--rpc",
@@ -1187,22 +1212,26 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
         KERNEL_V2,
         "--key-file",
         governance,
-        // Long enough that the second proposal and the status below still see
-        // it pending on an instrumented build under a full parallel test load.
         "--delay",
-        "30",
+        "1000000",
         "--required-gates",
         "",
     ];
     let report = ok(&upgrade);
     assert!(report.contains("code hash  0x"), "{report}");
     assert!(report.contains("chunks ("), "{report}");
-    let activation: u64 = report
-        .lines()
-        .find_map(|l| l.strip_prefix("activation "))
-        .unwrap()
-        .parse()
-        .unwrap();
+    let field = |name: &str| {
+        report
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    let activation: u64 = field("activation ").parse().unwrap();
+    let digits = field("code hash ");
+    let code_hash: [u8; 32] =
+        std::array::from_fn(|i| u8::from_str_radix(&digits[2 + 2 * i..4 + 2 * i], 16).unwrap());
     let again = err(&upgrade);
     assert!(again.contains("already pending"), "{again}");
     let text = ok(&["devnet", "status", "--dir", d, "--json"]);
@@ -1210,6 +1239,26 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
         text.contains(&format!("\"pendingUpgrade\": {activation}")),
         "{text}"
     );
+    // Governance cancels it and proposes the code it staged again, a few
+    // blocks ahead (spec 13 §3: staged chunks stay).
+    let key = parse_key(
+        std::fs::read_to_string(devnet.governance_key())
+            .unwrap()
+            .trim(),
+    )
+    .unwrap();
+    let receipt = send_action(&rpc, &key, &Action::Cancel { code_hash });
+    assert_eq!(receipt["status"], "0x1", "{receipt}");
+    let head =
+        client::quantity(&client::call(&rpc, "eth_blockNumber", &serde_json::json!([])).unwrap())
+            .unwrap();
+    let propose = Action::Propose {
+        code_hash,
+        activation_height: head + 20,
+        required_gates: 0,
+    };
+    let receipt = send_action(&rpc, &key, &propose);
+    assert_eq!(receipt["status"], "0x1", "{receipt}");
     let text = ok(&[
         "devnet",
         "wait",
