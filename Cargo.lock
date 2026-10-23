@@ -3028,6 +3028,7 @@ dependencies = [
 name = "solo-node"
 version = "0.0.1"
 dependencies = [
+ "getrandom 0.3.4",
  "k256",
  "p256",
  "proptest",

@@ -441,6 +441,36 @@ fn threshold_edge_cases() {
     );
 }
 
+#[test]
+fn batched_partial_checks_agree_with_single_ones() {
+    let sk = SecretKey::generate(&[4; 32], b"batch").unwrap();
+    let msg = b"batched partials";
+    for (t, n) in [(3u32, 40u32), (40, 60)] {
+        let (keys, shares) = threshold::deal(&sk, t, n, &[5; 32]).unwrap();
+        let mut partials: Vec<PartialSignature> = shares.iter().map(|s| s.sign(msg)).collect();
+        assert!(
+            keys.verify_partials(msg, &partials, &[1; 32])
+                .iter()
+                .all(|v| *v)
+        );
+        // Another message, index zero, and a partial claiming another's index.
+        partials[3] = shares[3].sign(b"other");
+        partials[17].index = 0;
+        partials[30].index = partials[31].index;
+        let expect: Vec<bool> = partials
+            .iter()
+            .map(|p| keys.verify_partial(msg, p))
+            .collect();
+        assert_eq!(expect.iter().filter(|v| !**v).count(), 3);
+        assert_eq!(keys.verify_partials(msg, &partials, &[2; 32]), expect);
+        assert_eq!(
+            keys.verify_partials(msg, &partials[3..4], &[2; 32]),
+            [false]
+        );
+        assert!(keys.verify_partials(msg, &[], &[2; 32]).is_empty());
+    }
+}
+
 fn threshold_case() -> impl Strategy<Value = (u32, u32, [u8; 32], Vec<u32>)> {
     (1u32..=7)
         .prop_flat_map(|n| (Just(n), 1..=n, any::<[u8; 32]>()))

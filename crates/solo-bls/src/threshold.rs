@@ -10,7 +10,7 @@ use zeroize::Zeroize;
 
 use crate::poly::{self, Polynomial};
 use crate::sig::{DST_SIGNATURE, PublicKey, SecretKey, Signature};
-use crate::{Error, hash, point};
+use crate::{Error, batch, hash, point};
 
 /// One participant's share `f(i)` of the group secret `f(0)`. Zeroed on drop.
 pub struct SecretShare {
@@ -176,6 +176,27 @@ impl PublicKeySet {
             && self
                 .public_share(partial.index)
                 .verify(msg, &partial.signature)
+    }
+
+    /// Which of `partials` are valid partial signatures over `msg`, one flag
+    /// each, in order: the same answer as [`Self::verify_partial`] on each,
+    /// except with probability at most `2^−64` per invalid partial, found
+    /// with one batched check of all of them and, when that fails, of halves
+    /// until each invalid one stands alone (spec 12 §4.1). `key` must be
+    /// fresh secret randomness: whoever chose the partials must not know it.
+    #[must_use]
+    pub fn verify_partials(
+        &self,
+        msg: &[u8],
+        partials: &[PartialSignature],
+        key: &[u8; 32],
+    ) -> Vec<bool> {
+        let h = hash::to_g1(msg, DST_SIGNATURE);
+        let rho: Vec<u64> = (0u64..)
+            .zip(partials)
+            .map(|(j, _)| batch::coefficient(&[key, &j.to_be_bytes()], batch::DST_PARTIAL_BATCH))
+            .collect();
+        batch::valid_partials(&self.commitment, &h, partials, &rho)
     }
 
     /// Combines the first `threshold` partial signatures by Lagrange

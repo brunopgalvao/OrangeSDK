@@ -388,7 +388,7 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let receipts_root = mpt::ordered_root(&envelopes, state::keccak256);
     let transactions_root = mpt::ordered_root(&listed, state::keccak256);
     crate::modules::end_block(height, template.timestamp_ms);
-    crate::governance::end_block(height);
+    crate::governance::end_block(height, block);
     // What the vault collected joins the reward pool before an epoch end
     // distributes it (spec 15 §10.2).
     fees::sweep();
@@ -528,7 +528,7 @@ fn call(request: CallRequest) -> CallResult {
     };
     // A governance call's gas includes its surcharge (spec 13 §9.9), so that
     // an estimate is a gas limit admission takes.
-    let surcharge = solo_abi::governance::surcharge(request.to.as_ref(), &request.data);
+    let surcharge = crate::governance::surcharge(request.to.as_ref(), &request.data);
     let message = Message {
         tx_type,
         caller: request.from,

@@ -4,9 +4,13 @@
 //! track the genesis governance key acts alone and at once; under the
 //! *stake* track validators vote on proposals weighed by stake, a passed
 //! proposal waits out a timelock during which the guardian may veto it, and
-//! anyone executes it. Also the bookkeeping at the end of every block, the
-//! queries, and this kernel's version and migration rule (spec 06 §7).
+//! anyone executes it. Delegators vote beside validators, each vote carrying
+//! the bonded stake behind it at the tally, and a proposal may carry a call
+//! the governance address makes to any account. Also the bookkeeping at the
+//! end of every block, the queries, and this kernel's version and migration
+//! rule (spec 06 §7).
 
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -14,10 +18,12 @@ use solo_abi::bridge_in::{LIGHT_CLIENT_ADDRESS, VERIFIER_ADDRESS};
 use solo_abi::chain::{Account, Log, UpgradeParams, ValidatorSet, call_status, reason};
 use solo_abi::codec::Seq;
 use solo_abi::governance::{
-    self as gov, ACTION_GAS, Ballot, Call, GOVERNANCE_ADDRESS, GOVERNANCE_GAS, GovernanceParams,
-    GovernanceStatus, MAX_OPEN_PROPOSALS, OpenProposal, Proposal, ProposalView, mode, status,
+    self as gov, ACTION_GAS, Ballot, BallotEntry, Call, DelegatorBallot, GOVERNANCE_ADDRESS,
+    GOVERNANCE_GAS, GovernanceParams, GovernanceStatus, MAX_BALLOTS, MAX_CALL_GAS,
+    MAX_OPEN_PROPOSALS, Member, OpenProposal, Proposal, ProposalView, mode, status,
 };
 use solo_abi::modules::{Install, MODULE_ADDRESS};
+use solo_abi::staking::GWEI;
 use solo_abi::types::{Address, Genesis, Hash, MigrateArgs, QueryResult};
 use solo_abi::{Decode, Encode};
 use solo_ethlc::abi as lcabi;
@@ -201,20 +207,125 @@ fn voters(id: u64) -> Vec<Hash> {
         .unwrap_or_default()
 }
 
-/// The stake voting yes and no on `id`, and the stake of the whole current
-/// validator set: a vote weighs what its validator weighs now, nothing once
-/// it has left the set.
-fn tally(id: u64) -> (u64, u64, u64) {
-    let (mut yes, mut no, mut total) = (0u64, 0u64, 0u64);
-    for (validator, weight) in validators() {
-        total = total.saturating_add(weight);
-        match vote_of(id, &validator) {
-            Some(true) => yes = yes.saturating_add(weight),
-            Some(false) => no = no.saturating_add(weight),
-            None => {}
-        }
+fn gwei(wei: u128) -> u64 {
+    u64::try_from(wei / GWEI).unwrap_or(u64::MAX)
+}
+
+/// The members of the current validator set whose stake counts in a tally,
+/// with their weights now (spec 13 §9.3): with staking, each member whose
+/// record is there and not jailed, weighing its own and its delegators'
+/// bonded stake in gwei; without, every member at its weight in the set.
+fn members() -> Vec<(Hash, u64)> {
+    let set = validators();
+    if !crate::staking::enabled() {
+        return set;
     }
-    (yes, no, total)
+    set.into_iter()
+        .filter_map(|(id, _)| {
+            let r = crate::staking::record(&id).filter(|r| !r.jailed)?;
+            Some((id, gwei(r.stake.saturating_add(r.delegated))))
+        })
+        .collect()
+}
+
+/// Positions of `members` by validator id.
+fn positions(members: &[(Hash, u64)]) -> BTreeMap<Hash, usize> {
+    members
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| (*id, i))
+        .collect()
+}
+
+/// `delegator`'s bonded stake, in gwei, behind each member that counts, by
+/// the member's position.
+fn behind(delegator: &Address, at: &BTreeMap<Hash, usize>) -> Vec<(usize, u64)> {
+    crate::staking::delegated_to(delegator)
+        .into_iter()
+        .filter_map(|v| {
+            let i = *at.get(&v)?;
+            let w = gwei(crate::staking::delegation(&v, delegator)?.stake);
+            (w != 0).then_some((i, w))
+        })
+        .collect()
+}
+
+fn ballot_count(id: u64) -> u32 {
+    state::get(&gov::keys::ballots(id)).unwrap_or(0)
+}
+
+/// Where `delegator`'s vote on `id` is kept, if it voted.
+fn ballot_index(id: u64, delegator: &Address) -> Option<u32> {
+    state::get(&gov::keys::ballot(id, delegator))
+}
+
+/// The delegators that voted on `id`, in the order they first did, with their votes.
+fn ballots(id: u64) -> Vec<(Address, bool)> {
+    (0..ballot_count(id))
+        .filter_map(|i| state::get::<BallotEntry>(&gov::keys::ballot_at(id, i)))
+        .map(|b| (b.delegator, b.support))
+        .collect()
+}
+
+/// A live tally of `id` with what went into it.
+struct Count {
+    members: Vec<(Hash, u64)>,
+    votes: Vec<Option<bool>>,
+    ballots: Vec<(Address, bool)>,
+    tally: gov::Tally,
+}
+
+/// The tally of `id` now (spec 13 §9.3): the members that count, each
+/// validator's vote carrying its member's stake less what its voting
+/// delegators took with them, each delegator's vote its bonded stake
+/// behind members that count.
+fn count(id: u64) -> Count {
+    let members = members();
+    let at = positions(&members);
+    let votes: Vec<Option<bool>> = members.iter().map(|(v, _)| vote_of(id, v)).collect();
+    let ballots = ballots(id);
+    let list: Vec<Member> = members
+        .iter()
+        .zip(&votes)
+        .map(|((_, weight), vote)| Member {
+            weight: *weight,
+            vote: *vote,
+        })
+        .collect();
+    let delegators: Vec<gov::Delegator> = ballots
+        .iter()
+        .map(|(a, support)| gov::Delegator {
+            support: *support,
+            behind: behind(a, &at),
+        })
+        .collect();
+    Count {
+        tally: gov::tally(&list, &delegators),
+        members,
+        votes,
+        ballots,
+    }
+}
+
+/// The stake voting yes and no on `id`, and the stake of the members that count.
+fn tally(id: u64) -> (u64, u64, u64) {
+    let t = count(id).tally;
+    (t.yes, t.no, t.total)
+}
+
+/// Moves `id`'s entry in the open list to `due`.
+fn set_due(id: u64, due: u64) {
+    let list: Vec<OpenProposal> = open()
+        .into_iter()
+        .map(|o| {
+            if o.id == id {
+                OpenProposal { id, due }
+            } else {
+                o
+            }
+        })
+        .collect();
+    set_open(&list);
 }
 
 /// Removes proposal `p` from state with its votes, and settles its deposit:
@@ -225,6 +336,11 @@ fn prune(p: &Proposal, refund: bool) {
         state::delete(&gov::keys::vote(p.id, &validator));
     }
     state::delete(&gov::keys::voters(p.id));
+    for (i, (a, _)) in (0u32..).zip(ballots(p.id)) {
+        state::delete(&gov::keys::ballot(p.id, &a));
+        state::delete(&gov::keys::ballot_at(p.id, i));
+    }
+    state::delete(&gov::keys::ballots(p.id));
     state::delete(&gov::keys::proposal(p.id));
     let rest: Vec<OpenProposal> = open().into_iter().filter(|o| o.id != p.id).collect();
     set_open(&rest);
@@ -244,20 +360,7 @@ fn close_voting(mut p: Proposal) {
         p.status = status::PASSED;
         (p.yes, p.no, p.total) = (yes, no, total);
         put_proposal(&p);
-        let list: Vec<OpenProposal> = open()
-            .into_iter()
-            .map(|o| {
-                if o.id == p.id {
-                    OpenProposal {
-                        id: o.id,
-                        due: p.expires_at,
-                    }
-                } else {
-                    o
-                }
-            })
-            .collect();
-        set_open(&list);
+        set_due(p.id, p.expires_at);
     } else {
         prune(&p, gov::quorum(yes, no, total, rules.quorum_bps));
     }
@@ -275,8 +378,8 @@ enum Track {
 }
 
 /// The track of the action `data` to `target`, if it is one a proposal may
-/// carry (spec 13 §9.2); `switch` admits `setMode`, which only the key
-/// track proposes.
+/// carry (spec 13 §9.2); `switch`, the key track, admits `setMode`, which
+/// only the key proposes, and refuses `reject`, which needs proposals.
 fn track_of(target: &Address, data: &[u8], switch: bool) -> Option<Track> {
     let selector = data.get(..4)?;
     match *target {
@@ -289,6 +392,7 @@ fn track_of(target: &Address, data: &[u8], switch: bool) -> Option<Track> {
                     Some(Track::Normal)
                 }
                 Call::SetMode { .. } if switch => Some(Track::Normal),
+                Call::Reject { .. } if !switch => Some(Track::Fast),
                 _ => None,
             },
         },
@@ -345,6 +449,12 @@ fn apply_action(target: &Address, data: &[u8], block: BlockFields) -> Option<Vec
                 // The fee market's parameters, from the next block on (spec 23 §5).
                 Call::SetFeeParams { params } => {
                     crate::fees::set_params(&params).then(|| vec![gov::fee_params_log(&params)])
+                }
+                // Withdraws a normal-track proposal before it executes, its
+                // deposit returned, as a veto does.
+                Call::Reject { id } => {
+                    prune(&proposal(id).filter(|p| !p.fast_track)?, true);
+                    Some(Vec::new())
                 }
                 _ => None,
             },
@@ -417,7 +527,8 @@ fn request_of(s: &Signed, height: u64) -> Option<Request> {
                 .then_some(Request::Upgrade(action)),
             None => {
                 let call = Call::decode(&s.tx.input)?;
-                if s.tx.gas_limit < s.tx.min_gas_limit().saturating_add(GOVERNANCE_GAS) {
+                let surcharge = surcharge(s.tx.to.as_ref(), &s.tx.input);
+                if s.tx.gas_limit < s.tx.min_gas_limit().saturating_add(surcharge) {
                     return None;
                 }
                 call_allowed(&call, s, height).then_some(Request::Call(call))
@@ -451,23 +562,31 @@ fn call_allowed(call: &Call, s: &Signed, height: u64) -> bool {
             Call::Submit { target, data } => {
                 value == 0 && key_acts(from) && track_of(target, data, true).is_some()
             }
+            Call::SubmitCall { target, gas, .. } => {
+                value == 0 && key_acts(from) && callable(target, *gas)
+            }
             _ => false,
         };
     }
+    let bonded = || {
+        let deposit = rules().deposit;
+        match validator_of(from) {
+            Some(_) => value == 0,
+            None => deposit != 0 && value == deposit,
+        }
+    };
     match call {
         Call::Submit { target, data } => {
-            let deposit = rules().deposit;
-            let bonded = match validator_of(from) {
-                Some(_) => value == 0,
-                None => deposit != 0 && value == deposit,
-            };
-            bonded && track_of(target, data, false).is_some() && open().len() < MAX_OPEN_PROPOSALS
+            bonded() && track_of(target, data, false).is_some() && open().len() < MAX_OPEN_PROPOSALS
+        }
+        Call::SubmitCall { target, gas, .. } => {
+            bonded() && callable(target, *gas) && open().len() < MAX_OPEN_PROPOSALS
         }
         Call::Vote { id, .. } => {
             value == 0
-                && validator_of(from).is_some()
                 && proposal(*id)
                     .is_some_and(|p| p.status == status::VOTING && height <= p.voting_end)
+                && (validator_of(from).is_some() || may_ballot(*id, from))
         }
         Call::Execute { id } => {
             value == 0
@@ -487,8 +606,36 @@ fn call_allowed(call: &Call, s: &Signed, height: u64) -> bool {
         Call::SetGuardian { .. }
         | Call::SetMode { .. }
         | Call::SetParams { .. }
-        | Call::SetFeeParams { .. } => false,
+        | Call::SetFeeParams { .. }
+        | Call::Reject { .. } => false,
     }
+}
+
+/// Whether a governed call may go to `target` with `gas` (spec 13 §9.2):
+/// never to a system address, whose actions are proposed as such, and with
+/// at most [`MAX_CALL_GAS`].
+fn callable(target: &Address, gas: u64) -> bool {
+    !gov::is_system(target) && gas <= MAX_CALL_GAS
+}
+
+/// Whether `from`, which is no validator's account, may vote on `id` as a
+/// delegator (spec 13 §9.3): staking is on and it has bonded stake behind a
+/// member of the current set that counts; and it voted on `id` before, or
+/// the proposal has room for another delegator's vote and that stake is at
+/// least `1 / MAX_BALLOTS` of the members' stake.
+fn may_ballot(id: u64, from: &Address) -> bool {
+    if !crate::staking::enabled() {
+        return false;
+    }
+    let members = members();
+    let weight: u128 = behind(from, &positions(&members))
+        .iter()
+        .map(|(_, w)| u128::from(*w))
+        .sum();
+    let total: u128 = members.iter().map(|(_, w)| u128::from(*w)).sum();
+    weight != 0
+        && (ballot_index(id, from).is_some()
+            || (ballot_count(id) < MAX_BALLOTS && weight * u128::from(MAX_BALLOTS) >= total))
 }
 
 fn guardian_acts(from: &Address) -> bool {
@@ -534,6 +681,20 @@ fn claimed(code_hash: &Hash) -> bool {
         .any(|p| code_of(&p.target, &p.data) == Some(*code_hash))
 }
 
+/// What a message to `to` with calldata `data` pays beyond the plain call
+/// (spec 13 §9.9): the surcharge of `solo_abi::governance::surcharge`, and
+/// for an `execute` of an open call proposal the call's gas, which the
+/// executor gives it.
+pub fn surcharge(to: Option<&Address>, data: &[u8]) -> u64 {
+    let base = gov::surcharge(to, data);
+    match Call::decode(data) {
+        Some(Call::Execute { id }) if to == Some(&GOVERNANCE_ADDRESS) => {
+            base + proposal(id).filter(Proposal::is_call).map_or(0, |p| p.gas)
+        }
+        _ => base,
+    }
+}
+
 /// Admission: a transaction to the governance or module address must be
 /// able to run in the next block. A governance call whose gas limit does
 /// not cover the surcharge is refused as the gas problem it is (spec 13
@@ -543,7 +704,7 @@ pub fn admit(s: &Signed) -> Result<(), u32> {
     let next = state::height().unwrap_or(0) + 1;
     if system {
         // Anything without a surcharge has its intrinsic gas already (`well_formed`).
-        let surcharge = gov::surcharge(s.tx.to.as_ref(), &s.tx.input);
+        let surcharge = surcharge(s.tx.to.as_ref(), &s.tx.input);
         if surcharge != 0 && s.tx.gas_limit < s.tx.min_gas_limit().saturating_add(surcharge) {
             return Err(reason::GAS_TOO_LOW);
         }
@@ -589,7 +750,11 @@ pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Out
                 // The governance surcharge, paid like every fee (spec 13 §9.9).
                 outcome.gas_used += GOVERNANCE_GAS;
                 crate::fees::pay_surcharge(s, GOVERNANCE_GAS, block);
-                apply_call(call, s, block)
+                let mut called = 0;
+                let applied = apply_call(call, s, block, &mut called);
+                // A governed call's gas, which it paid the same way.
+                outcome.gas_used += called;
+                applied
             }
         };
         match applied {
@@ -691,13 +856,139 @@ fn apply_upgrade(action: Action, from: &Address, height: u64) -> Option<Vec<Log>
     }
 }
 
+/// Opens a proposal under the stake track (spec 13 §9.3) for the action, or
+/// the governed call, `target` and `data` carry.
+fn open_proposal(
+    s: &Signed,
+    target: Address,
+    data: Vec<u8>,
+    call: Option<(u128, u64)>,
+    height: u64,
+) -> Proposal {
+    let rules = rules();
+    let id: u64 = state::get(gov::keys::NEXT).unwrap_or(1);
+    let fast = call.is_none() && track_of(&target, &data, false) == Some(Track::Fast);
+    let voting_end = height.saturating_add(rules.voting_blocks);
+    let (executable_at, expires_at) = if fast {
+        (0, voting_end)
+    } else {
+        let first = voting_end
+            .saturating_add(rules.timelock_blocks)
+            .saturating_add(1);
+        (
+            first,
+            first.saturating_add(rules.voting_blocks).saturating_sub(1),
+        )
+    };
+    let (value, gas) = call.unwrap_or_default();
+    let p = Proposal {
+        id,
+        proposer: s.from,
+        deposit: s.tx.value,
+        target,
+        data,
+        submitted_at: height,
+        voting_end,
+        executable_at,
+        expires_at,
+        fast_track: fast,
+        status: status::VOTING,
+        yes: 0,
+        no: 0,
+        total: 0,
+        value,
+        gas,
+    };
+    put_proposal(&p);
+    let mut list = open();
+    list.push(OpenProposal {
+        id,
+        due: voting_end,
+    });
+    set_open(&list);
+    state::set(gov::keys::NEXT, &(id + 1));
+    p
+}
+
+/// Runs a governed call (spec 13 §9.5): the governance address calls
+/// `target` with `value` and `data` and a gas limit of `gas`, at a gas price
+/// of zero, its state changes kept if it succeeds; `value` only from what
+/// the address holds beyond the deposits of open proposals. The executor of
+/// `s` pays the gas it used, which `called` accumulates. Whatever the call
+/// does, it returns the logs to record: the call's own on success, then
+/// `CallExecuted`.
+fn governed_call(
+    id: u64,
+    p: &Proposal,
+    s: &Signed,
+    block: BlockFields,
+    called: &mut u64,
+) -> Vec<Log> {
+    let held: u128 = open()
+        .into_iter()
+        .filter_map(|o| proposal(o.id))
+        .map(|o| o.deposit)
+        .sum();
+    let funds = state::account(&GOVERNANCE_ADDRESS)
+        .balance
+        .saturating_sub(held);
+    let outcome = (p.value <= funds).then(|| {
+        crate::native::run(
+            Message {
+                tx_type: 0,
+                caller: GOVERNANCE_ADDRESS,
+                to: Some(p.target),
+                value: p.value,
+                data: p.data.clone(),
+                gas_limit: p.gas,
+                gas_price: 0,
+                priority_fee: None,
+                nonce: None,
+                access_list: Vec::new(),
+                authorization_list: Vec::new(),
+            },
+            block,
+            true,
+        )
+    });
+    let (success, used, output, mut logs) = match outcome {
+        Some(o) if o.status == call_status::SUCCESS => (true, o.gas_used, o.output, o.logs),
+        Some(o) => (false, o.gas_used, o.output, Vec::new()),
+        None => (false, 0, Vec::new(), Vec::new()),
+    };
+    *called += used;
+    crate::fees::pay_surcharge(s, used, block);
+    logs.push(gov::call_executed_log(
+        id, &p.target, success, used, &output,
+    ));
+    logs
+}
+
 /// Applies an authorized governance call in `block` (spec 13 §9.4–§9.5);
-/// `None` if its checks fail.
-fn apply_call(call: Call, s: &Signed, block: BlockFields) -> Option<Vec<Log>> {
+/// `None` if its checks fail. The gas of a governed call it runs adds to
+/// `called`.
+fn apply_call(call: Call, s: &Signed, block: BlockFields, called: &mut u64) -> Option<Vec<Log>> {
     let height = block.number;
     match call {
         Call::Submit { target, data } if mode() == mode::KEY => {
             enact(&s.from, &target, &data, block)
+        }
+        Call::SubmitCall {
+            target,
+            value,
+            gas,
+            data,
+        } if mode() == mode::KEY => {
+            let mut logs = vec![gov::enacted_log(&s.from, &target, &data)];
+            let p = Proposal {
+                target,
+                data,
+                value,
+                gas,
+                ..Proposal::default()
+            };
+            logs.extend(governed_call(0, &p, s, block, called));
+            Some(logs)
         }
         Call::Submit { target, data } => {
             // What a proposal runs code of is complete when the proposal
@@ -708,71 +999,64 @@ fn apply_call(call: Call, s: &Signed, block: BlockFields) -> Option<Vec<Log>> {
             {
                 return None;
             }
-            let rules = rules();
-            let id: u64 = state::get(gov::keys::NEXT).unwrap_or(1);
-            let fast = track_of(&target, &data, false) == Some(Track::Fast);
-            let voting_end = height.saturating_add(rules.voting_blocks);
-            let (executable_at, expires_at) = if fast {
-                (0, voting_end)
-            } else {
-                let first = voting_end
-                    .saturating_add(rules.timelock_blocks)
-                    .saturating_add(1);
-                (
-                    first,
-                    first.saturating_add(rules.voting_blocks).saturating_sub(1),
-                )
-            };
-            let p = Proposal {
-                id,
-                proposer: s.from,
-                deposit: s.tx.value,
-                target,
-                data,
-                submitted_at: height,
-                voting_end,
-                executable_at,
-                expires_at,
-                fast_track: fast,
-                status: status::VOTING,
-                yes: 0,
-                no: 0,
-                total: 0,
-            };
-            put_proposal(&p);
-            let mut list = open();
-            list.push(OpenProposal {
-                id,
-                due: voting_end,
-            });
-            set_open(&list);
-            state::set(gov::keys::NEXT, &(id + 1));
+            let p = open_proposal(s, target, data, None, height);
+            Some(vec![gov::submitted_log(&p)])
+        }
+        Call::SubmitCall {
+            target,
+            value,
+            gas,
+            data,
+        } => {
+            let p = open_proposal(s, target, data, Some((value, gas)), height);
             Some(vec![gov::submitted_log(&p)])
         }
         Call::Vote { id, support } => {
-            let (validator, weight) = validator_of(&s.from)?;
             let p = proposal(id)?;
-            if vote_of(id, &validator).is_none() {
-                let mut list = voters(id);
-                list.push(validator);
-                state::set(&gov::keys::voters(id), &Seq(list));
-            }
-            state::set(&gov::keys::vote(id, &validator), &support);
-            let mut logs = vec![gov::voted_log(id, &s.from, support, weight)];
-            if p.fast_track {
-                let (yes, _, total) = tally(id);
-                if gov::fast_passes(yes, total) {
-                    prune(&p, true);
-                    logs.push(gov::executed_log(id));
-                    logs.extend(apply_action(&p.target, &p.data, block)?);
+            let weight = match validator_of(&s.from) {
+                Some((validator, _)) => {
+                    if vote_of(id, &validator).is_none() {
+                        let mut list = voters(id);
+                        list.push(validator);
+                        state::set(&gov::keys::voters(id), &Seq(list));
+                    }
+                    state::set(&gov::keys::vote(id, &validator), &support);
+                    members()
+                        .into_iter()
+                        .find(|(v, _)| *v == validator)
+                        .map_or(0, |(_, w)| w)
                 }
+                None => {
+                    let at = ballot_index(id, &s.from).unwrap_or_else(|| {
+                        let n = ballot_count(id);
+                        state::set(&gov::keys::ballot(id, &s.from), &n);
+                        state::set(&gov::keys::ballots(id), &(n + 1));
+                        n
+                    });
+                    let entry = BallotEntry {
+                        delegator: s.from,
+                        support,
+                    };
+                    state::set(&gov::keys::ballot_at(id, at), &entry);
+                    behind(&s.from, &positions(&members()))
+                        .iter()
+                        .fold(0u64, |sum, (_, w)| sum.saturating_add(*w))
+                }
+            };
+            if p.fast_track {
+                // Tallied at the end of this block (spec 13 §9.3).
+                set_due(id, height);
             }
-            Some(logs)
+            Some(vec![gov::voted_log(id, &s.from, support, weight)])
         }
         Call::Execute { id } => {
             let p = proposal(id)?;
             prune(&p, true);
             let mut logs = vec![gov::executed_log(id)];
+            if p.is_call() {
+                logs.extend(governed_call(id, &p, s, block, called));
+                return Some(logs);
+            }
             logs.extend(apply_action(&p.target, &p.data, block)?);
             Some(logs)
         }
@@ -784,7 +1068,8 @@ fn apply_call(call: Call, s: &Signed, block: BlockFields) -> Option<Vec<Log>> {
         Call::SetGuardian { .. }
         | Call::SetMode { .. }
         | Call::SetParams { .. }
-        | Call::SetFeeParams { .. } => None,
+        | Call::SetFeeParams { .. }
+        | Call::Reject { .. } => None,
     }
 }
 
@@ -811,15 +1096,16 @@ fn assemble(code_hash: &Hash) -> Option<(Vec<u8>, u32)> {
     (chunks > 0).then_some((code, chunks))
 }
 
-/// Bookkeeping at the end of the block at `height`, before the state commitment.
-pub fn end_block(height: u64) {
+/// Bookkeeping at the end of `block`, before the state commitment.
+pub fn end_block(height: u64, block: BlockFields) {
     if pending().is_some_and(|up| height > up.activation_height) {
         // This kernel was superseded at the activation height. A host still
         // running it past there must halt rather than fork the chain.
         solo_guest::trap();
     }
-    // Proposals whose voting ends here are tallied; passed ones left
-    // unexecuted through their window expire (spec 13 §9.3).
+    // Proposals whose voting ends here are tallied, and fast-track ones that
+    // took a vote in this block; passed ones left unexecuted through their
+    // window expire (spec 13 §9.3).
     for entry in open() {
         if entry.due != height {
             continue;
@@ -827,10 +1113,22 @@ pub fn end_block(height: u64) {
         let Some(p) = proposal(entry.id) else {
             continue;
         };
-        if p.status == status::VOTING {
+        if p.status != status::VOTING {
+            prune(&p, true);
+        } else if !p.fast_track {
             close_voting(p);
         } else {
-            prune(&p, true);
+            let (yes, no, total) = tally(p.id);
+            if gov::fast_passes(yes, total) {
+                // A safety action executes at once; what it logs has no
+                // receipt to go to.
+                prune(&p, true);
+                let _ = apply_action(&p.target, &p.data, block);
+            } else if height >= p.voting_end {
+                prune(&p, gov::quorum(yes, no, total, rules().quorum_bps));
+            } else {
+                set_due(p.id, p.voting_end);
+            }
         }
     }
     let p = params();
@@ -880,31 +1178,39 @@ fn upgrade_status() -> UpgradeStatus {
     }
 }
 
-/// An open proposal with its live tally and every vote.
+/// An open proposal with its live tally and every vote that counts.
 fn view(p: Proposal) -> ProposalView {
-    let (mut yes, mut no, mut total) = (0u64, 0u64, 0u64);
-    let mut votes = Vec::new();
-    for (validator, weight) in validators() {
-        total = total.saturating_add(weight);
-        if let Some(support) = vote_of(p.id, &validator) {
-            if support {
-                yes = yes.saturating_add(weight);
-            } else {
-                no = no.saturating_add(weight);
-            }
-            votes.push(Ballot {
-                validator,
+    let c = count(p.id);
+    let votes = c
+        .members
+        .iter()
+        .zip(&c.votes)
+        .zip(&c.tally.effective)
+        .filter_map(|(((validator, _), vote), weight)| {
+            vote.map(|support| Ballot {
+                validator: *validator,
                 support,
-                weight,
-            });
-        }
-    }
+                weight: *weight,
+            })
+        })
+        .collect();
+    let delegators = c
+        .ballots
+        .iter()
+        .zip(&c.tally.delegators)
+        .map(|((delegator, support), weight)| DelegatorBallot {
+            delegator: *delegator,
+            support: *support,
+            weight: *weight,
+        })
+        .collect();
     ProposalView {
         proposal: p,
-        yes,
-        no,
-        total,
+        yes: c.tally.yes,
+        no: c.tally.no,
+        total: c.tally.total,
         votes: Seq(votes),
+        delegators: Seq(delegators),
     }
 }
 

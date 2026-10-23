@@ -104,6 +104,7 @@ fn governance_parameters() {
 #[allow(clippy::too_many_lines)]
 fn gov_encodes_every_call() {
     let target = format!("0x{}", "45".repeat(20));
+    let target_far = format!("0x{}", "77".repeat(20));
     let guardian = format!("0x{}", "ab".repeat(20));
     let wrapped = |call: Call| Call::Submit {
         target: GOVERNANCE_ADDRESS,
@@ -132,6 +133,16 @@ fn gov_encodes_every_call() {
             },
         ),
         (vec!["execute", "5"], Call::Execute { id: 5 }),
+        (
+            vec!["submit-call", &target_far, "1000", "50000", "0x8456cb59"],
+            Call::SubmitCall {
+                target: [0x77; 20],
+                value: 1_000,
+                gas: 50_000,
+                data: vec![0x84, 0x56, 0xcb, 0x59],
+            },
+        ),
+        (vec!["reject", "7"], wrapped(Call::Reject { id: 7 })),
         (vec!["veto", "6"], Call::Veto { id: 6 }),
         (vec!["pause", &target], Call::Pause { target: [0x45; 20] }),
         (
@@ -191,7 +202,12 @@ fn gov_encodes_every_call() {
         assert!(text.contains(&calldata), "{text}");
         assert_eq!(
             text.contains("\nvalue    0 from the key or a validator"),
-            matches!(call, Call::Submit { .. }),
+            matches!(call, Call::Submit { .. } | Call::SubmitCall { .. }),
+            "{text}"
+        );
+        assert_eq!(
+            text.contains("plus the call's gas"),
+            matches!(call, Call::Execute { .. }),
             "{text}"
         );
         let mut full = vec!["solo".to_owned(), "gov".to_owned()];
@@ -209,9 +225,19 @@ fn gov_encodes_every_call() {
     };
     assert_eq!(gas_of(&["vote", "3", "yes"]), "71860");
     assert_eq!(gas_of(&["execute", "5"]), "71510");
+    // A governed call's gas limit carries the call's own gas.
+    let far = format!("0x{}", "77".repeat(20));
+    // (Both gas words hold one non-zero byte, so their calldata costs the same.)
+    let call = gas_of(&["submit-call", &far, "0", "65536", "0x"]);
+    let plain = gas_of(&["submit-call", &far, "0", "256", "0x"]);
+    assert_eq!(
+        call.parse::<u64>().unwrap() - plain.parse::<u64>().unwrap(),
+        65_536 - 256
+    );
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn gov_names_every_mistake() {
     let target = format!("0x{}", "45".repeat(20));
     // 160 bits of hex: every digit valid, the amount past a `u128`.
@@ -281,6 +307,35 @@ fn gov_names_every_mistake() {
             vec!["set-fee-params", "x", "2", "1", "burn"],
             "denominator must be a number",
         ),
+        (vec!["submit-call", &target], "gas missing"),
+        (
+            vec!["submit-call", &target, "zz", "5", "0x"],
+            "value must be a decimal or 0x hex amount in wei",
+        ),
+        (
+            vec!["submit-call", &target, "1", "x"],
+            "gas must be a number",
+        ),
+        (
+            vec!["submit-call", &target, "1", "10000001", "0x"],
+            "gas must be at most 10000000",
+        ),
+        (
+            vec![
+                "submit-call",
+                "0x0000000000000000000000000000000000005354",
+                "1",
+                "2",
+                "0x",
+            ],
+            "a governed call cannot go to a system address",
+        ),
+        (vec!["submit-call", &target, "1", "2"], "calldata missing"),
+        (
+            vec!["submit-call", &target, "1", "2", "q"],
+            "calldata must be 0x hex",
+        ),
+        (vec!["reject", "z"], "proposal id must be a number"),
         (vec!["dance"], "unknown subcommand dance"),
     ];
     for (args, expected) in errors {

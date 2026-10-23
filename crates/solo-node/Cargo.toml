@@ -18,6 +18,7 @@ solo-upgrade = { path = "../solo-upgrade" }
 solo-bls = { path = "../solo-bls" }
 solo-rlp = { path = "../solo-rlp" }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+getrandom = "0.3"
 
 [features]
 # `Node::inject_store_fault`, over the store's own `fault-injection`: the

@@ -22,10 +22,12 @@
 //!
 //! ```sh
 //! solo gov submit <target> <0x calldata>           # a proposal, or under the key an action executed at once
-//! solo gov vote <id> yes|no                         # a validator's vote
+//! solo gov submit-call <target> <value wei> <gas> <0x calldata>  # a governed call to any account
+//! solo gov vote <id> yes|no                         # a validator's or a delegator's vote
 //! solo gov execute <id>                             # a passed proposal, after its timelock
 //! solo gov veto <id>                                # the guardian
 //! solo gov pause <target>                           # the guardian
+//! solo gov reject <id>                             # withdraw a proposal, on the fast track
 //! solo gov set-guardian <address>                   # the actions governance applies to itself,
 //! solo gov set-mode stake                           # each wrapped in `submit` to the governance address
 //! solo gov set-params <voting> <timelock> <quorumBps> <deposit wei>
@@ -35,7 +37,9 @@
 use serde_json::Value;
 use solo_abi::chain::CallRequest;
 use solo_abi::fees::FeeParams;
-use solo_abi::governance::{Call, GOVERNANCE_ADDRESS, GovernanceParams, mode};
+use solo_abi::governance::{
+    Call, GOVERNANCE_ADDRESS, GovernanceParams, MAX_CALL_GAS, is_system, mode,
+};
 
 fn address(text: &str, what: &str) -> Result<[u8; 20], String> {
     solo_rpc::methods::parse_hex(text)
@@ -86,6 +90,27 @@ pub fn parse(args: &[String]) -> Result<Call, String> {
                 .ok()
                 .ok_or("gov: calldata must be 0x hex")?,
         },
+        "submit-call" => {
+            let gas = number(word(3, "gas")?, "gas")?;
+            if gas > MAX_CALL_GAS {
+                return Err(format!("gov: gas must be at most {MAX_CALL_GAS}"));
+            }
+            let target = address(word(1, "target")?, "target")?;
+            if is_system(&target) {
+                return Err("gov: a governed call cannot go to a system address".to_owned());
+            }
+            Call::SubmitCall {
+                target,
+                value: wei(word(2, "value")?, "value")?,
+                gas,
+                data: solo_rpc::methods::parse_hex(word(4, "calldata")?)
+                    .ok()
+                    .ok_or("gov: calldata must be 0x hex")?,
+            }
+        }
+        "reject" => action(Call::Reject {
+            id: number(word(1, "proposal id")?, "proposal id")?,
+        }),
         "vote" => Call::Vote {
             id: number(word(1, "proposal id")?, "proposal id")?,
             support: match word(2, "yes or no")? {
@@ -156,10 +181,13 @@ pub fn describe(call: &Call) -> String {
         solo_rpc::methods::data(&GOVERNANCE_ADDRESS),
         solo_rpc::methods::data(&data)
     );
-    if matches!(call, Call::Submit { .. }) {
+    if matches!(call, Call::Submit { .. } | Call::SubmitCall { .. }) {
         text.push_str(
             "\nvalue    0 from the key or a validator; else the proposal deposit (solo_getGovernance)",
         );
+    }
+    if matches!(call, Call::Execute { .. }) {
+        text.push_str("\n         plus the call's gas, for a proposal that carries a call");
     }
     text
 }
