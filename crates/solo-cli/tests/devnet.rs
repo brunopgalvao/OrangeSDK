@@ -1184,8 +1184,10 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
         KERNEL_V2,
         "--key-file",
         governance,
+        // Long enough that the second proposal and the status below still see
+        // it pending on an instrumented build under a full parallel test load.
         "--delay",
-        "3",
+        "12",
         "--required-gates",
         "",
     ];
@@ -1215,8 +1217,8 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
         "300",
     ]);
     assert!(text.contains("kernel version >= 2"), "{text}");
-    // Alone, this validator holds the one share of the threshold key: its
-    // finalized blocks carry threshold certificates.
+    // Alone, this validator holds every share of the threshold key (four, of
+    // which three sign): its finalized blocks carry threshold certificates.
     ok(&[
         "devnet",
         "wait",
