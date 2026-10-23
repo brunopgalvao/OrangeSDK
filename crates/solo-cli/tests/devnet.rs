@@ -46,6 +46,7 @@ const COMPOSE_REHEARSAL: &str = concat!(
 const SEED: &str = "0x5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed";
 /// A key that is not the governance account.
 const STRANGER: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+const ETHER: u128 = 1_000_000_000_000_000_000;
 /// Doctor limits a healthy node meets on an instrumented build under load.
 const TOLERANT: [&str; 6] = [
     "--max-call-ms",
@@ -149,11 +150,32 @@ fn init_writes_a_reproducible_devnet_and_names_mistakes() {
         params.upgrades.governance,
         client::address(&parse_key(STRANGER).unwrap())
     );
-    assert_eq!(params.allocations.0[0].address, {
+    // The README's account, every validator and the governance key are funded;
+    // the fee market runs at the production defaults (spec 23 §2.1).
+    let funded = |address: [u8; 20]| {
+        params
+            .allocations
+            .0
+            .iter()
+            .find(|a| a.address == address)
+            .map(|a| a.balance)
+    };
+    let readme = {
         let mut a = [0u8; 20];
         a.copy_from_slice(&solo_rpc::methods::parse_hex(FUNDED).unwrap());
         a
-    });
+    };
+    assert_eq!(funded(readme), Some(1_000_000 * ETHER));
+    assert_eq!(
+        funded(client::address(&parse_key(STRANGER).unwrap())),
+        Some(1_000 * ETHER)
+    );
+    assert_eq!(params.allocations.0.len(), 4);
+    assert_eq!(params.fees, solo_abi::fees::FeeParams::production());
+    assert!(
+        report.contains("base fee floor 1000000000 wei, burned"),
+        "{report}"
+    );
     // The key files are the governance account and the validators.
     let governance = std::fs::read_to_string(devnet.governance_key()).unwrap();
     assert_eq!(governance, STRANGER[2..]);
@@ -509,9 +531,9 @@ fn a_proposal_that_lands_too_late_is_sent_again_with_more_slack() {
     let hash = result(r#""0xabc""#.to_owned());
     // What the node answers before the first proposal's receipt: the status
     // naming this key as governance with an upgradeDelay of 2, the chain id,
-    // the nonce, the one chunk's hash and its receipt in block 5, the head
-    // (5) and the proposal's hash; that proposal names activation height
-    // 5 + 2 + 2 = 9.
+    // the gas price, the nonce, the one chunk's hash and its receipt in
+    // block 5, the head (5) and the proposal's hash; that proposal names
+    // activation height 5 + 2 + 2 = 9.
     let status = result(format!(
         r#"{{"pending":null,"params":{{"governance":"{}","minDelay":2}}}}"#,
         data(&client::address(&key))
@@ -519,6 +541,7 @@ fn a_proposal_that_lands_too_late_is_sent_again_with_more_slack() {
     let preamble = [
         status,
         quantity(1337),
+        quantity(1_000_000_000),
         quantity(0),
         hash,
         receipt(true, 5),

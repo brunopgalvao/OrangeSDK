@@ -473,7 +473,11 @@ fn rejections_carry_reasons() {
         ),
         (
             alice.dynamic(&to_bob, GAS_PRICE, GAS_PRICE + 1, &[]),
-            reason_text(reason::FEE_TOO_LOW).into(),
+            format!(
+                "{}: address {a}, maxPriorityFeePerGas: {}, maxFeePerGas: {GAS_PRICE}",
+                reason_text(reason::TIP_ABOVE_FEE_CAP),
+                GAS_PRICE + 1
+            ),
         ),
         // A blob transaction (type 3) is not executed, and a first byte below 0x80
         // such as 'g' names a typed envelope of no type the kernel executes.

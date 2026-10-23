@@ -10,6 +10,7 @@ mod bridge;
 mod dkg;
 mod driver;
 mod evm;
+mod fees;
 mod governance;
 mod modules;
 mod native;
@@ -37,6 +38,7 @@ fn decode_or_trap<T: Decode>(bytes: &[u8]) -> T {
 solo_guest::solo_export!(kernel_init, |input: &[u8]| -> Vec<u8> {
     let genesis: Genesis = decode_or_trap(input);
     state::init(&genesis);
+    fees::init();
     governance::init(&genesis);
     staking::init(&genesis);
     modules::init(&genesis);

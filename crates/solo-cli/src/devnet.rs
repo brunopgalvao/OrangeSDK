@@ -23,9 +23,12 @@
 //! `<dir>/genesis.json`, `<dir>/governance.key`, one `<dir>/node-<i>/key`
 //! per validator and the manifest `<dir>/devnet.json`: each node's
 //! peer-to-peer and JSON-RPC addresses (port 0 picks free ports) and its
-//! peers, every node dialling the ones before it. The genesis funds the
-//! account of the README's key `0x01…01`. A second `init` leaves an
-//! initialized directory alone unless `--force`.
+//! peers, every node dialling the ones before it. The genesis runs the fee
+//! market at the production defaults (spec 23 §2.1) and funds the account
+//! of the README's key `0x01…01`, every validator's account and the
+//! governance account, so that validators pay for their gate signals and
+//! the governance key for its upgrades at the base fee. A second `init`
+//! leaves an initialized directory alone unless `--force`.
 //!
 //! `up` starts every node as a `solo devnet node` process, its output in
 //! `<dir>/node-<i>/log` and its pid in `<dir>/node-<i>/pid`, and waits for
@@ -81,6 +84,11 @@ pub const FUNDED: &str = "0x1a642f0e3c3af545e7acbd38b07251b3990914f1";
 
 /// Its balance, in wei: one million ether.
 pub const FUNDING: &str = "1000000000000000000000000";
+
+/// What each validator's account and the governance account hold at
+/// genesis, in wei: a thousand ether, for their signals and upgrades at the
+/// base fee (spec 23).
+pub const OPERATOR_FUNDING: &str = "1000000000000000000000";
 
 /// How long `start` waits for a node to answer, and `stop` for it to go.
 pub const NODE_TIMEOUT: Duration = Duration::from_mins(2);
@@ -307,15 +315,21 @@ fn init(args: &[String]) -> Result<String, String> {
         .iter()
         .map(|k| data(&solo_node::validator_id(k)))
         .collect();
+    let mut alloc = serde_json::Map::new();
+    alloc.insert(FUNDED.to_owned(), json!(FUNDING));
+    for key in keys.iter().chain(std::iter::once(&governance)) {
+        alloc.insert(data(&client::address(key)), json!(OPERATOR_FUNDING));
+    }
     let mut genesis = json!({
         "chainId": chain_id,
         "slotMs": slot_ms,
         "maxTxs": 64,
-        "alloc": {FUNDED: FUNDING},
+        "alloc": alloc,
         "validators": ids,
         "governance": data(&client::address(&governance)),
         "upgradeDelay": upgrade_delay,
         "epochBlocks": epoch_blocks,
+        "fees": crate::fees::production_json(),
     });
     if epoch_blocks != 0 {
         let dkg_keys: serde_json::Map<String, Value> = keys
@@ -361,8 +375,9 @@ fn init(args: &[String]) -> Result<String, String> {
     let hex = |k: &SigningKey| data(&k.to_bytes())[2..].to_owned();
     write_secret(&devnet.governance_key(), hex(&governance).as_bytes())?;
     let mut report = format!(
-        "devnet initialized in {}\n  chain id {chain_id}, {validators} validators, slot {slot_ms} ms, epochs of {epoch_blocks} blocks, DKG phases of {dkg_phase_blocks} blocks, upgrade delay {upgrade_delay} blocks\n  governance {} (key in governance.key)",
+        "devnet initialized in {}\n  chain id {chain_id}, {validators} validators, slot {slot_ms} ms, epochs of {epoch_blocks} blocks, DKG phases of {dkg_phase_blocks} blocks, upgrade delay {upgrade_delay} blocks\n  fee market at the production defaults: base fee floor {} wei, burned\n  governance {} (key in governance.key)",
         dir.display(),
+        solo_abi::fees::DEFAULT_MIN_BASE_FEE,
         data(&client::address(&governance))
     );
     let mut nodes = Vec::new();

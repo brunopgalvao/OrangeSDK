@@ -615,16 +615,24 @@ impl Mempool {
     /// Pending transactions in an order a block can execute, within
     /// `max_bytes` and `max_gas` (spec 14 §3): each sender's by nonce, the
     /// senders interleaved by priority, then arrival. A sender whose next
-    /// transaction does not fit, or whose balance would not cover it after
-    /// the ones before it, contributes nothing more. A transaction in `skip`
-    /// counts as already taken: it is left out and uses none of the budget,
-    /// but its cost counts against its sender's balance and the sender's
-    /// later transactions may follow it. A sender that an authorization of a
-    /// transaction ahead of it names, one in `skip` or one taken before,
-    /// contributes nothing more: the authorization can move its nonce when
-    /// it runs. The pool keeps what it hands out until a block includes it.
+    /// transaction does not fit, whose balance would not cover it after
+    /// the ones before it, or whose fee cap is below `base_fee`, the next
+    /// block's base fee (spec 23 §3), contributes nothing more. A
+    /// transaction in `skip` counts as already taken: it is left out and
+    /// uses none of the budget, but its cost counts against its sender's
+    /// balance and the sender's later transactions may follow it. A sender
+    /// that an authorization of a transaction ahead of it names, one in
+    /// `skip` or one taken before, contributes nothing more: the
+    /// authorization can move its nonce when it runs. The pool keeps what
+    /// it hands out until a block includes it.
     #[must_use]
-    pub fn take(&self, max_bytes: usize, max_gas: u64, skip: &[[u8; 32]]) -> Vec<Vec<u8>> {
+    pub fn take(
+        &self,
+        max_bytes: usize,
+        max_gas: u64,
+        skip: &[[u8; 32]],
+        base_fee: u128,
+    ) -> Vec<Vec<u8>> {
         // What `skip` carries runs before anything taken now, whatever its
         // priority.
         let mut named: HashSet<&Address> = skip
@@ -665,7 +673,9 @@ impl Mempool {
             } else {
                 (tx.raw.len(), tx.gas)
             };
-            if bytes + len > max_bytes || gas + used > max_gas || cost > runs[run].1 {
+            let underpriced = !skipped && tx.fee_cap < base_fee;
+            if bytes + len > max_bytes || gas + used > max_gas || cost > runs[run].1 || underpriced
+            {
                 continue;
             }
             bytes += len;

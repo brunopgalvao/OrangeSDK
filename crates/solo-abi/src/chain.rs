@@ -84,6 +84,8 @@ record! {
         bridge_in: crate::bridge_in::BridgeInParams,
         /// Two-track governance (spec 13 §9): the mode and the proposal rules.
         governance: crate::governance::GovernanceParams,
+        /// The fee market (spec 23): off, with a zero base fee, by default.
+        fees: crate::fees::FeeParams,
     }
 }
 
@@ -134,9 +136,10 @@ record! {
         logs_bloom: Vec<u8>,
         /// Block gas limit.
         gas_limit: u64,
-        /// Base fee per gas.
+        /// Base fee per gas (spec 23 §3).
         base_fee: u64,
-        /// Fee recipient.
+        /// Fee recipient: the fee vault of spec 23 §4 on a chain with
+        /// staking, the zero address otherwise.
         beneficiary: Address,
     }
 }
@@ -335,7 +338,7 @@ pub mod reason {
     pub const GAS_TOO_LOW: u32 = 6;
     /// A transaction type the kernel does not execute (blob, set-code).
     pub const UNSUPPORTED: u32 = 7;
-    /// The maximum fee per gas is below the base fee.
+    /// The maximum fee per gas (the gas price) is below the block's base fee.
     pub const FEE_TOO_LOW: u32 = 8;
     /// The gas limit is above the per-transaction cap (EIP-7825) or the block's.
     pub const GAS_LIMIT_TOO_HIGH: u32 = 9;
@@ -369,6 +372,8 @@ pub mod reason {
     pub const MESSAGE_DELIVERED: u32 = 22;
     /// An inbox delivery while the inbox is paused (spec 18 §7).
     pub const INBOX_PAUSED: u32 = 23;
+    /// The maximum priority fee per gas is above the maximum fee per gas.
+    pub const TIP_ABOVE_FEE_CAP: u32 = 24;
 }
 
 /// Storage key prefixes of the reference kernel.
@@ -437,10 +442,6 @@ pub const TRANSFER_GAS: u64 = 21_000;
 
 /// Gas limit of every block.
 pub const BLOCK_GAS_LIMIT: u64 = 30_000_000;
-
-/// Base fee per gas of the reference kernel: zero in this version, so a
-/// transaction pays its priority fee (or its legacy gas price) and nothing more.
-pub const BASE_FEE: u64 = 0;
 
 record! {
     /// A consensus validator. `id` is `keccak256` of the uncompressed
@@ -961,6 +962,7 @@ mod tests {
                 voting_blocks: 3,
                 ..crate::governance::GovernanceParams::default()
             },
+            fees: crate::fees::FeeParams::production(),
         });
         roundtrip(&BlockHeader {
             height: 1,
@@ -1028,9 +1030,8 @@ mod tests {
                 call_status::HALT,
                 call_status::INVALID,
                 BLOCK_GAS_LIMIT,
-                BASE_FEE
             ),
-            (0, 2, 3, 30_000_000, 0)
+            (0, 2, 3, 30_000_000)
         );
         roundtrip(&DriverState {
             next_height: 1,
@@ -1044,9 +1045,11 @@ mod tests {
             (
                 reason::BAD_NONCE,
                 reason::SYSTEM_ACTION,
-                reason::STAKING_ACTION
+                reason::STAKING_ACTION,
+                reason::FEE_TOO_LOW,
+                reason::TIP_ABOVE_FEE_CAP
             ),
-            (4, 12, 13)
+            (4, 12, 13, 8, 24)
         );
         assert_eq!(keys::ACCOUNT, b"acct/");
         assert!(alloc::format!("{:?}", Account::default()).contains("Account"));

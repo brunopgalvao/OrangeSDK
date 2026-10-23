@@ -29,10 +29,12 @@
 //! solo gov set-guardian <address>                   # the actions governance applies to itself,
 //! solo gov set-mode stake                           # each wrapped in `submit` to the governance address
 //! solo gov set-params <voting> <timelock> <quorumBps> <deposit wei>
+//! solo gov set-fee-params <denominator> <elasticity> <minBaseFee wei> <treasury address|burn>
 //! ```
 
 use serde_json::Value;
 use solo_abi::chain::CallRequest;
+use solo_abi::fees::FeeParams;
 use solo_abi::governance::{Call, GOVERNANCE_ADDRESS, GovernanceParams, mode};
 
 fn address(text: &str, what: &str) -> Result<[u8; 20], String> {
@@ -114,6 +116,28 @@ pub fn parse(args: &[String]) -> Result<Call, String> {
             quorum_bps: number(word(3, "quorum")?, "quorum")?,
             deposit: wei(word(4, "deposit")?, "deposit")?,
         }),
+        // The fee market's parameters (spec 23 §5); the kernel refuses ones
+        // that cannot work, so the command does too.
+        "set-fee-params" => {
+            let params = FeeParams {
+                denominator: number(word(1, "denominator")?, "denominator")?,
+                elasticity: number(word(2, "elasticity")?, "elasticity")?,
+                min_base_fee: u64::try_from(wei(word(3, "min base fee")?, "min base fee")?)
+                    .ok()
+                    .ok_or("gov: min base fee must be below 2^64 wei")?,
+                treasury: match word(4, "treasury")? {
+                    "burn" => [0; 20],
+                    text => address(text, "treasury")?,
+                },
+            };
+            if !params.workable() {
+                return Err(
+                    "gov: denominator must be 0 (the market off, with elasticity 0) or 100 to 125 with elasticity 2 to 4 (spec 23 §2)"
+                        .to_owned(),
+                );
+            }
+            action(Call::SetFeeParams { params })
+        }
         other => return Err(format!("gov: unknown subcommand {other}")),
     })
 }

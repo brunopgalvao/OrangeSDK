@@ -285,16 +285,24 @@ impl Upgrades {
 }
 
 /// The legacy EIP-155 transaction with which a validator's host signals
-/// `features`: to the upgrade address, no value, gas price zero.
+/// `features`: to the upgrade address, no value, at `gas_price`, the base
+/// fee of the next block (spec 23 §3), so that on a chain whose base fee is
+/// above zero a validator's account pays for its signals.
 ///
 /// # Panics
 /// Never: signing a 32-byte digest with a valid key cannot fail.
 #[must_use]
-pub fn signal_tx(key: &SigningKey, chain_id: u64, nonce: u64, features: u64) -> Vec<u8> {
+pub fn signal_tx(
+    key: &SigningKey,
+    chain_id: u64,
+    nonce: u64,
+    features: u64,
+    gas_price: u128,
+) -> Vec<u8> {
     let data = Action::Signal { features }.encode();
     let fields = |out: &mut Vec<u8>| {
         encode_uint(u128::from(nonce), out);
-        encode_uint(0, out);
+        encode_uint(gas_price, out);
         encode_uint(u128::from(SIGNAL_GAS), out);
         encode_bytes(&UPGRADE_ADDRESS, out);
         encode_uint(0, out);
@@ -641,7 +649,8 @@ impl Node {
         let address: [u8; 20] = id[12..].try_into().expect("20 bytes");
         let nonce = self.account(&address)?.nonce;
         let chain_id = self.chain_id()?;
-        Ok(Some(signal_tx(&key, chain_id, nonce, features)))
+        let gas_price = u128::from(self.fee_status().base_fee);
+        Ok(Some(signal_tx(&key, chain_id, nonce, features, gas_price)))
     }
 
     /// Submits the signal transaction the last executed block called for.

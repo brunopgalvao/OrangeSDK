@@ -3,6 +3,7 @@
 
 use solo_abi::Decode;
 use solo_abi::chain::GenesisParams;
+use solo_abi::fees::FeeParams;
 use solo_abi::governance::{Call, GOVERNANCE_ADDRESS, GovernanceParams, mode};
 use solo_cli::gov::{describe, parse};
 use solo_cli::{parse_genesis, run};
@@ -100,6 +101,7 @@ fn governance_parameters() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn gov_encodes_every_call() {
     let target = format!("0x{}", "45".repeat(20));
     let guardian = format!("0x{}", "ab".repeat(20));
@@ -149,6 +151,29 @@ fn gov_encodes_every_call() {
                 timelock_blocks: 50,
                 quorum_bps: 4_000,
                 deposit: 16,
+            }),
+        ),
+        (
+            vec!["set-fee-params", "125", "2", "1000000000", "burn"],
+            wrapped(Call::SetFeeParams {
+                params: FeeParams::production(),
+            }),
+        ),
+        (
+            vec!["set-fee-params", "100", "4", "0x10", &guardian],
+            wrapped(Call::SetFeeParams {
+                params: FeeParams {
+                    denominator: 100,
+                    elasticity: 4,
+                    min_base_fee: 16,
+                    treasury: [0xAB; 20],
+                },
+            }),
+        ),
+        (
+            vec!["set-fee-params", "0", "0", "0", "burn"],
+            wrapped(Call::SetFeeParams {
+                params: FeeParams::default(),
             }),
         ),
     ];
@@ -220,6 +245,27 @@ fn gov_names_every_mistake() {
         (
             vec!["set-params", "a", "2", "3", "4"],
             "voting blocks must be a number",
+        ),
+        (vec!["set-fee-params", "125", "2"], "min base fee missing"),
+        (
+            vec!["set-fee-params", "125", "2", "1", "0x01"],
+            "treasury must be a 0x address",
+        ),
+        (
+            vec!["set-fee-params", "125", "2", &too_big, "burn"],
+            "min base fee must be a decimal or 0x hex amount in wei",
+        ),
+        (
+            vec!["set-fee-params", "125", "2", "0x10000000000000000", "burn"],
+            "min base fee must be below 2^64 wei",
+        ),
+        (
+            vec!["set-fee-params", "99", "2", "1", "burn"],
+            "denominator must be 0 (the market off, with elasticity 0) or 100 to 125",
+        ),
+        (
+            vec!["set-fee-params", "x", "2", "1", "burn"],
+            "denominator must be a number",
         ),
         (vec!["dance"], "unknown subcommand dance"),
     ];

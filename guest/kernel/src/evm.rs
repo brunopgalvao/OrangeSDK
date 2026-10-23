@@ -24,10 +24,6 @@ use solo_guest::host;
 
 use crate::state;
 
-/// Base fee per gas, the constant the host's RPC reports too. Fixed in this
-/// kernel version; fees go to the zero address.
-pub use solo_abi::chain::BASE_FEE;
-
 /// Kernel state seen through revm's `Database`.
 pub struct StateDb;
 
@@ -155,6 +151,13 @@ pub struct BlockFields {
     pub number: u64,
     /// Timestamp in seconds.
     pub timestamp: u64,
+    /// Base fee per gas (spec 23 §3).
+    pub base_fee: u64,
+    /// Fee recipient (`COINBASE`): the fee vault or the zero address (spec 23 §4).
+    pub beneficiary: Address,
+    /// Where the base fee goes: the treasury the parameters named when the
+    /// block began, or the zero address for a burn (spec 23 §4).
+    pub treasury: Address,
 }
 
 /// A message to execute.
@@ -223,16 +226,16 @@ pub struct Env {
 
 impl Env {
     /// What the reference kernel's blocks look like to the EVM: the fixed
-    /// block gas limit and base fee, the zero beneficiary, `PREVRANDAO` and
-    /// difficulty, and no excess blob gas.
+    /// block gas limit, the block's base fee and beneficiary (spec 23), the
+    /// zero `PREVRANDAO` and difficulty, and no excess blob gas.
     pub fn kernel(block: BlockFields) -> Env {
         Env {
             chain_id: state::chain_id(),
             number: block.number,
             timestamp: block.timestamp,
             gas_limit: BLOCK_GAS_LIMIT,
-            basefee: BASE_FEE,
-            beneficiary: [0; 20],
+            basefee: block.base_fee,
+            beneficiary: block.beneficiary,
             prevrandao: [0; 32],
             difficulty: [0; 32],
             excess_blob_gas: 0,
@@ -307,15 +310,21 @@ pub fn run_in<P: Precompiles>(message: Message, env: &Env, commit_state: bool) -
         .modify_cfg_chained(|cfg| {
             cfg.set_spec_and_mainnet_gas_params(SpecId::OSAKA);
             cfg.chain_id = chain_id;
-            // A call query is a simulation: like geth's eth_call it skips the nonce
-            // and lets a contract be the caller (EIP-3607 applies to transactions).
+            // A call query is a simulation: like geth's eth_call it skips the nonce,
+            // lets a contract be the caller (EIP-3607 applies to transactions) and
+            // runs at a gas price of zero under any base fee, which `BASEFEE` still
+            // reports (spec 23 §3).
             cfg.disable_nonce_check = skip_nonce;
             cfg.disable_eip3607 = skip_nonce;
+            cfg.disable_base_fee = skip_nonce;
         })
         .with_block(block_env)
         .with_db(StateDb)
         .build_mainnet()
-        .with_precompiles(P::for_message(BlockFields { number: env.number, timestamp: env.timestamp }, !commit_state));
+        .with_precompiles(P::for_message(
+            BlockFields { number: env.number, timestamp: env.timestamp, base_fee: env.basefee, beneficiary: env.beneficiary, treasury: [0; 20] },
+            !commit_state,
+        ));
     let Ok(result) = evm.transact(tx) else {
         return Outcome { status: call_status::INVALID, gas_used: 0, output: Vec::new(), logs: Vec::new(), contract: None };
     };

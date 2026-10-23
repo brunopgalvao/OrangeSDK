@@ -1009,7 +1009,7 @@ fn typed_transactions_and_exact_fees() {
     );
     assert_eq!(
         chain.node.submit(&capped),
-        Err(SubmitError::Rejected(reason::FEE_TOO_LOW)),
+        Err(SubmitError::Rejected(reason::TIP_ABOVE_FEE_CAP)),
         "a priority fee above the maximum fee is malformed"
     );
     bob.nonce.set(bob.nonce.get() - 1);
