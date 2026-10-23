@@ -858,9 +858,17 @@ fn height_of(node: &Node, prefix: &[u8], id: u64) -> Option<u64> {
         .map(|b| u64::from_bytes(&b).unwrap())
 }
 
-/// Validator `key`'s partial signature over `message` with its share of key
-/// set `id`, its keystore having replayed the run from `node`'s chain state.
+/// Validator `key`'s partial signature over `message` with its first share
+/// of key set `id`, its keystore having replayed the run from `node`'s chain
+/// state.
 fn partial_of(node: &Node, key: &SigningKey, id: u64, message: &[u8]) -> PartialShare {
+    partials_of(node, key, id, message).swap_remove(0)
+}
+
+/// Validator `key`'s partial signatures over `message` with every share it
+/// holds of key set `id` (none when it holds none), its keystore having
+/// replayed the run from `node`'s chain state.
+fn partials_of(node: &Node, key: &SigningKey, id: u64, message: &[u8]) -> Vec<PartialShare> {
     let run = DkgRun::from_bytes(
         &node
             .state_get(&[skeys::RUN, &id.to_be_bytes()].concat())
@@ -872,37 +880,37 @@ fn partial_of(node: &Node, key: &SigningKey, id: u64, message: &[u8]) -> Partial
         .into_iter()
         .map(|(_, v)| v)
         .collect();
-    let index = u32::try_from(
-        run.recipients
-            .0
-            .iter()
-            .position(|r| *r == validator_id(key))
-            .unwrap(),
-    )
-    .unwrap()
-        + 1;
+    let Some(position) = run
+        .recipients
+        .0
+        .iter()
+        .position(|r| *r == validator_id(key))
+    else {
+        return Vec::new();
+    };
     let mut store = Keystore::default();
-    let replay = KeystoreRequest::Dkg(DkgRequest {
-        key_set: id,
-        session: run.session,
-        threshold: run.threshold,
-        dealers: u32::try_from(run.dealers.0.len()).unwrap(),
-        recipients: run.keys.clone(),
-        recipient: index,
-        transcript: Seq(transcript),
-        upto: 3,
-        ..DkgRequest::default()
-    });
+    let replay = KeystoreRequest::WeightedDkg {
+        request: DkgRequest {
+            key_set: id,
+            session: run.session,
+            threshold: run.threshold,
+            dealers: u32::try_from(run.dealers.0.len()).unwrap(),
+            recipients: run.keys.clone(),
+            recipient: u32::try_from(position + 1).unwrap(),
+            transcript: Seq(transcript),
+            upto: 3,
+            ..DkgRequest::default()
+        },
+        shares: run.shares.clone(),
+    };
     store.handle(Some(key), &replay.to_bytes()).unwrap();
-    let sign = KeystoreRequest::Sign {
+    let sign = KeystoreRequest::SignAll {
         key_set: id,
         message: message.to_vec(),
     };
-    PartialShare {
-        key_set: id,
-        index,
-        signature: store.handle(Some(key), &sign.to_bytes()).unwrap(),
-    }
+    Seq::<PartialShare>::from_bytes(&store.handle(Some(key), &sign.to_bytes()).unwrap())
+        .unwrap()
+        .0
 }
 
 #[test]
@@ -915,7 +923,8 @@ fn threshold_keys_rotate_across_epochs() {
     let genesis = genesis(&keys, &[0, 1, 2, 3], &[STAKE; 4], &staking(24, 4));
     let mut sim = Sim::new(kernel, &genesis, &keys, 1, &at(10_000), 20).unwrap();
     sim.crash(5);
-    // Epoch 0's DKG: four dealers, threshold 3, the key adopted in its confirmation phase
+    // Epoch 0's DKG: four dealers with equal stake, four shares each and a threshold of
+    // 11 shares, that is three validators; the key is adopted in its confirmation phase
     // and active at once, as the first key needs no handoff.
     let done = sim
         .run_until(80 * SLOT_MS, |s| adopted(s, &[0, 1, 2, 3, 4], 0))
@@ -923,7 +932,7 @@ fn threshold_keys_rotate_across_epochs() {
     assert!(done, "{:?}", sim.finalized_heights().unwrap());
     let s = status(&mut sim.nodes[0]);
     let first = s.active.unwrap();
-    assert_eq!((first.threshold(), first.shareholders.0.len()), (3, 4));
+    assert_eq!((first.threshold(), first.shareholders.0.len()), (11, 16));
     assert_eq!(s.group_key, first.key_set[..96].to_vec());
     // Certificates switch to BLS: once the key is active every finalized block gets a
     // version-2 certificate (97 bytes, spec 12 §7) naming key set 0.
@@ -968,7 +977,11 @@ fn threshold_keys_rotate_across_epochs() {
         .iter()
         .map(|&i| validator_id(&keys[i]))
         .collect();
-    assert_eq!(second.shareholders.0, ids);
+    let holders: Vec<[u8; 32]> = ids
+        .iter()
+        .flat_map(|id| std::iter::repeat_n(*id, 4))
+        .collect();
+    assert_eq!(second.shareholders.0, holders);
     assert_ne!(second.key_set[..96], first.key_set[..96]);
     assert_eq!(s.group_key, second.key_set[..96].to_vec());
     let run = DkgRun::from_bytes(
@@ -1147,7 +1160,8 @@ fn a_dkg_with_a_misbehaving_dealer_still_completes() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!((run.threshold, run.dealers.0.len()), (4, 5));
+    assert_eq!((run.threshold, run.dealers.0.len()), (14, 5));
+    assert_eq!(run.shares.0, [4; 5]);
     let recipients = run
         .keys
         .0
@@ -1161,6 +1175,8 @@ fn a_dkg_with_a_misbehaving_dealer_still_completes() {
         threshold: run.threshold,
         dealers: 5,
         recipients,
+        shares: run.shares.0.clone(),
+        weights: run.shares.0.clone(),
         previous: None,
     };
     let dealer = solo_bls::dkg::Dealer {
@@ -1368,12 +1384,19 @@ fn a_flood_of_messages_for_later_epochs_neither_fills_the_buffer_nor_holds_up_sy
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn shareholders_with_little_stake_cannot_certify_blocks_to_a_syncing_node() {
-    // One validator holds nearly all the stake and three a gwei each, and an observer
-    // follows. The three small ones hold three of the four shares: the threshold.
+fn seats_without_two_thirds_of_the_stake_cannot_certify_and_sync_wants_votes() {
+    // One validator holds 70% of the stake and three 10% each, and an observer follows.
+    // The three small ones hold three of the four seats, the old threshold of three
+    // shareholders, but 30% of the stake: shares follow stake (spec 15 §6.1), one each
+    // of Q = 16, against a threshold of 11 that the large one alone reaches.
     let keys = keys(4);
     let kernel = kernel_module();
-    let genesis = genesis(&keys, &[0, 1, 2, 3], &[1_000_000, 1, 1, 1], &staking(24, 4));
+    let genesis = genesis(
+        &keys,
+        &[0, 1, 2, 3],
+        &[7 * STAKE, STAKE, STAKE, STAKE],
+        &staking(24, 4),
+    );
     let mut sim = Sim::new(kernel, &genesis, &keys, 1, &at(10_000), 20).unwrap();
     let done = sim
         .run_until(80 * SLOT_MS, |s| adopted(s, &[0, 1, 2, 3, 4], 0))
@@ -1381,7 +1404,12 @@ fn shareholders_with_little_stake_cannot_certify_blocks_to_a_syncing_node() {
     assert!(done, "{:?}", sim.finalized_heights().unwrap());
     let s = status(&mut sim.nodes[4]);
     let record = s.active.unwrap();
-    assert_eq!((record.threshold(), record.shareholders.0.len()), (3, 4));
+    assert_eq!((record.threshold(), record.shareholders.0.len()), (11, 14));
+    let holders: Vec<[u8; 32]> = [(0, 11), (1, 1), (2, 1), (3, 1)]
+        .iter()
+        .flat_map(|&(i, m)| std::iter::repeat_n(validator_id(&keys[i]), m))
+        .collect();
+    assert_eq!(record.shareholders.0, holders);
     // The observer stops, and the test speaks to it as a peer.
     sim.crash(4);
     let st = sim.nodes[4].simplex_state().unwrap();
@@ -1398,22 +1426,32 @@ fn shareholders_with_little_stake_cannot_certify_blocks_to_a_syncing_node() {
         dkg: Seq(vec![]),
     };
     let hash = keccak256(&fake.to_bytes());
-    // The three replay the run from chain state in their own keystores and sign the fake
-    // block; their partials combine into a certificate that verifies under the group key.
+    // The three small ones replay the run from chain state in their own keystores and
+    // sign the fake block: three partials, which combine into nothing.
     let message = certificate_message_v2(CHAIN_ID, 0, fake.height, &hash);
-    let partials = (1..4)
-        .map(|i| partial_of(&sim.nodes[4], &keys[i], 0, &message))
-        .collect();
-    let combine = KeystoreRequest::Combine {
-        key_set: record.key_set.clone(),
-        message,
-        partials: Seq(partials),
+    let combine = |partials: Vec<PartialShare>| {
+        let request = KeystoreRequest::Combine {
+            key_set: record.key_set.clone(),
+            message: message.clone(),
+            partials: Seq(partials),
+        };
+        Keystore::default().handle(None, &request.to_bytes())
     };
-    let signature = Keystore::default()
-        .handle(None, &combine.to_bytes())
-        .unwrap();
+    let small: Vec<PartialShare> = (1..4)
+        .flat_map(|i| partials_of(&sim.nodes[4], &keys[i], 0, &message))
+        .collect();
+    assert_eq!(small.len(), 3);
+    assert_eq!(combine(small.clone()), None);
+    // The large one, with 70% of the stake, holds the threshold alone; with the small
+    // ones' partials besides, the certificate is the same.
+    let large = partials_of(&sim.nodes[4], &keys[0], 0, &message);
+    assert_eq!(large.len(), 11);
+    assert_eq!(combine(large[..10].to_vec()), None);
+    let signature = combine(large.clone()).unwrap();
+    assert_eq!(combine([small, large].concat()), Some(signature.clone()));
     let forged = certificate_bytes_v2(0, fake.height, &hash, &signature);
     assert!(verifies(&sim.nodes[4], &forged));
+    // Even so, a full node syncs on votes, not on a threshold certificate (spec 08 §7a).
     // A proposal far above its tip, signed by the view's leader, makes the observer ask
     // the test for blocks.
     let set = set_of(&mut sim.nodes[4], view_epoch(st.view)).unwrap();
@@ -1475,7 +1513,7 @@ fn finalized_hash(node: &Node, height: u64) -> [u8; 32] {
 #[allow(clippy::too_many_lines)]
 fn an_epoch_end_finalized_by_a_suffix_and_a_restarted_shareholder() {
     // Four validators, three with nodes: every quorum, and every threshold certificate
-    // (three of four shares), needs all three.
+    // (11 of 16 shares, three validators), needs all three.
     let keys = keys(4);
     let kernel = kernel_module();
     let genesis = genesis(&keys, &[0, 1, 2, 3], &[STAKE; 4], &staking(24, 4));
@@ -1578,15 +1616,18 @@ fn a_failed_dkg_keeps_the_active_key() {
     // Two validators hold nearly all the stake and two very little; all four hold shares.
     let keys = keys(4);
     let kernel = kernel_module();
-    let weights = [1_000_000, 1_000_000, 1, 1];
+    // Weights 5 : 5 : 2 : 2 deal shares 5, 5, 2 and 2 of Q = 16 (W = 14, rounded down),
+    // threshold 11: the two large ones hold 71% of the stake, enough to finalize, but
+    // only 10 shares, the cost of rounding (spec 15 §6.8).
+    let weights = [500_000, 500_000, 200_000, 200_000];
     let genesis = genesis(&keys, &[0, 1, 2, 3], &weights, &staking(24, 4));
     let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
     let done = sim
         .run_until(80 * SLOT_MS, |s| adopted(s, &[0, 1, 2, 3], 0))
         .unwrap();
     assert!(done, "{:?}", sim.finalized_heights().unwrap());
-    // The two small ones go down before epoch 1's dealings. Two dealers of four cannot
-    // reach the threshold of three, so epoch 1's run makes no key, while the two large
+    // The two small ones go down before epoch 1's dealings. The two large dealers weigh
+    // 10, below the threshold of 11, so epoch 1's run makes no key, while the two large
     // ones keep finalizing.
     sim.crash(2);
     sim.crash(3);
@@ -1767,7 +1808,12 @@ fn threshold_misbehaviour_is_slashed_once() {
     let share = solo_abi::rotation::RotationShare {
         to: 0,
         key: wrong.clone(),
-        partial: p.clone(),
+        partials: Seq(partials_of(
+            &sim.nodes[0],
+            &keys[2],
+            0,
+            &rotation_message(CHAIN_ID, 0, &wrong),
+        )),
     };
     let m = envelope_of(&keys[2], 0, envelope::ROTATION_SHARE, share.to_bytes());
     for i in 0..4 {
@@ -1934,7 +1980,7 @@ fn a_key_hands_off_only_once_its_shareholders_sign_and_only_to_the_newest_key() 
     sim.crash(2);
     sim.crash(3);
     // Epochs 1 and 2 each adopt a fresh key among the new set, but only two of key 0's
-    // four shareholders are left to sign a handoff, below its threshold of three: key 0
+    // four shareholders are left to sign a handoff, 8 shares below its threshold of 11: key 0
     // stays active, whichever newer key is the target.
     let stalled = sim
         .run_until(400 * SLOT_MS, |s| key_set(&s.nodes[0], 2).is_some())
@@ -1956,7 +2002,7 @@ fn a_key_hands_off_only_once_its_shareholders_sign_and_only_to_the_newest_key() 
     let older = key_set(&sim.nodes[0], 1).unwrap();
     let message = rotation_message(CHAIN_ID, 1, &older.key_set[..96]);
     let partials = (0..3)
-        .map(|i| partial_of(&sim.nodes[0], &keys[i], 0, &message))
+        .flat_map(|i| partials_of(&sim.nodes[0], &keys[i], 0, &message))
         .collect();
     let combine = KeystoreRequest::Combine {
         key_set: key_set(&sim.nodes[0], 0).unwrap().key_set,
@@ -2007,4 +2053,111 @@ fn a_key_hands_off_only_once_its_shareholders_sign_and_only_to_the_newest_key() 
     assert!(height_of(&sim.nodes[0], rotation::keys::ACTIVATED, 1).is_none());
     assert_eq!(status(&mut sim.nodes[0]).active.unwrap().id, h.to);
     assert_agreement(&sim);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn shares_follow_stake_across_an_epoch_transition() {
+    // Four validators with equal stake; during epoch 0 validator 0 bonds six times its
+    // stake more and validator 1 twice, so epoch 1 weighs 7 : 3 : 1 : 1.
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, &[0, 1, 2, 3], &[STAKE; 4], &staking(24, 4));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    // Key set 0, equal stakes: four shares each of Q = 16, threshold 11, so any three
+    // validators sign and no two do.
+    let done = sim
+        .run_until(80 * SLOT_MS, |s| adopted(s, &[0, 1, 2, 3], 0))
+        .unwrap();
+    assert!(done, "{:?}", sim.finalized_heights().unwrap());
+    let first = key_set(&sim.nodes[0], 0).unwrap();
+    assert_eq!((first.threshold(), first.shareholders.0.len()), (11, 16));
+    let run = |node: &Node, id: u64| {
+        DkgRun::from_bytes(
+            &node
+                .state_get(&[skeys::RUN, &id.to_be_bytes()].concat())
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let first_run = run(&sim.nodes[0], 0);
+    assert_eq!((first_run.threshold, first_run.shares.0), (11, vec![4; 4]));
+    for (i, times) in [(0, 6), (1, 2)] {
+        let value = u128::from(STAKE) * GWEI * times;
+        sim.submit(i, &action(&keys[i], 0, value, &StakingAction::Bond))
+            .unwrap();
+    }
+    // Epoch 1's run deals by the new weights, W = 12: 16·7/12, 16·3/12 and 16/12 rounded
+    // down, 9, 4, 1 and 1 of the 15 shares, against the threshold of 11 for Q = 16.
+    let rotated = sim
+        .run_until(160 * SLOT_MS, |s| adopted(s, &[0, 1, 2, 3], 1))
+        .unwrap();
+    assert!(rotated, "{:?}", sim.finalized_heights().unwrap());
+    let r = sim.nodes[0]
+        .query(query::STAKING_SET, &1u64.to_bytes())
+        .unwrap();
+    let weights: Vec<u64> = ValidatorSet::from_bytes(&r.body)
+        .unwrap()
+        .validators
+        .0
+        .iter()
+        .map(|v| v.weight)
+        .collect();
+    assert_eq!(weights, [7 * STAKE, 3 * STAKE, STAKE, STAKE]);
+    let second_run = run(&sim.nodes[0], 1);
+    assert_eq!(
+        (second_run.threshold, second_run.shares.0.clone()),
+        (11, vec![9, 4, 1, 1])
+    );
+    let second = key_set(&sim.nodes[0], 1).unwrap();
+    let holders: Vec<[u8; 32]> = [(0, 9), (1, 4), (2, 1), (3, 1)]
+        .iter()
+        .flat_map(|&(i, m)| std::iter::repeat_n(validator_id(&keys[i]), m))
+        .collect();
+    assert_eq!(second.shareholders.0, holders);
+    assert_eq!(second.public_shares.0.len(), 15);
+    // Key 0, dealt equally, handed off to the skewed key 1, and certificates follow it.
+    let h = handoff(&mut sim.nodes[0], 0).unwrap();
+    assert_eq!((h.from, h.to), (0, 1));
+    let later = sim.nodes[0].finalized_height().unwrap() + 2;
+    assert!(
+        sim.run_until(40 * SLOT_MS, |s| bls_certificate(&s.nodes[0], later)
+            .is_some())
+            .unwrap()
+    );
+    let cert = bls_certificate(&sim.nodes[0], later).unwrap();
+    assert_eq!(key_id_of(&cert), 1);
+    assert!(verifies(&sim.nodes[0], &cert));
+    // Which validators can sign with key 1: exactly the sets with more than two thirds
+    // of epoch 1's stake. Validators 0 and 2 hold exactly two thirds and fall short.
+    let message = certificate_message_v2(CHAIN_ID, 1, 99, &[7; 32]);
+    let partials: Vec<Vec<PartialShare>> = (0..4)
+        .map(|i| partials_of(&sim.nodes[0], &keys[i], 1, &message))
+        .collect();
+    assert_eq!(
+        partials.iter().map(Vec::len).collect::<Vec<_>>(),
+        [9, 4, 1, 1]
+    );
+    for mask in 1u32..16 {
+        let members: Vec<usize> = (0..4).filter(|i| mask & (1 << i) != 0).collect();
+        let stake: u64 = members.iter().map(|&i| weights[i]).sum();
+        let request = KeystoreRequest::Combine {
+            key_set: second.key_set.clone(),
+            message: message.clone(),
+            partials: Seq(members.iter().flat_map(|&i| partials[i].clone()).collect()),
+        };
+        let signed = Keystore::default()
+            .handle(None, &request.to_bytes())
+            .is_some();
+        assert_eq!(signed, 3 * stake > 2 * 12 * STAKE, "{members:?}");
+    }
+    // Validator 3, a twelfth of the stake, stops: blocks and certificates go on.
+    sim.crash(3);
+    let resumed = sim.nodes[0].finalized_height().unwrap() + 3;
+    assert!(
+        sim.run_until(60 * SLOT_MS, |s| bls_certificate(&s.nodes[0], resumed)
+            .is_some())
+            .unwrap()
+    );
+    assert_eq!(evidence_count(&mut sim.nodes[0]), 0);
 }

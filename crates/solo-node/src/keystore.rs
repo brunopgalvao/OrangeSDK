@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use k256::ecdsa::SigningKey;
+use solo_abi::codec::Seq;
 use solo_abi::staking::{DkgReply, DkgRequest, KeySetVote, KeystoreRequest, PartialShare};
 use solo_abi::{Decode, Encode};
 use solo_bls::dkg::{Config, Dealer, DecryptionKey, Dkg, EncryptionKey, Message, Recipient, Step};
@@ -39,10 +40,10 @@ fn dealer_seed(key: &SigningKey, session: &[u8; 32]) -> [u8; 32] {
     out.try_into().expect("32 bytes asked for")
 }
 
-/// Threshold shares by key set id.
+/// Threshold shares by key set id, ascending by index within a key set.
 #[derive(Debug, Default)]
 pub struct Keystore {
-    shares: BTreeMap<u64, SecretShare>,
+    shares: BTreeMap<u64, Vec<SecretShare>>,
 }
 
 impl Keystore {
@@ -57,11 +58,28 @@ impl Keystore {
     pub fn handle(&mut self, key: Option<&SigningKey>, request: &[u8]) -> Option<Vec<u8>> {
         match KeystoreRequest::from_bytes(request).ok()? {
             KeystoreRequest::EncryptionKey => Some(encryption_key(key?).to_vec()),
-            KeystoreRequest::Dkg(request) => self.dkg(key?, &request).map(|r| r.to_bytes()),
+            KeystoreRequest::Dkg(request) => self.dkg(key?, &request, &[]).map(|r| r.to_bytes()),
+            KeystoreRequest::WeightedDkg { request, shares } => {
+                self.dkg(key?, &request, &shares.0).map(|r| r.to_bytes())
+            }
             KeystoreRequest::Sign { key_set, message } => {
                 key?;
-                let share = self.shares.get(&key_set)?;
+                let share = self.shares.get(&key_set)?.first()?;
                 Some(share.sign(&message).signature.to_bytes().to_vec())
+            }
+            KeystoreRequest::SignAll { key_set, message } => {
+                key?;
+                let partials = self
+                    .shares
+                    .get(&key_set)?
+                    .iter()
+                    .map(|share| PartialShare {
+                        key_set,
+                        index: share.index(),
+                        signature: share.sign(&message).signature.to_bytes().to_vec(),
+                    })
+                    .collect();
+                Some(Seq(partials).to_bytes())
             }
             KeystoreRequest::Combine {
                 key_set,
@@ -71,8 +89,10 @@ impl Keystore {
         }
     }
 
-    /// Replays the run for this node up to the requested boundary.
-    fn dkg(&mut self, key: &SigningKey, r: &DkgRequest) -> Option<DkgReply> {
+    /// Replays the run for this node up to the requested boundary, with
+    /// recipient `j` holding `shares[j − 1]` shares (one each when empty)
+    /// and, for a fresh key, dealer `j` weighing as much.
+    fn dkg(&mut self, key: &SigningKey, r: &DkgRequest, shares: &[u32]) -> Option<DkgReply> {
         let recipients = r
             .recipients
             .0
@@ -89,6 +109,7 @@ impl Keystore {
         } else {
             let share = if previous.is_some() {
                 let current = self.shares.get(&r.previous_id)?;
+                let current = current.iter().find(|s| s.index() == r.dealer)?;
                 Some(SecretShare::from_bytes(r.dealer, &current.to_bytes()).ok()?)
             } else {
                 None
@@ -103,11 +124,18 @@ impl Keystore {
             index: r.recipient,
             key: decryption_key(key),
         });
+        let weights = if previous.is_none() {
+            shares.to_vec()
+        } else {
+            Vec::new()
+        };
         let config = Config {
             session: r.session,
             threshold: r.threshold,
             dealers: r.dealers,
             recipients,
+            shares: shares.to_vec(),
+            weights,
             previous,
         };
         let (mut dkg, dealing) = Dkg::new(config, dealer, recipient).ok()?;
@@ -125,12 +153,16 @@ impl Keystore {
                     return Some(DkgReply::Message(m.to_bytes()));
                 }
                 Step::Finished(out) => {
-                    let n = u32::try_from(r.recipients.0.len()).expect("checked by the run");
-                    let public_shares = (1..=n)
-                        .map(|j| out.key_set.public_share(j).to_bytes().to_vec())
+                    let total = if shares.is_empty() {
+                        u32::try_from(r.recipients.0.len()).expect("checked by the run")
+                    } else {
+                        shares.iter().sum()
+                    };
+                    let public_shares = (1..=total)
+                        .map(|x| out.key_set.public_share(x).to_bytes().to_vec())
                         .collect();
-                    if let Some(share) = out.share {
-                        self.shares.insert(r.key_set, share);
+                    if !out.shares.is_empty() {
+                        self.shares.insert(r.key_set, out.shares);
                     }
                     return Some(DkgReply::Finished(KeySetVote {
                         key_set: out.key_set.to_bytes(),

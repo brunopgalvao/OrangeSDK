@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-This document specifies the finality certificate that codex ADR 0008 calls for and the cryptography behind it: BLS signatures over BLS12-381, a `t`-of-`n` threshold key shared among the validators, the dealerless key generation (DKG) that creates the key, the resharing that hands a key to a new validator set without changing it, the rotation message with which one key hands off to the next, and the procedure an Ethereum contract follows to verify a certificate and a rotation with the EIP-2537 precompiles. The decisions behind it are recorded in codex ADRs 0017 and 0031.
+This document specifies the finality certificate that codex ADR 0008 calls for and the cryptography behind it: BLS signatures over BLS12-381, a `t`-of-`M` threshold key whose `M` shares are dealt to the validators, several to a validator when shares follow stake, the dealerless key generation (DKG) that creates the key, the resharing that hands a key to a new validator set without changing it, the rotation message with which one key hands off to the next, and the procedure an Ethereum contract follows to verify a certificate and a rotation with the EIP-2537 precompiles. The decisions behind it are recorded in codex ADRs 0017, 0031 and 0040.
 
 A certificate verifies with one pairing check against the group public key of the key set that signed it, for about 115 000 gas of precompile calls on Ethereum. The reference kernel generates a fresh key every epoch and the old key hands off to it (spec 15 §6.6), so a version-2 certificate (97 bytes) names the key set that signed it, and a light client on Ethereum (codex ADR 0013, tier 2) follows the chain of rotation messages from the key it trusts. The 89-byte version-1 certificate of a key that never changes stays decodable.
 
@@ -63,22 +63,24 @@ which an implementation computes as one two-pair multi-Miller loop and one final
 
 ## 4. Threshold keys
 
-A threshold key has `n` shareholders with indices `1..n` and threshold `t`, `1 ≤ t ≤ n`. Behind it is a secret polynomial `f(x) = a_0 + a_1·x + … + a_{t−1}·x^{t−1}` over `F_r`:
+A threshold key has `M` shares with indices `1..M` and threshold `t`, `1 ≤ t ≤ M`. Behind it is a secret polynomial `f(x) = a_0 + a_1·x + … + a_{t−1}·x^{t−1}` over `F_r`:
 
-- shareholder `i` holds the share `s_i = f(i)`;
+- share `i` is `s_i = f(i)`;
 - the group secret is `f(0) = a_0`, which nobody holds, and the group public key is `PK = a_0 · g2`;
-- the **public key set** is the Feldman commitment `C = (a_0 · g2, …, a_{t−1} · g2)`: its first point is `PK`, its length is `t`, and `pk_i = Σ_k i^k · C_k` is shareholder `i`'s public key share, equal to `s_i · g2`. It is encoded as the concatenation of its compressed points (`96·t` bytes);
+- the **public key set** is the Feldman commitment `C = (a_0 · g2, …, a_{t−1} · g2)`: its first point is `PK`, its length is `t`, and `pk_i = Σ_k i^k · C_k` is the public key share of share `i`, equal to `s_i · g2`. It is encoded as the concatenation of its compressed points (`96·t` bytes);
 - a share `s` for index `i` passes the **Feldman check** against `C` when `s · g2 = Σ_k i^k · C_k`.
 
-**Partial signatures.** Shareholder `i`'s partial signature over `m` is `σ_i = s_i · H(m, DST_SIG)`; it is valid when it verifies (§3) under `pk_i`.
+**Shareholders.** A *shareholder* is a party that holds shares, each a run of consecutive indices: with `N` shareholders holding `m_1, …, m_N ≥ 1` shares, `M = Σ m_j`, shareholder `j` holds the indices `o_j + 1` to `o_j + m_j`, `o_j = m_1 + … + m_{j−1}`. With one share each (`m_j = 1`, `M = N`) share `j` is shareholder `j`'s, as in every key before codex ADR 0040. How many shares a party holds is a parameter of the run that makes the key; the reference kernel deals them in proportion to stake (spec 15 §6.1), so that any `t` shares stand for more than two thirds of the stake (15 §6.8). Nothing about a key set, a group signature or its verification depends on who holds which share.
 
-**Combination.** Given partial signatures from a set `S` of `t` distinct nonzero indices, the group signature is
+**Partial signatures.** The partial signature of share `i` over `m` is `σ_i = s_i · H(m, DST_SIG)`; it is valid when it verifies (§3) under `pk_i`. A shareholder signs once with each share it holds.
+
+**Combination.** Given partial signatures of a set `S` of `t` distinct nonzero share indices, the group signature is
 
 ```
 σ = Σ_{i ∈ S} λ_i · σ_i,    λ_i = Π_{j ∈ S, j ≠ i} j / (j − i)  (mod r)
 ```
 
-When every `σ_i` is valid, `σ = a_0 · H(m, DST_SIG)`: the unique signature of the group key, the same whichever `t` shareholders signed. Fewer than `t` partial signatures determine nothing about it. A combiner takes the first `t` partial signatures it is given and then verifies either each of them or the result; the reference combiner for certificates verifies the result (§7).
+When every `σ_i` is valid, `σ = a_0 · H(m, DST_SIG)`: the unique signature of the group key, the same whichever `t` shares signed. Fewer than `t` partial signatures determine nothing about it. A combiner takes the first `t` partial signatures it is given and then verifies either each of them or the result; the reference combiner for certificates verifies the result (§7).
 
 **Trusted dealing.** A single operator who holds every share anyway (a development chain) MAY split a secret key `sk` itself: `a_0 = sk`, and for `k ≥ 1`, `a_k = hash_to_scalar(seed ‖ "deal" ‖ I2OSP(k, 4), DST_COEFFICIENT)` with `seed` 32 bytes of fresh randomness. The worked example of §9.2 uses this derivation. Validator sets use the DKG.
 
@@ -86,9 +88,9 @@ When every `σ_i` is valid, `σ = a_0 · H(m, DST_SIG)`: the unique signature of
 
 The DKG is synchronous Joint-Feldman (Pedersen's DKG) with complaints. It is a pure state machine: each participant's machine consumes broadcast messages and phase boundaries and produces broadcast messages and, at the end, its output. The reference kernel runs it for a fresh key every epoch (spec 15 §6.1).
 
-**Assumptions.** Senders are authenticated by the transport (the driver's signed consensus messages). Every honest participant processes the same messages in the same phase and ends each phase at the same point, as when the messages are carried in finalized blocks and phases end at fixed heights. Fewer than `t` participants are faulty (for a resharing, fewer than the previous threshold among the dealers). Under these assumptions every honest participant computes the same qualified set and the same public key set.
+**Assumptions.** Senders are authenticated by the transport (the driver's signed consensus messages). Every honest participant processes the same messages in the same phase and ends each phase at the same point, as when the messages are carried in finalized blocks and phases end at fixed heights. The faulty participants hold fewer than `t` shares and their dealers weigh less than `t` in all (for a resharing, they are fewer than the previous threshold among the dealers). Under these assumptions every honest participant computes the same qualified set and the same public key set.
 
-**Parameters**, identical at every participant: a 32-byte `session` unique to the run (a driver derives it from the chain id and the epoch); the threshold `t`; the number of dealers `D`, indexed `1..D`; the recipients' encryption keys `ek_1 … ek_N` (recipient `j` has index `j`); and, for a resharing, the previous public key set. `1 ≤ t ≤ N`, and `D` is at least 1 (for a resharing, at least the previous threshold).
+**Parameters**, identical at every participant: a 32-byte `session` unique to the run (a driver derives it from the chain id and the epoch); the threshold `t`; the number of dealers `D`, indexed `1..D`, and each dealer's *weight* `v_i ≥ 1`; the recipients' encryption keys `ek_1 … ek_N` (recipient `j` has index `j`) and each recipient's share count `m_j ≥ 1`, so that recipient `j` becomes the shareholder of the indices `X_j = o_j + 1 … o_j + m_j` of §4 and the new key has `M = Σ m_j` shares; and, for a resharing, the previous public key set. Weights and share counts are 1 unless a driver says otherwise; the reference kernel gives each recipient the share count of its stake and each dealer, which is also a recipient, its share count as its weight (spec 15 §6.1). `M` is below `2^32`, `1 ≤ t ≤ M`, and `D` is at least 1 (for a resharing, at least the previous threshold, with every weight 1). Below, `x` ranges over share indices and `owner(x)` is the recipient `j` with `x ∈ X_j`.
 
 **Encryption keys.** A recipient's decryption key is `dk = KeyGen(IKM, "SOLO-DKG-ENCRYPTION")` and its encryption key is `ek = dk · g1`, a G1 point other than the identity, registered before the run.
 
@@ -97,25 +99,25 @@ The DKG is synchronous Joint-Feldman (Pedersen's DKG) with complaints. It is a p
 ```
 C_i   = (a_{i,0} · g2, …, a_{i,t−1} · g2)
 R_i   = e_i · g1
-pad_ij = hash_to_scalar(session ‖ I2OSP(i, 4) ‖ I2OSP(j, 4) ‖ encode(R_i) ‖ encode(e_i · ek_j), DST_PAD)
-c_ij  = f_i(j) + pad_ij  (mod r)          for every recipient j
+pad_ix = hash_to_scalar(session ‖ I2OSP(i, 4) ‖ I2OSP(x, 4) ‖ encode(R_i) ‖ encode(e_i · ek_owner(x)), DST_PAD)
+c_ix  = f_i(x) + pad_ix  (mod r)          for every share index x in 1..M
 ```
 
-and broadcasts `Dealing { session, dealer: i, commitment: C_i, ephemeral: R_i, shares: (c_i1, …, c_iN) }`. Recipient `j` recovers its share as `s_ij = c_ij − pad_ij`, computing the shared point as `dk_j · R_i`. A pad is a one-time pad over `F_r`, used once per `(session, dealer, recipient)`; integrity comes from the Feldman check, not from the encryption.
+and broadcasts `Dealing { session, dealer: i, commitment: C_i, ephemeral: R_i, shares: (c_i1, …, c_iM) }`. Recipient `j` recovers each of its shares as `s_ix = c_ix − pad_ix`, `x ∈ X_j`, computing the shared point as `dk_j · R_i`. A pad is a one-time pad over `F_r`, used once per `(session, dealer, share index)`; integrity comes from the Feldman check, not from the encryption. With one share per recipient `x = j`, and the dealing is byte for byte the one earlier versions made.
 
-**Phase 1, dealing.** A machine accepts a `Dealing` only in this phase, and only when its `session` matches, `1 ≤ dealer ≤ D`, it has no dealing from that dealer yet, the commitment has exactly `t` points and the shares exactly `N` scalars, every point and scalar decodes (§2), and, in a resharing, `C_{i,0}` equals the dealer's previous public key share. Anything else is rejected and changes nothing; a dealer without an accepted dealing is absent. At the end of the phase, each recipient `j` decrypts and Feldman-checks its share from every accepted dealing and, if any fails, broadcasts `Complaints { session, accuser: j, dealers }` listing those dealers.
+**Phase 1, dealing.** A machine accepts a `Dealing` only in this phase, and only when its `session` matches, `1 ≤ dealer ≤ D`, it has no dealing from that dealer yet, the commitment has exactly `t` points and the shares exactly `M` scalars, every point and scalar decodes (§2), and, in a resharing, `C_{i,0}` equals the dealer's previous public key share. Anything else is rejected and changes nothing; a dealer without an accepted dealing is absent. At the end of the phase, each recipient `j` decrypts and Feldman-checks each of its shares `x ∈ X_j` from every accepted dealing and, if any fails, broadcasts `Complaints { session, accuser: j, dealers }` listing, ascending and once each, the dealers with a failing share.
 
-**Phase 2, complaints.** A machine accepts the first `Complaints` from each recipient `1 ≤ accuser ≤ N` with a matching `session`, and records a complaint `(i, accuser)` for each listed dealer `i` with an accepted dealing; other listed indices are ignored. At the end of the phase, each dealer with recorded complaints broadcasts `Justification { session, dealer: i, shares }` revealing `f_i(j)` for every accuser `j`, in ascending order of `j`.
+**Phase 2, complaints.** A machine accepts the first `Complaints` from each recipient `1 ≤ accuser ≤ N` with a matching `session`, and records a complaint `(i, accuser)` for each listed dealer `i` with an accepted dealing; other listed indices are ignored. At the end of the phase, each dealer with recorded complaints broadcasts `Justification { session, dealer: i, shares }` revealing `f_i(x)` for every share index `x` of every accuser, in ascending order of `x`.
 
-**Phase 3, justifications.** A machine accepts the first `Justification` from each dealer `1 ≤ dealer ≤ D` with a matching `session`. An entry `(j, s)` answers the complaint `(i, j)` when that complaint was recorded, `s` is a canonical scalar, and `s` passes the Feldman check against `C_i` at `j`; other entries are ignored. At the end of the phase every dealer with an unanswered complaint is disqualified, and an accuser whose complaint was answered takes the revealed share as `s_ij`.
+**Phase 3, justifications.** A machine accepts the first `Justification` from each dealer `1 ≤ dealer ≤ D` with a matching `session`. An entry `(x, s)` is *valid* when `x` is a share index, the complaint `(i, owner(x))` was recorded, `s` is a canonical scalar, and `s` passes the Feldman check against `C_i` at `x`; other entries are ignored. The complaint `(i, j)` is *answered* when every `x ∈ X_j` has a valid entry. At the end of the phase every dealer with an unanswered complaint is disqualified, and an accuser whose complaint was answered takes the revealed shares as its `s_ix`.
 
-**Output.** `QUAL` is the accepted dealers that were not disqualified, ascending. The run fails if `|QUAL|` is below `t` (for a resharing, below the previous threshold). Otherwise, for a fresh key
+**Output.** `QUAL` is the accepted dealers that were not disqualified, ascending. The run fails if the weights of `QUAL` sum to less than `t` (for a resharing, if `|QUAL|` is below the previous threshold). Otherwise, for a fresh key
 
 ```
-C   = Σ_{i ∈ QUAL} C_i   (point-wise)        s_j = Σ_{i ∈ QUAL} s_ij
+C   = Σ_{i ∈ QUAL} C_i   (point-wise)        s_x = Σ_{i ∈ QUAL} s_ix     for each x ∈ X_j
 ```
 
-and the new public key set is `C`, the group key `C_0`, recipient `j`'s share `s_j`. A recipient that holds no verified share from some qualified dealer (its complaint was not delivered) ends without a share; everyone else is unaffected.
+and the new public key set is `C`, the group key `C_0`, recipient `j`'s shares the `s_x` of its indices. A recipient that lacks a verified share from some qualified dealer (its complaint was not delivered) ends without any share; everyone else is unaffected.
 
 **Messages.** On the wire, in the canonical encoding of 06 §2:
 
@@ -123,15 +125,17 @@ and the new public key set is `C`, the group key `C_0`, recipient `j`'s share `s
 enum DkgMessage {
   0 Dealing       { session: [32], dealer: u32, commitment: vec<[96]>, ephemeral: [48], shares: vec<[32]> }
   1 Complaints    { session: [32], accuser: u32, dealers: vec<u32> }
-  2 Justification { session: [32], dealer: u32, shares: vec<RevealedShare { recipient: u32, share: [32] }> }
+  2 Justification { session: [32], dealer: u32, shares: vec<RevealedShare { index: u32, share: [32] }> }
 }
 ```
 
-**Security notes.** An honest dealer is never disqualified, so with fewer than `t` faulty participants `QUAL` contains an honest dealer and the group secret stays unknown. A falsely accused honest dealer reveals only the accuser's share. Joint-Feldman lets a faulty dealer bias the distribution of the group key by choosing whether to be disqualified; for threshold signatures this bias does not enable forgery (Gennaro, Jarecki, Krawczyk and Rabin, "Secure Applications of Pedersen's Distributed Key Generation Protocol", CT-RSA 2003), which is why the cheaper protocol is used, as drand does for its threshold BLS beacon. Pads are secure under the computational Diffie-Hellman assumption in G1 with the hash modelled as a random oracle; a recipient's decryption key opens every share ever sent to it, so validators rotate encryption keys with the validator set.
+`RevealedShare.index` is a share index; with one share per recipient it is the accuser's index, so the encoding of every message is unchanged from earlier versions.
+
+**Security notes.** An honest dealer is never disqualified, and the faulty dealers weigh less than `t` in all, so a `QUAL` of weight `t` or more contains an honest dealer and the group secret stays unknown. With the reference kernel's weights (a dealer weighs its share count) that is the assumption that the faulty participants hold fewer than `t` shares, which validators holding at most two thirds of the stake always do (15 §6.8). A falsely accused honest dealer reveals only the accuser's shares. Joint-Feldman lets a faulty dealer bias the distribution of the group key by choosing whether to be disqualified; for threshold signatures this bias does not enable forgery (Gennaro, Jarecki, Krawczyk and Rabin, "Secure Applications of Pedersen's Distributed Key Generation Protocol", CT-RSA 2003), which is why the cheaper protocol is used, as drand does for its threshold BLS beacon. Pads are secure under the computational Diffie-Hellman assumption in G1 with the hash modelled as a random oracle; a recipient's decryption key opens every share ever sent to it, so validators rotate encryption keys with the validator set.
 
 ## 6. Resharing
 
-A resharing hands an existing key to a new set of recipients, with a new threshold if desired, and keeps the group key. It is a run of §5 with the previous public key set given: the dealers are the previous shareholders, dealer `i` uses its current share `s_i` as `a_{i,0}`, and every machine rejects a dealing whose constant term is not `pk_i` of the previous set. With `λ_i` the Lagrange coefficients at zero over `QUAL` (§4),
+A resharing hands an existing key to a new set of recipients, with a new threshold if desired, and keeps the group key. It is a run of §5 with the previous public key set given: the dealers are the previous shares, each of weight 1, so that a party holding several previous shares deals once for each; dealer `i` uses share `s_i` as `a_{i,0}`, and every machine rejects a dealing whose constant term is not `pk_i` of the previous set. With `λ_i` the Lagrange coefficients at zero over `QUAL` (§4),
 
 ```
 C   = Σ_{i ∈ QUAL} λ_i · C_i        s'_j = Σ_{i ∈ QUAL} λ_i · s_ij
@@ -157,7 +161,7 @@ certificate_v2 = 2 ‖ key_id (u64) ‖ height (u64) ‖ block_hash (32 bytes) �
 
 A decoder MUST reject a first byte other than 1 or 2 (an unknown version), a length other than 89 for version 1 or 97 for version 2, and a signature that does not decode. The reference driver produces version 2 only; version 1 stays decodable and its verifier (§8, Appendix A) stays deployed for chains whose key never changes. A later signature scheme gets a new version byte, a new message tag and its own Ethereum verifier.
 
-**Producing.** Each shareholder of key set `key_id` signs `message_v2` with its share; any `t` partial signatures combine into the group signature (§4). The combiner verifies the combined signature before emitting the certificate, so an invalid partial never yields an invalid certificate; when that check fails, the driver verifies the partials one by one, drops the invalid ones and combines again.
+**Producing.** Each shareholder of key set `key_id` signs `message_v2` with each share it holds; any `t` partial signatures of distinct shares combine into the group signature (§4). The combiner verifies the combined signature before emitting the certificate, so an invalid partial never yields an invalid certificate; when that check fails, the driver verifies the partials one by one, drops the invalid ones and combines again.
 
 **Verifying.** A certificate is valid for `chain_id` under the group key `PK` of the key set it names (version 2) or of the chain (version 1) when its signature verifies (§3) over the message rebuilt from `chain_id`, its key id, its height and its block hash. Inside a kernel this is the host function `bls12381_verify` (05 §4.3) with arguments `message`, `DST_SIG`, the signature and `PK`. Which key sets a verifier accepts for which heights is the verifier's rule: a full node's is spec 08 §7a, a light client's spec 17 §5.3.
 
@@ -169,7 +173,7 @@ rotation_message = "SOLO-ROTATE" (11 ASCII bytes) ‖ 1 ‖ chain_id (u64) ‖ k
 
 Its group signature over it is a *rotation certificate*. The version byte 1 lets a later rotation format coexist; the tag differs from the certificate tag in its sixth byte, so no rotation message is a certificate message and no certificate message a rotation message, and both are signed under one `DST_SIG` without ambiguity. A rotation message names the new key, not the old: the old key is whoever signs it, and a verifier checks it against the key it holds.
 
-**Relationship to 08.** A driver that adopts these certificates carries them in `FinalizeBlock.certificate`. A spec 08 finalize certificate opens with its kind byte 2 too, but its encoding is `42 + 69·n` bytes for `n` votes (one byte more from 128 votes on), never 97, and never 89, so a decoder tells the three formats apart by the first byte and the length. A certificate does not say which validators signed; participation is recorded separately (ADR 0008).
+**Relationship to 08.** A driver that adopts these certificates carries them in `FinalizeBlock.certificate`. A spec 08 finalize certificate opens with its kind byte 2 too, but its encoding is `42 + 69·n` bytes for `n` votes (one byte more from 128 votes on), never 97, and never 89, so a decoder tells the three formats apart by the first byte and the length. A certificate does not say which validators signed; participation is recorded separately (ADR 0008). What a certificate proves about stake follows from how the shares were dealt, never from the certificate: under the reference kernel's dealing, the shares behind any certificate belong to validators holding more than two thirds of the stake of the key set's epoch (15 §6.8), so a verifier, an Ethereum contract included, needs no list of validators or stakes.
 
 ## 8. Verification on Ethereum
 
@@ -267,7 +271,7 @@ The key of §9.1 as key set 3 certifies the block of §9.1, and hands off to the
 ## 10. Limits of this version
 
 - The reference kernel's DKG (15 §6) carries messages in blocks, ends phases at fixed heights and adopts a key set only when more than two thirds of the stake confirm the same public outcome, which is how it checks that every participant derived the same key set. Partial signatures ride on finalize votes, rotation partials on their own envelopes (15 §6.6), and both are combined in the host's keystore (05 §4.3), natively, rather than in the interpreter.
-- The threshold counts shareholders, not stake (15 §9).
+- The threshold counts shares. The reference kernel deals shares in proportion to stake, rounded down, so that `t` of them always stand for more than two thirds of the key set's epoch stake; the rounding costs liveness, never safety (15 §6.8). A recipient Feldman-checks each of its shares from each dealer one at a time, so its work grows with its share count; a batched check is left for later.
 - `bls12381_verify` covers this scheme only. The Ethereum consensus layer's signatures (keys in G1, signatures in G2), which the sync-committee light client of spec 18 checks, have their own host function, `bls12381_fast_aggregate_verify`, behind feature gate 1 (05 §4.3).
 - The DKG is synchronous; a run whose messages are not delivered to everyone alike can end with different outputs at different participants. In the reference kernel every participant reads the same messages from chain state, and a key set is adopted only once more than two thirds of the stake confirm it.
 

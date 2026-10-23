@@ -718,8 +718,9 @@ pub enum ConsensusMessage {
         /// The certified proposal, when the certificate names one the sender holds.
         proposal: Option<Proposal>,
     },
-    /// A finalize vote with the voter's threshold partial signature over
-    /// the proposal's certificate message (spec 08 §4, spec 12 §7).
+    /// A finalize vote with the voter's threshold partial signatures over
+    /// the proposal's certificate message, one per share it holds (spec 08
+    /// §4, spec 12 §7).
     FinalizeShare {
         /// View.
         view: u64,
@@ -727,8 +728,8 @@ pub enum ConsensusMessage {
         hash: Hash,
         /// Signature of the finalize vote.
         signature: Signature,
-        /// The partial signature.
-        partial: crate::staking::PartialShare,
+        /// The partial signatures.
+        partials: Seq<crate::staking::PartialShare>,
     },
     /// A DKG envelope for leaders to put in proposals (spec 15 §6.2).
     Dkg {
@@ -774,10 +775,10 @@ impl Encode for ConsensusMessage {
                 view,
                 hash,
                 signature,
-                partial,
+                partials,
             } => {
                 e.raw(&[4]);
-                e.put(view).put(hash).put(signature).put(partial);
+                e.put(view).put(hash).put(signature).put(partials);
             }
             ConsensusMessage::Dkg { envelope } => {
                 e.raw(&[5]);
@@ -812,7 +813,7 @@ impl Decode for ConsensusMessage {
                 view: d.get()?,
                 hash: d.get()?,
                 signature: d.get()?,
-                partial: d.get()?,
+                partials: d.get()?,
             },
             5 => ConsensusMessage::Dkg { envelope: d.get()? },
             tag => return Err(DecodeError::BadTag(tag)),
@@ -1176,11 +1177,11 @@ mod tests {
                 view: 2,
                 hash: [4; 32],
                 signature: Signature([5; 65]),
-                partial: crate::staking::PartialShare {
+                partials: Seq(vec![crate::staking::PartialShare {
                     key_set: 1,
                     index: 2,
                     signature: vec![6; 48],
-                },
+                }]),
             },
             ConsensusMessage::Dkg {
                 envelope: vec![7, 8],

@@ -31,6 +31,8 @@ fn config(t: u32, dealers: u32, n: u32, previous: Option<PublicKeySet>) -> Confi
         threshold: t,
         dealers,
         recipients: encryption_keys(n),
+        shares: Vec::new(),
+        weights: Vec::new(),
         previous,
     }
 }
@@ -140,7 +142,7 @@ fn check(outputs: &[Output], qualified: &[u32]) -> PublicKeySet {
         assert_eq!(o.key_set, keys);
         assert_eq!(o.qualified, qualified);
     }
-    let shares: Vec<&SecretShare> = outputs.iter().filter_map(|o| o.share.as_ref()).collect();
+    let shares: Vec<&SecretShare> = outputs.iter().filter_map(|o| o.shares.first()).collect();
     for s in &shares {
         assert_eq!(s.public_key(), keys.public_share(s.index()));
     }
@@ -223,10 +225,10 @@ fn a_dealer_who_answers_a_complaint_with_the_right_share_stays() {
     assert!(matches!(
         &justified[..],
         [Message::Justification(Justification { dealer: 2, shares, .. })]
-            if shares.len() == 1 && shares[0].recipient == 3
+            if shares.len() == 1 && shares[0].index == 3
     ));
     check(&outputs, &[1, 2, 3, 4]);
-    assert!(outputs[2].share.is_some());
+    assert!(outputs[2].shares.len() == 1);
 }
 
 #[test]
@@ -272,9 +274,9 @@ fn a_justification_that_dodges_the_complaint_disqualifies() {
                 panic!("expected a justification")
             };
             // Reveal recipient 2's share instead, then a garbage scalar.
-            j.shares[0].recipient = 2;
+            j.shares[0].index = 2;
             j.shares.push(RevealedShare {
-                recipient: 4,
+                index: 4,
                 share: [0xFF; 32],
             });
         }
@@ -448,8 +450,8 @@ fn a_lost_complaint_leaves_only_the_accuser_without_a_share() {
         _ => {}
     });
     check(&outputs, &[1, 2, 3, 4]);
-    assert!(outputs[2].share.is_none());
-    assert!(outputs.iter().filter(|o| o.share.is_some()).count() == 3);
+    assert!(outputs[2].shares.is_empty());
+    assert!(outputs.iter().filter(|o| o.shares.len() == 1).count() == 3);
 }
 
 #[test]
@@ -472,9 +474,9 @@ fn observers_and_pure_recipients_follow_the_run() {
     nodes.push(observer);
     let outputs = run(&mut nodes, dealings, |_, _| {});
     check(&outputs, &[1, 2, 3]);
-    assert!(outputs[..3].iter().all(|o| o.share.is_none()));
-    assert!(outputs[3..6].iter().all(|o| o.share.is_some()));
-    assert!(outputs[6].share.is_none());
+    assert!(outputs[..3].iter().all(|o| o.shares.is_empty()));
+    assert!(outputs[3..6].iter().all(|o| o.shares.len() == 1));
+    assert!(outputs[6].shares.is_empty());
 }
 
 /// Reshares `outputs` (a 3-of-4 key) to `n_new` recipients with threshold
@@ -490,7 +492,7 @@ fn reshare(
     let mut nodes = Vec::new();
     let mut dealings = Vec::new();
     for o in outputs {
-        let share = o.share.unwrap();
+        let share = o.shares.into_iter().next().unwrap();
         let i = share.index();
         if dealers.contains(&i) {
             let (dkg, d) = Dkg::new(cfg.clone(), dealer(i, Some(share)), None).unwrap();
@@ -518,7 +520,7 @@ fn resharing_to_a_new_set_keeps_the_group_key() {
     // A certificate from the new set verifies under the old group key.
     let shares: Vec<&SecretShare> = new_outputs[4..]
         .iter()
-        .filter_map(|o| o.share.as_ref())
+        .filter_map(|o| o.shares.first())
         .collect();
     let partials: Vec<_> = shares[1..]
         .iter()
@@ -535,7 +537,7 @@ fn a_resharing_dealer_cannot_change_the_group_key() {
     let keys = check(&outputs, &[1, 2, 3, 4]);
     // Dealer 4 deals with a share it does not hold: its own share plus one.
     let cfg = config(2, 4, 3, Some(keys.clone()));
-    let mut forged_bytes = outputs[3].share.as_ref().unwrap().to_bytes();
+    let mut forged_bytes = outputs[3].shares.first().unwrap().to_bytes();
     forged_bytes[31] ^= 1;
     let forged = SecretShare::from_bytes(4, &forged_bytes).unwrap();
     let (_, bad) = Dkg::new(cfg, dealer(4, Some(forged)), None).unwrap();
@@ -638,7 +640,7 @@ fn keys_and_messages_have_canonical_encodings() {
             session: SESSION,
             dealer: 1,
             shares: vec![RevealedShare {
-                recipient: 2,
+                index: 2,
                 share: [3; 32],
             }],
         }),
@@ -704,7 +706,7 @@ fn a_pinned_two_party_run() {
     );
     let shares: Vec<String> = outputs
         .iter()
-        .map(|o| hex(&o.share.as_ref().unwrap().to_bytes()))
+        .map(|o| hex(&o.shares.first().unwrap().to_bytes()))
         .collect();
     assert_eq!(
         shares,
@@ -713,4 +715,197 @@ fn a_pinned_two_party_run() {
             "1d90c23af67638a1e5f471c93486d0163ef41c680ee807a57d599431274f522c",
         ]
     );
+}
+
+// Weighted shareholders (spec 12 §4–§5): recipients holding several shares,
+// dealers weighing their share counts.
+
+/// Recipients 1..=n holding `shares`, dealers 1..=n weighing the same.
+fn weighted_config(t: u32, shares: &[u32]) -> Config {
+    let n = u32::try_from(shares.len()).unwrap();
+    Config {
+        session: SESSION,
+        threshold: t,
+        dealers: n,
+        recipients: encryption_keys(n),
+        shares: shares.to_vec(),
+        weights: shares.to_vec(),
+        previous: None,
+    }
+}
+
+/// A weighted run in which participant `i` deals and receives as index `i`.
+fn weighted(t: u32, shares: &[u32]) -> (Vec<Dkg>, Vec<Message>) {
+    let mut nodes = Vec::new();
+    let mut dealings = Vec::new();
+    for i in 1..=u32::try_from(shares.len()).unwrap() {
+        let (dkg, dealing) =
+            Dkg::new(weighted_config(t, shares), dealer(i, None), recipient(i)).unwrap();
+        nodes.push(dkg);
+        dealings.push(dealing.unwrap());
+    }
+    (nodes, dealings)
+}
+
+/// Every output agrees; recipient `j` holds exactly its run of indices,
+/// each matching its public share; and a set of recipients signs exactly
+/// when its shares reach the threshold.
+fn check_weighted(outputs: &[Output], shares: &[u32], qualified: &[u32]) -> PublicKeySet {
+    let keys = outputs[0].key_set.clone();
+    let mut next = 1u32;
+    for (o, &m) in outputs.iter().zip(shares) {
+        assert_eq!(o.key_set, keys);
+        assert_eq!(o.qualified, qualified);
+        let indices: Vec<u32> = o.shares.iter().map(SecretShare::index).collect();
+        assert_eq!(indices, (next..next + m).collect::<Vec<_>>());
+        next += m;
+        for s in &o.shares {
+            assert_eq!(s.public_key(), keys.public_share(s.index()));
+        }
+    }
+    let t = keys.threshold() as usize;
+    for mask in 1u32..(1 << outputs.len()) {
+        let partials: Vec<_> = outputs
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| mask & (1 << j) != 0)
+            .flat_map(|(_, o)| &o.shares)
+            .map(|s| certificate::sign_partial(s, CHAIN_ID, 9, &[7; 32]))
+            .collect();
+        let cert = Certificate::combine(&keys, CHAIN_ID, 9, &[7; 32], &partials);
+        assert_eq!(cert.is_ok(), partials.len() >= t, "recipients {mask:b}");
+    }
+    keys
+}
+
+#[test]
+fn a_weighted_run_gives_each_recipient_its_run_of_shares() {
+    let shares = [1, 3, 2];
+    let (mut nodes, dealings) = weighted(4, &shares);
+    let Message::Dealing(d) = &dealings[0] else {
+        panic!()
+    };
+    assert_eq!(d.shares.len(), 6);
+    let outputs = run(&mut nodes, dealings, |_, _| {});
+    let keys = check_weighted(&outputs, &shares, &[1, 2, 3]);
+    assert_eq!(keys.threshold(), 4);
+    // Recipients 1 and 3 hold three shares together: one short.
+    let partials: Vec<_> = [&outputs[0], &outputs[2]]
+        .iter()
+        .flat_map(|o| &o.shares)
+        .map(|s| certificate::sign_partial(s, CHAIN_ID, 9, &[7; 32]))
+        .collect();
+    assert_eq!(
+        Certificate::combine(&keys, CHAIN_ID, 9, &[7; 32], &partials),
+        Err(Error::NotEnoughShares)
+    );
+}
+
+#[test]
+fn a_weighted_complaint_reveals_every_share_of_the_accuser() {
+    let shares = [1, 3, 2];
+    let (mut nodes, dealings) = weighted(4, &shares);
+    let mut seen = Vec::new();
+    let outputs = run(&mut nodes, dealings, |phase, msgs| match phase {
+        // Dealer 1 spoils share 3, the second of recipient 2's.
+        0 => dealing_of(msgs, 1).shares[2][31] ^= 1,
+        1 | 2 => seen.extend(msgs.iter().cloned()),
+        _ => {}
+    });
+    assert_eq!(
+        seen[0],
+        Message::Complaints(Complaints {
+            session: SESSION,
+            accuser: 2,
+            dealers: vec![1],
+        })
+    );
+    assert!(matches!(
+        &seen[1],
+        Message::Justification(Justification { dealer: 1, shares, .. })
+            if shares.iter().map(|s| s.index).collect::<Vec<_>>() == [2, 3, 4]
+    ));
+    check_weighted(&outputs, &shares, &[1, 2, 3]);
+}
+
+#[test]
+fn a_weighted_justification_must_answer_every_share_of_the_accuser() {
+    let shares = [1, 3, 2];
+    let (mut nodes, dealings) = weighted(4, &shares);
+    let outputs = run(&mut nodes, dealings, |phase, msgs| match phase {
+        0 => dealing_of(msgs, 1).shares[2][31] ^= 1,
+        2 => {
+            let Message::Justification(j) = &mut msgs[0] else {
+                panic!("expected a justification")
+            };
+            // Drop share 4; add entries for share 0, a share of recipient 3,
+            // who did not complain, and a share past the last.
+            j.shares.retain(|s| s.index != 4);
+            for index in [0, 5, 7] {
+                j.shares.push(RevealedShare {
+                    index,
+                    share: [0; 32],
+                });
+            }
+        }
+        _ => {}
+    });
+    // Dealer 1 is disqualified; dealers 2 and 3 weigh 5 of the threshold 4.
+    check_weighted(&outputs, &shares, &[2, 3]);
+}
+
+#[test]
+fn qualified_dealers_count_by_weight() {
+    // Dealer 2 alone weighs 3 of the threshold 3: one qualified dealer is enough.
+    let shares = [1, 3];
+    let (mut nodes, dealings) = weighted(3, &shares);
+    let outputs = run(&mut nodes, dealings, |phase, msgs| {
+        if phase == 0 {
+            msgs.retain(|m| !matches!(m, Message::Dealing(d) if d.dealer == 1));
+        }
+    });
+    check_weighted(&outputs, &shares, &[2]);
+    // Dealer 1 alone weighs 1, below it.
+    let (mut nodes, mut dealings) = weighted(3, &shares);
+    dealings.retain(|m| !matches!(m, Message::Dealing(d) if d.dealer == 2));
+    deliver(&mut nodes, &dealings);
+    advance(&mut nodes);
+    advance(&mut nodes);
+    assert_eq!(nodes[0].advance().unwrap_err(), DkgError::TooFewQualified);
+}
+
+#[test]
+fn weighted_configurations_that_do_not_fit_are_refused() {
+    let keys = threshold::deal(
+        &solo_bls::SecretKey::generate(&[1; 32], b"").unwrap(),
+        2,
+        3,
+        &[2; 32],
+    )
+    .unwrap()
+    .0;
+    let with = |shares: &[u32], weights: &[u32], t: u32| Config {
+        shares: shares.to_vec(),
+        weights: weights.to_vec(),
+        ..config(t, 2, 2, None)
+    };
+    let cases = vec![
+        with(&[1, 0], &[], 1),
+        with(&[1], &[], 1),
+        with(&[u32::MAX, 1], &[], 1),
+        with(&[1, 2], &[], 4),
+        with(&[], &[1], 1),
+        with(&[], &[1, 0], 1),
+        Config {
+            weights: vec![1, 1, 1],
+            ..config(2, 3, 3, Some(keys))
+        },
+    ];
+    for cfg in cases {
+        assert_eq!(
+            Dkg::new(cfg, None, None).err(),
+            Some(DkgError::InvalidConfig)
+        );
+    }
+    assert!(Dkg::new(with(&[1, 2], &[2, 1], 3), None, recipient(2)).is_ok());
 }

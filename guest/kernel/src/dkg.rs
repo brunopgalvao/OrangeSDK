@@ -31,10 +31,13 @@ const POOL_CAP: usize = 64;
 const OUT_KEY: &[u8] = b"dkg/out/";
 /// This node's validator id, once learned.
 const ID_KEY: &[u8] = b"dkg/id";
-/// Rotation shares received for the pending handoff, one per shareholder index.
-const SHARES_KEY: &[u8] = b"dkg/shares";
-/// This node's rotation share, once computed: `dkg/rshare/` ‖ target.
-const RSHARE_KEY: &[u8] = b"dkg/rshare/";
+/// Rotation shares received for the pending handoff, one partial per share
+/// index. Rotation shares carry a list of partials since shares follow stake
+/// (spec 15 §6.6); the keys are new so that a node whose driver store holds
+/// the earlier single-partial records ignores them rather than misreading them.
+const SHARES_KEY: &[u8] = b"dkg/shares2";
+/// This node's rotation share, once computed: `dkg/rshare2/` ‖ active ‖ target.
+const RSHARE_KEY: &[u8] = b"dkg/rshare2/";
 /// The handoff this node combined: `dkg/handoff/` ‖ target.
 const HANDOFF_KEY: &[u8] = b"dkg/handoff/";
 /// Evidence this node found that chain state does not hold yet.
@@ -79,6 +82,22 @@ fn index_of(list: &[Hash], id: &Hash) -> u32 {
     list.iter().position(|x| x == id).map_or(0, |i| i as u32 + 1)
 }
 
+/// The share indices `id` holds of a key set with these shareholders.
+fn indices_of(shareholders: &[Hash], id: &Hash) -> Vec<u32> {
+    (1u32..).zip(shareholders).filter(|(_, s)| *s == id).map(|(x, _)| x).collect()
+}
+
+/// This node's partial signatures with every share it holds of key set
+/// `key_set` (`SignAll`, spec 15 §6.4), installing its shares again first
+/// if the keystore lost them; only partials of the share indices chain
+/// state gives `me` are kept.
+fn sign_all(key_set: u64, me: &Hash, indices: &[u32], message: Vec<u8>) -> Vec<PartialShare> {
+    let request = KeystoreRequest::SignAll { key_set, message };
+    let reply = keystore(&request).or_else(|| if install(key_set, me) { keystore(&request) } else { None });
+    let partials = reply.and_then(|r| Seq::<PartialShare>::from_bytes(&r).ok()).map(|s| s.0).unwrap_or_default();
+    partials.into_iter().filter(|p| p.key_set == key_set && indices.contains(&p.index)).collect()
+}
+
 fn signer(chain_id: u64, env: &DkgEnvelope) -> Option<Hash> {
     let body_hash = state::keccak256(&DkgEnvelope::signed_hash_preimage(env.kind, &env.body));
     let digest = state::keccak256(&signing_preimage(KIND_DKG, chain_id, env.epoch, &body_hash));
@@ -98,7 +117,7 @@ fn sign_envelope(chain_id: u64, epoch: u64, kind: u8, body: Vec<u8>) -> Option<V
 
 fn request(run: &DkgRun, dealer: u32, recipient: u32, upto: u8) -> KeystoreRequest {
     let previous = run.previous.and_then(staking::key_set);
-    KeystoreRequest::Dkg(DkgRequest {
+    let request = DkgRequest {
         key_set: run.epoch,
         session: run.session,
         threshold: run.threshold,
@@ -110,7 +129,8 @@ fn request(run: &DkgRun, dealer: u32, recipient: u32, upto: u8) -> KeystoreReque
         recipient,
         transcript: Seq(staking::transcript(run, upto)),
         upto,
-    })
+    };
+    KeystoreRequest::WeightedDkg { request, shares: run.shares.clone() }
 }
 
 fn ask(run: &DkgRun, dealer: u32, recipient: u32, upto: u8) -> Option<DkgReply> {
@@ -319,45 +339,49 @@ fn due() -> Option<(KeySetRecord, KeySetRecord)> {
     Some((staking::active()?, target))
 }
 
-/// Keeps `share`, signed by `signer`, when it is the partial of the
-/// shareholder `signer` of the active key set over the rotation message to
-/// the pending target: one per shareholder index. Shares for any other
-/// handoff are dropped, as are all shares once no handoff is due.
+/// Keeps the partials of `share`, signed by `signer`, that are partials of
+/// shares `signer` holds of the active key set over the rotation message
+/// to the pending target: one per share index, each kept as a share of its
+/// own. Partials for any other handoff are dropped, as are all of them
+/// once no handoff is due.
 fn add_share(share: &RotationShare, signer: &Hash) {
     let Some((active, target)) = due() else {
         persist::set(SHARES_KEY, &Seq::<RotationShare>(Vec::new()));
         return;
     };
-    let mut held: Vec<RotationShare> = shares().into_iter().filter(|s| s.to == target.id && s.partial.key_set == active.id).collect();
-    let p = &share.partial;
-    let fits = share.to == target.id
-        && target.group_key() == Some(share.key.as_slice())
-        && p.key_set == active.id
-        && p.index != 0
-        && active.shareholders.0.get(p.index as usize - 1) == Some(signer)
-        && !held.iter().any(|s| s.partial.index == p.index);
-    if fits {
-        held.push(share.clone());
+    let mut held: Vec<RotationShare> = shares().into_iter().filter(|s| s.to == target.id && s.partials.0.iter().all(|p| p.key_set == active.id)).collect();
+    let for_target = share.to == target.id && target.group_key() == Some(share.key.as_slice());
+    for p in &share.partials.0 {
+        let fits = for_target
+            && p.key_set == active.id
+            && p.index != 0
+            && active.shareholders.0.get(p.index as usize - 1) == Some(signer)
+            && !held.iter().flat_map(|s| &s.partials.0).any(|q| q.index == p.index);
+        if fits {
+            held.push(RotationShare { to: share.to, key: share.key.clone(), partials: Seq(vec![p.clone()]) });
+        }
     }
     persist::set(SHARES_KEY, &Seq(held));
 }
 
 /// Evidence of a rotation share that no honest shareholder signs: a partial
 /// over the rotation message to a key set with another group key than the
-/// one the chain adopted, or to one never adopted whose epoch is over.
+/// one the chain adopted, or to one never adopted whose epoch is over. Of
+/// a share's partials, the first that shows an offence.
 fn rotation_fraud(share: &RotationShare, signer: &Hash) -> Option<ThresholdEvidence> {
-    let p = &share.partial;
-    let record = staking::key_set(p.key_set)?;
-    if p.index == 0 || record.shareholders.0.get(p.index as usize - 1) != Some(signer) {
-        return None;
-    }
     let honest = staking::key_set(share.to).is_some_and(|t| t.group_key() == Some(share.key.as_slice()));
     if honest {
         return None;
     }
     let subject = [&share.to.to_be_bytes()[..], &share.key].concat();
-    let evidence = ThresholdEvidence { kind: offence::ROTATION, key_set: p.key_set, index: p.index, signature: p.signature.clone(), subject };
-    rotation::offender(&evidence, state::height().unwrap_or(0) + 1).map(|_| evidence)
+    share.partials.0.iter().find_map(|p| {
+        let record = staking::key_set(p.key_set)?;
+        if p.index == 0 || record.shareholders.0.get(p.index as usize - 1) != Some(signer) {
+            return None;
+        }
+        let evidence = ThresholdEvidence { kind: offence::ROTATION, key_set: p.key_set, index: p.index, signature: p.signature.clone(), subject: subject.clone() };
+        rotation::offender(&evidence, state::height().unwrap_or(0) + 1).map(|_| evidence)
+    })
 }
 
 /// Evidence of a finalize vote's partial `partial` over proposal `p` that no
@@ -406,7 +430,7 @@ fn combine(chain_id: u64) -> Option<Vec<u8>> {
     if persist::get_raw(&out_key).is_some() {
         return None;
     }
-    let partials: Vec<PartialShare> = shares().into_iter().filter(|s| s.to == target.id && s.partial.key_set == active.id).map(|s| s.partial).collect();
+    let partials: Vec<PartialShare> = shares().into_iter().filter(|s| s.to == target.id).flat_map(|s| s.partials.0).filter(|p| p.key_set == active.id).collect();
     if partials.len() < active.threshold() {
         return None;
     }
@@ -420,9 +444,9 @@ fn combine(chain_id: u64) -> Option<Vec<u8>> {
 }
 
 /// What this node broadcasts for key rotation after each block: its
-/// rotation share while a handoff is due and it holds a share of the active
-/// key set, the handoff once it can combine one, and the evidence it found
-/// that chain state does not hold yet.
+/// rotation share, a partial for each share it holds of the active key
+/// set, while a handoff is due, the handoff once it can combine one, and
+/// the evidence it found that chain state does not hold yet.
 pub fn rotation_step(chain_id: u64, me: &Hash) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut held: Vec<ThresholdEvidence> = persist::get::<Seq<ThresholdEvidence>>(EVIDENCE_KEY).map(|s| s.0).unwrap_or_default();
@@ -441,16 +465,18 @@ pub fn rotation_step(chain_id: u64, me: &Hash) -> Vec<Vec<u8>> {
         persist::set(SHARES_KEY, &Seq::<RotationShare>(Vec::new()));
         return out;
     };
-    let index = index_of(&active.shareholders.0, me);
-    if index != 0 {
-        // Keyed by both ends: a share is the active key set's partial over
+    let indices = indices_of(&active.shareholders.0, me);
+    if !indices.is_empty() {
+        // Keyed by both ends: a share is the active key set's partials over
         // the rotation to the target, and is never reused for another pair.
         let out_key = [RSHARE_KEY, &active.id.to_be_bytes(), &target.id.to_be_bytes()].concat();
         let share = persist::get::<RotationShare>(&out_key).or_else(|| {
             let key = target.group_key()?.to_vec();
-            let request = KeystoreRequest::Sign { key_set: active.id, message: rotation_message(chain_id, target.id, &key) };
-            let signature = keystore(&request).or_else(|| if install(active.id, me) { keystore(&request) } else { None })?;
-            let share = RotationShare { to: target.id, key, partial: PartialShare { key_set: active.id, index, signature } };
+            let partials = sign_all(active.id, me, &indices, rotation_message(chain_id, target.id, &key));
+            if partials.is_empty() {
+                return None;
+            }
+            let share = RotationShare { to: target.id, key, partials: Seq(partials) };
             persist::set(&out_key, &share);
             Some(share)
         });
@@ -497,17 +523,16 @@ pub fn for_proposal() -> Seq<Vec<u8>> {
     Seq(pool)
 }
 
-/// This node's partial signature over the version-2 certificate message of
-/// the proposal at `height` with `hash`, with the share of the active key set.
-pub fn partial(chain_id: u64, me: &Hash, height: u64, hash: &Hash) -> Option<PartialShare> {
-    let active = staking::active()?;
-    let index = index_of(&active.shareholders.0, me);
-    if index == 0 {
-        return None;
+/// This node's partial signatures over the version-2 certificate message
+/// of the proposal at `height` with `hash`, one with each share it holds of
+/// the active key set; empty when it holds none.
+pub fn partials(chain_id: u64, me: &Hash, height: u64, hash: &Hash) -> Vec<PartialShare> {
+    let Some(active) = staking::active() else { return Vec::new() };
+    let indices = indices_of(&active.shareholders.0, me);
+    if indices.is_empty() {
+        return Vec::new();
     }
-    let request = KeystoreRequest::Sign { key_set: active.id, message: certificate_message(chain_id, active.id, height, hash) };
-    let signature = keystore(&request).or_else(|| if install(active.id, me) { keystore(&request) } else { None })?;
-    Some(PartialShare { key_set: active.id, index, signature })
+    sign_all(active.id, me, &indices, certificate_message(chain_id, active.id, height, hash))
 }
 
 /// Whether `partial`, carried by a finalize vote of validator `signer`,

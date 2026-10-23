@@ -6,7 +6,7 @@
 
 use alloc::vec::Vec;
 
-use crate::codec::{Decode, DecodeError, Decoder, Encode, Encoder};
+use crate::codec::{Decode, DecodeError, Decoder, Encode, Encoder, Seq};
 use crate::staking::{G1_LENGTH, G2_LENGTH, PartialShare};
 use crate::types::Hash;
 
@@ -207,15 +207,16 @@ pub fn threshold_certificate(bytes: &[u8]) -> Option<ThresholdCertificate<'_>> {
 
 record! {
     /// The body of a rotation-share envelope (spec 15 §6.6): a shareholder's
-    /// partial signature, with the active key set, over the rotation
-    /// message to key set `to`.
+    /// partial signatures, one per share it holds of the active key set,
+    /// over the rotation message to key set `to`.
     RotationShare {
         /// The key set handed off to.
         to: u64,
         /// Its group key, compressed (96 bytes), as the signer read it.
         key: Vec<u8>,
-        /// The partial signature, with the signing key set and index.
-        partial: PartialShare,
+        /// The partial signatures, each with the signing key set and its
+        /// share index.
+        partials: Seq<PartialShare>,
     }
 }
 
@@ -421,11 +422,11 @@ mod tests {
         roundtrip(&RotationShare {
             to: 3,
             key: vec![3; 96],
-            partial: PartialShare {
+            partials: Seq(vec![PartialShare {
                 key_set: 2,
                 index: 1,
                 signature: vec![4; 48],
-            },
+            }]),
         });
         roundtrip(&RotationCertificate {
             from: 2,
