@@ -68,14 +68,10 @@ fn msm_cost(n: usize, bits: usize) -> u64 {
 trait Equations {
     /// What checking positions `range` one by one, and in one batch, cost.
     fn costs(&self, range: Range<usize>) -> (u64, u64);
-    /// Whether the equation at position `i` holds.
-    fn one(&mut self, i: usize) -> bool;
+    /// The positions in `range` whose equations fail, each checked alone.
+    fn singles(&mut self, range: Range<usize>) -> Vec<usize>;
     /// Whether the batch over positions `range` holds.
     fn batch(&mut self, range: Range<usize>) -> bool;
-    /// The positions in `range` whose equations fail, each checked alone.
-    fn singles(&mut self, range: Range<usize>) -> Vec<usize> {
-        range.filter(|&i| !self.one(i)).collect()
-    }
 }
 
 /// The positions in `range` whose equations fail, ascending: batches where
@@ -141,12 +137,8 @@ impl Equations for Feldman<'_, '_> {
         (range.len() as u64 * e, msm_cost(range.len(), 64) + e)
     }
 
-    /// The Feldman check of each share of dealer `i`.
-    fn one(&mut self, i: usize) -> bool {
-        feldman(&self.items[i], self.first)
-    }
-
-    /// The dealers split over threads, each checked alone.
+    /// The Feldman check of each share of each dealer, the dealers split
+    /// over threads.
     fn singles(&mut self, range: Range<usize>) -> Vec<usize> {
         let (items, first) = (self.items, self.first);
         let start = range.start;
@@ -281,14 +273,18 @@ impl Equations for PartialChecks<'_> {
         (e + n * PAIRING, msm_cost(range.len(), 64) + key + PAIRING)
     }
 
-    fn one(&mut self, i: usize) -> bool {
-        let p = &self.partials[i];
-        p.index != 0
-            && sig::verify_hashed(
-                self.h,
-                &p.signature.0,
-                &poly::evaluate_commitment(self.commitment, p.index).into(),
-            )
+    fn singles(&mut self, range: Range<usize>) -> Vec<usize> {
+        range
+            .filter(|&i| {
+                let p = &self.partials[i];
+                !(p.index != 0
+                    && sig::verify_hashed(
+                        self.h,
+                        &p.signature.0,
+                        &poly::evaluate_commitment(self.commitment, p.index).into(),
+                    ))
+            })
+            .collect()
     }
 
     /// `e(Σ_j ρ_j σ_j, −g2) · e(h, Σ_j ρ_j pk_{x_j}) = 1`. A partial naming
@@ -351,9 +347,9 @@ mod tests {
             let n = range.len() as u64;
             (n * self.costs.0, self.costs.1)
         }
-        fn one(&mut self, i: usize) -> bool {
-            self.ones += 1;
-            self.bad >> i & 1 == 0
+        fn singles(&mut self, range: Range<usize>) -> Vec<usize> {
+            self.ones += range.len();
+            range.filter(|i| self.bad >> i & 1 == 1).collect()
         }
         fn batch(&mut self, range: Range<usize>) -> bool {
             self.batches += 1;
