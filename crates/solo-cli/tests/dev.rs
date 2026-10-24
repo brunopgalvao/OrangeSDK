@@ -41,7 +41,11 @@ const HELLO: &str = concat!(
 /// validator leads every view and skips the new check: the rebuilt code), and left
 /// the start at 80 224; the kernel with tip fetching (spec 08 §5a, codex ADR 0049)
 /// moved them to 80 228 and 276 548 (the only validator never fetches, and a
-/// proposal on its own tip leaves the new check at once: the rebuilt code).
+/// proposal on its own tip leaves the new check at once: the rebuilt code); the
+/// kernel whose DKG phases end on completion or at a deadline, with the tip sent
+/// to a leader behind it (codex ADR 0048), gave 80 224 and 276 009 on its own, and
+/// merged with tip fetching gives 80 228 and 276 548 again (this chain has no
+/// staking and one validator, so none of the new code runs).
 const STARVED_GAS: &str = "100000";
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4,

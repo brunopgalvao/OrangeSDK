@@ -19,8 +19,10 @@ const KERNEL: &str = concat!(
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4, "alloc": {}}"#;
 
-/// Gas that lets the driver start (80 224) but not produce a block (275 837); see
-/// `dev.rs`, whose budget this is. It was 80 000 until the driver start passed it
+/// Gas that lets the driver start (80 173) but not produce a block (276 500) with
+/// this genesis, which has no genesis time, and the pinned kernel fixture, bisected
+/// on 2026-10-24 in a debug host build; `dev.rs` pins the same budget against its
+/// own genesis (80 228 and 276 548). It was 80 000 until the driver start passed it
 /// on 2026-10-24.
 const STARVED_GAS: i64 = 100_000;
 

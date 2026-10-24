@@ -72,9 +72,10 @@ fn dealings(t: u32, shares: &[u32]) -> Vec<Message> {
     })
 }
 
-/// The time recipient `j` takes to end the dealing phase: decrypting and
-/// checking its shares from every dealing. Asserts it accuses nobody.
-fn complaint_phase(t: u32, shares: &[u32], j: u32, all: &[Message]) -> Duration {
+/// The time recipient `j` takes to end the dealing phase on `threads`
+/// threads: decrypting and checking its shares from every dealing. Asserts
+/// it accuses nobody.
+fn complaint_phase(t: u32, shares: &[u32], j: u32, all: &[Message], threads: usize) -> Duration {
     let mut best = Duration::MAX;
     for _ in 0..3 {
         let recipient = Recipient {
@@ -82,6 +83,7 @@ fn complaint_phase(t: u32, shares: &[u32], j: u32, all: &[Message]) -> Duration 
             key: key(j),
         };
         let (mut dkg, _) = Dkg::new(config(t, shares), None, Some(recipient)).unwrap();
+        dkg.set_threads(threads);
         for m in all {
             dkg.handle(m).unwrap();
         }
@@ -96,6 +98,7 @@ fn complaint_phase(t: u32, shares: &[u32], j: u32, all: &[Message]) -> Duration 
 fn run(label: &str, t: u32, shares: &[u32], recipients: &[u32]) {
     let start = Instant::now();
     let all = dealings(t, shares);
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
     eprintln!(
         "{label}: {} dealers, {} shares, threshold {t}, dealt in {:?}",
         shares.len(),
@@ -104,8 +107,12 @@ fn run(label: &str, t: u32, shares: &[u32], recipients: &[u32]) {
     );
     for &j in recipients {
         let m = shares[j as usize - 1];
-        let took = complaint_phase(t, shares, j, &all);
-        eprintln!("  recipient {j} with {m} shares checks them in {took:?}");
+        let one = complaint_phase(t, shares, j, &all, 1);
+        let every = complaint_phase(t, shares, j, &all, cores);
+        eprintln!(
+            "  recipient {j} with {m} shares checks them in {one:?} on one core, {every:?} on {cores} ({:.1}x)",
+            one.as_secs_f64() / every.as_secs_f64()
+        );
     }
 }
 

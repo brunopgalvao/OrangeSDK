@@ -203,14 +203,16 @@ fn an_answer_after_the_driver_asked_again_serves_the_new_request() {
     let next = c.on_request(A, 3, ask(20), 160, &mut out);
     assert_eq!(handed(next), (3, (20..=32).collect()));
     assert!(out.is_empty());
+    // The driver took it: the answer is spent.
     c.settle(32);
+    assert_eq!(c.parked(), 0);
     // An answer the driver has not asked for yet waits; it was slow, so
     // the window narrows.
     assert_eq!(
         c.on_response(HOST_IDS + 2, answer(33, 40, 40), 2_000, &mut out),
         None
     );
-    assert_eq!((c.depth(), c.parked(), c.in_flight()), (1, 2, 0));
+    assert_eq!((c.depth(), c.parked(), c.in_flight()), (1, 1, 0));
     assert_eq!(
         handed(c.on_request(A, 4, ask(33), 2_010, &mut out)).1.len(),
         8
@@ -236,6 +238,62 @@ fn a_refused_answer_is_dropped_and_asked_for_again() {
     c.settle(4);
     assert!(c.on_request(A, 3, ask(5), 30, &mut out).is_none());
     assert_eq!(sent(&mut out), vec![(A, HOST_IDS + 1, 5)]);
+}
+
+/// A driver that refuses a parked answer and asks for the same blocks again
+/// within the same step is not handed it a second time. Found by
+/// `staking_fuzz.rs`: an observer catching up after a partition was handed
+/// the same refused answer tens of thousands of times in one step, since
+/// the refused answer was dropped only once the step ended, and the
+/// simulated network never moved on.
+#[test]
+fn an_answer_refused_within_a_step_is_not_handed_again() {
+    let mut c = CatchUp::default();
+    let mut out = Vec::new();
+    c.on_request(A, 1, ask(5), 0, &mut out);
+    sent(&mut out);
+    // The answer goes to request 1, which the driver may have abandoned;
+    // in the step it starts, the driver asks again and is handed it.
+    let input = c.on_response(HOST_IDS, answer(5, 9, 9), 10, &mut out);
+    assert_eq!(handed(input).0, 1);
+    assert_eq!(handed(c.on_request(A, 2, ask(5), 20, &mut out)).0, 2);
+    // Still in the step, the driver asks again for block 5: the answer is
+    // gone and the request goes out.
+    assert!(c.on_request(A, 3, ask(5), 20, &mut out).is_none());
+    assert_eq!(c.parked(), 0);
+    assert_eq!(sent(&mut out), vec![(A, HOST_IDS + 1, 5)]);
+    c.settle(4);
+    assert_eq!(c.depth(), 1);
+}
+
+/// What is left of an answer the driver took is the suffix proposals after
+/// an epoch's last block (spec 08 §3a), which the driver never takes: it is
+/// dropped with the rest, and the next request goes to the wire. Found by
+/// `staking_fuzz.rs`: a validator restarted after an epoch end was handed
+/// the suffix left of its first answer at every request, from then on,
+/// and never asked a peer again.
+#[test]
+fn an_answer_the_driver_took_is_spent() {
+    let mut c = CatchUp::default();
+    let mut out = Vec::new();
+    c.on_request(A, 1, ask(34), 0, &mut out);
+    sent(&mut out);
+    // Blocks 34 to 48, the epoch's last, and a suffix proposal at 49.
+    let input = c.on_response(HOST_IDS, answer(34, 49, 48), 10, &mut out);
+    assert_eq!(handed(input).0, 1);
+    // The step after finalized up to 48 without the driver asking.
+    c.settle(48);
+    assert_eq!(c.parked(), 1);
+    // Asked from 49, the driver is handed the suffix once; it takes
+    // nothing, and the answer is gone.
+    assert_eq!(
+        handed(c.on_request(A, 2, ask(49), 20, &mut out)).1,
+        vec![49]
+    );
+    c.settle(48);
+    assert_eq!(c.parked(), 0);
+    assert!(c.on_request(A, 3, ask(49), 30, &mut out).is_none());
+    assert_eq!(sent(&mut out), vec![(A, HOST_IDS + 1, 49)]);
 }
 
 #[test]
@@ -292,8 +350,21 @@ fn a_silent_peer_is_replaced_and_waited_for_longer() {
         c.poll(at, 8, &mut out);
         assert_eq!(sent(&mut out)[0].0, A);
     }
-    // Once the driver finalized past it, nothing is asked again.
-    c.poll(at + MAX_WAIT_MS, 9, &mut out);
+    // Once the driver finalized past it, nothing is asked again, and the
+    // driver's request is answered with nothing, which frees it to ask
+    // again. Found by `staking_fuzz.rs`: a validator that finalized past
+    // its own request through consensus waited for that answer for good,
+    // since its peers had moved on to the next epoch and it never entered
+    // another view, which is what abandons a request.
+    let moot = c.poll(at + MAX_WAIT_MS, 9, &mut out);
+    assert_eq!(
+        moot,
+        Some(Input::Response {
+            request_id: 1,
+            payload: Vec::new()
+        })
+    );
     assert!(out.is_empty());
     assert_eq!(c.in_flight(), 0);
+    assert_eq!(c.poll(at + 2 * MAX_WAIT_MS, 9, &mut out), None);
 }

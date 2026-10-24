@@ -1326,6 +1326,56 @@ fn a_held_proposal_gets_its_vote_once_it_can() {
     assert!(s.voted, "the new tip lets it vote for the held proposal");
 }
 
+/// A leader that proposes at or below a node's tip lacks that tip, and the
+/// node sends it the tip's certificate with the proposal (spec 08 §5a).
+/// Found by `staking_fuzz.rs`: after a partition a heavy validator never
+/// saw the notarization of height 1, which was not finalized yet, so sync
+/// could not bring it; it proposed height 1 again whenever it led, nobody
+/// voted, and without it the others could neither notarize nor skip.
+#[test]
+fn a_leader_behind_the_tip_is_sent_the_tip() {
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, address(&keys[0]));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    let node = &mut sim.nodes[3];
+    let from = |i: usize| validator_id(&keys[i]);
+    let now = node.now_ms();
+    let p1 = Proposal {
+        view: 1,
+        height: 1,
+        timestamp_ms: now,
+        ..Proposal::default()
+    };
+    let h1 = keccak256(&p1.to_bytes());
+    node.deliver(from(0), TOPIC, propose(&keys[0], p1.clone()))
+        .unwrap();
+    for i in [0, 1] {
+        node.deliver(from(i), TOPIC, vote(&keys[i], 1, h1)).unwrap();
+    }
+    let s = node.simplex_state().unwrap();
+    assert_eq!((s.view, s.tip_height), (2, 1));
+    node.take_outbound();
+    // The leader of view 2 proposes height 1 again, on the genesis.
+    let behind = Proposal {
+        view: 2,
+        height: 1,
+        timestamp_ms: now + 1,
+        ..Proposal::default()
+    };
+    node.deliver(from(1), TOPIC, propose(&keys[1], behind))
+        .unwrap();
+    let sent = sends(node, &from(1));
+    assert!(
+        sent.iter().any(|m| matches!(
+            m,
+            ConsensusMessage::Certificate { certificate, proposal: Some(p) }
+                if certificate.view == 1 && certificate.hash == h1 && *p == p1
+        )),
+        "{sent:?}"
+    );
+}
+
 #[test]
 fn a_restarted_leader_does_not_propose_twice_in_a_view() {
     let keys = keys(4);
@@ -1407,12 +1457,14 @@ fn a_leader_whose_tip_the_others_lack_is_voted_promptly() {
 }
 
 /// A validator whose vote for a proposal it held completes that view's
-/// quorum notarizes the view at once. Found by the fault schedules of
-/// `consensus_fuzz.rs` (base seed 1, case 1542): a validator that entered a
-/// view holding its proposal and two votes for it voted, but did not count
-/// its own vote, so it timed out in a view it held the notarization of;
-/// every later certificate for that view then told it nothing new, and it
-/// never took the proposal as its tip.
+/// quorum notarizes the view at once (spec 08 §5: its own vote counts).
+/// Found twice, by the fault schedules of `consensus_fuzz.rs` (base seed 1,
+/// case 1542) and by `staking_fuzz.rs`: a validator that entered a view
+/// holding its proposal and two votes for it voted, but did not count its
+/// own vote, so it timed out in a view it held the notarization of; every
+/// later certificate for that view then told it nothing new, and it never
+/// took the proposal as its tip. When that validator led the next view and
+/// the others lacked the stake to skip it, the chain stopped.
 #[test]
 fn a_held_vote_that_completes_a_quorum_notarizes() {
     let keys = keys(4);

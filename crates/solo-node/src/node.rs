@@ -1169,9 +1169,12 @@ impl Node {
             self.step(Input::TimerFired { timer_id, now_ms })?;
         }
         let mut out = Vec::new();
-        self.catch_up.poll(now_ms, self.host_finalized(), &mut out);
+        let moot = self.catch_up.poll(now_ms, self.host_finalized(), &mut out);
         self.services.borrow_mut().outbound.extend(out);
-        Ok(())
+        match moot {
+            Some(input) => self.step(input),
+            None => Ok(()),
+        }
     }
 
     /// Brings the mempool up to the state the last block left (spec 14 §5)

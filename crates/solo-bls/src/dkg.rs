@@ -20,7 +20,7 @@ use zeroize::Zeroize;
 use crate::poly::{self, Polynomial};
 use crate::sig::SecretKey;
 use crate::threshold::{PublicKeySet, SecretShare};
-use crate::{Error, batch, hash, point};
+use crate::{Error, batch, hash, par, point};
 
 /// Domain separation tag of a dealer's ephemeral encryption scalar.
 pub const DST_EPHEMERAL: &[u8] = b"SOLO-V01-DKG-EPHEMERAL_XMD:SHA-256";
@@ -286,6 +286,8 @@ pub struct Dkg {
     justified: BTreeSet<u32>,
     /// Valid revealed shares by `(dealer, share index)`.
     revealed: BTreeMap<(u32, u32), Scalar>,
+    /// Threads a recipient's share checks run on (every core by default).
+    threads: usize,
 }
 
 /// The share indices recipient `j` holds: `first..first + count`.
@@ -384,8 +386,16 @@ impl Dkg {
             accusers: BTreeSet::new(),
             justified: BTreeSet::new(),
             revealed: BTreeMap::new(),
+            threads: par::threads(),
         };
         Ok((dkg, message))
+    }
+
+    /// Runs the share checks at the end of dealing on at most `threads`
+    /// threads (at least one) instead of every core the machine has. The
+    /// outcome is the same on any number of threads.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.max(1);
     }
 
     /// The current phase.
@@ -490,38 +500,43 @@ impl Dkg {
         let me = recipient.index;
         let mine = range_of(&self.shares, me);
         let mut secret = point::scalar_bytes(&recipient.key.0);
-        let decrypted: Vec<(u32, Vec<Scalar>, u64)> = self
-            .dealings
-            .iter()
-            .map(|(&dealer, received)| {
-                let shared: G1Affine = (received.ephemeral * recipient.key.0).into();
-                let decrypted = mine
-                    .clone()
-                    .map(|x| {
-                        let pad = pad(
+        let dealings: Vec<(&u32, &Received)> = self.dealings.iter().collect();
+        // Each dealer's shares decrypt on their own, so the dealers split
+        // over threads with the same result.
+        let decrypt = |range: core::ops::Range<usize>| -> Vec<(u32, Vec<Scalar>, u64)> {
+            dealings[range]
+                .iter()
+                .map(|&(&dealer, received)| {
+                    let shared: G1Affine = (received.ephemeral * recipient.key.0).into();
+                    let decrypted = mine
+                        .clone()
+                        .map(|x| {
+                            let pad = pad(
+                                &self.config.session,
+                                dealer,
+                                x,
+                                &received.ephemeral,
+                                &shared,
+                            );
+                            received.shares[x as usize - 1] - pad
+                        })
+                        .collect();
+                    // The coefficient of the batched check (spec 12 §5.1): keyed
+                    // by this recipient's secret, so the dealer cannot predict it.
+                    let rho = batch::coefficient(
+                        &[
+                            &secret,
                             &self.config.session,
-                            dealer,
-                            x,
-                            &received.ephemeral,
-                            &shared,
-                        );
-                        received.shares[x as usize - 1] - pad
-                    })
-                    .collect();
-                // The coefficient of the batched check (spec 12 §5.1): keyed
-                // by this recipient's secret, so the dealer cannot predict it.
-                let rho = batch::coefficient(
-                    &[
-                        &secret,
-                        &self.config.session,
-                        &dealer.to_be_bytes(),
-                        &received.ephemeral.to_compressed(),
-                    ],
-                    batch::DST_SHARE_BATCH,
-                );
-                (dealer, decrypted, rho)
-            })
-            .collect();
+                            &dealer.to_be_bytes(),
+                            &received.ephemeral.to_compressed(),
+                        ],
+                        batch::DST_SHARE_BATCH,
+                    );
+                    (dealer, decrypted, rho)
+                })
+                .collect()
+        };
+        let decrypted = par::map(dealings.len(), self.threads, &decrypt);
         secret.zeroize();
         let items: Vec<batch::DealerShares<'_>> = decrypted
             .iter()
@@ -531,7 +546,7 @@ impl Dkg {
                 rho: *rho,
             })
             .collect();
-        let failing = batch::failing_dealers(&items, mine.start);
+        let failing = batch::failing_dealers(&items, mine.start, self.threads);
         let accused: Vec<u32> = failing.iter().map(|&i| decrypted[i].0).collect();
         for (dealer, shares, _) in decrypted {
             if !accused.contains(&dealer) {
