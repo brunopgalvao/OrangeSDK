@@ -12,7 +12,7 @@ Solo is a framework for EVM-compatible solochains: a from-scratch RISC-V derived
 
 ## Codex reference
 
-The long arc (vision, strategy, decisions, research) lives in the codex at `/Users/bruno/src/projects/solochain/solochain-codex/`. Before shaping the product, read in order: `company/vision.md`, `product/solo/vision.md`, `product/solo/features/README.md`, `product/solo/ideas/README.md`, `decisions/README.md`. Durable insights go back to the codex, not here. Architecture design doc: https://claude.ai/code/artifact/ca8b7b11-96e2-475b-b15f-4c83e7cd7afb
+The long arc (vision, strategy, decisions, research) lives in the codex at `/Users/bruno/src/projects/solochain/solochain-codex/`. Before shaping the product, read in order: `company/vision.md`, `product/solo/vision.md`, `product/solo/features/README.md`, `product/solo/ideas/README.md`, `decisions/README.md`. Durable insights go back to the codex, not here. Architecture design doc: https://claude.ai/artifact/CZuDJPFeGe3piYY9MZJ8Gd
 
 ## Layout
 
