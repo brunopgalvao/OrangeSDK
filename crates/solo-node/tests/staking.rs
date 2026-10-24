@@ -22,9 +22,9 @@ use solo_abi::rotation::{
     offence, rotation_message,
 };
 use solo_abi::staking::{
-    DkgEnvelope, DkgRequest, DkgRun, GWEI, KIND_DKG, KeySetRecord, KeystoreRequest, PartialShare,
-    STAKING_ADDRESS, StakingAction, StakingParams, StakingStatus, ValidatorKey, envelope, event,
-    first_view, keys as skeys, query, selector, view_epoch,
+    DkgEnvelope, DkgProgress, DkgRequest, DkgRun, GWEI, KIND_DKG, KeySetRecord, KeystoreRequest,
+    PartialShare, STAKING_ADDRESS, StakingAction, StakingParams, StakingStatus, ValidatorKey,
+    envelope, event, first_view, keys as skeys, query, selector, view_epoch,
 };
 use solo_abi::types::{Block, Effect, Genesis, Input};
 use solo_abi::{Decode, Encode};
@@ -944,6 +944,148 @@ fn a_validator_finalizes_while_its_keystore_computes() {
         .run_until(80 * SLOT_MS, |s| adopted(s, &[0], 0))
         .unwrap();
     assert!(done, "{:?}", sim.finalized_heights().unwrap());
+}
+
+/// Where the run of `epoch` stands in `node`'s chain state (spec 15 §6.1).
+fn progress(node: &Node, epoch: u64) -> DkgProgress {
+    DkgProgress::from_bytes(
+        &node
+            .state_get(&[skeys::PROGRESS, &epoch.to_be_bytes()].concat())
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// The DKG message of sender `index` in `phase` of `epoch`'s run, as chain
+/// state recorded it.
+fn dkg_message(node: &Node, epoch: u64, phase: u8, index: u32) -> Option<Vec<u8>> {
+    node.state_get(
+        &[
+            skeys::MESSAGE,
+            &epoch.to_be_bytes(),
+            &[phase],
+            &index.to_be_bytes(),
+        ]
+        .concat(),
+    )
+}
+
+/// A validator whose keystore is still computing when the dealing phase
+/// would have ended at a fixed height lands its dealing all the same, and
+/// then its confirmation (spec 15 §6.1, codex ADR 0048): the phase waits
+/// for it, up to its deadline. Here the slow validator holds half the
+/// stake, so without its dealing the dealers would weigh 6 shares against a
+/// threshold of 11 and without its vote nothing would reach two thirds:
+/// key set 1 exists only because the phase waited.
+#[test]
+fn a_slow_validator_still_lands_its_dealing_and_confirmation() {
+    let keys = keys(4);
+    let kernel = kernel_module();
+    // Epochs of 40 blocks, phases of at least 4: span 10, so dealing may run
+    // to block 10, complaints to 20, justifications to 30.
+    let weights = [1_000, 1_000, 1_000, 3_000];
+    let genesis = genesis(&keys, &[0, 1, 2, 3], &weights, &staking(40, 4));
+    let template = NodeConfig {
+        background: true,
+        ..at(10_000)
+    };
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &template, 20).unwrap();
+    let first = sim
+        .run_until(120 * SLOT_MS, |s| {
+            adopted(s, &[0, 1, 2, 3], 0) && s.nodes[0].finalized_height().unwrap() >= 35
+        })
+        .unwrap();
+    assert!(first, "{:?}", sim.finalized_heights().unwrap());
+    // Epoch 1's run starts at block 41; the fourth validator's keystore is
+    // held before it is asked for its dealing.
+    sim.nodes[3].hold_keystore(true);
+    // Past the dealing phase's fourth block, the end of a fixed schedule:
+    // three dealings are in, the fourth validator's keystore still computes,
+    // and the run is still dealing.
+    let waited = sim
+        .run_until(40 * SLOT_MS, |s| {
+            s.nodes[0].finalized_height().unwrap() >= 47
+        })
+        .unwrap();
+    assert!(waited, "{:?}", sim.finalized_heights().unwrap());
+    let p = progress(&sim.nodes[0], 1);
+    assert_eq!((p.phase, p.since, p.dealings), (0, 41, 3));
+    assert!(dkg_message(&sim.nodes[0], 1, 0, 4).is_none());
+    assert!(sim.nodes[3].keystore_busy() >= 1);
+    // Released, its dealing lands within the deadline and the run goes on.
+    sim.nodes[3].hold_keystore(false);
+    let done = sim
+        .run_until(160 * SLOT_MS, |s| key_set(&s.nodes[0], 1).is_some())
+        .unwrap();
+    assert!(done, "{:?}", sim.finalized_heights().unwrap());
+    assert!(dkg_message(&sim.nodes[0], 1, 0, 4).is_some());
+    let p = progress(&sim.nodes[0], 1);
+    assert_eq!((p.phase, p.dealings, p.complaints), (3, 4, 4));
+    assert!(p.accused.0.is_empty());
+    // Every recipient spoke, so complaints ended after their 4 blocks;
+    // nobody was accused, so justifications ended after theirs too.
+    assert!(p.since <= 50 + 4 + 4 + 1, "{p:?}");
+    let vote = [
+        skeys::VOTE,
+        &1u64.to_be_bytes(),
+        &validator_id(&keys[3])[..],
+    ]
+    .concat();
+    assert!(sim.nodes[0].state_get(&vote).is_some());
+    // The group key is the sum of all four dealers' constant terms: the slow
+    // dealer qualified.
+    let mut sum = solo_bls::curve::G2Projective::identity();
+    for i in 1..=4 {
+        let Ok(solo_bls::dkg::Message::Dealing(d)) =
+            solo_bls::dkg::Message::from_bytes(&dkg_message(&sim.nodes[0], 1, 0, i).unwrap())
+        else {
+            panic!("a dealing");
+        };
+        sum += solo_bls::curve::G2Affine::from_compressed(&d.commitment[0]).unwrap();
+    }
+    let record = key_set(&sim.nodes[0], 1).unwrap();
+    assert_eq!(
+        solo_bls::curve::G2Affine::from(sum)
+            .to_compressed()
+            .to_vec(),
+        record.key_set[..96].to_vec()
+    );
+    assert_eq!(record.shareholders.0.len(), 2 + 2 + 2 + 8);
+}
+
+/// Phases keep their fixed length of `P` blocks when every participant is in
+/// time, and wait for an absent one only up to their deadlines, after which
+/// the run goes on without it and still makes a key (spec 15 §6.1).
+#[test]
+fn dkg_phases_wait_for_an_absent_validator_only_up_to_their_deadlines() {
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, &[0, 1, 2, 3], &[STAKE; 4], &staking(40, 4));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    let done = sim
+        .run_until(80 * SLOT_MS, |s| adopted(s, &[0, 1, 2, 3], 0))
+        .unwrap();
+    assert!(done, "{:?}", sim.finalized_heights().unwrap());
+    // Everyone in time: dealing 1–4, complaints 5–8, justifications 9–12.
+    let p = progress(&sim.nodes[0], 0);
+    assert_eq!((p.phase, p.since, p.dealings, p.complaints), (3, 13, 4, 4));
+    // The fourth validator is down for all of epoch 1's run.
+    let ready = sim
+        .run_until(80 * SLOT_MS, |s| {
+            s.nodes[0].finalized_height().unwrap() >= 38
+        })
+        .unwrap();
+    assert!(ready);
+    sim.crash(3);
+    let made = sim
+        .run_until(400 * SLOT_MS, |s| key_set(&s.nodes[0], 1).is_some())
+        .unwrap();
+    assert!(made, "{:?}", sim.finalized_heights().unwrap());
+    // Dealing waits to its deadline (block 50), complaints to theirs (60);
+    // nobody is accused, so justifications last their 4 blocks.
+    let p = progress(&sim.nodes[0], 1);
+    assert_eq!((p.phase, p.since, p.dealings, p.complaints), (3, 65, 3, 3));
+    assert_eq!(key_set(&sim.nodes[0], 1).unwrap().shareholders.0.len(), 16);
 }
 
 #[test]

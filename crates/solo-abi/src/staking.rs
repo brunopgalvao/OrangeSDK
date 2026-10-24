@@ -219,6 +219,9 @@ pub mod keys {
     pub const RUN: &[u8] = b"dkg/run/";
     /// `dkg/msg/` + epoch ‖ phase ‖ sender index (big-endian u32) → DKG message.
     pub const MESSAGE: &[u8] = b"dkg/msg/";
+    /// `dkg/progress/` + epoch → `DkgProgress`, where the run stands
+    /// (spec 15 §6.1); absent for a run an earlier kernel scheduled.
+    pub const PROGRESS: &[u8] = b"dkg/progress/";
     /// `dkg/vote/` + epoch ‖ id → hash of the `KeySetVote` the validator confirmed.
     pub const VOTE: &[u8] = b"dkg/vote/";
     /// `dkg/tally/` + epoch ‖ vote hash → u128 weight behind it.
@@ -390,6 +393,28 @@ impl Decode for DkgRun {
             d.get()?
         };
         Ok(run)
+    }
+}
+
+record! {
+    /// Where a DKG run stands (spec 15 §6.1): the phase of the next block
+    /// and the height its phase began at, and what the run's phases have
+    /// recorded, which decides when a phase may end early.
+    DkgProgress {
+        /// The phase of the block after the last one executed: 0 dealing,
+        /// 1 complaints, 2 justifications, 3 confirmation.
+        phase: u8,
+        /// The height of the first block of that phase.
+        since: u64,
+        /// Dealings recorded.
+        dealings: u32,
+        /// Complaints recorded, empty ones included.
+        complaints: u32,
+        /// The dealers accused by a recorded complaint that have a recorded
+        /// dealing, ascending.
+        accused: Seq<u32>,
+        /// Justifications recorded from accused dealers.
+        justified: u32,
     }
 }
 
@@ -574,6 +599,16 @@ pub fn dkg_header(message: &[u8]) -> Option<(u8, Hash, u32)> {
     let session: Hash = message.get(1..33)?.try_into().ok()?;
     let index = u32::from_le_bytes(message.get(33..37)?.try_into().ok()?);
     (phase <= 2).then_some((phase, session, index))
+}
+
+/// The dealers a `Complaints` message of spec 12 §5 lists, as encoded;
+/// `None` for any other message or one that does not decode.
+#[must_use]
+pub fn complaint_dealers(message: &[u8]) -> Option<Vec<u32>> {
+    match dkg_header(message)? {
+        (1, _, _) => Seq::<u32>::from_bytes(&message[37..]).ok().map(|s| s.0),
+        _ => None,
+    }
 }
 
 /// A staking action (spec 15 §3).
@@ -1113,6 +1148,28 @@ mod tests {
         assert_eq!(dkg_header(&[]), None);
         message[0] = 3;
         assert_eq!(dkg_header(&message), None);
+        // The dealers a complaint lists: only of a `Complaints` message that
+        // decodes to its end.
+        let mut complaint = vec![1u8];
+        complaint.extend_from_slice(&[5; 32]);
+        complaint.extend_from_slice(&9u32.to_le_bytes());
+        complaint.extend_from_slice(&Seq(vec![2u32, 4]).to_bytes());
+        assert_eq!(complaint_dealers(&complaint), Some(vec![2, 4]));
+        assert_eq!(complaint_dealers(&complaint[..complaint.len() - 1]), None);
+        complaint.truncate(37);
+        complaint.extend_from_slice(&Seq::<u32>(vec![]).to_bytes());
+        assert_eq!(complaint_dealers(&complaint), Some(vec![]));
+        complaint[0] = 2;
+        assert_eq!(complaint_dealers(&complaint), None);
+        assert_eq!(complaint_dealers(&[]), None);
+        roundtrip(&DkgProgress {
+            phase: 2,
+            since: 9,
+            dealings: 4,
+            complaints: 3,
+            accused: Seq(vec![1, 3]),
+            justified: 1,
+        });
     }
 
     #[test]

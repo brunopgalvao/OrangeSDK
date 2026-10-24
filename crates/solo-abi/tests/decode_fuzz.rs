@@ -138,6 +138,7 @@ codecs!(
     staking::DelegationEntry,
     staking::StakeEntry,
     staking::KeySetRecord,
+    staking::DkgProgress,
     staking::KeySetVote,
     staking::DkgEnvelope,
     staking::PartialShare,

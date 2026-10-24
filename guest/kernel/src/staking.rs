@@ -17,10 +17,10 @@ use solo_abi::codec::Seq;
 use solo_abi::fees::mul_div;
 use solo_abi::rotation::{HANDOFF_EPOCHS, REPORT_GAS, ThresholdEvidence};
 use solo_abi::staking::{
-    Delegation, DelegationEntry, DkgEnvelope, DkgRun, G1_LENGTH, G2_LENGTH, GWEI, KIND_DKG,
+    Delegation, DelegationEntry, DkgEnvelope, DkgProgress, DkgRun, G1_LENGTH, G2_LENGTH, GWEI, KIND_DKG,
     KeySetRecord, KeySetVote, MAX_DELEGATIONS, MAX_DELEGATORS, MAX_DKG, MAX_REGISTERED, SLASH_BPS,
     STAKING_ADDRESS, StakeEntry, StakeRecord, StakingAction, StakingParams, StakingStatus,
-    address_word, dkg_header, envelope, epoch_of, epoch_start, event, keys, query,
+    address_word, complaint_dealers, dkg_header, envelope, epoch_of, epoch_start, event, keys, query,
     session_preimage, stake_shares, view_epoch, word,
 };
 use solo_abi::types::{Address, Genesis, Hash, QueryResult};
@@ -50,6 +50,10 @@ fn set_key(epoch: u64) -> Vec<u8> {
 
 fn run_key(epoch: u64) -> Vec<u8> {
     concat(&[keys::RUN, &epoch.to_be_bytes()])
+}
+
+fn progress_key(epoch: u64) -> Vec<u8> {
+    concat(&[keys::PROGRESS, &epoch.to_be_bytes()])
 }
 
 fn message_key(epoch: u64, phase: u8, index: u32) -> Vec<u8> {
@@ -209,6 +213,64 @@ pub fn set_entries_in(epoch_blocks: u64, epoch: u64) -> Option<Vec<(Hash, u64)>>
 /// The DKG run of `epoch`, if one was scheduled.
 pub fn dkg_run(epoch: u64) -> Option<DkgRun> {
     state::get(&run_key(epoch))
+}
+
+/// Where the run of `epoch` stands, for a run this kernel scheduled.
+fn progress(epoch: u64) -> Option<DkgProgress> {
+    state::get(&progress_key(epoch))
+}
+
+/// The phase of the block at `height`, the block after the executed head
+/// or the one being executed, in the run of `height`'s epoch (spec 15
+/// §6.1): as the run's progress holds it, or, for a run an earlier kernel
+/// scheduled, by the fixed schedule of `P` blocks a phase.
+pub fn phase(epoch: u64, height: u64) -> u8 {
+    if let Some(p) = progress(epoch) {
+        return p.phase;
+    }
+    let p = params();
+    ((height - epoch_start(epoch, p.epoch_blocks)) / p.dkg_phase_blocks).min(3) as u8
+}
+
+/// Whether every message phase `phase` of the run of `epoch` waits for is
+/// recorded, so that its outcome can no longer change (spec 15 §6.1): every
+/// dealing, every recipient's complaints, or a justification from every
+/// accused dealer. Never for a run an earlier kernel scheduled.
+pub fn phase_complete(run: &DkgRun, phase: u8) -> bool {
+    progress(run.epoch).is_some_and(|p| complete(run, &p, phase))
+}
+
+fn complete(run: &DkgRun, p: &DkgProgress, phase: u8) -> bool {
+    match phase {
+        0 => p.dealings as usize == run.dealers.0.len(),
+        1 => p.complaints as usize == run.recipients.0.len(),
+        _ => p.justified as usize == p.accused.0.len(),
+    }
+}
+
+/// Ends the phase of the current epoch's run after the block at `height`
+/// when it has lasted its `P` blocks and either everything it waits for is
+/// recorded or it reaches its deadline (spec 15 §6.1): phase `i` ends at the
+/// latest after the block at `start + (i + 1)·⌊L/4⌋ − 1`. The confirmation
+/// lasts to the end of the epoch.
+fn advance_phase(height: u64, p: &StakingParams) {
+    let epoch = epoch_of(height, p.epoch_blocks);
+    let (Some(mut progress), Some(run)) = (progress(epoch), dkg_run(epoch)) else {
+        return;
+    };
+    if progress.phase >= 3 {
+        return;
+    }
+    let next = height + 1;
+    let span = p.epoch_blocks / 4;
+    let lasted = next >= progress.since + p.dkg_phase_blocks;
+    let deadline =
+        next >= epoch_start(epoch, p.epoch_blocks) + (u64::from(progress.phase) + 1) * span;
+    if lasted && (deadline || complete(&run, &progress, progress.phase)) {
+        progress.phase += 1;
+        progress.since = next;
+        state::set(&progress_key(epoch), &progress);
+    }
 }
 
 /// Whether chain state holds the DKG message of `index` in `phase` of `epoch`.
@@ -829,6 +891,13 @@ fn schedule_run(epoch: u64, set: &ValidatorSet) {
         shares: Seq(shares),
     };
     state::set(&run_key(epoch), &run);
+    state::set(
+        &progress_key(epoch),
+        &DkgProgress {
+            since: epoch_start(epoch, params().epoch_blocks),
+            ..DkgProgress::default()
+        },
+    );
 }
 
 /// Frees the registration slots of validators that hold nothing: not
@@ -928,7 +997,13 @@ fn distribute(epoch: u64) {
 pub fn end_block(height: u64) {
     state::delete(PAIRING_GAS);
     let p = params();
-    if p.epoch_blocks == 0 || !height.is_multiple_of(p.epoch_blocks) {
+    if p.epoch_blocks == 0 {
+        return;
+    }
+    if !height.is_multiple_of(p.epoch_blocks) {
+        if p.dkg_phase_blocks != 0 {
+            advance_phase(height, &p);
+        }
         return;
     }
     let next = height / p.epoch_blocks;
@@ -953,7 +1028,7 @@ pub fn record_dkg(envelopes: &[Vec<u8>], height: u64) {
     }
     let epoch = epoch_of(height, p.epoch_blocks);
     let Some(run) = dkg_run(epoch) else { return };
-    let phase = ((height - epoch_start(epoch, p.epoch_blocks)) / p.dkg_phase_blocks).min(3);
+    let phase = u64::from(self::phase(epoch, height));
     let chain_id = state::chain_id();
     for raw in envelopes.iter().take(MAX_DKG) {
         let Ok(env) = DkgEnvelope::from_bytes(raw) else {
@@ -994,9 +1069,30 @@ fn record_message(run: &DkgRun, body: &[u8], signer: &Hash, now: u64) {
         return;
     }
     let k = message_key(run.epoch, phase, index);
-    if state::get_raw(&k).is_none() {
-        state::set_raw(&k, body);
+    if state::get_raw(&k).is_some() {
+        return;
     }
+    state::set_raw(&k, body);
+    let Some(mut p) = progress(run.epoch) else {
+        return;
+    };
+    match phase {
+        0 => p.dealings += 1,
+        1 => {
+            p.complaints += 1;
+            // The dealers it accuses that dealt: those must justify.
+            for dealer in complaint_dealers(body).unwrap_or_default() {
+                if let Err(at) = p.accused.0.binary_search(&dealer)
+                    && has_message(run.epoch, 0, dealer)
+                {
+                    p.accused.0.insert(at, dealer);
+                }
+            }
+        }
+        _ if p.accused.0.binary_search(&index).is_ok() => p.justified += 1,
+        _ => return,
+    }
+    state::set(&progress_key(run.epoch), &p);
 }
 
 fn confirm(run: &DkgRun, body: &[u8], signer: &Hash, height: u64) {

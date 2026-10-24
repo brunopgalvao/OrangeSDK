@@ -21,7 +21,7 @@ use solo_abi::rotation::{
 };
 use solo_abi::staking::{
     DkgEnvelope, DkgReply, DkgRequest, DkgRun, KEY_ROLE_THRESHOLD, KIND_DKG, KeySetRecord,
-    KeystoreRequest, MAX_DKG, PartialShare, dkg_header, envelope, epoch_of, epoch_start,
+    KeystoreRequest, MAX_DKG, PartialShare, dkg_header, envelope, epoch_of,
 };
 use solo_abi::types::Hash;
 use solo_abi::{Decode, Encode};
@@ -207,7 +207,20 @@ pub fn duties(chain_id: u64, me: &Hash, executed: u64) -> Option<Vec<u8>> {
     let next = executed + 1;
     let epoch = epoch_of(next, p.epoch_blocks);
     let run = staking::dkg_run(epoch)?;
-    let phase = ((next - epoch_start(epoch, p.epoch_blocks)) / p.dkg_phase_blocks).min(3) as u8;
+    let phase = staking::phase(epoch, next);
+    if phase < 3 && staking::phase_complete(&run, phase) {
+        // What the next phase sends depends only on what this one recorded,
+        // which is all in: the keystore can start on it now.
+        let _ = duty(chain_id, me, &run, phase + 1);
+    }
+    duty(chain_id, me, &run, phase)
+}
+
+/// This node's message or confirmation for `phase` of `run`, as long as
+/// chain state lacks it, computed once and then repeated. Its inputs, the
+/// messages of the earlier phases, must be final.
+fn duty(chain_id: u64, me: &Hash, run: &DkgRun, phase: u8) -> Option<Vec<u8>> {
+    let epoch = run.epoch;
     let dealer = index_of(&run.dealers.0, me);
     let recipient = index_of(&run.recipients.0, me);
     let pending = match phase {
@@ -231,7 +244,7 @@ pub fn duties(chain_id: u64, me: &Hash, executed: u64) -> Option<Vec<u8>> {
     } else {
         (0, recipient)
     };
-    let mut reply = ask(&run, as_dealer, as_recipient, phase);
+    let mut reply = ask(run, as_dealer, as_recipient, phase);
     if reply.is_none()
         && as_dealer != 0
         && let Some(previous) = run.previous
@@ -239,7 +252,7 @@ pub fn duties(chain_id: u64, me: &Hash, executed: u64) -> Option<Vec<u8>> {
     {
         // A resharing dealer deals its current share, which a restart may have
         // taken out of the keystore.
-        reply = ask(&run, as_dealer, as_recipient, phase);
+        reply = ask(run, as_dealer, as_recipient, phase);
     }
     let envelope = match reply? {
         DkgReply::Message(m) => sign_envelope(chain_id, epoch, envelope::MESSAGE, m),
@@ -301,13 +314,13 @@ fn wanted(env: &DkgEnvelope, signer: &Hash, executed: u64) -> bool {
     }
     let next = executed + 1;
     let epoch = epoch_of(next, p.epoch_blocks);
-    let phase = ((next - epoch_start(epoch, p.epoch_blocks)) / p.dkg_phase_blocks).min(3) as u8;
     if env.epoch != epoch {
         return false;
     }
     let Some(run) = staking::dkg_run(epoch) else {
         return false;
     };
+    let phase = staking::phase(epoch, next);
     if env.kind == envelope::HANDOFF {
         return RotationCertificate::from_bytes(&env.body).is_ok_and(|c| {
             staking::active().is_some_and(|a| a.id == c.from)

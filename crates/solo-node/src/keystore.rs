@@ -20,7 +20,9 @@ use k256::ecdsa::SigningKey;
 use solo_abi::codec::Seq;
 use solo_abi::staking::{DkgReply, DkgRequest, KeySetVote, KeystoreRequest, PartialShare};
 use solo_abi::{Decode, Encode};
-use solo_bls::dkg::{Config, Dealer, DecryptionKey, Dkg, EncryptionKey, Message, Recipient, Step};
+use solo_bls::dkg::{
+    Complaints, Config, Dealer, DecryptionKey, Dkg, EncryptionKey, Message, Recipient, Step,
+};
 use solo_bls::{PartialSignature, PublicKeySet, SecretShare, Signature};
 
 /// Domain separation tag of a dealer's per-run seed.
@@ -321,6 +323,17 @@ fn run(
         match dkg.advance().ok()? {
             Step::Broadcast(m) if phase + 1 == r.upto => {
                 return Some((DkgReply::Message(m.to_bytes()), None));
+            }
+            // A recipient none of whose shares failed says so, with an empty
+            // complaint, so that the phase can end as soon as every recipient
+            // has spoken (spec 15 §6.1).
+            Step::Idle if phase == 0 && r.upto == 1 && r.recipient != 0 => {
+                let none = Message::Complaints(Complaints {
+                    session: r.session,
+                    accuser: r.recipient,
+                    dealers: Vec::new(),
+                });
+                return Some((DkgReply::Message(none.to_bytes()), None));
             }
             Step::Finished(out) => {
                 let total = if shares.is_empty() {

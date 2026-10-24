@@ -561,7 +561,9 @@ fn refused(background: bool) {
         }),
         None
     );
-    // Not a dealer: nothing to deal. Nothing to complain about: idle.
+    // Not a dealer: nothing to deal. A recipient with nothing to complain
+    // about says so with an empty complaint (spec 15 §6.4); one that is not
+    // a recipient has nothing to say.
     assert_eq!(
         party.dkg(DkgRequest {
             upto: 0,
@@ -569,9 +571,21 @@ fn refused(background: bool) {
         }),
         Some(DkgReply::Idle)
     );
+    let none = solo_bls::dkg::Message::Complaints(solo_bls::dkg::Complaints {
+        session: template.session,
+        accuser: 1,
+        dealers: Vec::new(),
+    });
     assert_eq!(
         party.dkg(DkgRequest {
             recipient: 1,
+            upto: 1,
+            ..template.clone()
+        }),
+        Some(DkgReply::Message(none.to_bytes()))
+    );
+    assert_eq!(
+        party.dkg(DkgRequest {
             upto: 1,
             ..template.clone()
         }),
