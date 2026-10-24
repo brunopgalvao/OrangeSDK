@@ -19,7 +19,7 @@ const HELLO: &str = concat!(
 );
 
 /// A kernel gas budget that lets the driver start (80 224) but not produce a block
-/// (276 003) with the pinned kernel fixture, bisected on 2026-10-24 in-process (the
+/// (276 009) with the pinned kernel fixture, bisected on 2026-10-24 in-process (the
 /// dev key, this genesis, slots of 60 ms, in a debug host build) on the kernel with
 /// the block log and snapshot record of spec 22, the fee market of spec 23 with its
 /// bounds and the payout that leaves jailed validators out (spec 23 §2, spec 15
@@ -39,7 +39,10 @@ const HELLO: &str = concat!(
 /// the kernel with bounded RLP nesting (spec 20 §2.1) and the vote for a held
 /// proposal (spec 08 §5) moved the block from 275 837 to 276 003 (the only
 /// validator leads every view and skips the new check: the rebuilt code), and left
-/// the start at 80 224.
+/// the start at 80 224; the kernel whose DKG phases end on completion or at a
+/// deadline, with the driver's notarization after a held vote and its tip sent to
+/// a leader behind it (codex ADR 0048), moved the block to 276 009, code
+/// generation again, since this chain has no staking and one validator.
 const STARVED_GAS: &str = "100000";
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4,
