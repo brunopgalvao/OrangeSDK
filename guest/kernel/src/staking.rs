@@ -17,11 +17,11 @@ use solo_abi::codec::Seq;
 use solo_abi::fees::mul_div;
 use solo_abi::rotation::{HANDOFF_EPOCHS, REPORT_GAS, ThresholdEvidence};
 use solo_abi::staking::{
-    Delegation, DelegationEntry, DkgEnvelope, DkgProgress, DkgRun, G1_LENGTH, G2_LENGTH, GWEI, KIND_DKG,
-    KeySetRecord, KeySetVote, MAX_DELEGATIONS, MAX_DELEGATORS, MAX_DKG, MAX_REGISTERED, SLASH_BPS,
-    STAKING_ADDRESS, StakeEntry, StakeRecord, StakingAction, StakingParams, StakingStatus,
-    address_word, complaint_dealers, dkg_header, envelope, epoch_of, epoch_start, event, keys, query,
-    session_preimage, stake_shares, view_epoch, word,
+    Delegation, DelegationEntry, DkgEnvelope, DkgProgress, DkgRun, G1_LENGTH, G2_LENGTH, GWEI,
+    KIND_DKG, KeySetRecord, KeySetVote, MAX_DELEGATIONS, MAX_DELEGATORS, MAX_DKG, MAX_REGISTERED,
+    SLASH_BPS, STAKING_ADDRESS, StakeEntry, StakeRecord, StakingAction, StakingParams,
+    StakingStatus, address_word, complaint_dealers, dkg_header, envelope, epoch_of, epoch_start,
+    event, keys, query, session_preimage, stake_shares, view_epoch, word,
 };
 use solo_abi::types::{Address, Genesis, Hash, QueryResult};
 use solo_abi::{Decode, Encode};
