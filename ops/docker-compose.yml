@@ -15,8 +15,11 @@
 # the chain's identities. Each node keeps its driver state in its directory
 # on that volume (`--data-dir`), so a restarted container resumes the view
 # it left (spec 08 §7). The nodes reach each other by fixed addresses on the
-# `solo` network, every node dialling the ones before it, as `solo devnet`
-# does on one machine.
+# `solo` network as `solo devnet` does on one machine: every node dials the
+# ones before it and has all the others as bootstrap addresses for peer
+# exchange (spec 09 §5a). Each advertises its own address, since it listens
+# on the unspecified address and would otherwise advertise nothing; peer
+# records carry an ip:port, so these are addresses, not service names.
 name: solo-devnet
 
 x-node: &node
@@ -68,6 +71,14 @@ services:
       - 0.0.0.0:30333
       - --rpc
       - 0.0.0.0:8545
+      - --advertise
+      - 172.28.0.10:30333
+      - --bootstrap
+      - 172.28.0.11:30333
+      - --bootstrap
+      - 172.28.0.12:30333
+      - --bootstrap
+      - 172.28.0.13:30333
     networks:
       solo:
         ipv4_address: 172.28.0.10
@@ -92,6 +103,14 @@ services:
       - 0.0.0.0:8545
       - --peer
       - 172.28.0.10:30333
+      - --advertise
+      - 172.28.0.11:30333
+      - --bootstrap
+      - 172.28.0.10:30333
+      - --bootstrap
+      - 172.28.0.12:30333
+      - --bootstrap
+      - 172.28.0.13:30333
     networks:
       solo:
         ipv4_address: 172.28.0.11
@@ -118,6 +137,14 @@ services:
       - 172.28.0.10:30333
       - --peer
       - 172.28.0.11:30333
+      - --advertise
+      - 172.28.0.12:30333
+      - --bootstrap
+      - 172.28.0.10:30333
+      - --bootstrap
+      - 172.28.0.11:30333
+      - --bootstrap
+      - 172.28.0.13:30333
     networks:
       solo:
         ipv4_address: 172.28.0.12
@@ -145,6 +172,14 @@ services:
       - --peer
       - 172.28.0.11:30333
       - --peer
+      - 172.28.0.12:30333
+      - --advertise
+      - 172.28.0.13:30333
+      - --bootstrap
+      - 172.28.0.10:30333
+      - --bootstrap
+      - 172.28.0.11:30333
+      - --bootstrap
       - 172.28.0.12:30333
     networks:
       solo:

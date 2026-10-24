@@ -9,7 +9,7 @@ What a node exports is specified in [spec 11](../spec/11-telemetry.md); a test (
 
 ## The compose stack
 
-`docker-compose.yml` runs the topology of `solo devnet init --validators 4` as containers: one image built once from `Dockerfile` (the host in release mode plus the committed kernel fixtures `kernel.elf` and `kernel_v2.elf`), an `init` service that writes genesis, keys and the recompiled kernel to a volume, four validators that dial each other at fixed addresses, Prometheus scraping all four with `alerts.yml` loaded, and Grafana with the dashboard provisioned.
+`docker-compose.yml` runs the topology of `solo devnet init --validators 4` as containers: one image built once from `Dockerfile` (the host in release mode plus the committed kernel fixtures `kernel.elf` and `kernel_v2.elf`), an `init` service that writes genesis, keys and the recompiled kernel to a volume, four validators that dial each other at fixed addresses, with the others as bootstrap addresses and their own advertised for peer exchange (spec 09 §5a), Prometheus scraping all four with `alerts.yml` loaded, and Grafana with the dashboard provisioned.
 
 ```sh
 docker compose -f ops/docker-compose.yml up --build -d
