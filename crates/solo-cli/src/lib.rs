@@ -17,6 +17,11 @@
 //! (see [`snapshot`]), and `solo snapshot` exports, verifies and imports one.
 //! `solo node --sync-from-peers` fetches one from its `--peer`s instead
 //! (spec 22 §7.4), and `--serve-snapshots` serves them to such nodes.
+//! `solo node` runs peer exchange (spec 09 §5a) unless `--no-discovery`: it
+//! learns the network from its `--peer`s and `--bootstrap` addresses, keeps
+//! up to `--outbound-peers` connections it dials itself and `--max-peers` in
+//! all, and advertises `--advertise` (by default its listen address) in a
+//! record signed with its key.
 //! The genesis file is
 //! JSON: `{"chainId": 1337, "slotMs": 400, "maxTxs": 64,
 //! "alloc": {"0x<address>": "<wei>"}, "validators": ["0x<32-byte id>"]}`.
@@ -108,7 +113,7 @@ pub const DEFAULT_RPC: &str = "127.0.0.1:8545";
 /// Usage line printed on a command-line mistake.
 pub const USAGE: &str = "usage:
   solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive] [--data-dir <dir>]
-  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--snapshot <file> | --sync-from-peers] [--trust-key <0x 96 bytes>] [--serve-snapshots] [--listen 127.0.0.1:30333] [--peer <addr>]... [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
+  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--snapshot <file> | --sync-from-peers] [--trust-key <0x 96 bytes>] [--serve-snapshots] [--listen 127.0.0.1:30333] [--peer <addr>]... [--bootstrap <addr>]... [--max-peers 32] [--outbound-peers 8] [--advertise <addr>] [--no-discovery] [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
   solo key  <64 hex>
   solo snapshot export --data-dir <dir> --out <file> [--epoch <n>] | verify --snapshot <file> --genesis <genesis.json> [--trust-key <0x 96 bytes>] | import --snapshot <file> --data-dir <dir> --kernel <kernel> --genesis <genesis.json> [--trust-key <0x 96 bytes>]
   solo gov  submit <target> <0x calldata> | vote <id> yes|no | execute <id> | veto <id> | pause <target> | set-guardian <address> | set-mode stake | set-params <voting> <timelock> <quorumBps> <deposit> | set-fee-params <denominator> <elasticity> <minBaseFee> <treasury|burn>
@@ -499,14 +504,66 @@ fn report(result: Result<(), solo_node::NodeError>) {
 }
 
 fn parse_peers(args: &[String]) -> Result<Vec<std::net::SocketAddr>, String> {
-    args_all(args, "--peer")
+    parse_addresses(args, "--peer")
+}
+
+/// Every address given with `flag`, each `ip:port`.
+fn parse_addresses(args: &[String], flag: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+    args_all(args, flag)
         .into_iter()
         .map(|peer| {
             peer.parse()
                 .ok()
-                .ok_or_else(|| format!("--peer {peer}: expected ip:port"))
+                .ok_or_else(|| format!("{flag} {peer}: expected ip:port"))
         })
         .collect()
+}
+
+/// Peer exchange as the options say (spec 09 §5a): on unless
+/// `--no-discovery`, signing the node's record with its consensus key.
+fn discovery(
+    args: &[String],
+    key: Option<k256::ecdsa::SigningKey>,
+) -> Result<Option<solo_node::Discovery>, String> {
+    let defaults = solo_node::Discovery::default();
+    let limit = |flag: &str, default: usize| -> Result<usize, String> {
+        match parse_number(args, flag)? {
+            None => Ok(default),
+            Some(0) => Err(format!("{flag} must be at least 1")),
+            Some(n) => Ok(usize::try_from(n).unwrap_or(usize::MAX)),
+        }
+    };
+    let advertise = match arg(args, "--advertise") {
+        None => None,
+        Some(text) => Some(
+            text.parse()
+                .ok()
+                .filter(solo_node::peers::dialable)
+                .ok_or_else(|| format!("--advertise {text}: expected an ip:port peers can dial"))?,
+        ),
+    };
+    let discovery = solo_node::Discovery {
+        key,
+        advertise,
+        bootstrap: parse_addresses(args, "--bootstrap")?,
+        max_peers: limit("--max-peers", defaults.max_peers)?,
+        outbound: limit("--outbound-peers", defaults.outbound)?,
+    };
+    if args.iter().any(|a| a == "--no-discovery") {
+        let given = [
+            "--bootstrap",
+            "--advertise",
+            "--max-peers",
+            "--outbound-peers",
+        ];
+        if let Some(flag) = given.iter().find(|f| args.iter().any(|a| a == *f)) {
+            return Err(format!(
+                "{flag} configures peer exchange, which --no-discovery turns off"
+            ));
+        }
+        return Ok(None);
+    }
+    Ok(Some(discovery))
 }
 
 /// What the commands that run no node print: `key`, `doctor`, `gov` and
@@ -542,12 +599,18 @@ fn bind_transport(
     let id = node
         .validator_id()
         .unwrap_or_else(|| solo_host::hash::keccak256(listen.as_bytes()));
-    let t = match solo_node::Transport::bind(listen, id, chain_id, peers) {
+    let discovery = discovery(args, node.services_key())?;
+    let mut t = match solo_node::Transport::bind(listen, id, chain_id, peers) {
         Ok(t) => t,
         Err(e) => return Err(format!("{listen}: {e}").into()),
     };
     let bound = t.local_addr().map_or(listen.to_owned(), |a| a.to_string());
     eprintln!("p2p listening on {bound}");
+    if let Some(discovery) = discovery {
+        let bootstrap = discovery.bootstrap.len();
+        t.enable_discovery(discovery);
+        eprintln!("peer exchange on, {bootstrap} bootstrap address(es)");
+    }
     Ok(t)
 }
 
@@ -750,6 +813,11 @@ fn check_options(args: &[String], command: &str) -> Result<(), CliError> {
             "--serve-snapshots",
             "--peer",
             "--listen",
+            "--bootstrap",
+            "--max-peers",
+            "--outbound-peers",
+            "--advertise",
+            "--no-discovery",
             "--key",
             "--key-file",
         ] {

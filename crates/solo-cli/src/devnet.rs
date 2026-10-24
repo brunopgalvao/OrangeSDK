@@ -23,8 +23,10 @@
 //! `<dir>/genesis.json`, `<dir>/governance.key`, one `<dir>/node-<i>/key`
 //! per validator and the manifest `<dir>/devnet.json`: each node's
 //! peer-to-peer and JSON-RPC addresses (port 0 picks free ports) and its
-//! peers, every node dialling the ones before it. The genesis carries the
-//! time of the `init` as its `timestamp`, or `--genesis-time` (spec 20
+//! bootstrap addresses, every other node's: each node runs peer exchange
+//! (spec 09 §5a) and dials them with backoff (a manifest of an earlier
+//! devnet may still name `peers`, which a node keeps dialling). The genesis
+//! carries the time of the `init` as its `timestamp`, or `--genesis-time` (spec 20
 //! §3.4): the genesis block's timestamp, before which nobody makes a
 //! block, so a devnet started late begins at once. The genesis runs the fee
 //! market at the production defaults (spec 23 §2.1) and funds the account
@@ -150,8 +152,10 @@ pub struct NodeSpec {
     pub listen: String,
     /// JSON-RPC address.
     pub rpc: String,
-    /// Peers it dials.
+    /// Peers it dials and keeps dialling (`--peer`).
     pub peers: Vec<String>,
+    /// Bootstrap addresses of its peer exchange (`--bootstrap`).
+    pub bootstrap: Vec<String>,
 }
 
 /// A devnet directory.
@@ -214,21 +218,23 @@ impl Devnet {
             .and_then(Value::as_array)
             .ok_or_else(|| format!("{MANIFEST}: nodes missing"))?
         {
-            let peers = node
-                .get("peers")
-                .and_then(Value::as_array)
-                .map(|p| {
-                    p.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
+            let list = |key: &str| -> Vec<String> {
+                node.get(key)
+                    .and_then(Value::as_array)
+                    .map(|p| {
+                        p.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
             nodes.push(NodeSpec {
                 validator: text_of(node, "validator")?,
                 listen: text_of(node, "listen")?,
                 rpc: text_of(node, "rpc")?,
-                peers,
+                peers: list("peers"),
+                bootstrap: list("bootstrap"),
             });
         }
         Ok(Devnet {
@@ -419,7 +425,11 @@ fn init(args: &[String]) -> Result<String, String> {
                 validator: ids[i].clone(),
                 listen: format!("{host}:{}", p2p[i]),
                 rpc: format!("{host}:{}", rpc[i]),
-                peers: (0..i).map(|j| format!("{host}:{}", p2p[j])).collect(),
+                peers: Vec::new(),
+                bootstrap: (0..validators)
+                    .filter(|j| *j != i)
+                    .map(|j| format!("{host}:{}", p2p[j]))
+                    .collect(),
             })
             .collect(),
     };
@@ -457,6 +467,7 @@ fn init(args: &[String]) -> Result<String, String> {
             "listen": node.listen,
             "rpc": node.rpc,
             "peers": node.peers,
+            "bootstrap": node.bootstrap,
         }));
     }
     let manifest = json!({"chainId": chain_id, "nodes": nodes});
@@ -1008,7 +1019,8 @@ fn wait(args: &[String]) -> Result<String, String> {
 
 /// `solo devnet node --dir <dir> --index <i> [options]`: runs node `i` of the
 /// manifest in this process, as `solo node` would with the manifest's
-/// addresses, the key file, the peers and `node-<i>` as its data directory,
+/// addresses, the key file, the peers, the bootstrap addresses and
+/// `node-<i>` as its data directory,
 /// plus any other `solo node` option.
 fn node(args: &[String], keep_going: &mut dyn FnMut(&solo_rpc::Rpc) -> bool) -> Result<(), String> {
     let devnet = Devnet::load(&dir_argument(args)?)?;
@@ -1049,6 +1061,9 @@ fn node(args: &[String], keep_going: &mut dyn FnMut(&solo_rpc::Rpc) -> bool) -> 
     );
     for peer in &spec.peers {
         line.extend(["--peer".to_owned(), peer.clone()]);
+    }
+    for addr in &spec.bootstrap {
+        line.extend(["--bootstrap".to_owned(), addr.clone()]);
     }
     let mut lifeline = Lifeline::from_env();
     crate::run_inner(&line, &mut |rpc| keep_going(rpc) && lifeline.holds()).map_err(|CliError(m)| m)

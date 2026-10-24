@@ -62,6 +62,8 @@ impl Frame {
             Frame::Response { .. } => "response",
             Frame::SyncRequest { .. } => "sync_request",
             Frame::SyncResponse { .. } => "sync_response",
+            Frame::GetPeers => "get_peers",
+            Frame::Peers { .. } => "peers",
         }
     }
 }

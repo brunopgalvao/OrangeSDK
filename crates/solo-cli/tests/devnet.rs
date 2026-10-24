@@ -174,8 +174,18 @@ fn init_writes_a_reproducible_devnet_and_names_mistakes() {
     assert!(report.contains("2 validators"), "{report}");
     let devnet = Devnet::load(&dir).unwrap();
     assert_eq!((devnet.nodes.len(), devnet.chain_id), (2, 1337));
-    assert!(devnet.nodes[0].peers.is_empty());
-    assert_eq!(devnet.nodes[1].peers, vec![devnet.nodes[0].listen.clone()]);
+    // Every node bootstraps from every other one, and pins none.
+    assert!(devnet.nodes.iter().all(|n| n.peers.is_empty()));
+    assert_eq!(
+        devnet.nodes[1].bootstrap,
+        devnet
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != 1)
+            .map(|(_, n)| n.listen.clone())
+            .collect::<Vec<_>>()
+    );
     assert_ne!(devnet.nodes[0].rpc, devnet.nodes[1].rpc);
     assert!(std::fs::read(devnet.kernel()).unwrap().starts_with(b"SOLO"));
     let params = genesis_params(&devnet);
@@ -1392,6 +1402,18 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
     .to_vec();
     run(&args).unwrap();
     assert_eq!(run(&args[..3]).unwrap_err(), "--dir is required");
+    // A manifest of an earlier devnet names pinned peers; the node dials them too.
+    let manifest = std::path::Path::new(d).join(MANIFEST);
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    v["nodes"][0]["peers"] = serde_json::json!(["127.0.0.1:1"]);
+    std::fs::write(&manifest, v.to_string()).unwrap();
+    assert_eq!(
+        Devnet::load(std::path::Path::new(d)).unwrap().nodes[0]
+            .peers
+            .len(),
+        1
+    );
     assert!(
         run(&[
             "solo", "devnet", "node", "--dir", d, "--index", "0", "--rpc", "nope"

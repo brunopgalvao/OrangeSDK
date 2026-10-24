@@ -643,8 +643,14 @@ fn node_command_runs_a_multi_validator_chain() {
             let data = scratch(&format!("multi-data-{i}"));
             let _ = std::fs::remove_dir_all(&data);
             list.extend(["--key".into(), seeds[i].clone(), "--data-dir".into(), data]);
-            for port in &ports[..i] {
-                list.extend(["--peer".into(), port.clone()]);
+            // Validators find each other by peer exchange from the first one's address.
+            if i > 0 {
+                list.extend(["--bootstrap".into(), ports[0].clone()]);
+            }
+            if i == 1 {
+                list.extend(["--max-peers".into(), "16".into()]);
+                list.extend(["--outbound-peers".into(), "4".into()]);
+                list.extend(["--advertise".into(), ports[1].clone()]);
             }
         } else {
             list.extend(["--peer".into(), ports[0].clone()]);
@@ -688,7 +694,16 @@ fn options_a_command_would_ignore_are_refused() {
         dev(&["--data-dir", "d", "--sync-from-peers"]),
         "solo dev does not take --sync-from-peers: it runs no peer-to-peer transport; use solo node"
     );
-    for flag in ["--serve-snapshots", "--peer", "--listen"] {
+    for flag in [
+        "--serve-snapshots",
+        "--peer",
+        "--listen",
+        "--bootstrap",
+        "--max-peers",
+        "--outbound-peers",
+        "--advertise",
+        "--no-discovery",
+    ] {
         assert!(
             dev(&[flag]).contains("runs no peer-to-peer transport"),
             "{flag}"
@@ -736,6 +751,24 @@ fn node_command_errors() {
             .unwrap_err()
             .contains("expected ip:port")
     );
+    // Peer exchange's options are checked, and refused beside --no-discovery.
+    assert_eq!(
+        with(&["--bootstrap", "nowhere"]).unwrap_err(),
+        "--bootstrap nowhere: expected ip:port"
+    );
+    assert_eq!(
+        with(&["--max-peers", "0"]).unwrap_err(),
+        "--max-peers must be at least 1"
+    );
+    assert!(with(&["--outbound-peers", "x"]).is_err());
+    assert_eq!(
+        with(&["--advertise", "0.0.0.0:1"]).unwrap_err(),
+        "--advertise 0.0.0.0:1: expected an ip:port peers can dial"
+    );
+    assert_eq!(
+        with(&["--no-discovery", "--bootstrap", "127.0.0.1:1"]).unwrap_err(),
+        "--bootstrap configures peer exchange, which --no-discovery turns off"
+    );
     assert!(with(&["--key", "zz"]).unwrap_err().contains("64 hex"));
     assert!(
         with(&["--listen", "nope"])
@@ -756,11 +789,12 @@ fn node_command_errors() {
             .starts_with(&format!("{file}: "))
     );
     // An observer with the default listen address stops on request like any
-    // node; with a data directory it keeps its driver state there.
+    // node; with a data directory it keeps its driver state there. Without
+    // peer exchange it only dials what it is told to.
     let mut iterations = 0;
     let data = scratch("observer-data");
     let mut list = base.to_vec();
-    list.extend(["--data-dir", &data]);
+    list.extend(["--data-dir", &data, "--no-discovery"]);
     run_until(&args(&list), |_| {
         iterations += 1;
         iterations < 5

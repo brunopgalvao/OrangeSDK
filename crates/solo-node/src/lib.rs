@@ -11,6 +11,7 @@ pub mod keystore;
 pub mod mempool;
 pub mod net;
 pub mod node;
+pub mod peers;
 pub mod sim;
 pub mod state;
 pub mod statesync;
@@ -21,7 +22,7 @@ pub mod worker;
 
 pub use extension::{NodeExtension, NodeServices, Outbound, sign_recoverable, validator_id};
 pub use mempool::{MAX_TX_BYTES, Mempool, PoolError, PoolLimits, PoolTx};
-pub use net::Transport;
+pub use net::{Discovery, Transport};
 pub use node::{
     ARCHIVE, BLOCK_KERNEL_GAS, DRIVER_RETENTION, HISTORY_KEYS_PER_BLOCK, Node, NodeConfig,
     NodeError, PRUNE_EVERY, STATE_HISTORY, SubmitError,

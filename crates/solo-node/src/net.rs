@@ -6,18 +6,26 @@
 //! A frame on the wire is a `u32` little-endian length followed by a
 //! [`Frame`] in the canonical encoding (spec 06 §2). The first frame on
 //! every connection is `Hello`; a peer on another chain is disconnected.
+//!
+//! With [`Transport::enable_discovery`] a node also runs peer exchange
+//! (spec 09 §5a): it trades signed address records with its peers, keeps
+//! them in a bounded [`PeerTable`], and dials from it, on threads of their
+//! own, up to its outbound target.
 
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
-use solo_abi::codec::{Decode, DecodeError, Decoder, Encode, Encoder};
+use solo_abi::codec::{Decode, DecodeError, Decoder, Encode, Encoder, Seq};
+use solo_abi::staking::{StakingStatus, query::STAKING};
 use solo_abi::types::Input;
 use solo_metrics::{Direction, Traffic};
 
 use crate::extension::Outbound;
 use crate::node::{Node, NodeError};
+use crate::peers::{self, PeerRecord, PeerTable};
 use crate::statesync::StateSync;
 
 /// Largest frame accepted, in bytes.
@@ -25,6 +33,12 @@ pub const MAX_FRAME: usize = 16 << 20;
 
 /// How often a lost outbound peer is redialled.
 pub const REDIAL_MS: u64 = 500;
+
+/// How long a dial of a discovered or bootstrap address may take.
+pub const DIAL_TIMEOUT_MS: u64 = 1_000;
+
+/// How long a connection peer exchange dialled may wait for its `Hello`.
+pub const HANDSHAKE_MS: u64 = 5_000;
 
 /// One unit on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +51,8 @@ pub enum Frame {
     Response { request_id: u64, payload: Vec<u8> },
     SyncRequest { request_id: u64, payload: Vec<u8> },
     SyncResponse { request_id: u64, payload: Vec<u8> },
+    GetPeers,
+    Peers { records: Seq<PeerRecord> },
 }
 
 impl Encode for Frame {
@@ -82,6 +98,13 @@ impl Encode for Frame {
                 e.raw(&[6]);
                 e.put(request_id).put(payload);
             }
+            Frame::GetPeers => {
+                e.raw(&[7]);
+            }
+            Frame::Peers { records } => {
+                e.raw(&[8]);
+                e.put(records);
+            }
         }
     }
 }
@@ -114,6 +137,8 @@ impl Decode for Frame {
                 request_id: d.get()?,
                 payload: d.get()?,
             },
+            7 => Frame::GetPeers,
+            8 => Frame::Peers { records: d.get()? },
             tag => return Err(DecodeError::BadTag(tag)),
         })
     }
@@ -189,6 +214,17 @@ struct Conn {
     /// The address this connection was dialled at, if we dialled it.
     dialled: Option<SocketAddr>,
     dead: bool,
+    /// What peer exchange dialled this connection for, if it did.
+    target: Option<Target>,
+    /// Where an accepted connection comes from.
+    remote: Option<SocketAddr>,
+    /// When a connection peer exchange dialled gives up waiting for its `Hello`.
+    hello_by_ms: u64,
+    /// When this node next asks the peer for its records.
+    next_exchange_ms: u64,
+    /// When the peer's last `GetPeers`, and its last `Peers`, were handled.
+    last_get_ms: Option<u64>,
+    last_peers_ms: Option<u64>,
 }
 
 impl Conn {
@@ -202,6 +238,12 @@ impl Conn {
             peer: None,
             dialled,
             dead: false,
+            target: None,
+            remote: None,
+            hello_by_ms: u64::MAX,
+            next_exchange_ms: 0,
+            last_get_ms: None,
+            last_peers_ms: None,
         }
     }
 
@@ -218,11 +260,97 @@ impl Conn {
     }
 }
 
+/// Peer exchange settings (spec 09 §5a).
+#[derive(Clone)]
+pub struct Discovery {
+    /// The node key that signs this node's record; without one the node
+    /// advertises nothing, and still learns and dials.
+    pub key: Option<k256::ecdsa::SigningKey>,
+    /// The address to advertise; by default the listen address, unless
+    /// that is unspecified.
+    pub advertise: Option<SocketAddr>,
+    /// Addresses dialled to learn the network, with no id expected.
+    pub bootstrap: Vec<SocketAddr>,
+    /// Most connections in all, configured peers aside.
+    pub max_peers: usize,
+    /// Connections this node dials itself, configured peers included.
+    pub outbound: usize,
+}
+
+impl Default for Discovery {
+    fn default() -> Discovery {
+        Discovery {
+            key: None,
+            advertise: None,
+            bootstrap: Vec::new(),
+            max_peers: peers::DEFAULT_MAX_PEERS,
+            outbound: peers::DEFAULT_OUTBOUND,
+        }
+    }
+}
+
+/// What peer exchange dialled a connection for: an entry of the table, or
+/// a bootstrap address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Entry([u8; 32]),
+    Boot(SocketAddr),
+}
+
+/// A bootstrap address and how its dials went.
+struct Boot {
+    addr: SocketAddr,
+    /// The id its last handshake named.
+    id: Option<[u8; 32]>,
+    failures: u32,
+    next_dial_ms: u64,
+}
+
+/// A finished dial: what it was for, and the stream or the error.
+type Dialled = (Target, std::io::Result<TcpStream>);
+
+/// The state of peer exchange.
+struct Exchange {
+    key: Option<k256::ecdsa::SigningKey>,
+    advertise: Option<SocketAddr>,
+    /// This node's record, signed at the first poll.
+    own: Option<PeerRecord>,
+    table: PeerTable,
+    boot: Vec<Boot>,
+    max_peers: usize,
+    outbound: usize,
+    /// Dials in flight.
+    dialing: Vec<Target>,
+    done: (Sender<Dialled>, Receiver<Dialled>),
+    next_validators_ms: u64,
+}
+
+impl Exchange {
+    fn boot(&mut self, addr: SocketAddr) -> Option<&mut Boot> {
+        self.boot.iter_mut().find(|b| b.addr == addr)
+    }
+
+    /// A dial of `target` failed, or its connection closed before its handshake.
+    fn failed(&mut self, target: Target, now_ms: u64) {
+        match target {
+            Target::Entry(id) => self.table.dial_failed(&id, now_ms),
+            Target::Boot(addr) => {
+                if let Some(b) = self.boot(addr) {
+                    b.failures += 1;
+                    b.next_dial_ms = now_ms + peers::backoff_ms(b.failures);
+                }
+            }
+        }
+    }
+}
+
 /// A node's TCP endpoint.
 pub struct Transport {
     listener: TcpListener,
     conns: Vec<Conn>,
     hello: Frame,
+    /// This node's id, as its `Hello` names it.
+    id: [u8; 32],
     chain_id: u64,
     peers: Vec<SocketAddr>,
     last_dial_ms: Option<u64>,
@@ -231,6 +359,8 @@ pub struct Transport {
     next_local_id: u64,
     /// Traffic counted since the last poll handed it to the node's telemetry.
     traffic: Traffic,
+    /// Peer exchange, when enabled.
+    exchange: Option<Exchange>,
 }
 
 impl Transport {
@@ -250,13 +380,65 @@ impl Transport {
             listener,
             conns: Vec::new(),
             hello: Frame::Hello { id, chain_id },
+            id,
             chain_id,
             peers,
             last_dial_ms: None,
             serving: BTreeMap::new(),
             next_local_id: 0,
             traffic: Traffic::default(),
+            exchange: None,
         })
+    }
+
+    /// Runs peer exchange from now on (spec 09 §5a).
+    pub fn enable_discovery(&mut self, discovery: Discovery) {
+        let advertise = discovery
+            .advertise
+            .or_else(|| self.local_addr().ok().filter(peers::dialable));
+        self.exchange = Some(Exchange {
+            key: discovery.key,
+            advertise,
+            own: None,
+            table: PeerTable::new(self.chain_id, self.id),
+            boot: discovery
+                .bootstrap
+                .into_iter()
+                .map(|addr| Boot {
+                    addr,
+                    id: None,
+                    failures: 0,
+                    next_dial_ms: 0,
+                })
+                .collect(),
+            max_peers: discovery.max_peers,
+            outbound: discovery.outbound,
+            dialing: Vec::new(),
+            done: channel(),
+            next_validators_ms: 0,
+        });
+    }
+
+    /// The peer table, when peer exchange runs.
+    #[must_use]
+    pub fn peer_table(&self) -> Option<&PeerTable> {
+        self.exchange.as_ref().map(|x| &x.table)
+    }
+
+    /// The record this node advertises, once signed.
+    #[must_use]
+    pub fn own_record(&self) -> Option<&PeerRecord> {
+        self.exchange.as_ref().and_then(|x| x.own.as_ref())
+    }
+
+    /// Connections this node dialled itself (configured peers and peer
+    /// exchange's), open or opening.
+    #[must_use]
+    pub fn outbound(&self) -> usize {
+        self.conns
+            .iter()
+            .filter(|c| c.dialled.is_some() || c.target.is_some())
+            .count()
     }
 
     /// The bound address.
@@ -274,9 +456,247 @@ impl Transport {
     }
 
     fn accept(&mut self) {
-        while let Ok((stream, _)) = self.listener.accept() {
-            self.conns.push(Conn::new(stream, None, &self.hello));
-            self.traffic.frame(Direction::Out, "hello");
+        while let Ok((stream, remote)) = self.listener.accept() {
+            // A connection beyond the limits is closed as it is dropped.
+            if self.admits(&remote) {
+                let mut conn = Conn::new(stream, None, &self.hello);
+                conn.remote = Some(remote);
+                self.conns.push(conn);
+                self.traffic.frame(Direction::Out, "hello");
+            }
+        }
+    }
+
+    /// Whether peer exchange's limits let a connection from `remote` in:
+    /// fewer than `max_peers` connections besides the configured peers', and
+    /// fewer than `PER_PREFIX` from its prefix (spec 09 §5a). Without peer
+    /// exchange, every connection is accepted.
+    fn admits(&self, remote: &SocketAddr) -> bool {
+        let Some(x) = &self.exchange else {
+            return true;
+        };
+        let open = self.conns.iter().filter(|c| c.dialled.is_none()).count();
+        let prefix = peers::prefix(remote);
+        let same = self
+            .conns
+            .iter()
+            .filter(|c| prefix.is_some() && c.remote.as_ref().and_then(peers::prefix) == prefix)
+            .count();
+        open < x.max_peers && same < peers::PER_PREFIX
+    }
+
+    /// Peer exchange's dialling (spec 09 §5a): signs this node's record at
+    /// the first call, takes the dials that finished, and starts new ones
+    /// while the node has fewer outbound connections than its target.
+    fn discover(&mut self, now_ms: u64) {
+        let mut busy = self.connected();
+        let Some(x) = self.exchange.as_mut() else {
+            return;
+        };
+        if x.own.is_none()
+            && let (Some(key), Some(addr)) = (&x.key, x.advertise)
+        {
+            x.own = PeerRecord::sign(key, self.chain_id, addr, now_ms);
+        }
+        while let Ok((target, result)) = x.done.1.try_recv() {
+            x.dialing.retain(|t| *t != target);
+            match result {
+                Ok(stream) => {
+                    let mut conn = Conn::new(stream, None, &self.hello);
+                    conn.target = Some(target);
+                    conn.hello_by_ms = now_ms + HANDSHAKE_MS;
+                    self.conns.push(conn);
+                    self.traffic.frame(Direction::Out, "hello");
+                }
+                Err(_) => x.failed(target, now_ms),
+            }
+        }
+        let open = self
+            .conns
+            .iter()
+            .filter(|c| c.dialled.is_some() || c.target.is_some())
+            .count();
+        let room = x
+            .outbound
+            .saturating_sub(open + x.dialing.len())
+            .min(peers::MAX_DIALING.saturating_sub(x.dialing.len()));
+        if room == 0 {
+            return;
+        }
+        let entry = |t: &Target| match t {
+            Target::Entry(id) => Some(*id),
+            Target::Boot(_) => None,
+        };
+        busy.extend(
+            self.conns
+                .iter()
+                .filter_map(|c| c.target.as_ref().and_then(entry)),
+        );
+        busy.extend(x.dialing.iter().filter_map(entry));
+        let mut targets: Vec<(Target, SocketAddr)> = x
+            .table
+            .candidates(now_ms, &busy, room)
+            .into_iter()
+            .map(|(id, addr)| (Target::Entry(id), addr))
+            .collect();
+        for boot in &x.boot {
+            let target = Target::Boot(boot.addr);
+            let open = self.conns.iter().any(|c| c.target == Some(target))
+                || x.dialing.contains(&target)
+                || boot.id.is_some_and(|id| busy.contains(&id));
+            if targets.len() < room && boot.next_dial_ms <= now_ms && !open {
+                targets.push((target, boot.addr));
+            }
+        }
+        for (target, addr) in targets {
+            x.dialing.push(target);
+            let done = x.done.0.clone();
+            std::thread::spawn(move || {
+                let stream =
+                    TcpStream::connect_timeout(&addr, Duration::from_millis(DIAL_TIMEOUT_MS));
+                // A transport dropped meanwhile no longer listens.
+                let _ = done.send((target, stream));
+            });
+        }
+    }
+
+    /// The first frame on connection `index`: a `Hello` for this chain names
+    /// the peer, and anything else closes the connection. With peer
+    /// exchange, a peer naming this node itself, or another id than the one
+    /// it was dialled for, is closed too, and a bootstrap address learns the
+    /// id it answers with.
+    fn hello(&mut self, index: usize, frame: &Frame, now_ms: u64) {
+        let conn = &mut self.conns[index];
+        let id = match *frame {
+            Frame::Hello { id, chain_id } if chain_id == self.chain_id => id,
+            _ => {
+                conn.dead = true;
+                return;
+            }
+        };
+        conn.peer = Some(id);
+        let Some(x) = self.exchange.as_mut() else {
+            return;
+        };
+        conn.dead |= id == self.id;
+        match conn.target {
+            Some(Target::Entry(expected)) => {
+                conn.dead |= !x.table.handshake(&expected, &id, now_ms);
+            }
+            // A bootstrap address that is this node's own is never dialled again.
+            Some(Target::Boot(addr)) if id == self.id => x.boot.retain(|b| b.addr != addr),
+            Some(Target::Boot(addr)) => {
+                if let Some(b) = x.boot(addr) {
+                    b.failures = 0;
+                    b.id = Some(id);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// A `GetPeers` from `peer` on connection `index`: answered with this
+    /// node's records, at most once per `PEER_GAP_MS` (spec 09 §5a).
+    fn get_peers(&mut self, index: usize, peer: [u8; 32], now_ms: u64) {
+        let Some(x) = self.exchange.as_ref() else {
+            return;
+        };
+        let conn = &mut self.conns[index];
+        if conn
+            .last_get_ms
+            .is_some_and(|t| now_ms < t + peers::PEER_GAP_MS)
+        {
+            return;
+        }
+        conn.last_get_ms = Some(now_ms);
+        let records = Seq(x.table.answer(&peer, x.own.as_ref()));
+        conn.send(&Frame::Peers { records });
+        self.traffic.frame(Direction::Out, "peers");
+    }
+
+    /// A `Peers` from `peer` on connection `index`: its records go into the
+    /// table, at most once per `PEER_GAP_MS`; a frame the table refuses
+    /// closes the connection (spec 09 §5a).
+    fn peers(&mut self, index: usize, peer: [u8; 32], records: &[PeerRecord], now_ms: u64) {
+        let connected = self.connected();
+        let Some(x) = self.exchange.as_mut() else {
+            return;
+        };
+        let conn = &mut self.conns[index];
+        if conn
+            .last_peers_ms
+            .is_some_and(|t| now_ms < t + peers::PEER_GAP_MS)
+        {
+            return;
+        }
+        conn.last_peers_ms = Some(now_ms);
+        conn.dead |= x.table.learn(peer, records, &connected).is_err();
+    }
+
+    /// Asks every handshaken peer for its records when its turn has come:
+    /// right after the handshake, then every `EXCHANGE_MS`.
+    fn ask_peers(&mut self, now_ms: u64) {
+        if self.exchange.is_none() {
+            return;
+        }
+        for conn in self
+            .conns
+            .iter_mut()
+            .filter(|c| c.peer.is_some() && !c.dead && now_ms >= c.next_exchange_ms)
+        {
+            conn.next_exchange_ms = now_ms + peers::EXCHANGE_MS;
+            conn.send(&Frame::GetPeers);
+            self.traffic.frame(Direction::Out, "get_peers");
+        }
+    }
+
+    /// Drops the dead connections. Peer exchange learns from those it
+    /// dialled: one lost after its handshake is dialled again after a
+    /// backoff, one closed before its handshake, or still without one
+    /// `HANDSHAKE_MS` after it opened, counts as a failed dial.
+    fn reap(&mut self, now_ms: u64) {
+        if let Some(x) = self.exchange.as_mut() {
+            for conn in &mut self.conns {
+                // A dialled peer that never says `Hello` is a failed dial.
+                conn.dead |= conn.peer.is_none() && now_ms >= conn.hello_by_ms;
+            }
+            for conn in self.conns.iter().filter(|c| c.dead) {
+                match (conn.target, conn.peer) {
+                    (Some(target), None) => x.failed(target, now_ms),
+                    (Some(Target::Entry(id)), Some(peer)) if peer == id => {
+                        x.table.lost(&id, now_ms);
+                    }
+                    (Some(Target::Boot(addr)), Some(_)) => {
+                        if let Some(b) = x.boot(addr) {
+                            b.next_dial_ms = now_ms + peers::BACKOFF_MS;
+                        }
+                    }
+                    // Not dialled by peer exchange, or a mismatch it counted already.
+                    _ => {}
+                }
+            }
+        }
+        self.conns.retain(|c| !c.dead);
+    }
+
+    /// Reads the current validator set from the node's chain state every
+    /// `VALIDATOR_REFRESH_MS`, for the table to prefer and protect.
+    fn refresh_validators(&mut self, node: &mut Node, now_ms: u64) {
+        let Some(x) = self.exchange.as_mut() else {
+            return;
+        };
+        if now_ms < x.next_validators_ms {
+            return;
+        }
+        x.next_validators_ms = now_ms + peers::VALIDATOR_REFRESH_MS;
+        let status = node
+            .query(STAKING, &[])
+            .ok()
+            .filter(|r| r.status == 0)
+            .and_then(|r| StakingStatus::from_bytes(&r.body).ok());
+        if let Some(status) = status {
+            let ids = status.validators.validators.0.iter().map(|v| v.id);
+            x.table.set_validators(ids.collect());
         }
     }
 
@@ -296,17 +716,22 @@ impl Transport {
         }
     }
 
-    fn handle(&mut self, index: usize, frame: Frame, node: &mut Node) -> Result<(), NodeError> {
+    fn handle(
+        &mut self,
+        index: usize,
+        frame: Frame,
+        node: &mut Node,
+        now_ms: u64,
+    ) -> Result<(), NodeError> {
         let conn = &mut self.conns[index];
         let Some(peer) = conn.peer else {
-            match frame {
-                Frame::Hello { id, chain_id } if chain_id == self.chain_id => conn.peer = Some(id),
-                _ => conn.dead = true,
-            }
+            self.hello(index, &frame, now_ms);
             return Ok(());
         };
         match frame {
             Frame::Hello { .. } => conn.dead = true,
+            Frame::GetPeers => self.get_peers(index, peer, now_ms),
+            Frame::Peers { records } => self.peers(index, peer, &records.0, now_ms),
             Frame::Message { topic, payload } => node.deliver(peer, topic, payload)?,
             Frame::Tx { raw } => {
                 // A peer's transaction we already hold, or cannot admit, is not an error.
@@ -352,14 +777,13 @@ impl Transport {
     fn handle_syncing(&mut self, index: usize, frame: Frame, sync: &mut StateSync, now_ms: u64) {
         let conn = &mut self.conns[index];
         let Some(peer) = conn.peer else {
-            match frame {
-                Frame::Hello { id, chain_id } if chain_id == self.chain_id => conn.peer = Some(id),
-                _ => conn.dead = true,
-            }
+            self.hello(index, &frame, now_ms);
             return;
         };
         match frame {
             Frame::Hello { .. } => conn.dead = true,
+            Frame::GetPeers => self.get_peers(index, peer, now_ms),
+            Frame::Peers { records } => self.peers(index, peer, &records.0, now_ms),
             Frame::SyncResponse {
                 request_id,
                 payload,
@@ -385,12 +809,14 @@ impl Transport {
     pub fn poll_sync(&mut self, sync: &mut StateSync, now_ms: u64) {
         self.accept();
         self.redial(now_ms);
+        self.discover(now_ms);
         for i in 0..self.conns.len() {
             for frame in self.read_frames(i) {
                 self.handle_syncing(i, frame, sync, now_ms);
             }
         }
-        self.conns.retain(|c| !c.dead);
+        self.ask_peers(now_ms);
+        self.reap(now_ms);
         for (peer, request_id, payload) in sync.poll(now_ms, &self.connected()) {
             self.send_to(
                 &peer,
@@ -451,11 +877,13 @@ impl Transport {
     pub fn poll(&mut self, node: &mut Node, now_ms: u64) -> Result<(), NodeError> {
         self.accept();
         self.redial(now_ms);
+        self.discover(now_ms);
         for i in 0..self.conns.len() {
             for frame in self.read_frames(i) {
-                self.handle(i, frame, node)?;
+                self.handle(i, frame, node, now_ms)?;
             }
         }
+        self.ask_peers(now_ms);
         // What the driver did is on disk before any peer hears of it (spec
         // 08 §7): a node whose store refuses sends nothing until it accepts.
         node.sync_store()?;
@@ -501,7 +929,8 @@ impl Transport {
             self.broadcast(&Frame::Tx { raw });
         }
         self.flush_all();
-        self.conns.retain(|c| !c.dead);
+        self.reap(now_ms);
+        self.refresh_validators(node, now_ms);
         node.telemetry
             .p2p(self.connected().len(), &mut self.traffic);
         Ok(())
