@@ -913,6 +913,42 @@ fn partials_of(node: &Node, key: &SigningKey, id: u64, message: &[u8]) -> Vec<Pa
         .0
 }
 
+/// Advances `sim` a slot at a time, after each slot waiting in real time for
+/// every background keystore computation to end and be taken up, except
+/// those of `held` nodes, until `done` holds or `max_ms` have passed. The
+/// simulator's clock never waits for threads, so on a loaded machine a
+/// computation could otherwise outlast any number of simulated blocks.
+fn run_patiently(
+    sim: &mut Sim,
+    held: &[usize],
+    max_ms: u64,
+    mut done: impl FnMut(&mut Sim) -> bool,
+) -> bool {
+    let mut waited = 0;
+    while waited < max_ms {
+        if done(sim) {
+            return true;
+        }
+        sim.advance(SLOT_MS).unwrap();
+        waited += SLOT_MS;
+        for _ in 0..60_000 {
+            let mut busy = false;
+            for (i, node) in sim.nodes.iter_mut().enumerate() {
+                if !held.contains(&i) {
+                    let now = node.now_ms();
+                    node.tick(now).unwrap();
+                    busy |= node.keystore_busy() > 0;
+                }
+            }
+            if !busy {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    done(sim)
+}
+
 /// A validator that runs its heavy work in the background goes on
 /// finalizing blocks while its keystore computes a DKG answer (spec 15
 /// §6.4): held from finishing, the computation leaves the node voting;
@@ -940,9 +976,7 @@ fn a_validator_finalizes_while_its_keystore_computes() {
     assert_eq!(sim.nodes[0].keystore_busy(), 1);
     assert!(sim.nodes[0].finalized_height().unwrap() >= before + 3);
     sim.nodes[0].hold_keystore(false);
-    let done = sim
-        .run_until(80 * SLOT_MS, |s| adopted(s, &[0], 0))
-        .unwrap();
+    let done = run_patiently(&mut sim, &[], 80 * SLOT_MS, |s| adopted(s, &[0], 0));
     assert!(done, "{:?}", sim.finalized_heights().unwrap());
 }
 
@@ -990,11 +1024,9 @@ fn a_slow_validator_still_lands_its_dealing_and_confirmation() {
         ..at(10_000)
     };
     let mut sim = Sim::new(kernel, &genesis, &keys, 0, &template, 20).unwrap();
-    let first = sim
-        .run_until(120 * SLOT_MS, |s| {
-            adopted(s, &[0, 1, 2, 3], 0) && s.nodes[0].finalized_height().unwrap() >= 35
-        })
-        .unwrap();
+    let first = run_patiently(&mut sim, &[], 120 * SLOT_MS, |s| {
+        adopted(s, &[0, 1, 2, 3], 0) && s.nodes[0].finalized_height().unwrap() >= 35
+    });
     assert!(first, "{:?}", sim.finalized_heights().unwrap());
     // Epoch 1's run starts at block 41; the fourth validator's keystore is
     // held before it is asked for its dealing.
@@ -1002,11 +1034,9 @@ fn a_slow_validator_still_lands_its_dealing_and_confirmation() {
     // Past the dealing phase's fourth block, the end of a fixed schedule:
     // three dealings are in, the fourth validator's keystore still computes,
     // and the run is still dealing.
-    let waited = sim
-        .run_until(40 * SLOT_MS, |s| {
-            s.nodes[0].finalized_height().unwrap() >= 47
-        })
-        .unwrap();
+    let waited = run_patiently(&mut sim, &[3], 40 * SLOT_MS, |s| {
+        s.nodes[0].finalized_height().unwrap() >= 47
+    });
     assert!(waited, "{:?}", sim.finalized_heights().unwrap());
     let p = progress(&sim.nodes[0], 1);
     assert_eq!((p.phase, p.since, p.dealings), (0, 41, 3));
@@ -1014,9 +1044,9 @@ fn a_slow_validator_still_lands_its_dealing_and_confirmation() {
     assert!(sim.nodes[3].keystore_busy() >= 1);
     // Released, its dealing lands within the deadline and the run goes on.
     sim.nodes[3].hold_keystore(false);
-    let done = sim
-        .run_until(160 * SLOT_MS, |s| key_set(&s.nodes[0], 1).is_some())
-        .unwrap();
+    let done = run_patiently(&mut sim, &[], 160 * SLOT_MS, |s| {
+        key_set(&s.nodes[0], 1).is_some()
+    });
     assert!(done, "{:?}", sim.finalized_heights().unwrap());
     assert!(dkg_message(&sim.nodes[0], 1, 0, 4).is_some());
     let p = progress(&sim.nodes[0], 1);
