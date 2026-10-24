@@ -663,6 +663,11 @@ impl Ctx {
                         self.late_proposal(proposal, hash);
                     }
                 } else {
+                    // A leader proposing at or below this node's tip lacks
+                    // the tip; nothing else would tell it (spec 08 §5a).
+                    if proposal.height <= self.s.tip_height {
+                        self.forward_certificates(view, proposer);
+                    }
                     self.handle_proposal(proposal, hash);
                 }
             }
@@ -814,6 +819,11 @@ impl Ctx {
             && let Some(proposal) = Self::proposal(&signed.hash)
         {
             self.try_vote(&proposal, signed.hash);
+            // Its own vote counts (spec 08 §5): the others' votes may all be
+            // in already, and without this check the quorum they complete
+            // would never notarize, nor would a certificate a peer forwards,
+            // which brings nothing this node does not hold.
+            self.check_notarization(view, &signed.hash);
         }
     }
 
