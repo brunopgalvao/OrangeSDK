@@ -62,7 +62,7 @@ fn address(key: &SigningKey) -> [u8; 20] {
     validator_id(key)[12..].try_into().unwrap()
 }
 
-fn genesis(keys: &[SigningKey], weights: &[u64], staking: StakingParams) -> Genesis {
+fn genesis(keys: &[SigningKey], weights: &[u64], staking: &StakingParams) -> Genesis {
     let allocations = keys
         .iter()
         .map(|k| Allocation {
@@ -93,7 +93,7 @@ fn genesis(keys: &[SigningKey], weights: &[u64], staking: StakingParams) -> Gene
                     dkg_key: encryption_key(k).to_vec(),
                 })
                 .collect()),
-            ..staking
+            ..staking.clone()
         },
         ..GenesisParams::default()
     };
@@ -313,10 +313,10 @@ fn act(sim: &mut Sim, live: &[usize], r: &mut Rng, accounts: &mut Accounts) {
                 return;
             };
             let to = *r.pick(live);
-            let Some(state) = sim.nodes[to].simplex_state() else {
+            let Some(driver) = sim.nodes[to].simplex_state() else {
                 return;
             };
-            let view = state.view + 1 + r.below(4);
+            let view = driver.view + 1 + r.below(4);
             let key = &accounts.keys[validator];
             for hash in [r.array32(), r.array32()] {
                 let digest = keccak256(&signing_preimage(KIND_VOTE, CHAIN_ID, view, &hash));
@@ -431,7 +431,7 @@ fn schedule(r: &mut Rng) {
         .min_by_key(|&i| weights[i])
         .filter(|&i| 3 * weights[i] < total);
     let kernel = kernel_module();
-    let genesis = genesis(&keys, &weights, staking);
+    let genesis = genesis(&keys, &weights, &staking);
     let config = NodeConfig {
         now_ms: 10_000,
         ..NodeConfig::default()
@@ -461,7 +461,7 @@ fn schedule(r: &mut Rng) {
             }
         }
         let live: Vec<usize> = (0..NODES).filter(|i| !down[*i]).collect();
-        for _ in 0..1 + r.below(3) {
+        for _ in 0..=r.below(3) {
             act(&mut sim, &live, r, &mut accounts);
         }
         sim.advance(SLOT_MS * (4 + r.below(epoch_blocks))).unwrap();
