@@ -213,6 +213,32 @@ fn a_dealer_who_sends_a_bad_share_and_stays_silent_is_excluded() {
     assert_eq!(keys.group_key(), expected);
 }
 
+/// A recipient's share checks give the same complaints and the same key on
+/// one thread as on several (codex ADR 0048).
+#[test]
+fn share_checks_agree_on_any_number_of_threads() {
+    let outcome = |threads: usize| {
+        let (mut nodes, mut dealings) = fresh(7, 5);
+        for n in &mut nodes {
+            n.set_threads(threads);
+        }
+        dealing_of(&mut dealings, 2).shares[2][31] ^= 1;
+        dealing_of(&mut dealings, 6).shares[4][31] ^= 1;
+        deliver(&mut nodes, &dealings);
+        let complaints = advance(&mut nodes);
+        deliver(&mut nodes, &complaints);
+        let justifications = advance(&mut nodes);
+        deliver(&mut nodes, &justifications);
+        let keys = check(&finish(&mut nodes), &[1, 2, 3, 4, 5, 6, 7]);
+        (complaints, keys.to_bytes())
+    };
+    let one = outcome(1);
+    assert_eq!(one.0.len(), 2);
+    for threads in [0, 2, 3, 16] {
+        assert_eq!(outcome(threads), one);
+    }
+}
+
 #[test]
 fn a_dealer_who_answers_a_complaint_with_the_right_share_stays() {
     let (mut nodes, dealings) = fresh(4, 3);
