@@ -195,13 +195,14 @@ impl Drop for Reporter<'_> {
 /// Runs `cases` times `SOLO_FUZZ_SCALE` cases of harness `name`, each with
 /// its own generator, or only case `SOLO_FUZZ_CASE`, and returns how many
 /// ran.
-pub fn run(name: &str, cases: u64, case: impl FnMut(&mut Rng)) -> u64 {
+pub fn run(name: &str, cases: u64, mut case: impl FnMut(&mut Rng)) -> u64 {
     let total = cases.saturating_mul(parse_scale(env("SOLO_FUZZ_SCALE").as_deref()));
     let only = parse_case(env("SOLO_FUZZ_CASE").as_deref());
-    run_cases(name, total, only, case)
+    run_cases(name, total, only, &mut case)
 }
 
-fn run_cases(name: &str, total: u64, only: Option<u64>, mut case: impl FnMut(&mut Rng)) -> u64 {
+/// The body of [`run`], not generic, so that coverage sees one copy of it.
+fn run_cases(name: &str, total: u64, only: Option<u64>, case: &mut dyn FnMut(&mut Rng)) -> u64 {
     let base = parse_seed(env("SOLO_FUZZ_SEED").as_deref());
     let indices = match only {
         Some(i) => i..i + 1,
@@ -236,7 +237,17 @@ pub fn evolve(
     seeds: impl IntoIterator<Item = Vec<u8>>,
     mut accept: impl FnMut(&[u8]) -> bool,
 ) -> u64 {
-    let mut corpus: Vec<Vec<u8>> = seeds.into_iter().filter(|s| accept(s)).collect();
+    let corpus: Vec<Vec<u8>> = seeds.into_iter().filter(|s| accept(s)).collect();
+    evolve_corpus(name, cases, corpus, &mut accept)
+}
+
+/// The body of [`evolve`], not generic, so that coverage sees one copy of it.
+fn evolve_corpus(
+    name: &str,
+    cases: u64,
+    mut corpus: Vec<Vec<u8>>,
+    accept: &mut dyn FnMut(&[u8]) -> bool,
+) -> u64 {
     let mut accepted = 0;
     run(name, cases, |r| {
         let input = if corpus.is_empty() || r.chance(1, 16) {
@@ -351,7 +362,10 @@ mod tests {
         assert_eq!(first, second);
         // One case alone draws what it drew in the full run.
         let mut alone = Vec::new();
-        assert_eq!(run_cases("count", 5, Some(3), |r| alone.push(r.u64())), 1);
+        assert_eq!(
+            run_cases("count", 5, Some(3), &mut |r| alone.push(r.u64())),
+            1
+        );
         assert_eq!(alone, [first[3]]);
     }
 
