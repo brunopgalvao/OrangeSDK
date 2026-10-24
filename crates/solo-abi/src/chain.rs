@@ -798,6 +798,16 @@ pub enum ConsensusMessage {
         /// The encoded `DkgEnvelope`.
         envelope: Vec<u8>,
     },
+    /// Asks the leader of `view`, point to point, for the certificates of
+    /// its tip, which the asker lacks and needs to vote for the leader's
+    /// proposal (spec 08 §5a). Signed with `consensus::KIND_FETCH` over
+    /// `view` and the zero hash.
+    Fetch {
+        /// The view of the proposal the asker cannot vote for yet.
+        view: u64,
+        /// The asker's signature.
+        signature: Signature,
+    },
 }
 
 impl Encode for ConsensusMessage {
@@ -846,6 +856,10 @@ impl Encode for ConsensusMessage {
                 e.raw(&[5]);
                 e.put(envelope);
             }
+            ConsensusMessage::Fetch { view, signature } => {
+                e.raw(&[6]);
+                e.put(view).put(signature);
+            }
         }
     }
 }
@@ -878,6 +892,10 @@ impl Decode for ConsensusMessage {
                 partials: d.get()?,
             },
             5 => ConsensusMessage::Dkg { envelope: d.get()? },
+            6 => ConsensusMessage::Fetch {
+                view: d.get()?,
+                signature: d.get()?,
+            },
             tag => return Err(DecodeError::BadTag(tag)),
         })
     }
@@ -897,6 +915,9 @@ pub mod consensus {
     pub const KIND_VOTE: u8 = 1;
     /// Signing domain of a finalize vote.
     pub const KIND_FINALIZE: u8 = 2;
+    /// Signing domain of a request for a leader's tip (spec 08 §5a); 3 is
+    /// the DKG envelope's (`staking::KIND_DKG`).
+    pub const KIND_FETCH: u8 = 4;
     /// Key role the driver signs with (`sign` host function).
     pub const KEY_ROLE: u64 = 0;
     /// The timeout of a view, in slots, before backoff. A node still in the
@@ -1180,6 +1201,17 @@ mod tests {
             reason::GAS_TOO_LOW,
             reason::UNSUPPORTED,
         );
+    }
+
+    #[test]
+    fn a_fetch_roundtrips() {
+        let fetch = ConsensusMessage::Fetch {
+            view: 9,
+            signature: Signature([9; 65]),
+        };
+        roundtrip(&fetch);
+        assert_eq!(fetch.to_bytes().len(), 74);
+        assert_eq!(consensus::KIND_FETCH, 4);
     }
 
     #[test]

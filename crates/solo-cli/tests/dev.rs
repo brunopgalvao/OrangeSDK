@@ -18,8 +18,8 @@ const HELLO: &str = concat!(
     "/../solo-recompile/tests/fixtures/hello.elf"
 );
 
-/// A kernel gas budget that lets the driver start (80 224) but not produce a block
-/// (276 003) with the pinned kernel fixture, bisected on 2026-10-24 in-process (the
+/// A kernel gas budget that lets the driver start (80 228) but not produce a block
+/// (276 548) with the pinned kernel fixture, bisected on 2026-10-24 in-process (the
 /// dev key, this genesis, slots of 60 ms, in a debug host build) on the kernel with
 /// the block log and snapshot record of spec 22, the fee market of spec 23 with its
 /// bounds and the payout that leaves jailed validators out (spec 23 §2, spec 15
@@ -39,7 +39,9 @@ const HELLO: &str = concat!(
 /// the kernel with bounded RLP nesting (spec 20 §2.1) and the vote for a held
 /// proposal (spec 08 §5) moved the block from 275 837 to 276 003 (the only
 /// validator leads every view and skips the new check: the rebuilt code), and left
-/// the start at 80 224.
+/// the start at 80 224; the kernel with tip fetching (spec 08 §5a, codex ADR 0049)
+/// moved them to 80 228 and 276 548 (the only validator never fetches, and a
+/// proposal on its own tip leaves the new check at once: the rebuilt code).
 const STARVED_GAS: &str = "100000";
 
 const GENESIS: &str = r#"{"chainId": 1337, "slotMs": 60, "maxTxs": 4,

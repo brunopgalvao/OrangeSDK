@@ -6,7 +6,8 @@
 
 use k256::ecdsa::SigningKey;
 use solo_abi::chain::consensus::{
-    KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE, MAX_EVIDENCE, TOPIC, leader, quorum, signing_preimage,
+    KIND_FETCH, KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE, MAX_EVIDENCE, TOPIC, leader, quorum,
+    signing_preimage,
 };
 use solo_abi::chain::{
     Allocation, Certificate, ConsensusMessage, Evidence, GenesisParams, Proposal, Signature,
@@ -1354,4 +1355,232 @@ fn a_restarted_leader_does_not_propose_twice_in_a_view() {
     );
     assert!(sim.nodes.iter().all(|n| equivocations(n) == 0));
     assert_agreement(&sim, &[0, 1, 2, 3]);
+}
+
+/// A leader whose tip the other validators lack is voted for within a few
+/// message delays (spec 08 §5a, tip fetching). Votes for the proposal of
+/// view 1 reach only validator 1, the leader of view 2: it alone notarizes
+/// view 1 and proposes on it, and the others hold neither the notarization
+/// nor a tip the proposal of view 2 extends. Each asks validator 1 for its
+/// tip as the proposal arrives and votes once the certificate is in. Before
+/// tip fetching they waited for their view-1 timeout (3 slots, more after
+/// backoff) to make their messages stale and draw the certificate that way:
+/// every node finalized 840 ms after the heal, against 440 ms with it, most
+/// of which is the leader of view 2 waiting out its slot.
+#[test]
+fn a_leader_whose_tip_the_others_lack_is_voted_promptly() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, address(&keys[0]));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    // Validator 0 proposes in view 1, and its proposal reaches everyone ...
+    assert!(sim.run_until(4 * SLOT_MS, |s| simplex(s, 0).voted).unwrap());
+    // ... but from then on only validator 1 hears anything, the votes included, until it
+    // notarizes view 1.
+    let cut = Rc::new(Cell::new(true));
+    let open = cut.clone();
+    sim.filter_links(Some(Box::new(move |_, to, _| {
+        (to == 1 || !open.get()).then_some(0)
+    })));
+    assert!(sim.run_until(SLOT_MS, |s| simplex(s, 1).view == 2).unwrap());
+    cut.set(false);
+    for i in [0, 2, 3] {
+        let s = simplex(&sim, i);
+        assert_eq!((s.view, s.tip_height), (1, 0), "node {i} lacks the tip");
+    }
+    let healed = sim.now_ms;
+    assert!(
+        sim.run_until(20 * SLOT_MS, |s| s
+            .nodes
+            .iter()
+            .all(|n| !n.finalized.is_empty()))
+            .unwrap()
+    );
+    let took = sim.now_ms - healed;
+    eprintln!("every node finalized {took} ms after the heal");
+    assert!(took < 2 * SLOT_MS, "{took} ms");
+    assert_agreement(&sim, &[0, 1, 2, 3]);
+    // Nobody timed out on the way.
+    assert!((0..4).all(|i| simplex(&sim, i).backoff == 0));
+}
+
+/// A validator whose vote for a proposal it held completes that view's
+/// quorum notarizes the view at once. Found by the fault schedules of
+/// `consensus_fuzz.rs` (base seed 1, case 1542): a validator that entered a
+/// view holding its proposal and two votes for it voted, but did not count
+/// its own vote, so it timed out in a view it held the notarization of;
+/// every later certificate for that view then told it nothing new, and it
+/// never took the proposal as its tip.
+#[test]
+fn a_held_vote_that_completes_a_quorum_notarizes() {
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, address(&keys[0]));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    let node = &mut sim.nodes[3];
+    let from = |i: usize| validator_id(&keys[i]);
+    let now = node.now_ms();
+    let p1 = Proposal {
+        view: 1,
+        height: 1,
+        timestamp_ms: now,
+        ..Proposal::default()
+    };
+    let h1 = keccak256(&p1.to_bytes());
+    let p2 = Proposal {
+        view: 2,
+        height: 2,
+        parent: h1,
+        timestamp_ms: now + 1,
+        ..Proposal::default()
+    };
+    let h2 = keccak256(&p2.to_bytes());
+    node.deliver(from(0), TOPIC, propose(&keys[0], p1)).unwrap();
+    // The proposal of view 2 and two votes for it arrive while node 3 is in view 1.
+    node.deliver(from(1), TOPIC, propose(&keys[1], p2)).unwrap();
+    for i in [0, 1] {
+        node.deliver(from(i), TOPIC, vote(&keys[i], 2, h2)).unwrap();
+    }
+    // View 1 is notarized: node 3 enters view 2, votes for the held proposal, and its
+    // vote is the third.
+    for i in [0, 1] {
+        node.deliver(from(i), TOPIC, vote(&keys[i], 1, h1)).unwrap();
+    }
+    let s = node.simplex_state().unwrap();
+    assert_eq!((s.view, s.tip_view, s.tip_hash), (3, 2, h2));
+}
+
+/// The messages of tip fetching (spec 08 §5a): a validator that holds the
+/// leader's proposal but not its parent's notarization asks the leader,
+/// once per view; the leader answers a `Fetch` its delivering validator
+/// signed with its tip certificate and tip, under the budget it shares with
+/// stale messages, and nothing else.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn tip_fetching_messages_are_checked_and_bounded() {
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, address(&keys[0]));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    // Run until node 0 is the leader of its current view and holds a notarized tip.
+    assert!(
+        sim.run_until(20 * SLOT_MS, |s| {
+            let st = simplex(s, 0);
+            st.tip_height >= 2 && leader(st.view, 4) == 0 && !st.voted
+        })
+        .unwrap()
+    );
+    for node in &mut sim.nodes {
+        node.take_outbound();
+    }
+    let st = simplex(&sim, 0);
+    let view = st.view;
+    let fetch = |key: &SigningKey, view: u64| ConsensusMessage::Fetch {
+        view,
+        signature: signed(key, KIND_FETCH, view, [0; 32]).signature,
+    };
+    // A validator's Fetch, delivered by that validator, draws the tip certificate and the
+    // tip; the entry certificate is the tip's, so that is all.
+    let asker = validator_id(&keys[2]);
+    sim.nodes[0]
+        .deliver(asker, TOPIC, fetch(&keys[2], view).to_bytes())
+        .unwrap();
+    let sent = sends(&mut sim.nodes[0], &asker);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let ConsensusMessage::Certificate {
+        certificate,
+        proposal: Some(tip),
+    } = &sent[0]
+    else {
+        panic!("{sent:?}")
+    };
+    assert_eq!(certificate.hash, st.tip_hash);
+    assert_eq!(keccak256(&tip.to_bytes()), st.tip_hash);
+    // Once per peer per view: again, or after a stale vote, nothing more.
+    sim.nodes[0]
+        .deliver(asker, TOPIC, fetch(&keys[2], view).to_bytes())
+        .unwrap();
+    sim.nodes[0]
+        .deliver(asker, TOPIC, vote(&keys[2], 1, [0; 32]))
+        .unwrap();
+    assert!(sends(&mut sim.nodes[0], &asker).is_empty());
+    // A Fetch replayed by another peer, signed by a non-validator, or forged, draws nothing.
+    let other = validator_id(&keys[3]);
+    let stranger = SigningKey::from_slice(&[0x77; 32]).unwrap();
+    for m in [
+        fetch(&keys[2], view),
+        fetch(&stranger, view),
+        ConsensusMessage::Fetch {
+            view,
+            signature: Signature([3; 65]),
+        },
+    ] {
+        sim.nodes[0].deliver(other, TOPIC, m.to_bytes()).unwrap();
+    }
+    assert!(sends(&mut sim.nodes[0], &other).is_empty());
+    // The asking side: node 1 holds a proposal of node 0 in its view on a parent it has
+    // never seen, and asks node 0, once.
+    let node = &mut sim.nodes[1];
+    let st1 = node.simplex_state().unwrap();
+    let unknown = [0xAB; 32];
+    let lacking = |view: u64, parent: [u8; 32], height: u64| Proposal {
+        view,
+        height,
+        parent,
+        timestamp_ms: st1.tip_timestamp_ms + 1,
+        ..Proposal::default()
+    };
+    let leader_of = |v: u64| leader(v, 4);
+    let mut v = st1.view;
+    while leader_of(v) != 0 {
+        v += 1;
+    }
+    let leader_id = validator_id(&keys[0]);
+    node.deliver(
+        leader_id,
+        TOPIC,
+        propose(&keys[0], lacking(v, unknown, st1.tip_height + 2)),
+    )
+    .unwrap();
+    let fetched = sends(node, &leader_id);
+    assert_eq!(fetched.len(), 1, "{fetched:?}");
+    let ConsensusMessage::Fetch {
+        view: asked_view, ..
+    } = fetched[0]
+    else {
+        panic!("{fetched:?}")
+    };
+    assert_eq!(asked_view, v);
+    // Not twice in one view, not for a proposal on its own tip, nor when the leader is
+    // the one behind (a parent it holds from a view at or below its tip's).
+    node.deliver(
+        leader_id,
+        TOPIC,
+        propose(&keys[0], lacking(v, [0xAC; 32], st1.tip_height + 2)),
+    )
+    .unwrap();
+    let mut w = v + 1;
+    while leader_of(w) != 0 {
+        w += 1;
+    }
+    let tip = notarized_in(node, st1.tip_view).unwrap();
+    node.deliver(
+        leader_id,
+        TOPIC,
+        propose(&keys[0], lacking(w, tip.parent, tip.height)),
+    )
+    .unwrap();
+    node.deliver(leader_id, TOPIC, propose(&keys[0], lacking(w, [0; 32], 1)))
+        .unwrap();
+    assert!(
+        sends(node, &leader_id)
+            .iter()
+            .all(|m| !matches!(m, ConsensusMessage::Fetch { .. }))
+    );
+    assert!(holds_proposal(
+        node,
+        &keccak256(&lacking(v, unknown, st1.tip_height + 2).to_bytes())
+    ));
 }

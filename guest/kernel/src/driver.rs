@@ -14,9 +14,9 @@ use alloc::vec::Vec;
 
 use solo_abi::bridge::FinalityProof;
 use solo_abi::chain::consensus::{
-    EQUIVOCATION_PENALTY, KEY_ROLE, KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE, MAX_BACKOFF,
-    MAX_EVIDENCE, TOPIC, identity_preimage, leader, propose_timer, signing_preimage, timeout_timer,
-    timer_view, view_timeout_ms,
+    EQUIVOCATION_PENALTY, KEY_ROLE, KIND_FETCH, KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE,
+    MAX_BACKOFF, MAX_EVIDENCE, TOPIC, identity_preimage, leader, propose_timer, signing_preimage,
+    timeout_timer, timer_view, view_timeout_ms,
 };
 use solo_abi::chain::{
     BLOCK_GAS_LIMIT, BlockHeader, Certificate, ConsensusMessage, Evidence, GenesisParams,
@@ -50,6 +50,9 @@ const WEAK_SYNC_KEY: &[u8] = b"simplex/weak_sync";
 /// The height a restarted node re-executes its own finalized blocks up to
 /// (spec 08 §7), while it does; 0 or absent otherwise.
 const REPLAY_KEY: &[u8] = b"simplex/replay";
+/// The highest view this node asked a leader for its tip in (spec 08 §5a),
+/// so that it asks at most once per view.
+const FETCHED_KEY: &[u8] = b"simplex/fetched";
 /// The block log (spec 22 §5): per finalized height, under `local/` in chain
 /// state so that it reaches the disk with the block it names, the proposal,
 /// its finalize certificate and its threshold certificate. A node whose
@@ -467,7 +470,7 @@ impl Ctx {
                     &first.signature,
                 )
             }
-            ConsensusMessage::Dkg { .. } => None,
+            ConsensusMessage::Dkg { .. } | ConsensusMessage::Fetch { .. } => None,
         }
     }
 
@@ -633,7 +636,8 @@ impl Ctx {
             | ConsensusMessage::Finalize { view, .. }
             | ConsensusMessage::FinalizeShare { view, .. } => Some(*view),
             ConsensusMessage::Certificate { certificate, .. } => Some(certificate.view),
-            ConsensusMessage::Dkg { .. } => None,
+            // A request for this node's tip is answered in its own epoch only.
+            ConsensusMessage::Dkg { .. } | ConsensusMessage::Fetch { .. } => None,
         };
         if let Some(epoch) = view.map(|v| self.view_epoch(v)).filter(|e| *e > self.epoch) {
             self.keep_for_later(&m, epoch);
@@ -714,7 +718,60 @@ impl Ctx {
                     self.broadcast(&ConsensusMessage::Dkg { envelope });
                 }
             }
+            ConsensusMessage::Fetch { view, signature } => self.on_fetch(view, signature),
         }
+    }
+
+    /// A validator asks for this node's tip: it holds this node's proposal
+    /// of `view` and cannot vote for it, because it lacks the parent's
+    /// notarization. It gets what a stale message from it would draw (spec
+    /// 08 §5a), under the same checks and the same once-per-period budget,
+    /// now rather than after its own view timeout.
+    fn on_fetch(&mut self, view: u64, signature: Signature) {
+        if self.view_epoch(view) != self.epoch
+            || self.peer.is_none_or(|p| self.s.answered.0.contains(&p))
+        {
+            return;
+        }
+        if let Some(asker) = self.verify(KIND_FETCH, view, &ZERO, &signature) {
+            self.forward_certificates(view, asker);
+        }
+    }
+
+    /// Asks the leader that made `proposal`, a valid proposal of the
+    /// current view or a later one whose parent is not this node's tip,
+    /// for the certificates of that parent (spec 08 §5a). The leader built
+    /// the proposal on its own tip, so it holds them; without them this
+    /// node could vote only after its view timeout made its messages
+    /// stale, possibly backed off. Not when the parent is a proposal this
+    /// node holds from a view at or below its tip's (the leader is behind,
+    /// not this node), nor when it has already voted or timed out in the
+    /// view, and at most once per view.
+    fn fetch_tip(&mut self, proposal: &Proposal) {
+        let view = proposal.view;
+        let n = self.n();
+        let proposer = if n == 0 { 0 } else { leader(view, n) };
+        let behind = proposal.parent == ZERO
+            || Self::proposal(&proposal.parent).is_some_and(|p| p.view <= self.s.tip_view);
+        let done = view == self.s.view && (self.s.voted || self.s.timed_out);
+        if proposal.parent == self.s.tip_hash
+            || behind
+            || done
+            || self.s.me.is_none_or(|me| me as usize == proposer)
+            || self.view_epoch(view) != self.epoch
+            || persist::get::<u64>(FETCHED_KEY).is_some_and(|last| view <= last)
+        {
+            return;
+        }
+        let Some(signature) = self.sign(KIND_FETCH, view, &ZERO) else {
+            return;
+        };
+        persist::set(FETCHED_KEY, &view);
+        self.effects.push(Effect::Send {
+            peer: self.set[proposer].0,
+            topic: TOPIC,
+            payload: ConsensusMessage::Fetch { view, signature }.to_bytes(),
+        });
     }
 
     /// A finalize vote, with the voter's partial signatures when it holds
@@ -770,6 +827,7 @@ impl Ctx {
             self.request_sync();
         }
         self.try_vote(&proposal, hash);
+        self.fetch_tip(&proposal);
         self.check_notarization(proposal.view, &hash);
     }
 
@@ -814,6 +872,12 @@ impl Ctx {
             && let Some(proposal) = Self::proposal(&signed.hash)
         {
             self.try_vote(&proposal, signed.hash);
+            if self.s.voted {
+                // Its own vote may complete the quorum.
+                self.check_notarization(view, &signed.hash);
+            } else {
+                self.fetch_tip(&proposal);
+            }
         }
     }
 
@@ -928,10 +992,15 @@ impl Ctx {
         } else {
             b"votes/"
         };
-        // A quorum this node already holds, with its proposal, teaches it nothing.
+        // A quorum this node already holds, with its proposal, needs no
+        // second check; it is counted again, in case this node held it
+        // without acting on it (a node that did is unchanged by that).
         if self.quorum(view, &Self::votes(prefix, view, &hash).0)
             && (!names_proposal || Self::proposal(&hash).is_some())
         {
+            if kind == KIND_VOTE && names_proposal && view > self.s.tip_view {
+                self.check_notarization(view, &hash);
+            }
             return;
         }
         if !self.verified(kind, view, &hash, &votes.0) {

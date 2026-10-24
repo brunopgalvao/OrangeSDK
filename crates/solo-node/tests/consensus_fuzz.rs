@@ -21,10 +21,16 @@ const KERNEL: &[u8] = include_bytes!("fixtures/kernel.elf");
 const SLOT_MS: u64 = 400;
 const VALIDATORS: usize = 4;
 /// How long a healed network may take to finalize again. The faults leave
-/// the views' timeouts backed off, up to `48 × slot_ms` (spec 08 §5a), and
-/// a leader whose tip the others lack costs a timeout like a faulty one
-/// (§8); four such views bound it.
-const HEAL_SLOTS: u64 = 4 * 48;
+/// the views' timeouts backed off, up to `48 × slot_ms` (spec 08 §5a); the
+/// view in progress at the heal may run out one such timeout, and a leader
+/// whose tip the others lack is voted once they have fetched it (§5a), a
+/// message round trip later. Two backed-off timeouts bound that with room
+/// to spare: over 2 000 cases from each of base seeds 0 and 1
+/// (`SOLO_FUZZ_SCALE=1000`, measured on 2026-10-24) the slowest took 13.3 s,
+/// 33 slots, and the median 1.9 s. The kernel before tip fetching needed
+/// four such timeouts and more: from seed 0 case 755 took 91.6 s and case
+/// 1068 never finalized again, from seed 1 case 10 never did.
+const HEAL_SLOTS: u64 = 2 * 48;
 
 fn kernel_module() -> &'static [u8] {
     static MODULE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
@@ -137,6 +143,7 @@ fn schedule(r: &mut Rng) {
         }
     }
     let target = seen.top() + 3;
+    let healed = sim.now_ms;
     let live = sim
         .run_until(HEAL_SLOTS * SLOT_MS, |s| {
             s.nodes
@@ -145,6 +152,10 @@ fn schedule(r: &mut Rng) {
         })
         .unwrap();
     seen.check(&sim);
+    eprintln!(
+        "healed: finalized {target} after {} ms",
+        sim.now_ms - healed
+    );
     assert!(
         live,
         "no progress to {target} after healing: {:?}",
