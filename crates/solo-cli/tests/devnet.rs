@@ -1166,12 +1166,16 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
     assert!(log.contains("resumed in view "), "{log}");
     assert_eq!(replayed(&log), 0, "{log}");
     assert!(opened_at(&log) >= ran, "{log}");
-    // Conditions not met yet: no peers, no gate, no certificate, not that high.
+    // Conditions not met yet: no peers, no gate, no certificate, not that high,
+    // another kernel.
+    let zero_hash = format!("0x{}", "00".repeat(32));
     let text = err(&[
         "devnet",
         "wait",
         "--dir",
         d,
+        "--kernel-hash",
+        &zero_hash,
         "--peers",
         "1",
         "--active-gates",
@@ -1189,6 +1193,7 @@ fn a_single_validator_devnet_runs_restarts_and_upgrades() {
     ]);
     for missing in [
         "peers 0 < 1",
+        "kernel hash 0x",
         "active gates",
         "0 threshold certificates above 1000000",
         "head",
