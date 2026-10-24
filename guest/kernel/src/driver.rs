@@ -803,14 +803,12 @@ impl Ctx {
     /// quorum needs that node times out with every validator honest and
     /// the network healthy.
     fn vote_held(&mut self) {
-        if self.s.voted || self.s.timed_out {
+        let view = self.s.view;
+        // A leader votes for its own proposal as it makes it.
+        if self.s.voted || self.s.timed_out || self.n() == 0 || self.is_leader(view) {
             return;
         }
-        let view = self.s.view;
-        let Some(set) = self.set_for(view) else {
-            return;
-        };
-        let proposer = (leader(view, set.len()) as u32).to_le_bytes();
+        let proposer = (leader(view, self.n()) as u32).to_le_bytes();
         let first = key(b"sig/", &[&[KIND_PROPOSE], &view.to_le_bytes(), &proposer]);
         if let Some(signed) = persist::get::<SignedHash>(&first)
             && let Some(proposal) = Self::proposal(&signed.hash)
