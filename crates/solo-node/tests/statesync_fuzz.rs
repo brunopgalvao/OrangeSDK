@@ -206,6 +206,6 @@ fn adversarial_peers_never_stop_a_sync_with_an_honest_one() {
     exported.verify(support::CHAIN_ID, &trust).unwrap();
     let original = std::fs::read(files.join("good.snap")).unwrap();
     solo_fuzz::run("snapshot-files", 150, |r| {
-        tampered_file(&original, &files, r)
+        tampered_file(&original, &files, r);
     });
 }
