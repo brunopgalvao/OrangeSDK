@@ -165,12 +165,20 @@ impl CatchUp {
         if let Some((&first, parked)) = self.parked.range(..=from).next_back()
             && let Some(payload) = trimmed(&parked.response, from)
         {
-            self.wanted = None;
-            self.handed = Some(first);
-            return Some(Input::Response {
-                request_id,
-                payload,
-            });
+            if self.handed != Some(first) {
+                self.wanted = None;
+                self.handed = Some(first);
+                return Some(Input::Response {
+                    request_id,
+                    payload,
+                });
+            }
+            // Handed in this very step and asked for again: the driver
+            // refused it. It is dropped now, not after the step, or a driver
+            // that asks again at once would be handed it for ever.
+            self.parked.remove(&first);
+            self.handed = None;
+            self.depth = 1;
         }
         self.wanted = Some((request_id, from));
         if !self.flights.values().any(|f| f.from == from) {
@@ -232,13 +240,16 @@ impl CatchUp {
         })
     }
 
-    /// After a step: a parked answer the driver was handed and did not take
-    /// (its finalized height is still below it) is dropped, so it is not
-    /// handed again; the peer that sent it is asked nothing more for now.
+    /// After a step: a parked answer the driver was handed is spent and
+    /// dropped, so it is not handed again. The driver takes an answer whole
+    /// or not at all, so what is left of one it took holds only suffix
+    /// proposals (spec 08 §3a), which it never takes. One it did not take
+    /// (its finalized height is still below it) was refused, and the peer
+    /// that sent it is asked nothing more for now.
     pub fn settle(&mut self, finalized: u64) {
         if let Some(first) = self.handed.take()
-            && finalized < first
             && self.parked.remove(&first).is_some()
+            && finalized < first
         {
             self.depth = 1;
         }
@@ -247,8 +258,21 @@ impl CatchUp {
     /// Asks again what timed out, of the next reachable peer, waiting twice
     /// as long; and the driver's outstanding request when nothing serves it.
     /// What the driver finalized, `finalized` and below, is not asked again.
-    pub fn poll(&mut self, now_ms: u64, finalized: u64, out: &mut Vec<Outbound>) {
+    /// The driver's outstanding request, once the driver finalized its first
+    /// height by other means, is answered with an empty `Response`, the
+    /// input to step the driver with: the driver drops it, and is free to
+    /// ask again. Without it the driver would wait for that answer until it
+    /// next enters a view, which a node whose peers have moved on to the
+    /// next epoch never does.
+    pub fn poll(&mut self, now_ms: u64, finalized: u64, out: &mut Vec<Outbound>) -> Option<Input> {
         self.forget_below(finalized + 1);
+        let moot = self
+            .wanted
+            .take_if(|(_, from)| *from <= finalized)
+            .map(|(request_id, _)| Input::Response {
+                request_id,
+                payload: Vec::new(),
+            });
         let late: Vec<Flight> = self
             .flights
             .extract_if(.., |_, f| f.deadline_ms <= now_ms)
@@ -260,12 +284,13 @@ impl CatchUp {
             let wait = (flight.wait_ms * 2).min(MAX_WAIT_MS);
             self.send(peer, flight.from, wait, now_ms, out);
         }
-        if let Some((_, from)) = self.wanted.filter(|(_, from)| *from > finalized)
+        if let Some((_, from)) = self.wanted
             && !self.flights.values().any(|f| f.from == from)
         {
             let peer = self.next_peer(&self.tried, now_ms);
             self.send(peer, from, FIRST_WAIT_MS, now_ms, out);
         }
+        moot
     }
 
     /// Forgets what holds nothing from `from` on: answers wholly below it,
