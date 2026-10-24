@@ -30,6 +30,7 @@ pub mod eth;
 pub mod evm;
 pub mod hash;
 pub mod host;
+mod par;
 mod point;
 mod poly;
 pub mod sig;

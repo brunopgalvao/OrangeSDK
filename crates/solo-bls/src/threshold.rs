@@ -10,24 +10,12 @@ use zeroize::Zeroize;
 
 use crate::poly::{self, Polynomial};
 use crate::sig::{DST_SIGNATURE, PublicKey, SecretKey, Signature};
-use crate::{Error, batch, hash, point};
+use crate::{Error, batch, hash, par, point};
 
 /// Cores from which [`PublicKeySet::public_shares`] evaluates the shares
 /// one by one spread over all of them, rather than by forward differences
 /// on one.
 pub const PARALLEL_THREADS: usize = 4;
-
-/// The cores this machine offers; one without the `std` feature.
-fn threads() -> usize {
-    #[cfg(feature = "std")]
-    {
-        std::thread::available_parallelism().map_or(1, core::num::NonZero::get)
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        1
-    }
-}
 
 /// `run` over `1..=count` split into at most `threads` runs of
 /// consecutive indices, each on a thread of its own; the points in order.
@@ -229,7 +217,7 @@ impl PublicKeySet {
     /// against 4.0 s, measured 2026-10-24). The points are the same.
     #[must_use]
     pub fn public_shares(&self, count: u32) -> Vec<PublicKey> {
-        self.public_shares_on(count, threads())
+        self.public_shares_on(count, par::threads())
     }
 
     /// [`Self::public_shares`] on at most `threads` threads; one thread

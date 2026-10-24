@@ -30,7 +30,7 @@ use core::ops::Range;
 use bls12_381::{G1Affine, G2Affine, G2Projective, Scalar};
 
 use crate::threshold::PartialSignature;
-use crate::{hash, point, poly, sig};
+use crate::{hash, par, point, poly, sig};
 
 /// Domain separation tag of a recipient's share-check coefficients.
 pub const DST_SHARE_BATCH: &[u8] = b"SOLO-V01-DKG-BATCH_XMD:SHA-256";
@@ -72,6 +72,10 @@ trait Equations {
     fn one(&mut self, i: usize) -> bool;
     /// Whether the batch over positions `range` holds.
     fn batch(&mut self, range: Range<usize>) -> bool;
+    /// The positions in `range` whose equations fail, each checked alone.
+    fn singles(&mut self, range: Range<usize>) -> Vec<usize> {
+        range.filter(|&i| !self.one(i)).collect()
+    }
 }
 
 /// The positions in `range` whose equations fail, ascending: batches where
@@ -84,7 +88,7 @@ fn search(range: Range<usize>, budget: &mut u64, eq: &mut dyn Equations, out: &m
     }
     let (one_by_one, batched) = eq.costs(range.clone());
     if n == 1 || one_by_one <= batched || *budget < batched {
-        out.extend(range.filter(|&i| !eq.one(i)));
+        out.extend(eq.singles(range));
         return;
     }
     *budget -= batched;
@@ -117,6 +121,8 @@ pub(crate) struct DealerShares<'a> {
 struct Feldman<'a, 'b> {
     items: &'b [DealerShares<'a>],
     first: u32,
+    /// Threads the aggregate's points are computed on.
+    threads: usize,
 }
 
 impl Feldman<'_, '_> {
@@ -137,11 +143,21 @@ impl Equations for Feldman<'_, '_> {
 
     /// The Feldman check of each share of dealer `i`.
     fn one(&mut self, i: usize) -> bool {
-        let d = &self.items[i];
-        d.shares
-            .iter()
-            .zip(self.first..)
-            .all(|(s, x)| poly::share_matches(d.commitment, x, s))
+        feldman(&self.items[i], self.first)
+    }
+
+    /// The dealers split over threads, each checked alone.
+    fn singles(&mut self, range: Range<usize>) -> Vec<usize> {
+        let (items, first) = (self.items, self.first);
+        let start = range.start;
+        let check = |r: Range<usize>| -> Vec<Option<usize>> {
+            r.map(|i| (!feldman(&items[start + i], first)).then_some(start + i))
+                .collect()
+        };
+        par::map(range.len(), self.threads, &check)
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     /// The Feldman equations of every share of every dealer in `range`, in
@@ -150,31 +166,64 @@ impl Equations for Feldman<'_, '_> {
     fn batch(&mut self, range: Range<usize>) -> bool {
         let items = &self.items[range];
         let scalars: Vec<[u8; 32]> = items.iter().map(|d| point::u64_scalar(d.rho)).collect();
-        let mut column = Vec::with_capacity(items.len());
-        let aggregate: Vec<G2Projective> = (0..items[0].commitment.len())
-            .map(|k| {
+        // Each aggregate point is a multi-scalar multiplication of its own,
+        // so the points split over threads with the same result.
+        let points = |ks: Range<usize>| -> Vec<G2Projective> {
+            let mut column = Vec::with_capacity(items.len());
+            ks.map(|k| {
                 column.clear();
                 column.extend(items.iter().map(|d| d.commitment[k]));
                 point::msm_g2(&column, &scalars, 64)
             })
-            .collect();
+            .collect()
+        };
+        let aggregate = par::map(items[0].commitment.len(), self.threads, &points);
         let aggregate = poly::normalize(&aggregate);
-        (0..items[0].shares.len()).zip(self.first..).all(|(j, x)| {
-            let combined: Scalar = items
-                .iter()
-                .map(|d| d.shares[j] * Scalar::from(d.rho))
-                .sum();
-            G2Projective::generator() * combined == poly::evaluate_commitment(&aggregate, x)
-        })
+        // One evaluation of the aggregate per share index, split over threads.
+        let first = self.first;
+        let holds = |js: Range<usize>| -> Vec<bool> {
+            js.map(|j| {
+                let combined: Scalar = items
+                    .iter()
+                    .map(|d| d.shares[j] * Scalar::from(d.rho))
+                    .sum();
+                let x = first + u32::try_from(j).expect("a share index");
+                G2Projective::generator() * combined == poly::evaluate_commitment(&aggregate, x)
+            })
+            .collect()
+        };
+        par::map(items[0].shares.len(), self.threads, &holds)
+            .into_iter()
+            .all(|h| h)
     }
+}
+
+/// The Feldman check of each of `d`'s shares, at `first`, `first + 1`, …
+fn feldman(d: &DealerShares<'_>, first: u32) -> bool {
+    d.shares
+        .iter()
+        .zip(first..)
+        .all(|(s, x)| poly::share_matches(d.commitment, x, s))
 }
 
 /// The positions in `items` of the dealers with a share that fails the
 /// Feldman check, ascending; the shares sit at indices `first`, `first + 1`,
 /// … Every commitment has the same length and every share list the same
-/// length.
-pub(crate) fn failing_dealers(items: &[DealerShares<'_>], first: u32) -> Vec<usize> {
-    failing(items.len(), &mut Feldman { items, first })
+/// length. A batch's aggregate is computed on up to `threads` threads; the
+/// answer is the same on any number.
+pub(crate) fn failing_dealers(
+    items: &[DealerShares<'_>],
+    first: u32,
+    threads: usize,
+) -> Vec<usize> {
+    failing(
+        items.len(),
+        &mut Feldman {
+            items,
+            first,
+            threads,
+        },
+    )
 }
 
 struct PartialChecks<'a> {
@@ -361,9 +410,14 @@ mod tests {
             let mut eq = Feldman {
                 items: &list,
                 first,
+                threads: 1,
             };
             let (one_by_one, batched) = eq.costs(0..list.len());
             let failing = failing(list.len(), &mut eq);
+            // The aggregate's points on several threads give the same answer.
+            for threads in [2, 3, 8] {
+                assert_eq!(failing_dealers(&list, first, threads), failing);
+            }
             (failing, usize::from(batched < one_by_one))
         };
         assert_eq!(run(&shares), (Vec::new(), 1));
@@ -394,12 +448,14 @@ mod tests {
         let low = Feldman {
             items: &items,
             first: 1,
+            threads: 1,
         };
         let (one_by_one, batched) = low.costs(0..64);
         assert!(one_by_one < batched);
         let high = Feldman {
             items: &items,
             first: 700,
+            threads: 1,
         };
         let (one_by_one, batched) = high.costs(0..64);
         assert!(one_by_one > 2 * batched);
