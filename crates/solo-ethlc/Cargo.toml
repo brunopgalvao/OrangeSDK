@@ -23,6 +23,7 @@ revm = { version = "43.0.3", default-features = false, features = ["std"], optio
 
 [dev-dependencies]
 serde_json = "1"
+solo-fuzz = { path = "../solo-fuzz" }
 solo-ethlc = { path = ".", features = ["testing"] }
 
 [lints]

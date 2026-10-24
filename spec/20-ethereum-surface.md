@@ -24,6 +24,8 @@ It extends codex ADR 0020, which specified the RPC with state at the head only a
 | `0x04` | EIP-7702 set code | yes |
 | any other byte below `0x80` | — | no: reason 7 |
 
+Decoding refuses with reason 1 (`MALFORMED`) a transaction whose RLP nests lists more than 16 deep (`solo_rlp::MAX_DEPTH`). No transaction type nests more than four (a typed transaction's access-list entry's storage keys), so the limit refuses nothing of a valid shape; it bounds the stack of a recursive decoder, which a short string of nested lists could otherwise overflow.
+
 A blob transaction pays for data that a data-availability layer keeps for a while; a solochain has none, so the kernel refuses the type before execution (`solo-eth` decodes it as unsupported). Every header therefore records zero blob gas used and zero excess blob gas (§3.1), and `BLOBBASEFEE` is the minimum, 1.
 
 ### 2.2 Set-code transactions

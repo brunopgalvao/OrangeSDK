@@ -2887,6 +2887,7 @@ name = "solo-abi"
 version = "0.0.1"
 dependencies = [
  "proptest",
+ "solo-fuzz",
 ]
 
 [[package]]
@@ -2902,6 +2903,7 @@ dependencies = [
  "proptest",
  "sha2 0.10.9",
  "solo-abi",
+ "solo-fuzz",
  "zeroize",
 ]
 
@@ -2967,6 +2969,7 @@ dependencies = [
  "k256",
  "serde_json",
  "solo-abi",
+ "solo-fuzz",
  "solo-rlp",
  "tiny-keccak",
 ]
@@ -2981,9 +2984,14 @@ dependencies = [
  "solo-abi",
  "solo-bls",
  "solo-ethlc",
+ "solo-fuzz",
  "solo-rlp",
  "tiny-keccak",
 ]
+
+[[package]]
+name = "solo-fuzz"
+version = "0.0.1"
 
 [[package]]
 name = "solo-host"
@@ -3011,10 +3019,13 @@ dependencies = [
  "libc",
  "proptest",
  "solo-abi",
+ "solo-fuzz",
  "solo-host",
  "solo-node",
  "solo-recompile",
  "solo-rlp",
+ "solo-scratch",
+ "solo-store",
  "solo-vm",
 ]
 
@@ -3038,6 +3049,7 @@ dependencies = [
  "solo-bls",
  "solo-eth",
  "solo-ethlc",
+ "solo-fuzz",
  "solo-host",
  "solo-metrics",
  "solo-node",
@@ -3055,6 +3067,7 @@ name = "solo-recompile"
 version = "0.0.1"
 dependencies = [
  "object",
+ "solo-fuzz",
  "solo-scratch",
  "solo-vm",
  "tiny-keccak",
@@ -3065,6 +3078,7 @@ name = "solo-rlp"
 version = "0.0.1"
 dependencies = [
  "proptest",
+ "solo-fuzz",
 ]
 
 [[package]]
@@ -3113,6 +3127,7 @@ name = "solo-trie"
 version = "0.0.1"
 dependencies = [
  "proptest",
+ "solo-fuzz",
  "tiny-keccak",
 ]
 
@@ -3122,6 +3137,7 @@ version = "0.0.1"
 dependencies = [
  "proptest",
  "solo-abi",
+ "solo-fuzz",
  "tiny-keccak",
 ]
 

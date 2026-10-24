@@ -51,6 +51,13 @@ enum Wire {
 /// by returning `false`. Tests make lying and silent peers with it.
 pub type SyncFilter = Box<dyn FnMut(usize, &mut Vec<u8>) -> bool>;
 
+/// What happens to a driver message (a broadcast, a send, a request or a
+/// response) between two nodes: given the sender's index, the receiver's
+/// and the clock, the extra delay in milliseconds on top of the latency, or
+/// `None` to drop it. Tests make partitions, lossy links and reordering
+/// with it.
+pub type LinkFilter = Box<dyn FnMut(usize, usize, u64) -> Option<u64>>;
+
 /// A message in flight.
 #[derive(Debug, Clone)]
 struct InFlight {
@@ -88,6 +95,7 @@ pub struct Sim {
     /// What the state sync reported, in order.
     pub sync_events: Vec<SyncEvent>,
     sync_filter: Option<SyncFilter>,
+    link_filter: Option<LinkFilter>,
 }
 
 impl Sim {
@@ -170,6 +178,7 @@ impl Sim {
             joining: None,
             sync_events: Vec::new(),
             sync_filter: None,
+            link_filter: None,
         };
         sim.collect();
         Ok(sim)
@@ -304,6 +313,34 @@ impl Sim {
         self.sync_filter = Some(filter);
     }
 
+    /// Passes every driver message through `filter` from now on, or through
+    /// none again with `None`: a healed network.
+    pub fn filter_links(&mut self, filter: Option<LinkFilter>) {
+        self.link_filter = filter;
+    }
+
+    /// Queues a driver message from node `from` unless the link filter
+    /// drops it, after the latency and whatever delay the filter adds.
+    fn send(&mut self, from: usize, to: usize, wire: Wire) {
+        self.send_after(from, to, wire, 0);
+    }
+
+    /// Queues `wire` from `from` to `to` after the link's latency, the link
+    /// filter's extra delay and `delay`; a filter that drops the link drops it.
+    fn send_after(&mut self, from: usize, to: usize, wire: Wire, delay: u64) {
+        let extra = match self.link_filter.as_mut() {
+            Some(filter) => filter(from, to, self.now_ms),
+            None => Some(0),
+        };
+        if let Some(extra) = extra {
+            self.queue.push_back(InFlight {
+                due_ms: self.now_ms + self.latency_ms + extra + delay,
+                to,
+                wire,
+            });
+        }
+    }
+
     /// Moves the joining node's state sync on: hands it the peers that are
     /// up and queues its requests; once it holds a snapshot, imports it and
     /// starts the node.
@@ -399,7 +436,8 @@ impl Sim {
                     Outbound::Broadcast { topic, payload } => {
                         for to in 0..self.nodes.len() {
                             if to != i {
-                                self.enqueue(
+                                self.send(
+                                    i,
                                     to,
                                     Wire::Message {
                                         from,
@@ -416,7 +454,8 @@ impl Sim {
                         payload,
                     } => {
                         if let Some(to) = self.index_of(&peer) {
-                            self.enqueue(
+                            self.send(
+                                i,
                                 to,
                                 Wire::Message {
                                     from,
@@ -432,7 +471,8 @@ impl Sim {
                         payload,
                     } => {
                         if let Some(to) = self.index_of(&peer) {
-                            self.enqueue(
+                            self.send(
+                                i,
                                 to,
                                 Wire::Request {
                                     from: i,
@@ -447,14 +487,16 @@ impl Sim {
                         payload,
                     } => {
                         if let Some((to, their_id)) = self.serving.remove(&(i, request_id)) {
-                            self.queue.push_back(InFlight {
-                                due_ms: self.now_ms + self.latency_ms + self.response_delay_ms,
+                            let delay = self.response_delay_ms;
+                            self.send_after(
+                                i,
                                 to,
-                                wire: Wire::Response {
+                                Wire::Response {
                                     request_id: their_id,
                                     payload,
                                 },
-                            });
+                                delay,
+                            );
                         }
                     }
                     Outbound::Disseminate { .. } | Outbound::PeerScore { .. } => {}

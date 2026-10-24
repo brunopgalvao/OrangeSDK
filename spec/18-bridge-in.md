@@ -57,7 +57,7 @@ LightClientUpdate          { attested_header, next_sync_committee: SyncCommittee
 LightClientFinalityUpdate  { attested_header, finalized_header, finality_branch: B32[7], sync_aggregate, signature_slot: u64 }
 ```
 
-Decoding is strict: the input is exactly one container, every offset of a variable-size field points where the previous part ends (the first just past the fixed part), and `extra_data` is at most 32 bytes. Anything else is `Malformed`. A `LightClientUpdate` whose next-sync-committee branch is all zeros carries no next committee, as in Altair; a finality update never does.
+Decoding is strict: the input is exactly one container, every offset of a variable-size field points where the previous part ends (the first just past the fixed part), and `extra_data` is at most 32 bytes. Anything else is `Malformed`. A `LightClientUpdate` whose next-sync-committee branch is all zeros carries no next committee, as in Altair, and its committee field is then not read (an Altair update without one carries zeros there; checking that would cost every such update a pass over `48 · N + 48` bytes, about 7 400 gas for `N = 512`, for nothing the client uses, so such an update has more than one encoding); a finality update never does.
 
 ### 3.3 Configuration
 

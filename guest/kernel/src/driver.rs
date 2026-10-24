@@ -328,6 +328,7 @@ impl Ctx {
         self.s.voted = false;
         self.s.timed_out = false;
         self.arm();
+        self.vote_held();
     }
 
     /// Enters the first view of `epoch` once this node has executed the last
@@ -768,13 +769,21 @@ impl Ctx {
         if proposal.height > self.s.tip_height + 1 {
             self.request_sync();
         }
+        self.try_vote(&proposal, hash);
+        self.check_notarization(proposal.view, &hash);
+    }
+
+    /// Votes for `proposal` if it is a valid proposal of the current view
+    /// that extends the tip and this node has neither voted nor timed out in
+    /// the view (spec 08 §5).
+    fn try_vote(&mut self, proposal: &Proposal, hash: Hash) {
         let extends_tip =
             proposal.parent == self.s.tip_hash && proposal.height == self.s.tip_height + 1;
         let bounded = proposal.evidence.0.len() <= MAX_EVIDENCE && proposal.dkg.0.len() <= MAX_DKG;
         let empty = proposal.txs.0.is_empty()
             && proposal.evidence.0.is_empty()
             && proposal.dkg.0.is_empty();
-        let fits = !self.is_suffix(&proposal) || empty;
+        let fits = !self.is_suffix(proposal) || empty;
         if proposal.view == self.s.view
             && extends_tip
             && bounded
@@ -785,7 +794,27 @@ impl Ctx {
             self.s.voted = true;
             self.cast(KIND_VOTE, proposal.view, hash);
         }
-        self.check_notarization(proposal.view, &hash);
+    }
+
+    /// Votes for the current view's proposal if this node already holds it:
+    /// one that arrived before the node entered the view, or before the node
+    /// held its parent as the tip. Without this a node that is a message
+    /// behind the leader never votes in the leader's view, and a view whose
+    /// quorum needs that node times out with every validator honest and
+    /// the network healthy.
+    fn vote_held(&mut self) {
+        let view = self.s.view;
+        // A leader votes for its own proposal as it makes it.
+        if self.s.voted || self.s.timed_out || self.n() == 0 || self.is_leader(view) {
+            return;
+        }
+        let proposer = (leader(view, self.n()) as u32).to_le_bytes();
+        let first = key(b"sig/", &[&[KIND_PROPOSE], &view.to_le_bytes(), &proposer]);
+        if let Some(signed) = persist::get::<SignedHash>(&first)
+            && let Some(proposal) = Self::proposal(&signed.hash)
+        {
+            self.try_vote(&proposal, signed.hash);
+        }
     }
 
     /// A proposal for a view this node has left matters only when this node
@@ -1118,6 +1147,9 @@ impl Ctx {
             }
         }
         if view < self.s.view {
+            // A tip moved up by an older notarization may now be the parent
+            // of the current view's proposal.
+            self.vote_held();
             return;
         }
         let finalize = proposal.is_some() && !(view == self.s.view && self.s.timed_out);

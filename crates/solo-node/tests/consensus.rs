@@ -1239,6 +1239,92 @@ fn the_chain_keeps_only_evidence_that_verifies() {
     assert_agreement(&sim, &[0, 1, 2]);
 }
 
+/// A proposal a validator holds before it can vote for it gets its vote as
+/// soon as it can: when the validator enters the proposal's view, and when
+/// a notarization makes the proposal's parent its tip. Found by the fault
+/// schedules of `consensus_fuzz.rs`: without it, a validator one message
+/// behind the leader never voted in the leader's view, and with the network
+/// healed and every validator honest, views whose quorum needed it timed
+/// out one after another.
+#[test]
+fn a_held_proposal_gets_its_vote_once_it_can() {
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, address(&keys[0]));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    // Node 3 leads none of views 1 to 3; the test hands it every message.
+    let node = &mut sim.nodes[3];
+    let from = |i: usize| validator_id(&keys[i]);
+    let now = node.now_ms();
+    let p1 = Proposal {
+        view: 1,
+        height: 1,
+        timestamp_ms: now,
+        ..Proposal::default()
+    };
+    let h1 = keccak256(&p1.to_bytes());
+    let p2 = Proposal {
+        view: 2,
+        height: 2,
+        parent: h1,
+        timestamp_ms: now + 1,
+        ..Proposal::default()
+    };
+    let h2 = keccak256(&p2.to_bytes());
+    let p3 = Proposal {
+        view: 3,
+        height: 3,
+        parent: h2,
+        timestamp_ms: now + 2,
+        ..Proposal::default()
+    };
+    let state = |node: &Node| node.simplex_state().unwrap();
+    node.deliver(from(0), TOPIC, propose(&keys[0], p1)).unwrap();
+    assert!(state(node).voted);
+    // The proposal of view 2 arrives before the votes that end view 1.
+    node.deliver(from(1), TOPIC, propose(&keys[1], p2.clone()))
+        .unwrap();
+    assert_eq!(state(node).view, 1);
+    for i in [0, 1] {
+        node.deliver(from(i), TOPIC, vote(&keys[i], 1, h1)).unwrap();
+    }
+    let s = state(node);
+    assert_eq!((s.view, s.tip_height), (2, 1));
+    assert!(s.voted, "entering view 2 votes for its held proposal");
+    // View 2 times out here, so the tip stays at height 1, and the proposal
+    // of view 3, on the proposal of view 2, does not extend it.
+    for i in [0, 1, 2] {
+        node.deliver(from(i), TOPIC, vote(&keys[i], 2, [0; 32]))
+            .unwrap();
+    }
+    node.deliver(from(2), TOPIC, propose(&keys[2], p3)).unwrap();
+    let s = state(node);
+    assert_eq!((s.view, s.tip_height), (3, 1));
+    assert!(!s.voted);
+    // The notarization of view 2 arrives: its proposal becomes the tip, and
+    // the held proposal of view 3 extends it.
+    let certificate = ConsensusMessage::Certificate {
+        certificate: Certificate {
+            kind: KIND_VOTE,
+            view: 2,
+            hash: h2,
+            votes: Seq([0usize, 1, 2]
+                .iter()
+                .map(|&i| SignedVote {
+                    validator: u32::try_from(i).unwrap(),
+                    signature: signed(&keys[i], KIND_VOTE, 2, h2).signature,
+                })
+                .collect()),
+        },
+        proposal: Some(p2),
+    };
+    node.deliver(from(0), TOPIC, certificate.to_bytes())
+        .unwrap();
+    let s = state(node);
+    assert_eq!((s.view, s.tip_height), (3, 2));
+    assert!(s.voted, "the new tip lets it vote for the held proposal");
+}
+
 #[test]
 fn a_restarted_leader_does_not_propose_twice_in_a_view() {
     let keys = keys(4);

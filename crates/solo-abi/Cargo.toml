@@ -14,6 +14,7 @@ std = []
 
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
+solo-fuzz = { path = "../solo-fuzz" }
 
 [lints]
 workspace = true

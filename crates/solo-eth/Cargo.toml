@@ -22,6 +22,7 @@ alloy-rlp = "0.3"
 alloy-trie = { version = "0.9", default-features = false, features = ["ethereum"] }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 serde_json = "1"
+solo-fuzz = { path = "../solo-fuzz" }
 tiny-keccak = { version = "2", features = ["keccak"] }
 
 [lints]
