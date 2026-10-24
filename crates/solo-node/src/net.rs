@@ -694,10 +694,12 @@ impl Transport {
             .ok()
             .filter(|r| r.status == 0)
             .and_then(|r| StakingStatus::from_bytes(&r.body).ok());
-        if let Some(status) = status {
-            let ids = status.validators.validators.0.iter().map(|v| v.id);
-            x.table.set_validators(ids.collect());
-        }
+        // A query that fails keeps the set the table has.
+        let previous = x.table.validators().to_vec();
+        let ids = status.map_or(previous, |s| {
+            s.validators.validators.0.iter().map(|v| v.id).collect()
+        });
+        x.table.set_validators(ids);
     }
 
     fn redial(&mut self, now_ms: u64) {
