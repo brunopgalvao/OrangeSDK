@@ -17,6 +17,7 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 revm = { version = "43.0.3", default-features = false, features = ["std"] }
 sha2 = { version = "0.10", default-features = false }
 solo-ethlc = { path = "../solo-ethlc", features = ["testing"] }
+solo-fuzz = { path = "../solo-fuzz" }
 solo-recompile = { path = "../solo-recompile" }
 solo-rlp = { path = "../solo-rlp" }
 
