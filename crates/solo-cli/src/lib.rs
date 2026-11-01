@@ -602,7 +602,9 @@ fn bind_transport(
     // key of its own, fresh at every start (spec 09 §3).
     let key = match node.services_key() {
         Some(key) => key,
-        None => solo_node::net::fresh_key().map_err(|e| format!("node key: {e}"))?,
+        None => solo_node::net::fresh_key()
+            .ok()
+            .ok_or("node key: the operating system gave no randomness")?,
     };
     let discovery = discovery(args, node.services_key())?;
     let genesis = node.genesis_hash();

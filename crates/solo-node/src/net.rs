@@ -79,7 +79,9 @@ pub fn hello_digest(
 /// Only if a hash is at or above the group order, odds about 2^-128.
 pub fn fresh_key() -> std::io::Result<k256::ecdsa::SigningKey> {
     let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed).map_err(|e| std::io::Error::other(e.to_string()))?;
+    getrandom::fill(&mut seed)
+        .ok()
+        .ok_or(std::io::ErrorKind::Other)?;
     let digest = solo_host::hash::keccak256(&seed);
     Ok(k256::ecdsa::SigningKey::from_slice(&digest)
         .expect("a hash is a scalar, bar a negligible chance"))
@@ -505,7 +507,9 @@ impl Transport {
         let listener = TcpListener::bind(listen)?;
         listener.set_nonblocking(true)?;
         let mut seed = [0u8; 32];
-        getrandom::fill(&mut seed).map_err(|e| std::io::Error::other(e.to_string()))?;
+        getrandom::fill(&mut seed)
+            .ok()
+            .ok_or(std::io::ErrorKind::Other)?;
         Ok(Transport {
             listener,
             conns: Vec::new(),
