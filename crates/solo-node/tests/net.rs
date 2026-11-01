@@ -875,4 +875,14 @@ fn a_state_sync_whose_peers_are_dropped_gives_up() {
         garbled.sync_stalled(dropped + SYNC_PEER_WAIT_MS),
         Some("no peer to sync from in time")
     );
+    // A second Hello after the handshake closes the connection.
+    send(&mut peer, &chain.hello(validator_id(&peer_key(4)), [9; 32]));
+    loop {
+        clock += 1;
+        garbled.poll_sync(&mut sync, clock);
+        if garbled.connected().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }

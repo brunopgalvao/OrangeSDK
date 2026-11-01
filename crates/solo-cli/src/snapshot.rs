@@ -194,10 +194,7 @@ pub fn sync_from_peers(
         for event in sync.take_events() {
             eprintln!("state sync: {}", describe_event(&event));
         }
-        if let Some(why) = sync.failed() {
-            return Err(format!("state sync: {why}"));
-        }
-        if let Some(why) = transport.sync_stalled(now()) {
+        if let Some(why) = sync.failed().or_else(|| transport.sync_stalled(now())) {
             return Err(format!("state sync: {why}"));
         }
         if let Some(snapshot) = sync.done() {

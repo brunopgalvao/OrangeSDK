@@ -74,16 +74,15 @@ pub fn hello_digest(
 ///
 /// # Errors
 /// If the operating system gives no randomness.
+///
+/// # Panics
+/// Only if a hash is at or above the group order, odds about 2^-128.
 pub fn fresh_key() -> std::io::Result<k256::ecdsa::SigningKey> {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).map_err(|e| std::io::Error::other(e.to_string()))?;
-    // A hash at or above the group order (odds about 2^-128) is hashed again.
-    loop {
-        seed = solo_host::hash::keccak256(&seed);
-        if let Ok(key) = k256::ecdsa::SigningKey::from_slice(&seed) {
-            return Ok(key);
-        }
-    }
+    let digest = solo_host::hash::keccak256(&seed);
+    Ok(k256::ecdsa::SigningKey::from_slice(&digest)
+        .expect("a hash is a scalar, bar a negligible chance"))
 }
 
 /// One unit on the wire.
