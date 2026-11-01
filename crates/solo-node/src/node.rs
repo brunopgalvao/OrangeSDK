@@ -1308,6 +1308,17 @@ impl Node {
         self.exec.state().base().genesis_root().unwrap_or_default()
     }
 
+    /// The genesis hash its handshakes name (spec 09 §3): what the chain
+    /// state holds at `bnum/` ‖ 0 (spec 22 §7.3), zero when it holds no
+    /// 32-byte hash there.
+    #[must_use]
+    pub fn genesis_hash(&self) -> [u8; 32] {
+        let key = [solo_abi::chain::keys::BLOCK_NUMBER, &0u64.to_be_bytes()[..]].concat();
+        self.state_get(&key)
+            .and_then(|hash| hash.try_into().ok())
+            .unwrap_or_default()
+    }
+
     /// The oldest height whose state the node keeps (spec 20 §5): queries
     /// and proofs reach back to it, and no further.
     #[must_use]

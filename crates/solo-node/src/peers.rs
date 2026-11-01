@@ -11,11 +11,16 @@
 //! before any of it has answered, and lets a new entry displace only an
 //! entry whose dials failed, so a flood of junk never pushes out peers that
 //! work.
+//!
+//! A node with a data directory keeps the entries that answered in
+//! [`PEER_FILE`] and takes them up again at start ([`PeerTable::saved`],
+//! [`PeerTable::restore`]), checking every record once more.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 
-use solo_abi::codec::{Decode, DecodeError, Decoder, Encode, Encoder};
+use solo_abi::codec::{Decode, DecodeError, Decoder, Encode, Encoder, Seq};
 
 /// Most records one `Peers` frame may carry.
 pub const MAX_RECORDS: usize = 32;
@@ -46,6 +51,12 @@ pub const VALIDATOR_REFRESH_MS: u64 = 10_000;
 pub const DEFAULT_MAX_PEERS: usize = 32;
 /// Default of `--outbound-peers`: connections this node dials itself.
 pub const DEFAULT_OUTBOUND: usize = 8;
+/// The file in the data directory that keeps the table across restarts.
+pub const PEER_FILE: &str = "peers.records";
+/// Least time between two writes of [`PEER_FILE`].
+pub const SAVE_MS: u64 = 10_000;
+/// How long after its last handshake a saved entry is still taken up.
+pub const SAVED_TTL_MS: u64 = 7 * 24 * 3_600_000;
 
 const MAX_SCORE: i32 = 100;
 const MIN_SCORE: i32 = -100;
@@ -122,7 +133,6 @@ impl PeerRecord {
     /// to the key whose hash is `id` and its address is one a node can dial.
     #[must_use]
     pub fn verify(&self, chain_id: u64) -> Option<SocketAddr> {
-        use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
         if self.addr.len() > MAX_ADDR {
             return None;
         }
@@ -131,12 +141,66 @@ impl PeerRecord {
             return None;
         }
         let digest = Self::digest(chain_id, self.seq, &self.addr);
-        let recovery = RecoveryId::from_byte(self.signature[64])?;
-        let signature = Signature::from_slice(&self.signature[..64]).ok()?;
-        let key = VerifyingKey::recover_from_prehash(&digest, &signature, recovery).ok()?;
-        let point = key.to_encoded_point(false);
-        (solo_host::hash::keccak256(&point.as_bytes()[1..]) == self.id).then_some(addr)
+        (recover_id(&digest, &self.signature)? == self.id).then_some(addr)
     }
+}
+
+/// The node id whose key made `signature` over `digest`: `keccak256` of
+/// the recovered uncompressed public key; none if nothing recovers.
+#[must_use]
+pub fn recover_id(digest: &[u8; 32], signature: &[u8; 65]) -> Option<[u8; 32]> {
+    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+    let recovery = RecoveryId::from_byte(signature[64])?;
+    let parsed = Signature::from_slice(&signature[..64]).ok()?;
+    let key = VerifyingKey::recover_from_prehash(digest, &parsed, recovery).ok()?;
+    let point = key.to_encoded_point(false);
+    Some(solo_host::hash::keccak256(&point.as_bytes()[1..]))
+}
+
+/// An entry as [`PEER_FILE`] keeps it: its record and the time of its
+/// last handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedPeer {
+    /// The entry's record, checked again when taken up.
+    pub record: PeerRecord,
+    /// When a dial of it last completed a handshake, in this node's clock.
+    pub seen_ms: u64,
+}
+
+impl Encode for SavedPeer {
+    fn encode(&self, e: &mut Encoder) {
+        e.put(&self.record).put(&self.seen_ms);
+    }
+}
+
+impl Decode for SavedPeer {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(SavedPeer {
+            record: d.get()?,
+            seen_ms: d.get()?,
+        })
+    }
+}
+
+/// What the file at `path` keeps; nothing when it is missing, unreadable
+/// or does not decode, which a node takes as an empty table.
+#[must_use]
+pub fn load_saved(path: &Path) -> Vec<SavedPeer> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| Seq::<SavedPeer>::from_bytes(&bytes).ok())
+        .map_or_else(Vec::new, |saved| saved.0)
+}
+
+/// Writes `bytes` to `path` through a temporary file renamed into place,
+/// so that a crash leaves the old file or the new one.
+///
+/// # Errors
+/// If the temporary file cannot be written or renamed.
+pub fn write_saved(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Whether a node can dial `addr`: not unspecified, not multicast, port not 0.
@@ -182,6 +246,8 @@ pub struct Entry {
     pub failures: u32,
     /// When it may be dialled next.
     pub next_dial_ms: u64,
+    /// When a dial of it last completed a handshake; 0 if none has.
+    pub seen_ms: u64,
 }
 
 /// Why a `Peers` frame was refused: its sender's connection is closed.
@@ -324,9 +390,47 @@ impl PeerTable {
                 score: 0,
                 failures: 0,
                 next_dial_ms: 0,
+                seen_ms: 0,
             },
         );
         true
+    }
+
+    /// The entries to keep across a restart (spec 09 §5a.7): those seen,
+    /// current validators first, then by score, then by id; at most `limit`.
+    #[must_use]
+    pub fn saved(&self, limit: usize) -> Vec<SavedPeer> {
+        let mut seen: Vec<(&[u8; 32], &Entry)> =
+            self.entries.iter().filter(|(_, e)| e.seen_ms > 0).collect();
+        seen.sort_by_key(|(id, e)| (!self.is_validator(id), -e.score, **id));
+        seen.into_iter()
+            .take(limit)
+            .map(|(_, e)| SavedPeer {
+                record: e.record.clone(),
+                seen_ms: e.seen_ms,
+            })
+            .collect()
+    }
+
+    /// Takes up the first `limit` of `saved` at `now_ms`, each as its
+    /// holder's own record (spec 09 §5a.7). Records that do not verify,
+    /// this node's own, and entries last seen more than [`SAVED_TTL_MS`]
+    /// ago are skipped. Returns how many entries were entered.
+    pub fn restore(&mut self, saved: &[SavedPeer], now_ms: u64, limit: usize) -> usize {
+        let mut taken = 0;
+        for s in saved.iter().take(limit) {
+            let fresh = now_ms.saturating_sub(s.seen_ms) <= SAVED_TTL_MS;
+            let Some(addr) = s.record.verify(self.chain_id).filter(|_| fresh) else {
+                continue;
+            };
+            if self.insert(s.record.id, &s.record, addr, &[]) {
+                if let Some(entry) = self.entries.get_mut(&s.record.id) {
+                    entry.seen_ms = s.seen_ms;
+                }
+                taken += 1;
+            }
+        }
+        taken
     }
 
     /// A dial of `id`'s address completed a handshake naming `hello`.
@@ -338,6 +442,7 @@ impl PeerTable {
             if matched {
                 entry.verified = true;
                 entry.failures = 0;
+                entry.seen_ms = now_ms.max(1);
                 entry.score = (entry.score + HANDSHAKE_REWARD).min(MAX_SCORE);
             } else {
                 entry.score = (entry.score - MISMATCH_PENALTY).max(MIN_SCORE);
@@ -681,5 +786,95 @@ mod tests {
         assert_eq!(big.answer(&id(0), Some(&own)).len(), MAX_RECORDS);
         assert!(format!("{big:?}").contains("PeerTable"));
         assert_eq!(format!("{:?}", Refused::TooMany), "TooMany");
+    }
+
+    #[test]
+    fn only_seen_entries_are_saved_best_first() {
+        let mut t = PeerTable::new(CHAIN, id(0));
+        let records: Vec<PeerRecord> = (1..=4)
+            .map(|i| record(i, &format!("127.0.0.1:{i}"), 1))
+            .collect();
+        t.learn(id(9), &records, &[]).unwrap();
+        assert!(t.saved(10).is_empty(), "nothing has answered");
+        // Entries 1, 2 and 3 answer; 3 twice, and 1 is a validator. A handshake at time
+        // 0 still counts as seen.
+        assert!(t.handshake(&id(1), &id(1), 0));
+        assert!(t.handshake(&id(2), &id(2), 500));
+        assert!(t.handshake(&id(3), &id(3), 600));
+        assert!(t.handshake(&id(3), &id(3), 700));
+        t.set_validators(vec![id(1)]);
+        let saved = t.saved(10);
+        let ids: Vec<[u8; 32]> = saved.iter().map(|s| s.record.id).collect();
+        assert_eq!(ids, vec![id(1), id(3), id(2)]);
+        assert_eq!(
+            saved.iter().map(|s| s.seen_ms).collect::<Vec<_>>(),
+            vec![1, 700, 500]
+        );
+        assert_eq!(t.saved(2).len(), 2);
+        assert_eq!(
+            SavedPeer::from_bytes(&saved[1].to_bytes()).unwrap(),
+            saved[1]
+        );
+    }
+
+    #[test]
+    fn restored_entries_are_checked_again() {
+        let now = SAVED_TTL_MS + 10_000;
+        let saved = |i: u32, seen_ms: u64| SavedPeer {
+            record: record(i, &format!("127.0.0.1:{i}"), 1),
+            seen_ms,
+        };
+        let mut forged = saved(2, now);
+        forged.record.id = id(3);
+        let file = vec![
+            saved(1, now - 5),
+            forged,
+            // Last seen just inside, and just outside, the time a saved entry is kept.
+            saved(4, now - SAVED_TTL_MS),
+            saved(5, now - SAVED_TTL_MS - 1),
+            // This node's own record.
+            saved(0, now),
+            saved(6, now),
+            saved(7, now),
+        ];
+        let mut t = PeerTable::new(CHAIN, id(0));
+        assert_eq!(t.restore(&file, now, 6), 3);
+        let ids: Vec<[u8; 32]> = t.entries().keys().copied().collect();
+        let mut want = vec![id(1), id(4), id(6)];
+        want.sort_unstable();
+        assert_eq!(ids, want, "entry 7 is past the limit");
+        let e = &t.entries()[&id(1)];
+        assert_eq!(
+            (e.source, e.verified, e.score, e.failures, e.seen_ms),
+            (None, false, 0, 0, now - 5)
+        );
+        // Taken up again, nothing changes: the records are no newer.
+        assert_eq!(t.restore(&file, now, 6), 0);
+        // A record from another chain does not verify.
+        let mut other = PeerTable::new(CHAIN + 1, id(0));
+        assert_eq!(other.restore(&file, now, 10), 0);
+    }
+
+    #[test]
+    fn the_peer_file_survives_only_whole() {
+        let dir = solo_scratch::Scratch::dir("peers", "file");
+        let path = dir.join(PEER_FILE);
+        // Missing, then written and read back.
+        assert!(load_saved(&path).is_empty());
+        let saved = vec![SavedPeer {
+            record: record(1, "127.0.0.1:1", 1),
+            seen_ms: 9,
+        }];
+        write_saved(&path, &Seq(saved.clone()).to_bytes()).unwrap();
+        assert_eq!(load_saved(&path), saved);
+        assert!(!path.with_extension("tmp").exists());
+        // Cut short, or with bytes after it, it reads as empty.
+        let bytes = Seq(saved).to_bytes();
+        std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        assert!(load_saved(&path).is_empty());
+        std::fs::write(&path, [bytes.as_slice(), &[0]].concat()).unwrap();
+        assert!(load_saved(&path).is_empty());
+        // A directory that is not there cannot be written to.
+        assert!(write_saved(&dir.join("gone").join(PEER_FILE), &bytes).is_err());
     }
 }

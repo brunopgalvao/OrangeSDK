@@ -210,15 +210,17 @@ fn the_transport_records_peers_and_traffic() {
     let start = Instant::now();
     let epoch = 1_000_000;
     let mut nodes = [open(Some(key()), epoch), open(None, epoch)];
-    let validator = Transport::bind(
+    let hash = nodes[0].genesis_hash();
+    let validator = Transport::bind("127.0.0.1:0", key(), CHAIN_ID, hash, vec![]).unwrap();
+    let dial = vec![validator.local_addr().unwrap()];
+    let observer = Transport::bind(
         "127.0.0.1:0",
-        solo_node::validator_id(&key()),
+        SigningKey::from_slice(&[0xEE; 32]).unwrap(),
         CHAIN_ID,
-        vec![],
+        hash,
+        dial,
     )
     .unwrap();
-    let dial = vec![validator.local_addr().unwrap()];
-    let observer = Transport::bind("127.0.0.1:0", [0xEE; 32], CHAIN_ID, dial).unwrap();
     let mut transports = [validator, observer];
     // Wait until the observer has followed the validator to height 3 over the wire.
     let deadline = Instant::now() + Duration::from_mins(2);
@@ -237,6 +239,8 @@ fn the_transport_records_peers_and_traffic() {
         assert_eq!((status.p2p, status.peers), (true, 1));
         assert_eq!(value(node, &P2P_FRAMES, &["in", "hello"]), 1.0);
         assert_eq!(value(node, &P2P_FRAMES, &["out", "hello"]), 1.0);
+        assert_eq!(value(node, &P2P_FRAMES, &["in", "auth"]), 1.0);
+        assert_eq!(value(node, &P2P_FRAMES, &["out", "auth"]), 1.0);
         assert!(value(node, &P2P_BYTES, &["in"]) > 0.0);
         assert!(value(node, &P2P_BYTES, &["out"]) > 0.0);
         assert!(node.metrics_text().contains("\nethereum_peer_count 1\n"));

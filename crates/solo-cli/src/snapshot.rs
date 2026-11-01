@@ -197,6 +197,9 @@ pub fn sync_from_peers(
         if let Some(why) = sync.failed() {
             return Err(format!("state sync: {why}"));
         }
+        if let Some(why) = transport.sync_stalled(now()) {
+            return Err(format!("state sync: {why}"));
+        }
         if let Some(snapshot) = sync.done() {
             return Ok(snapshot.clone());
         }
