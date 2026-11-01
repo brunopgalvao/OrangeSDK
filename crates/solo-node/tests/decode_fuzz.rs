@@ -43,10 +43,15 @@ fn frame(r: &mut Rng) -> Frame {
     let len = r.index(40);
     let payload = r.bytes(len);
     let id = r.u64();
-    match r.below(7) {
+    match r.below(8) {
         0 => Frame::Hello {
             id: r.array32(),
             chain_id: id,
+            genesis: r.array32(),
+            nonce: r.array32(),
+        },
+        6 => Frame::Auth {
+            signature: std::array::from_fn(|_| r.byte()),
         },
         1 => Frame::Message {
             topic: u16::try_from(r.below(5)).unwrap(),

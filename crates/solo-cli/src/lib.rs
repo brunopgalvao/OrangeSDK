@@ -520,7 +520,8 @@ fn parse_addresses(args: &[String], flag: &str) -> Result<Vec<std::net::SocketAd
 }
 
 /// Peer exchange as the options say (spec 09 §5a): on unless
-/// `--no-discovery`, signing the node's record with its consensus key.
+/// `--no-discovery`, signing the node's record with its consensus key and
+/// keeping its table under `--data-dir` (spec 09 §5a.7).
 fn discovery(
     args: &[String],
     key: Option<k256::ecdsa::SigningKey>,
@@ -548,6 +549,8 @@ fn discovery(
         bootstrap: parse_addresses(args, "--bootstrap")?,
         max_peers: limit("--max-peers", defaults.max_peers)?,
         outbound: limit("--outbound-peers", defaults.outbound)?,
+        peer_file: arg(args, "--data-dir")
+            .map(|dir| std::path::Path::new(&dir).join(solo_node::peers::PEER_FILE)),
     };
     if args.iter().any(|a| a == "--no-discovery") {
         let given = [
@@ -595,12 +598,15 @@ fn bind_transport(
 ) -> Result<solo_node::Transport, CliError> {
     let listen_arg = arg(args, "--listen");
     let listen = listen_arg.as_deref().unwrap_or(DEFAULT_LISTEN);
-    // An observer still needs an identity for its peers; a hash of its address will do.
-    let id = node
-        .validator_id()
-        .unwrap_or_else(|| solo_host::hash::keccak256(listen.as_bytes()));
+    // A validator proves its id with its consensus key; an observer with a
+    // key of its own, fresh at every start (spec 09 §3).
+    let key = match node.services_key() {
+        Some(key) => key,
+        None => solo_node::net::fresh_key().map_err(|e| format!("node key: {e}"))?,
+    };
     let discovery = discovery(args, node.services_key())?;
-    let mut t = match solo_node::Transport::bind(listen, id, chain_id, peers) {
+    let genesis = node.genesis_hash();
+    let mut t = match solo_node::Transport::bind(listen, key, chain_id, genesis, peers) {
         Ok(t) => t,
         Err(e) => return Err(format!("{listen}: {e}").into()),
     };

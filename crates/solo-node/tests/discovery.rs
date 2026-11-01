@@ -5,8 +5,12 @@
 //! sources stays within the per-source, per-prefix and table limits and
 //! never displaces a peer that answers; and the dial bookkeeping (backoff,
 //! a handshake naming another id, a connection lost before or after its
-//! handshake, a node dialling itself) and the limits on accepted
-//! connections.
+//! handshake, a node dialling itself, an impostor answering at a peer's
+//! address) and the limits on accepted connections; and the table kept
+//! across a restart (spec 09 §5a.7).
+
+#[path = "support/raw_peer.rs"]
+mod raw_peer;
 
 use std::collections::BTreeSet;
 use std::io::{ErrorKind, Read, Write};
@@ -14,6 +18,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use k256::ecdsa::SigningKey;
+use raw_peer::Chain;
 use solo_abi::Encode;
 use solo_abi::chain::GenesisParams;
 use solo_abi::codec::Seq;
@@ -72,6 +77,8 @@ fn distinct(t: &Transport) -> usize {
 /// Nodes and their transports on one thread, with one clock.
 struct Net {
     genesis: Genesis,
+    /// The chain the raw peers say they are on.
+    chain: Chain,
     nodes: Vec<Node>,
     transports: Vec<Transport>,
     start: Instant,
@@ -80,8 +87,14 @@ struct Net {
 
 impl Net {
     fn new(validators: &[SigningKey]) -> Net {
+        let genesis = genesis(validators);
+        let node = Node::open(kernel_module(), &genesis, NodeConfig::default()).unwrap();
         Net {
-            genesis: genesis(validators),
+            chain: Chain {
+                chain_id: CHAIN_ID,
+                genesis: node.genesis_hash(),
+            },
+            genesis,
             nodes: Vec::new(),
             transports: Vec::new(),
             start: Instant::now(),
@@ -112,8 +125,9 @@ impl Net {
         )
         .unwrap();
         node.start(None).unwrap();
+        let genesis = node.genesis_hash();
         let mut t =
-            Transport::bind("127.0.0.1:0", validator_id(identity), CHAIN_ID, vec![]).unwrap();
+            Transport::bind("127.0.0.1:0", identity.clone(), CHAIN_ID, genesis, vec![]).unwrap();
         if let Some(d) = discovery {
             t.enable_discovery(Discovery {
                 key: Some(identity.clone()),
@@ -230,17 +244,11 @@ fn one_bootstrap_address_finds_the_network_and_outlives_it() {
     );
 }
 
-/// A raw peer: a socket that has said `Hello` as `id`.
-fn raw(addr: SocketAddr, id: [u8; 32]) -> TcpStream {
-    let mut s = TcpStream::connect(addr).unwrap();
-    send(
-        &mut s,
-        &Frame::Hello {
-            id,
-            chain_id: CHAIN_ID,
-        },
-    );
-    s
+/// A raw peer: a socket that has completed the handshake with `addr`, a
+/// node of `net`, as the holder of `key`.
+fn raw(net: &mut Net, addr: SocketAddr, key: &SigningKey) -> TcpStream {
+    let chain = net.chain;
+    raw_peer::connect(addr, key, chain, &mut || net.poll()).0
 }
 
 fn send(s: &mut TcpStream, frame: &Frame) {
@@ -317,11 +325,11 @@ fn forged_records_are_refused_and_a_flood_displaces_no_good_peer() {
     let attacker_addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
     let mut forged = PeerRecord::sign(&attacker, CHAIN_ID, attacker_addr, u64::MAX).unwrap();
     forged.id = good_id;
-    let mut s = raw(addr, validator_id(&attacker));
+    let mut s = raw(&mut net, addr, &attacker);
     send(&mut s, &peers(vec![forged]));
     assert!(read_while(&mut net, &mut s, Duration::from_secs(10)).1);
     // An unsigned record, and more records than a frame may carry, close it too.
-    let mut s = raw(addr, validator_id(&attacker));
+    let mut s = raw(&mut net, addr, &attacker);
     let unsigned = PeerRecord {
         id: [7; 32],
         addr: b"127.0.0.1:7".to_vec(),
@@ -330,7 +338,7 @@ fn forged_records_are_refused_and_a_flood_displaces_no_good_peer() {
     };
     send(&mut s, &peers(vec![unsigned]));
     assert!(read_while(&mut net, &mut s, Duration::from_secs(10)).1);
-    let mut s = raw(addr, validator_id(&attacker));
+    let mut s = raw(&mut net, addr, &attacker);
     let many = (0..=MAX_RECORDS as u64)
         .map(|i| PeerRecord::sign(&stranger(100 + i), CHAIN_ID, attacker_addr, 1).unwrap())
         .collect();
@@ -345,8 +353,9 @@ fn forged_records_are_refused_and_a_flood_displaces_no_good_peer() {
     let mut sources = Vec::new();
     let mut junk = 1_000u64;
     for c in 0..20u64 {
-        let id = validator_id(&stranger(10_000 + c));
-        let mut s = raw(addr, id);
+        let source = stranger(10_000 + c);
+        let id = validator_id(&source);
+        let mut s = raw(&mut net, addr, &source);
         let records = (0..MAX_RECORDS as u64)
             .map(|j| {
                 junk += 1;
@@ -424,8 +433,7 @@ fn dials_are_judged_by_their_handshakes() {
     let x = stranger(1);
     let x_id = validator_id(&x);
     let record = PeerRecord::sign(&x, CHAIN_ID, fake.local_addr().unwrap(), 1).unwrap();
-    let source = validator_id(&stranger(2));
-    let mut s = raw(own, source);
+    let mut s = raw(&mut net, own, &stranger(2));
     send(&mut s, &peers(vec![record]));
     // Asked twice in a row, the node answers once: its own record first, then X's.
     send(&mut s, &Frame::GetPeers);
@@ -462,14 +470,9 @@ fn dials_are_judged_by_their_handshakes() {
             std::thread::sleep(Duration::from_millis(2));
         }
     };
+    let chain = net.chain;
     let mut c = accept(&mut net);
-    send(
-        &mut c,
-        &Frame::Hello {
-            id: x_id,
-            chain_id: CHAIN_ID,
-        },
-    );
+    raw_peer::complete(&mut c, &x, chain, &mut || net.poll());
     let verified = net.pump(Duration::from_secs(10), |net| {
         net.transports[me].peer_table().unwrap().entries()[&x_id].verified
     });
@@ -477,13 +480,7 @@ fn dials_are_judged_by_their_handshakes() {
     assert_eq!(net.transports[me].outbound(), 1);
     drop(c);
     let mut c = accept(&mut net);
-    send(
-        &mut c,
-        &Frame::Hello {
-            id: [9; 32],
-            chain_id: CHAIN_ID,
-        },
-    );
+    raw_peer::complete(&mut c, &stranger(9), chain, &mut || net.poll());
     assert!(read_while(&mut net, &mut c, Duration::from_secs(10)).1);
     let c = accept(&mut net);
     drop(c);
@@ -503,6 +500,24 @@ fn dials_are_judged_by_their_handshakes() {
         (3, 10 - 50 - 5 - 5),
         "{entry:?}"
     );
+    // The fifth time an impostor answers at X's address, naming X's id with a proof it
+    // signed itself: the connection closes before its handshake completes, which counts
+    // as a failed dial, and the node never counts the impostor as X.
+    let mut c = accept(&mut net);
+    let (frames, _) = raw_peer::read_until(&mut c, &mut || net.poll(), |f| {
+        raw_peer::nonce_of(f).is_some()
+    });
+    let theirs = raw_peer::nonce_of(&frames).unwrap();
+    raw_peer::send(&mut c, &chain.hello(x_id, [1; 32]));
+    raw_peer::send(&mut c, &chain.auth(&stranger(9), &[1; 32], &theirs));
+    assert!(read_while(&mut net, &mut c, Duration::from_secs(10)).1);
+    let entry = net.transports[me].peer_table().unwrap().entries()[&x_id].clone();
+    assert_eq!(
+        (entry.failures, entry.score),
+        (4, 10 - 50 - 5 - 5 - 5),
+        "{entry:?}"
+    );
+    assert!(!net.transports[me].connected().contains(&x_id));
     // The node never kept a connection to itself, nor to the closed port.
     assert!(
         !net.transports[me]
@@ -526,10 +541,11 @@ fn accepted_connections_are_limited() {
         }),
     );
     let addr = net.addr(me);
-    let mut first = raw(addr, [1; 32]);
-    let mut second = raw(addr, [2; 32]);
+    let mut first = raw(&mut net, addr, &stranger(1));
+    let mut second = raw(&mut net, addr, &stranger(2));
     net.pump(Duration::from_millis(200), |_| false);
-    let mut third = raw(addr, [3; 32]);
+    // A third is closed as it is accepted, before any handshake.
+    let mut third = TcpStream::connect(addr).unwrap();
     assert!(read_while(&mut net, &mut third, Duration::from_secs(5)).1);
     assert!(!read_while(&mut net, &mut first, Duration::from_millis(300)).1);
     assert!(!read_while(&mut net, &mut second, Duration::from_millis(300)).1);
@@ -549,26 +565,47 @@ fn a_syncing_node_exchanges_peers_and_one_without_exchange_ignores_them() {
     })
     .unwrap();
     let me = stranger(5);
-    let mut syncing = Transport::bind("127.0.0.1:0", validator_id(&me), CHAIN_ID, vec![]).unwrap();
+    let mut node = Node::open(kernel_module(), &genesis(&keys), NodeConfig::default()).unwrap();
+    node.start(None).unwrap();
+    let chain = Chain {
+        chain_id: CHAIN_ID,
+        genesis: node.genesis_hash(),
+    };
+    let mut syncing =
+        Transport::bind("127.0.0.1:0", me.clone(), CHAIN_ID, chain.genesis, vec![]).unwrap();
     syncing.enable_discovery(Discovery {
         key: Some(me.clone()),
         advertise: Some("127.0.0.1:4444".parse().unwrap()),
         ..Discovery::default()
     });
-    let plain = Transport::bind("127.0.0.1:0", [1; 32], CHAIN_ID, vec![]).unwrap();
+    let mut plain =
+        Transport::bind("127.0.0.1:0", stranger(1), CHAIN_ID, chain.genesis, vec![]).unwrap();
     let r = PeerRecord::sign(&stranger(6), CHAIN_ID, "127.0.0.1:6".parse().unwrap(), 1).unwrap();
-    let mut s = raw(syncing.local_addr().unwrap(), [2; 32]);
+    let mut clock = 1_000;
+    let (mut s, early) = raw_peer::connect(
+        syncing.local_addr().unwrap(),
+        &stranger(2),
+        chain,
+        &mut || {
+            clock += 1;
+            syncing.poll_sync(&mut sync, clock);
+        },
+    );
     send(&mut s, &Frame::GetPeers);
     send(&mut s, &peers(vec![r.clone()]));
-    let mut q = raw(plain.local_addr().unwrap(), [3; 32]);
+    let (mut q, _) = raw_peer::connect(
+        plain.local_addr().unwrap(),
+        &stranger(3),
+        chain,
+        &mut || {
+            plain.poll(&mut node, 1_000).unwrap();
+        },
+    );
     send(&mut q, &Frame::GetPeers);
     send(&mut q, &peers(vec![r.clone()]));
-    let mut plain = plain;
-    let mut node = Node::open(kernel_module(), &genesis(&keys), NodeConfig::default()).unwrap();
-    node.start(None).unwrap();
     for i in 0..50 {
-        syncing.poll_sync(&mut sync, 1_000 + i);
-        plain.poll(&mut node, 1_000 + i).unwrap();
+        syncing.poll_sync(&mut sync, 2_000 + i);
+        plain.poll(&mut node, 2_000 + i).unwrap();
         std::thread::sleep(Duration::from_millis(2));
     }
     assert!(syncing.peer_table().unwrap().entries().contains_key(&r.id));
@@ -577,10 +614,10 @@ fn a_syncing_node_exchanges_peers_and_one_without_exchange_ignores_them() {
         Some("127.0.0.1:4444".parse().unwrap())
     );
     assert!(plain.peer_table().is_none() && plain.own_record().is_none());
-    assert_eq!(plain.connected(), vec![[3; 32]]);
+    assert_eq!(plain.connected(), vec![validator_id(&stranger(3))]);
     // The syncing node answered with its own record and asked for the peer's.
     s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    let (mut buf, mut got, mut chunk) = (Vec::new(), Vec::new(), [0u8; 4096]);
+    let (mut buf, mut got, mut chunk) = (Vec::new(), early, [0u8; 4096]);
     while !got.iter().any(|f| matches!(f, Frame::Peers { .. })) {
         let n = s.read(&mut chunk).unwrap();
         buf.extend_from_slice(&chunk[..n]);
@@ -597,4 +634,111 @@ fn a_syncing_node_exchanges_peers_and_one_without_exchange_ignores_them() {
         assert_eq!(take_frames(&mut bytes).unwrap(), vec![f.clone()]);
         assert!(!f.kind().is_empty());
     }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_restarted_node_keeps_the_peers_that_answered() {
+    use solo_node::peers::{PEER_FILE, SavedPeer, load_saved};
+    let keys = keys(1);
+    let dir = solo_scratch::Scratch::dir("discovery", "restart");
+    let file = dir.join(PEER_FILE);
+    let mut net = Net::new(&keys);
+    // A hub, a peer told of the hub, and the node under test, told of the hub and keeping
+    // its table in a file. It learns the peer from the hub and dials it.
+    let hub = net.add(None, &stranger(1), Some(Discovery::default()));
+    let boot = vec![net.addr(hub)];
+    net.add(
+        None,
+        &stranger(2),
+        Some(Discovery {
+            bootstrap: boot.clone(),
+            ..Discovery::default()
+        }),
+    );
+    let me = stranger(3);
+    let keeping = Discovery {
+        bootstrap: boot,
+        peer_file: Some(file.clone()),
+        ..Discovery::default()
+    };
+    let at = net.add(None, &me, Some(keeping.clone()));
+    let peer = validator_id(&stranger(2));
+    let peer_addr = net.addr(1);
+    let seen = net.pump(Duration::from_mins(1), |net| {
+        net.transports[at]
+            .peer_table()
+            .unwrap()
+            .entries()
+            .get(&peer)
+            .is_some_and(|e| e.seen_ms > 0)
+    });
+    assert!(seen);
+    // It stops: the file holds the peer that answered, and not the hub, which it reached
+    // only as a bootstrap address.
+    net.remove(at);
+    let saved = load_saved(&file);
+    assert_eq!(
+        saved.iter().map(|s| s.record.id).collect::<Vec<_>>(),
+        vec![peer]
+    );
+    assert_eq!(saved[0].record.verify(CHAIN_ID), Some(peer_addr));
+    // Started again with no bootstrap address, it takes the peer up from the file and
+    // dials it.
+    let back = net.add(
+        None,
+        &me,
+        Some(Discovery {
+            bootstrap: vec![],
+            ..keeping.clone()
+        }),
+    );
+    net.poll();
+    let entry = net.transports[back].peer_table().unwrap().entries()[&peer].clone();
+    assert_eq!((entry.addr, entry.source), (peer_addr, None));
+    assert_eq!(entry.seen_ms, saved[0].seen_ms);
+    let reconnected = net.pump(Duration::from_mins(1), |net| {
+        net.transports[back].connected().contains(&peer)
+    });
+    assert!(reconnected);
+    net.remove(back);
+    // A corrupt file is no failure: the node starts with an empty table and writes the file
+    // anew. So is a file with a forged record, which is skipped.
+    std::fs::write(&file, b"not a peer file").unwrap();
+    let fresh = net.add(
+        None,
+        &me,
+        Some(Discovery {
+            bootstrap: vec![],
+            ..keeping.clone()
+        }),
+    );
+    net.poll();
+    assert!(
+        net.transports[fresh]
+            .peer_table()
+            .unwrap()
+            .entries()
+            .is_empty()
+    );
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        Seq::<SavedPeer>(vec![]).to_bytes()
+    );
+    net.remove(fresh);
+    let mut forged = saved[0].clone();
+    forged.record.seq += 1;
+    std::fs::write(&file, Seq(vec![forged, saved[0].clone()]).to_bytes()).unwrap();
+    let last = net.add(
+        None,
+        &me,
+        Some(Discovery {
+            bootstrap: vec![],
+            ..keeping
+        }),
+    );
+    net.poll();
+    let table = net.transports[last].peer_table().unwrap();
+    assert_eq!(table.entries().len(), 1);
+    assert_eq!(table.entries()[&peer].record, saved[0].record);
 }

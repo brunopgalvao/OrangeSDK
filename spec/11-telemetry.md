@@ -75,7 +75,7 @@ Label values:
 - `status`: `out_of_gas`, `trap`, `memory_fault`, `invalid_jump`, `host_error` or `step_limit` (01 §6).
 - `level`: `error`, `warn`, `info`, `debug`, `trace` for `log_emit` levels 0 to 4; `other` for any other level.
 - `direction`: `in` or `out`.
-- `kind`: `hello`, `message`, `tx`, `request`, `response`, `sync_request`, `sync_response`, `get_peers`, `peers`, the frame variants of 09 §2.
+- `kind`: `hello`, `message`, `tx`, `request`, `response`, `sync_request`, `sync_response`, `get_peers`, `peers`, `auth`, the frame variants of 09 §2.
 - `gate`: a feature gate's index (13 §8.1), in decimal.
 - `origin`, `name`, `reason`: §5.
 

@@ -747,6 +747,12 @@ impl StateSync {
         }
     }
 
+    /// Whether `peer` is no longer asked during this sync (spec 09 §6).
+    #[must_use]
+    pub fn drops(&self, peer: &[u8; 32]) -> bool {
+        self.peers.get(peer).is_some_and(|p| p.banned)
+    }
+
     /// Slices verified and slices in all, once a manifest is accepted.
     #[must_use]
     pub fn progress(&self) -> Option<(usize, usize)> {

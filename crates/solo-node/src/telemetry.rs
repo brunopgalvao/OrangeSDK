@@ -64,6 +64,7 @@ impl Frame {
             Frame::SyncResponse { .. } => "sync_response",
             Frame::GetPeers => "get_peers",
             Frame::Peers { .. } => "peers",
+            Frame::Auth { .. } => "auth",
         }
     }
 }
@@ -239,9 +240,12 @@ mod tests {
                 Frame::Hello {
                     id: [0; 32],
                     chain_id: 1,
+                    genesis: [0; 32],
+                    nonce: [0; 32],
                 },
                 "hello",
             ),
+            (Frame::Auth { signature: [0; 65] }, "auth"),
             (
                 Frame::Message {
                     topic: 0,
