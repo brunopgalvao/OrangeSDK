@@ -45,10 +45,12 @@ fn frame(r: &mut Rng) -> Frame {
     let id = r.u64();
     match r.below(8) {
         0 => Frame::Hello {
+            version: u16::try_from(r.below(3)).unwrap(),
             id: r.array32(),
             chain_id: id,
             genesis: r.array32(),
             nonce: r.array32(),
+            ephemeral: std::array::from_fn(|_| r.byte()),
         },
         6 => Frame::Auth {
             signature: std::array::from_fn(|_| r.byte()),

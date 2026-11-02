@@ -238,10 +238,12 @@ mod tests {
         let frames = [
             (
                 Frame::Hello {
+                    version: 1,
                     id: [0; 32],
                     chain_id: 1,
                     genesis: [0; 32],
                     nonce: [0; 32],
+                    ephemeral: [0; 33],
                 },
                 "hello",
             ),

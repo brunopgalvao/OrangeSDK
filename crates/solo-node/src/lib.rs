@@ -12,6 +12,7 @@ pub mod mempool;
 pub mod net;
 pub mod node;
 pub mod peers;
+pub mod session;
 pub mod sim;
 pub mod state;
 pub mod statesync;

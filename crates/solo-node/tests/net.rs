@@ -11,16 +11,17 @@ use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use k256::ecdsa::SigningKey;
-use raw_peer::{Chain, nonce_of, read_until, send};
+use raw_peer::{Chain, Wire};
 use solo_abi::chain::{Allocation, GenesisParams};
 use solo_abi::codec::Seq;
 use solo_abi::types::Genesis;
 use solo_abi::{Decode, Encode};
 use solo_host::hash::keccak256;
 use solo_node::net::{
-    Frame, MAX_FRAME, Transport, frame_bytes, fresh_key, hello_digest, take_frames,
+    Frame, HELLO_LEN, MAX_FRAME, Transport, frame_bytes, fresh_key, hello_digest, take_frames,
 };
 use solo_node::peers::recover_id;
+use solo_node::session::{Side, TAG, VERSION};
 use solo_node::{Node, NodeConfig, Sim, validator_id};
 
 const KERNEL: &[u8] = include_bytes!("fixtures/kernel.elf");
@@ -107,10 +108,12 @@ fn genesis(keys: &[SigningKey]) -> Genesis {
 fn framing() {
     let frames = [
         Frame::Hello {
+            version: 1,
             id: [1; 32],
             chain_id: 5,
             genesis: [2; 32],
             nonce: [3; 32],
+            ephemeral: [2; 33],
         },
         Frame::Auth { signature: [4; 65] },
         Frame::Message {
@@ -156,6 +159,8 @@ fn framing() {
     let mut bad = vec![1, 0, 0, 0, 9];
     assert_eq!(take_frames(&mut bad).unwrap_err(), "undecodable frame");
     assert!(format!("{:?}", frames[0]).contains("Hello"));
+    // A Hello is exactly as long as the longest frame accepted before the session.
+    assert_eq!(frame_bytes(&frames[0]).len(), 4 + HELLO_LEN);
 }
 
 /// Polls every live node and its transport until `done` or the deadline. Deadlines are
@@ -389,10 +394,10 @@ fn without_the_hosts_catch_up_a_loaded_chain_is_never_caught() {
     assert_eq!(observer, 0);
 }
 
-/// How an impostor answers the transport's nonce.
-type Proof<'a> = dyn Fn(&[u8; 32]) -> Frame + 'a;
+/// How an impostor answers the transport's `Hello`: its own side and the
+/// transport's.
+type Proof<'a> = dyn Fn(&Side, &Side) -> Frame + 'a;
 
-/// A key for a peer the tests play by hand.
 fn peer_key(i: u8) -> SigningKey {
     SigningKey::from_slice(&[0x70 + i; 32]).unwrap()
 }
@@ -405,18 +410,23 @@ fn poll_n(t: &mut Transport, n: &mut Node, now_ms: u64) {
     }
 }
 
-#[test]
-#[allow(clippy::too_many_lines)]
-fn handshake_rules() {
+/// A started one-validator node and its chain.
+fn one_node() -> (Node, Chain) {
     let keys = keys(1);
-    let kernel = kernel_module();
-    let genesis = genesis(&keys);
-    let mut node = Node::open(&kernel, &genesis, NodeConfig::default()).unwrap();
+    let mut node = Node::open(&kernel_module(), &genesis(&keys), NodeConfig::default()).unwrap();
     node.start(None).unwrap();
     let chain = Chain {
         chain_id: CHAIN_ID,
         genesis: node.genesis_hash(),
     };
+    (node, chain)
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn handshake_rules() {
+    let keys = keys(1);
+    let (mut node, chain) = one_node();
     assert_ne!(chain.genesis, [0; 32], "the kernel stores a genesis block");
     let me = peer_key(1);
     let mut transport =
@@ -441,7 +451,7 @@ fn handshake_rules() {
         }
     };
     // Wrong chain, wrong genesis, a message before hello, a second hello or a message in
-    // place of the proof, a proof before hello, garbage: all dropped.
+    // place of the proof (neither sealed), a proof before hello, garbage: all dropped.
     let other_chain = Chain {
         chain_id: 1,
         ..chain
@@ -464,59 +474,68 @@ fn handshake_rules() {
         transport.connected()
     );
     // Impostors name the validator's id. Each reads the transport's own proof, which
-    // recovers to the transport's id over its nonce and the impostor's, and answers with a
-    // proof that is not the validator's for this connection: signed by another key, by the
-    // validator for another connection, another chain or another genesis, with the nonces
-    // swapped, or not a signature at all. Each is dropped and never connected.
+    // recovers to the transport's id over both Hellos, and answers, sealed, with a proof
+    // that is not the validator's for this connection: signed by another key, by the
+    // validator for another connection, another chain or another genesis, with the sides
+    // swapped, over another fresh key than the one its Hello carried (a party in the
+    // middle that put its own key in the Hello), or not a signature at all. Each is
+    // dropped and never connected.
     let validator = validator_id(&keys[0]);
     let mine = [5; 32];
+    let stranger = raw_peer::ephemeral(&[6; 32]).public();
     let attempts: Vec<Box<Proof>> = vec![
-        Box::new(|theirs| chain.auth(&peer_key(3), &mine, theirs)),
-        Box::new(|_| chain.auth(&keys[0], &mine, &[6; 32])),
-        Box::new(|theirs| other_chain.auth(&keys[0], &mine, theirs)),
-        Box::new(|theirs| other_genesis.auth(&keys[0], &mine, theirs)),
-        Box::new(|theirs| chain.auth(&keys[0], theirs, &mine)),
-        Box::new(|_| Frame::Auth {
+        Box::new(|m, t| chain.auth(&peer_key(3), m, t)),
+        Box::new(|m, t| {
+            let elsewhere = Side {
+                nonce: [6; 32],
+                ..*t
+            };
+            chain.auth(&keys[0], m, &elsewhere)
+        }),
+        Box::new(|m, t| other_chain.auth(&keys[0], m, t)),
+        Box::new(|m, t| other_genesis.auth(&keys[0], m, t)),
+        Box::new(|m, t| chain.auth(&keys[0], t, m)),
+        Box::new(|m, t| {
+            let swapped = Side {
+                ephemeral: stranger,
+                ..*m
+            };
+            chain.auth(&keys[0], &swapped, t)
+        }),
+        Box::new(|_, _| Frame::Auth {
             signature: [0xFF; 65],
         }),
     ];
     for (i, attempt) in attempts.iter().enumerate() {
-        let mut s = TcpStream::connect(addr).unwrap();
-        send(&mut s, &chain.hello(validator, mine));
-        let (frames, _) = read_until(&mut s, &mut || poll_n(&mut transport, &mut node, 0), |f| {
+        let mut w = Wire::dial(addr, chain, mine);
+        w.send_clear(&w.hello(validator));
+        let (frames, _) = w.read_until(&mut || poll_n(&mut transport, &mut node, 0), |f| {
             f.iter().any(|f| matches!(f, Frame::Auth { .. }))
         });
-        let theirs = nonce_of(&frames).unwrap();
+        let theirs = w.theirs.unwrap();
         let proof = frames.iter().find_map(|f| match f {
             Frame::Auth { signature } => Some(*signature),
             _ => None,
         });
-        let digest = hello_digest(CHAIN_ID, &chain.genesis, &theirs, &mine);
+        let digest = hello_digest(CHAIN_ID, &chain.genesis, &theirs, &w.side);
         assert_eq!(recover_id(&digest, &proof.unwrap()), Some(transport.id()));
-        send(&mut s, &attempt(&theirs));
-        let (_, closed) = read_until(&mut s, &mut || poll_n(&mut transport, &mut node, 0), |_| {
-            false
-        });
-        assert!(closed, "impostor {i} was not dropped");
+        let proof = attempt(&w.side, &theirs);
+        w.send(&proof);
+        assert!(
+            w.closes(&mut || poll_n(&mut transport, &mut node, 0)),
+            "impostor {i} was not dropped"
+        );
         assert!(transport.connected().is_empty(), "impostor {i}");
     }
-    // The validator itself, with the same nonces, gets in; so does a peer that proves a key
+    // The validator itself, with the same nonce, gets in; so does a peer that proves a key
     // of its own.
     let (mut real, _) = raw_peer::connect(addr, &keys[0], chain, &mut || {
         poll_n(&mut transport, &mut node, 0);
     });
-    poll(&mut transport, &mut node);
-    assert_eq!(transport.connected(), vec![validator]);
+    assert!(connected_as(&mut transport, &mut node, &[validator]));
     // A proof after the handshake closes the connection.
-    send(&mut real, &chain.auth(&keys[0], &mine, &mine));
-    assert!(
-        read_until(
-            &mut real,
-            &mut || poll_n(&mut transport, &mut node, 0),
-            |_| false
-        )
-        .1
-    );
+    real.send(&real.auth(&keys[0]));
+    assert!(real.closes(&mut || poll_n(&mut transport, &mut node, 0)));
     // A good peer stays; its requests are served and unknown responses ignored.
     let (mut good, _) = raw_peer::connect(addr, &good_key, chain, &mut || {
         poll_n(&mut transport, &mut node, 0);
@@ -536,9 +555,15 @@ fn handshake_rules() {
             payload: vec![],
         },
     ] {
-        send(&mut good, &f);
+        good.send(&f);
     }
-    poll(&mut transport, &mut node);
+    // The request is answered before the effects below are applied, so that the order
+    // the peer sees does not depend on how fast the transport reads.
+    let answered = |f: &Frame| matches!(f, Frame::Response { request_id: 9, .. });
+    let (got, closed) = good.read_until(&mut || poll_n(&mut transport, &mut node, 0), |f| {
+        f.iter().any(answered)
+    });
+    assert!(got.iter().any(answered) && !closed, "{got:?}");
     assert_eq!(transport.connected(), vec![good_id]);
     // Point-to-point sends reach the named peer; blobs and scores are not transported.
     for effect in [
@@ -562,31 +587,21 @@ fn handshake_rules() {
         topic: 5,
         payload: vec![8],
     };
-    let (got, closed) = read_until(
-        &mut good,
-        &mut || poll_n(&mut transport, &mut node, 0),
-        |f| f.contains(&message),
-    );
-    assert!(!closed);
-    let answered = got
-        .iter()
-        .position(|f| matches!(f, Frame::Response { request_id: 9, .. }));
-    let sent = got.iter().position(|f| *f == message);
-    assert!(answered.unwrap() < sent.unwrap(), "{got:?}");
+    let (got, closed) = good.read_until(&mut || poll_n(&mut transport, &mut node, 0), |f| {
+        f.contains(&message)
+    });
+    assert!(got.contains(&message) && !closed, "{got:?}");
     // A peer that says Hello and never proves it is dropped once HANDSHAKE_MS has passed.
-    let mut silent = speak(&[chain.hello(validator_id(&peer_key(4)), [4; 32])], &[]);
+    let mut silent = Wire::dial(addr, chain, [4; 32]);
+    silent.send_clear(&silent.hello(validator_id(&peer_key(4))));
     poll(&mut transport, &mut node);
-    assert_eq!(transport.connected(), vec![good_id]);
-    let (_, closed) = read_until(
-        &mut silent,
-        &mut || poll_n(&mut transport, &mut node, solo_node::net::HANDSHAKE_MS),
-        |_| false,
-    );
-    assert!(closed);
+    assert!(connected_as(&mut transport, &mut node, &[good_id]));
+    assert!(silent.closes(&mut || {
+        poll_n(&mut transport, &mut node, solo_node::net::HANDSHAKE_MS);
+    }));
     // A closed peer is forgotten; a dial target that is down is retried without error.
     drop(good);
-    poll(&mut transport, &mut node);
-    assert!(transport.connected().is_empty());
+    assert!(connected_as(&mut transport, &mut node, &[]));
     let unused = TcpListener::bind("127.0.0.1:0").unwrap();
     let down = unused.local_addr().unwrap();
     drop(unused);
@@ -602,6 +617,144 @@ fn handshake_rules() {
     dialer.poll(&mut node, 1).unwrap();
     assert!(dialer.connected().is_empty());
     assert!(Transport::bind("nope", peer_key(6), 1, [0; 32], vec![]).is_err());
+}
+
+/// Every frame after the `Hello`s is sealed (spec 09 §3a): what goes over the wire does
+/// not show the frames it carries, and a frame that is altered, replayed, reordered,
+/// sent in the clear or of a length no sealed frame has closes the connection, before
+/// or after the handshake.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn frames_after_the_hellos_are_sealed() {
+    let (mut node, chain) = one_node();
+    let mut transport =
+        Transport::bind("127.0.0.1:0", peer_key(1), CHAIN_ID, chain.genesis, vec![]).unwrap();
+    let addr = transport.local_addr().unwrap();
+    let key = peer_key(2);
+    let id = validator_id(&key);
+    let mut poll = || poll_n(&mut transport, &mut node, 0);
+    // A passive observer sees the Hellos and the lengths, not what the frames carry.
+    let (mut observer, _) = raw_peer::connect(addr, &key, chain, &mut poll);
+    let secret = vec![0xA5; 64];
+    let message = Frame::Message {
+        topic: 3,
+        payload: secret.clone(),
+    };
+    assert!(connected_as(&mut transport, &mut node, &[id]));
+    node.apply_effect(solo_abi::types::Effect::Send {
+        peer: id,
+        topic: 3,
+        payload: secret.clone(),
+    })
+    .unwrap();
+    let mut poll = || poll_n(&mut transport, &mut node, 0);
+    let (got, closed) = observer.read_until(&mut poll, |f| f.contains(&message));
+    assert!(got.contains(&message) && !closed, "{got:?}");
+    let seen = &observer.seen;
+    assert!(!seen.windows(secret.len()).any(|x| x == secret));
+    assert!(seen.len() >= HELLO_LEN + secret.len() + TAG);
+    drop(observer);
+    // Altered: a byte of the body, of the tag, or of the length, one less.
+    let tx = Frame::Tx { raw: vec![1] };
+    for at in [6, 0, usize::MAX] {
+        let (mut w, _) = raw_peer::connect(addr, &key, chain, &mut poll);
+        let mut sealed = w.seal(&tx);
+        let at = at.min(sealed.len() - 1);
+        sealed[at] = sealed[at].wrapping_sub(1);
+        w.write(&sealed);
+        assert!(w.closes(&mut poll), "a frame altered at {at} was taken");
+    }
+    // Replayed: the same sealed frame twice. The first is taken, the second closes.
+    let (mut w, _) = raw_peer::connect(addr, &key, chain, &mut poll);
+    let sealed = w.seal(&tx);
+    w.write(&sealed);
+    let (_, closed) = w.read_for(Duration::from_millis(100), &mut poll, |_| false);
+    assert!(!closed);
+    w.write(&sealed);
+    assert!(w.closes(&mut poll));
+    // Reordered: the second frame sealed sent first.
+    let (mut w, _) = raw_peer::connect(addr, &key, chain, &mut poll);
+    let first = w.seal(&tx);
+    let second = w.seal(&Frame::Tx { raw: vec![2] });
+    w.write(&second);
+    w.write(&first);
+    assert!(w.closes(&mut poll));
+    // Dropped from the middle: the third frame sent after the first.
+    let (mut w, _) = raw_peer::connect(addr, &key, chain, &mut poll);
+    let first = w.seal(&tx);
+    let _skipped = w.seal(&tx);
+    let third = w.seal(&tx);
+    w.write(&first);
+    w.write(&third);
+    assert!(w.closes(&mut poll));
+    // In the clear after the handshake.
+    let (mut w, _) = raw_peer::connect(addr, &key, chain, &mut poll);
+    w.send_clear(&Frame::Tx { raw: vec![0; 40] });
+    assert!(w.closes(&mut poll));
+    // A peer that skips encryption altogether, its proof in the clear, never gets in.
+    let mut w = Wire::dial(addr, chain, [8; 32]);
+    w.send_clear(&w.hello(id));
+    let (_, closed) = w.read_until(&mut poll, |f| f.len() >= 2);
+    assert!(!closed);
+    w.send_clear(&w.auth(&key));
+    assert!(w.closes(&mut poll));
+    assert!(connected_as(&mut transport, &mut node, &[]));
+    let mut poll = || poll_n(&mut transport, &mut node, 0);
+    // A sealed frame's length is at least the tag's and at most `MAX_FRAME` past it.
+    for len in [0, TAG - 1, MAX_FRAME + TAG + 1] {
+        let (mut w, _) = raw_peer::connect(addr, &key, chain, &mut poll);
+        w.write(&u32::try_from(len).unwrap().to_le_bytes());
+        assert!(w.closes(&mut poll), "a sealed length of {len} was taken");
+    }
+    // Before the session: a frame longer than a Hello, a Hello of another version, one
+    // in the layout of version 0, one whose fresh key is not a point, and the
+    // transport's own Hello sent back to it.
+    let mut w = Wire::dial(addr, chain, [9; 32]);
+    w.write(&u32::try_from(HELLO_LEN + 1).unwrap().to_le_bytes());
+    assert!(w.closes(&mut poll));
+    let hello = |version, ephemeral| Frame::Hello {
+        version,
+        id,
+        chain_id: CHAIN_ID,
+        genesis: chain.genesis,
+        nonce: [9; 32],
+        ephemeral,
+    };
+    let point = raw_peer::ephemeral(&[9; 32]).public();
+    for bad in [
+        hello(VERSION + 1, point),
+        hello(0, point),
+        hello(VERSION, [0; 33]),
+    ] {
+        let mut w = Wire::dial(addr, chain, [9; 32]);
+        w.send_clear(&bad);
+        assert!(w.closes(&mut poll), "{bad:?}");
+    }
+    let mut old = vec![0];
+    old.extend_from_slice(&id);
+    old.extend_from_slice(&CHAIN_ID.to_le_bytes());
+    old.extend_from_slice(&chain.genesis);
+    old.extend_from_slice(&[9; 32]);
+    let mut w = Wire::dial(addr, chain, [9; 32]);
+    w.write(&u32::try_from(old.len()).unwrap().to_le_bytes());
+    w.write(&old);
+    assert!(w.closes(&mut poll));
+    let mut w = Wire::dial(addr, chain, [9; 32]);
+    let (got, _) = w.read_until(&mut poll, |f| !f.is_empty());
+    w.send_clear(&got[0]);
+    assert!(w.closes(&mut poll));
+    assert!(connected_as(&mut transport, &mut node, &[]));
+}
+
+/// Polls `t` until its handshaken peers are `want`: whether they got there.
+fn connected_as(t: &mut Transport, n: &mut Node, want: &[[u8; 32]]) -> bool {
+    for _ in 0..200 {
+        if t.connected() == want {
+            return true;
+        }
+        poll_n(t, n, 0);
+    }
+    t.connected() == want
 }
 
 #[test]
@@ -627,25 +780,19 @@ fn state_sync_frames_are_the_hosts() {
     let (mut s, _) = raw_peer::connect(running.local_addr().unwrap(), &peer, chain, &mut || {
         poll_n(&mut running, &mut node, 0);
     });
-    send(
-        &mut s,
-        &Frame::SyncResponse {
-            request_id: 1,
-            payload: vec![],
-        },
-    );
-    send(
-        &mut s,
-        &Frame::SyncRequest {
-            request_id: 5,
-            payload: offers.clone(),
-        },
-    );
+    s.send(&Frame::SyncResponse {
+        request_id: 1,
+        payload: vec![],
+    });
+    s.send(&Frame::SyncRequest {
+        request_id: 5,
+        payload: offers.clone(),
+    });
     let answer = Frame::SyncResponse {
         request_id: 5,
         payload: nothing.clone(),
     };
-    let (got, _) = read_until(&mut s, &mut || poll_n(&mut running, &mut node, 0), |f| {
+    let (got, _) = s.read_until(&mut || poll_n(&mut running, &mut node, 0), |f| {
         f.contains(&answer)
     });
     assert!(got.contains(&answer), "{got:?}");
@@ -688,20 +835,14 @@ fn state_sync_frames_are_the_hosts() {
     let (mut good, _) = raw_peer::connect(addr, &peer, chain, &mut || {
         poll_sync(&mut syncing, &mut sync);
     });
-    send(
-        &mut good,
-        &Frame::Message {
-            topic: 1,
-            payload: vec![],
-        },
-    );
-    send(
-        &mut good,
-        &Frame::SyncRequest {
-            request_id: 6,
-            payload: offers,
-        },
-    );
+    good.send(&Frame::Message {
+        topic: 1,
+        payload: vec![],
+    });
+    good.send(&Frame::SyncRequest {
+        request_id: 6,
+        payload: offers,
+    });
     let unserved = Frame::SyncResponse {
         request_id: 6,
         payload: nothing,
@@ -713,7 +854,7 @@ fn state_sync_frames_are_the_hosts() {
         } => Some((*request_id, SyncRequest::from_bytes(payload).unwrap())),
         _ => None,
     };
-    let (got, _) = read_until(&mut good, &mut || poll_sync(&mut syncing, &mut sync), |f| {
+    let (got, _) = good.read_until(&mut || poll_sync(&mut syncing, &mut sync), |f| {
         f.contains(&unserved) && f.iter().any(|f| asked(f).is_some())
     });
     assert_eq!(syncing.connected(), vec![validator_id(&peer)]);
@@ -721,13 +862,10 @@ fn state_sync_frames_are_the_hosts() {
     let (id, request) = got.iter().find_map(asked).unwrap();
     assert_eq!(request, SyncRequest::Offers);
     // Its answer reaches the sync.
-    send(
-        &mut good,
-        &Frame::SyncResponse {
-            request_id: id,
-            payload: SyncResponse::Offers(vec![]).to_bytes(),
-        },
-    );
+    good.send(&Frame::SyncResponse {
+        request_id: id,
+        payload: SyncResponse::Offers(vec![]).to_bytes(),
+    });
     for _ in 0..4 {
         poll_sync(&mut syncing, &mut sync);
     }
@@ -774,7 +912,8 @@ fn a_state_sync_without_peers_gives_up() {
         clock += 1;
         served.poll_sync(&mut sync, clock);
     });
-    for _ in 0..10 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while served.connected().is_empty() && Instant::now() < deadline {
         clock += 1;
         served.poll_sync(&mut sync, clock);
         std::thread::sleep(Duration::from_millis(2));
@@ -794,16 +933,13 @@ fn a_state_sync_without_peers_gives_up() {
     assert!(served.sync_stalled(left + SYNC_PEER_WAIT_MS).is_some());
     // A peer of this chain id on another genesis: stalled at once.
     let mut foreign = bind();
-    let mut s = TcpStream::connect(foreign.local_addr().unwrap()).unwrap();
+    let mut s = Wire::dial(foreign.local_addr().unwrap(), chain, [3; 32]);
     let elsewhere = Chain {
         genesis: [8; 32],
         ..chain
     };
-    send(
-        &mut s,
-        &elsewhere.hello(validator_id(&peer_key(3)), [3; 32]),
-    );
-    let (_, closed) = read_until(&mut s, &mut || foreign.poll_sync(&mut sync, 5), |_| false);
+    s.send(&elsewhere.hello(validator_id(&peer_key(3)), [3; 32]));
+    let (_, closed) = s.read_until(&mut || foreign.poll_sync(&mut sync, 5), |_| false);
     assert!(closed);
     assert_eq!(
         foreign.sync_stalled(5),
@@ -838,8 +974,7 @@ fn a_state_sync_whose_peers_are_dropped_gives_up() {
         clock += 1;
         garbled.poll_sync(&mut sync, clock);
     });
-    let (got, _) = read_until(
-        &mut peer,
+    let (got, _) = peer.read_until(
         &mut || {
             clock += 1;
             garbled.poll_sync(&mut sync, clock);
@@ -854,13 +989,10 @@ fn a_state_sync_whose_peers_are_dropped_gives_up() {
         })
         .unwrap();
     assert_eq!(garbled.sync_stalled(clock + 10 * SYNC_PEER_WAIT_MS), None);
-    send(
-        &mut peer,
-        &Frame::SyncResponse {
-            request_id,
-            payload: vec![0xff],
-        },
-    );
+    peer.send(&Frame::SyncResponse {
+        request_id,
+        payload: vec![0xff],
+    });
     let dropped = loop {
         clock += 1;
         garbled.poll_sync(&mut sync, clock);
@@ -876,7 +1008,7 @@ fn a_state_sync_whose_peers_are_dropped_gives_up() {
         Some("no peer to sync from in time")
     );
     // A second Hello after the handshake closes the connection.
-    send(&mut peer, &chain.hello(validator_id(&peer_key(4)), [9; 32]));
+    peer.send(&chain.hello(validator_id(&peer_key(4)), [9; 32]));
     loop {
         clock += 1;
         garbled.poll_sync(&mut sync, clock);
