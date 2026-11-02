@@ -22,6 +22,9 @@ pub const MINT: u8 = 1;
 pub const RELEASE: u8 = 2;
 /// Message kind: the sending gateway exists (spec 21 §5.7).
 pub const HELLO: u8 = 3;
+/// Message kind: give back the value of a cancelled `MINT` or `RELEASE` to
+/// its sender (spec 21 §5.5b).
+pub const REFUND: u8 = 4;
 /// The token address that stands for a chain's native currency.
 pub const NATIVE: Address = [0; 20];
 /// Bytes of a token's name and symbol that a deposit carries.
@@ -68,6 +71,23 @@ pub enum TokenMessage {
         /// Whether a message of the receiving gateway reached the sender.
         heard: bool,
     },
+    /// Give back to `from` the value of message `nonce`, a `MINT` or
+    /// `RELEASE` the receiving gateway sent asking exactly this, which the
+    /// sending gateway queued and its owner cancelled.
+    Refund {
+        /// The channel's nonce of the message refunded.
+        nonce: u64,
+        /// Its kind, [`MINT`] or [`RELEASE`].
+        kind: u8,
+        /// The token it named: a mint's origin, a release's token.
+        token: Address,
+        /// Its sender, who gets the value back.
+        from: Address,
+        /// Its recipient.
+        to: Address,
+        /// Its amount.
+        amount: u128,
+    },
 }
 
 fn word_address(word: &[u8]) -> Address {
@@ -90,8 +110,9 @@ impl TokenMessage {
     /// The payload: `abi.encode(uint8 MINT, address origin, address from,
     /// address to, uint256 amount, string name, string symbol, uint8
     /// decimals)`, `abi.encode(uint8 RELEASE, address token, address
-    /// from, address to, uint256 amount)` or `abi.encode(uint8 HELLO, bool
-    /// heard)`.
+    /// from, address to, uint256 amount)`, `abi.encode(uint8 HELLO, bool
+    /// heard)` or `abi.encode(uint8 REFUND, uint64 nonce, uint8 kind,
+    /// address token, address from, address to, uint256 amount)`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         match self {
@@ -129,6 +150,22 @@ impl TokenMessage {
                 Value::uint(u128::from(HELLO)),
                 Value::uint(u128::from(*heard)),
             ]),
+            TokenMessage::Refund {
+                nonce,
+                kind,
+                token,
+                from,
+                to,
+                amount,
+            } => abi::encode(&[
+                Value::uint(u128::from(REFUND)),
+                Value::uint(u128::from(*nonce)),
+                Value::uint(u128::from(*kind)),
+                Value::address(token),
+                Value::address(from),
+                Value::address(to),
+                Value::uint(*amount),
+            ]),
         }
     }
 
@@ -153,6 +190,15 @@ impl TokenMessage {
                 name: tail(payload, 5 * 32)?,
                 symbol: tail(payload, 6 * 32)?,
                 decimals: word(7)?[31],
+            }
+        } else if kind == REFUND {
+            TokenMessage::Refund {
+                nonce: u64::from_be_bytes(word(1)?[24..32].try_into().ok()?),
+                kind: word(2)?[31],
+                token: address(3)?,
+                from: address(4)?,
+                to: address(5)?,
+                amount: word_u128(word(6)?),
             }
         } else {
             TokenMessage::Release {
@@ -287,6 +333,14 @@ pub fn cancel_queued_calldata(id: u64) -> Vec<u8> {
     abi::call("cancelQueued(uint256)", &[Value::uint(u128::from(id))])
 }
 
+/// `refundQueued(id)`: cancels queued transfer `id` as
+/// [`cancel_queued_calldata`] does and asks the paired gateway to give its
+/// value back to its sender; the owner (spec 21 §5.5b).
+#[must_use]
+pub fn refund_queued_calldata(id: u64) -> Vec<u8> {
+    abi::call("refundQueued(uint256)", &[Value::uint(u128::from(id))])
+}
+
 /// The calldata of a gateway view that takes one address, such as
 /// `locked(address)`, `lockCap(address)`, `wrappedToken(address)` or a
 /// token's `balanceOf(address)`.
@@ -414,11 +468,22 @@ mod tests {
             to: [5; 20],
             amount: u128::MAX,
         };
+        let refund = TokenMessage::Refund {
+            nonce: u64::MAX,
+            kind: MINT,
+            token: [6; 20],
+            from: [7; 20],
+            to: [8; 20],
+            amount: 9,
+        };
         let hellos = [
             TokenMessage::Hello { heard: false },
             TokenMessage::Hello { heard: true },
         ];
-        for m in [mint(), release.clone()].into_iter().chain(hellos) {
+        for m in [mint(), release.clone(), refund.clone()]
+            .into_iter()
+            .chain(hellos)
+        {
             assert_eq!(TokenMessage::decode(&m.encode()), Some(m));
         }
         let payload = mint().encode();
@@ -448,8 +513,18 @@ mod tests {
             cases.push(huge);
         }
         let mut unknown = release.encode();
-        unknown[31] = 4;
+        unknown[31] = 5;
         cases.push(unknown);
+        // A refund is seven words; its nonce a u64 and its kind a u8.
+        let refunded = refund.encode();
+        assert_eq!(refunded.len(), 7 * 32);
+        assert_eq!(refunded[31], REFUND);
+        for at in [32 + 23, 2 * 32 + 30] {
+            let mut dirty = refunded.clone();
+            dirty[at] = 1;
+            cases.push(dirty);
+        }
+        cases.push(refunded[..6 * 32].to_vec());
         // A hello is two words, its flag 0 or 1.
         let hello = TokenMessage::Hello { heard: true }.encode();
         assert_eq!(hello.len(), 2 * 32);
@@ -540,6 +615,11 @@ mod tests {
             (
                 cancel_queued_calldata(9),
                 [0xb1, 0xfd, 0x65, 0x3e],
+                &word(&[9]).to_vec(),
+            ),
+            (
+                refund_queued_calldata(9),
+                [0x87, 0x5d, 0x2f, 0x72],
                 &word(&[9]).to_vec(),
             ),
         ] {

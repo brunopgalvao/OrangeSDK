@@ -16,7 +16,9 @@
 //! deliveries fail and wait, a message from another Ethereum account than
 //! the gateway is never honoured, replays are refused on both sides, a
 //! fee-on-transfer token and a deposit over the lock cap are refused, and a
-//! release to a recipient that refuses ETH is owed and claimed later. Every
+//! release to a recipient that refuses ETH is owed and claimed later. A
+//! deposit queued on Solo by its mint limit is cancelled and refunded by
+//! governance, and the refund crosses back to release Alice's ETH. Every
 //! balance at the end is exact, and minted never exceeds locked.
 
 mod support;
@@ -36,7 +38,8 @@ use solo_abi::types::Genesis;
 use solo_bridge::abi::{self, Value};
 use solo_bridge::tokens::{
     EthereumGatewayConfig, NATIVE, SoloGatewayConfig, TokenMessage, address_view, claim_calldata,
-    deposit_calldata, set_lock_cap_calldata, set_mint_cap_calldata, wrapped_token,
+    deposit_calldata, refund_queued_calldata, set_lock_cap_calldata, set_mint_cap_calldata,
+    set_mint_limit_calldata, wrapped_token,
 };
 use solo_bridge::{
     InboxConfig, execute_calldata, group_key, light_client_v2_args, sent_messages, slot_proof,
@@ -77,23 +80,25 @@ const BIG: u128 = 1 << 100;
 
 /// Transaction gas of the first `deposit` of ETH on Ethereum, through `EthereumOutbox`, whose
 /// nonce the gateway's `HELLO` and its answer moved from zero.
-const DEPOSIT_ETH_GAS: u64 = 101_488;
+const DEPOSIT_ETH_GAS: u64 = 124_005;
 /// Of the first `deposit` of an ERC-20 there.
-const DEPOSIT_TOKEN_GAS: u64 = 159_477;
+const DEPOSIT_TOKEN_GAS: u64 = 181_994;
 /// Of the delivery on Solo whose mint creates wrapped ETH (the inbox's proofs included).
-const FIRST_MINT_GAS: u64 = 832_773;
+const FIRST_MINT_GAS: u64 = 832_800;
 /// Of a delivery on Solo whose wrapped token exists.
-const MINT_GAS: u64 = 109_695;
+const MINT_GAS: u64 = 109_722;
 /// Of a withdrawal on Solo: the burn and the send through the outbox.
-const BURN_GAS: u64 = 97_687;
+const BURN_GAS: u64 = 120_010;
 /// Of a deposit of Solo's currency on Solo.
-const LOCK_NATIVE_GAS: u64 = 117_644;
+const LOCK_NATIVE_GAS: u64 = 140_138;
 /// Of `SoloInbox.execute` releasing ETH through the gateway on Ethereum.
-const RELEASE_GAS: u64 = 80_361;
+const RELEASE_GAS: u64 = 80_437;
 /// Of a withdrawal on Ethereum: the burn and the send through `EthereumOutbox`.
-const ETH_BURN_GAS: u64 = 86_547;
+const ETH_BURN_GAS: u64 = 108_893;
 /// Of the delivery on Solo that releases Solo's currency.
-const NATIVE_RELEASE_GAS: u64 = 100_124;
+const NATIVE_RELEASE_GAS: u64 = 100_178;
+/// Of `SoloInbox.execute` of a `REFUND` that releases ETH back to its depositor.
+const REFUND_GAS: u64 = 83_374;
 
 /// The Solo side: the simulated chain and its wallets' nonces.
 struct Solo {
@@ -999,6 +1004,99 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
         ("ETH_BURN_GAS", back.gas, ETH_BURN_GAS),
         ("NATIVE_RELEASE_GAS", released.gas_used, NATIVE_RELEASE_GAS),
     ]);
+
+    // A refund (spec 21 §5.5b): with a mint limit on wrapped ETH, Alice's next deposit queues on
+    // Solo; governance, the owner there, cancels it and refunds it, and the refund crosses back
+    // through the outbox, a certificate and `SoloInbox` to the Ethereum gateway, which recorded
+    // sending that very message and releases Alice's ETH to her.
+    assert_eq!(
+        solo.send(
+            &governance,
+            Some(solo_gateway),
+            0,
+            &set_mint_limit_calldata(&NATIVE, ETHER / 10, 1_000),
+            100_000
+        )
+        .status,
+        1
+    );
+    let alice_eth = eth.balance(ALICE);
+    let refundable = deposit(&mut eth, NATIVE, address(&bob), ETHER);
+    ok(&refundable);
+    let refundable = ethereum_messages(eth_outbox, &refundable).remove(0);
+    let state = eth.state();
+    let update = beacon.update(36, &beacon.header(32, state.root(), [0; 32]), false, 37, 32);
+    let applied = solo.send(
+        &relayer,
+        Some(LIGHT_CLIENT_ADDRESS),
+        0,
+        &client::submit_call(&update.encode_update(32), false),
+        UPDATE_GAS,
+    );
+    assert_eq!(applied.status, 1);
+    let root = solo.view(
+        LIGHT_CLIENT_ADDRESS,
+        &client::u64_call(ethabi::EXECUTION_ROOT, 32),
+    );
+    let usable_at = u64::from_be_bytes(root[120..128].try_into().unwrap());
+    assert!(
+        solo.sim
+            .run_until(60 * SLOT_MS, |s| {
+                let n = s.nodes[0].block_number().unwrap();
+                s.nodes[0].block_by_number(n).unwrap().unwrap().timestamp_ms / 1000 > usable_at
+            })
+            .unwrap()
+    );
+    let queued = solo.send(
+        &relayer,
+        Some(INBOX_ADDRESS),
+        0,
+        &delivery(&state, &eth_outbox, 32, &refundable),
+        DELIVER_GAS,
+    );
+    assert_eq!(queued.status, 1);
+    assert_eq!(solo.balance_of(weth, address(&bob)), 2 * ETHER);
+    assert_eq!(
+        solo.u128_view(solo_gateway, &address_view("mintsQueued(address)", &NATIVE)),
+        ETHER
+    );
+    let refunding = solo.send(
+        &governance,
+        Some(solo_gateway),
+        0,
+        &refund_queued_calldata(0),
+        300_000,
+    );
+    assert_eq!(refunding.status, 1);
+    let refund: Vec<SoloMessage> = sent_messages(CHAIN_ID, &refunding.logs.0)
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect();
+    assert_eq!(
+        TokenMessage::decode(&refund[0].payload),
+        Some(TokenMessage::Refund {
+            nonce: refundable.nonce,
+            kind: 1,
+            token: NATIVE,
+            from: ALICE,
+            to: address(&bob),
+            amount: ETHER,
+        })
+    );
+    prove_on_ethereum(
+        &mut solo,
+        &mut eth,
+        (light_client, solo_inbox),
+        &refund,
+        refunding.height,
+    );
+    eth.advance(DELAY);
+    let refunded = eth.call(RELAYER, solo_inbox, &execute_calldata(&refund[0]));
+    ok(&refunded);
+    gas.push(("REFUND_GAS", refunded.gas, REFUND_GAS));
+    assert_eq!(eth.balance(ALICE), alice_eth);
+    let sent = abi::call("sent(uint64)", &[Value::uint(u128::from(refundable.nonce))]);
+    assert_eq!(eth.view(RELAYER, eth_gateway, &sent).output, [0; 32]);
 
     // Every balance is exact, and on each side what is minted is what the other side locked.
     assert_eq!(eth.balance(ALICE), 96 * ETHER);
