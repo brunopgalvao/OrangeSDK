@@ -445,7 +445,11 @@ impl Drop for Live {
 }
 
 fn start(extra: &[&str]) -> Live {
-    let good = genesis_file("live.json", GENESIS);
+    // Tests run at once in one process: each node gets a genesis file of its
+    // own, which another test's cleanup cannot remove under it.
+    static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let good = genesis_file(&format!("live-{n}.json"), GENESIS);
     let mut child = Command::new(env!("CARGO_BIN_EXE_solo"))
         .args([
             "dev",
