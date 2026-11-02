@@ -16,8 +16,9 @@
 //!   and [`rotations_from`] read the handoffs the chain recorded, and
 //!   [`Rotation::calldata`] builds `SoloLightClientV2.rotate`, which moves a
 //!   light client from one key set to the next. A version-2 certificate
-//!   names its key set, and [`submission_covering_key`] picks one under the
-//!   key set a light client holds.
+//!   names its key set, and [`submission_covering_key`] picks one that
+//!   verifies under the key set a light client holds, passing over, with
+//!   the reason, any that names another or does not verify.
 //!
 //! - **Tokens.** [`tokens`] holds what the canonical token bridge of spec 21
 //!   adds on top of both channels: its messages, the addresses of wrapped
@@ -39,6 +40,7 @@ use solo_abi::bridge::{
 };
 use solo_abi::chain::Log;
 use solo_abi::rotation::{Handoff, query as rotation_query, threshold_certificate};
+use solo_abi::staking::{KeySetRecord, keys as staking_keys};
 use solo_abi::types::{Address, Hash};
 use solo_abi::{Decode, Encode};
 use solo_node::{Node, NodeError};
@@ -59,6 +61,8 @@ pub enum Error {
     /// A state proof that does not show the outbox slot holding the
     /// message hash: the message is not in the state at that height.
     NotCommitted,
+    /// The chain holds no key set of this id with a usable group key.
+    UnknownKeySet(u64),
     /// The node failed.
     Node(NodeError),
 }
@@ -72,6 +76,7 @@ impl fmt::Display for Error {
             }
             Error::NoAnchor => f.write_str("the proposal carries no anchor"),
             Error::NotCommitted => f.write_str("the message is not committed at that height"),
+            Error::UnknownKeySet(id) => write!(f, "the chain holds no key set {id}"),
             Error::Node(e) => write!(f, "node: {e}"),
         }
     }
@@ -473,43 +478,125 @@ pub fn finality_proof(node: &mut Node, height: u64) -> Result<Option<FinalityPro
 /// # Errors
 /// [`Error::Node`] if a query fails.
 pub fn submission_covering(node: &mut Node, height: u64) -> Result<Option<Submission>, Error> {
-    covering(node, height, None)
+    Ok(covering(node, height, None)?.submission)
 }
 
-/// [`submission_covering`] among the version-2 certificates of key set
-/// `key_id`, the key set a light client holds.
+/// Why [`submission_covering_key`] passed over a stored certificate that
+/// it would otherwise have chosen: the light client would revert the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Skip {
+    /// It names another key set, or none (`None`, version 1).
+    OtherKeySet(Option<u64>),
+    /// It names the light client's key set, but its signature does not
+    /// verify under that key set's group key on this chain.
+    BadSignature,
+}
+
+impl fmt::Display for Skip {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Skip::OtherKeySet(Some(id)) => write!(f, "the certificate names key set {id}"),
+            Skip::OtherKeySet(None) => f.write_str("the certificate names no key set"),
+            Skip::BadSignature => {
+                f.write_str("the certificate does not verify under the key set it names")
+            }
+        }
+    }
+}
+
+/// What [`submission_covering_key`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Covering {
+    /// The submission, if a certificate qualifies.
+    pub submission: Option<Submission>,
+    /// The certificates passed over, by height, highest first, each with
+    /// why: what a relayer logs instead of sending a call that reverts.
+    pub skipped: Vec<(u64, Skip)>,
+}
+
+/// The key set a version-2 light client holds: what a certificate must
+/// verify under for its `submit` to pass (spec 17 §5.3).
+struct HeldKey {
+    id: u64,
+    chain_id: u64,
+    key: solo_bls::PublicKey,
+}
+
+impl HeldKey {
+    /// Whether the light client holding this key set takes `proof`: it
+    /// names this key set and its signature verifies under the group key
+    /// over `message_v2` of this chain, as the light client checks it.
+    fn check(&self, proof: &FinalityProof) -> Result<(), Skip> {
+        let certificate = threshold_certificate(&proof.certificate);
+        let named = certificate.filter(|c| c.version == 2).map(|c| c.key_id);
+        if named != Some(self.id) {
+            return Err(Skip::OtherKeySet(named));
+        }
+        let verifies = certificate
+            .and_then(|c| Some((c.message(self.chain_id), signature_point(c.signature).ok()?)))
+            .is_some_and(|(message, signature)| self.key.verify(&message, &signature));
+        if verifies {
+            Ok(())
+        } else {
+            Err(Skip::BadSignature)
+        }
+    }
+}
+
+/// [`submission_covering`] among the version-2 certificates that a light
+/// client holding key set `key_id` takes: each candidate must name that key
+/// set and verify under its group key, which the relayer checks off chain
+/// against the key set `node`'s chain adopted, so that a mislabelled or
+/// badly signed certificate costs no reverted call. The certificates it
+/// passes over for that are in [`Covering::skipped`].
 ///
 /// # Errors
+/// [`Error::UnknownKeySet`] if the chain holds no such key set,
 /// [`Error::Node`] if a query fails.
 pub fn submission_covering_key(
     node: &mut Node,
     height: u64,
     key_id: u64,
-) -> Result<Option<Submission>, Error> {
-    covering(node, height, Some(key_id))
+) -> Result<Covering, Error> {
+    let key = node
+        .state_get(&[staking_keys::KEY_SET, &key_id.to_be_bytes()].concat())
+        .and_then(|bytes| KeySetRecord::from_bytes(&bytes).ok())
+        .and_then(|record| {
+            let key: [u8; 96] = record.group_key()?.try_into().ok()?;
+            solo_bls::PublicKey::from_bytes(&key).ok()
+        })
+        .ok_or(Error::UnknownKeySet(key_id))?;
+    let held = HeldKey {
+        id: key_id,
+        chain_id: node.chain_id().map_err(Error::Node)?,
+        key,
+    };
+    covering(node, height, Some(&held))
 }
 
-fn covering(
-    node: &mut Node,
-    height: u64,
-    key_id: Option<u64>,
-) -> Result<Option<Submission>, Error> {
+fn covering(node: &mut Node, height: u64, held: Option<&HeldKey>) -> Result<Covering, Error> {
     let top = node.finalized_height().map_err(Error::Node)?;
     // An anchor below the oldest state the node keeps cannot be proven
     // against, and a proposal anchors a height below its own (spec 17 §4),
     // so the proposals at or below that floor anchor nothing of use.
     let oldest = height.max(node.oldest_state());
-    let mut best: Option<Submission> = None;
+    let mut found = Covering {
+        submission: None,
+        skipped: Vec::new(),
+    };
     for h in (oldest + 1..=top).rev() {
-        let candidate = finality_proof(node, h)?
-            .and_then(|p| Submission::new(&p).ok())
-            .filter(|s| key_id.is_none() || s.key_id == key_id);
-        let floor = oldest.max(best.as_ref().map_or(0, |b| b.anchor_height + 1));
-        if let Some(s) = candidate.filter(|s| s.anchor_height >= floor) {
-            best = Some(s);
+        let candidate = finality_proof(node, h)?.and_then(|p| Some((Submission::new(&p).ok()?, p)));
+        let floor = oldest.max(found.submission.as_ref().map_or(0, |b| b.anchor_height + 1));
+        let Some((s, proof)) = candidate.filter(|(s, _)| s.anchor_height >= floor) else {
+            continue;
+        };
+        // Checked last, as only a certificate that would be chosen is worth a pairing.
+        match held.map_or(Ok(()), |k| k.check(&proof)) {
+            Ok(()) => found.submission = Some(s),
+            Err(skip) => found.skipped.push((h, skip)),
         }
     }
-    Ok(best)
+    Ok(found)
 }
 
 /// The proof of message `nonce`'s outbox slot against the state root of
@@ -551,6 +638,7 @@ mod tests {
                 Error::NotCommitted,
                 "the message is not committed at that height",
             ),
+            (Error::UnknownKeySet(7), "the chain holds no key set 7"),
             (
                 Error::Node(NodeError::Decode("x")),
                 "node: x returned an undecodable result",
@@ -617,24 +705,84 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn version_two_submissions_and_rotations() {
-        let sk = solo_bls::SecretKey::generate(&[3; 32], b"").unwrap();
+    /// A version-2 certificate of height 9, anchoring 8, labelled key set
+    /// `labelled` and signed by `sk` as key set `signed` on chain 1.
+    fn signed_v2(sk: &solo_bls::SecretKey, signed: u64, labelled: u64) -> FinalityProof {
         let mut proposal = vec![0u8; 120];
         proposal[8..16].copy_from_slice(&9u64.to_le_bytes());
         proposal[56..64].copy_from_slice(&8u64.to_le_bytes());
         let hash = keccak256(&proposal);
-        let signature = sk.sign(&solo_bls::certificate::message_v2(1, 4, 9, &hash));
         let certificate = solo_bls::certificate::CertificateV2 {
-            key_id: 4,
+            key_id: labelled,
             height: 9,
             block_hash: hash,
-            signature,
+            signature: sk.sign(&solo_bls::certificate::message_v2(1, signed, 9, &hash)),
         };
-        let proof = FinalityProof {
+        FinalityProof {
             certificate: certificate.to_bytes().to_vec(),
-            proposal: proposal.clone(),
+            proposal,
+        }
+    }
+
+    #[test]
+    fn relayers_check_certificates_against_the_held_key_set() {
+        let sk = solo_bls::SecretKey::generate(&[3; 32], b"").unwrap();
+        let proof = signed_v2(&sk, 4, 4);
+        // A light client holding key set 4 takes it; one holding another key
+        // set, or the same id under another key or chain, would revert.
+        let held = |id: u64, chain_id: u64, key: solo_bls::PublicKey| HeldKey { id, chain_id, key };
+        assert_eq!(held(4, 1, sk.public_key()).check(&proof), Ok(()));
+        assert_eq!(
+            held(5, 1, sk.public_key()).check(&proof),
+            Err(Skip::OtherKeySet(Some(4)))
+        );
+        let other = solo_bls::SecretKey::generate(&[5; 32], b"").unwrap();
+        assert_eq!(
+            held(4, 1, other.public_key()).check(&proof),
+            Err(Skip::BadSignature)
+        );
+        assert_eq!(
+            held(4, 2, sk.public_key()).check(&proof),
+            Err(Skip::BadSignature)
+        );
+        // Signed as key set 5 but labelled 4: mislabelled, refused.
+        assert_eq!(
+            held(4, 1, sk.public_key()).check(&signed_v2(&sk, 5, 4)),
+            Err(Skip::BadSignature)
+        );
+        let hash = keccak256(&proof.proposal);
+        let v1 = solo_bls::Certificate {
+            height: 9,
+            block_hash: hash,
+            signature: sk.sign(&solo_bls::certificate::message(1, 9, &hash)),
         };
+        let v1 = FinalityProof {
+            certificate: v1.to_bytes().to_vec(),
+            proposal: proof.proposal.clone(),
+        };
+        assert_eq!(
+            held(4, 1, sk.public_key()).check(&v1),
+            Err(Skip::OtherKeySet(None))
+        );
+        for (skip, text) in [
+            (
+                Skip::OtherKeySet(Some(3)),
+                "the certificate names key set 3",
+            ),
+            (Skip::OtherKeySet(None), "the certificate names no key set"),
+            (
+                Skip::BadSignature,
+                "the certificate does not verify under the key set it names",
+            ),
+        ] {
+            assert_eq!(skip.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn version_two_submissions_and_rotations() {
+        let sk = solo_bls::SecretKey::generate(&[3; 32], b"").unwrap();
+        let proof = signed_v2(&sk, 4, 4);
         let s = Submission::new(&proof).unwrap();
         assert_eq!((s.key_id, s.height, s.anchor_height), (Some(4), 9, 8));
         let mut bad = proof.clone();

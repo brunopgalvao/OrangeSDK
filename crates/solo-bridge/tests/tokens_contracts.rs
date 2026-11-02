@@ -6,11 +6,13 @@
 //! or over a mint cap, and a release whose transfer fails is owed and
 //! claimed later; mints and releases over their rate limit wait in a queue
 //! until it allows them, one of them frozen or cancelled without stopping
-//! the rest, and no gateway takes deposits before a message of its peer
-//! proves the peer exists. A randomized run checks the value invariant
-//! after every step: what a gateway holds locked is exactly what the other
-//! side has minted plus what is in flight or queued, plus what owners
-//! cancelled out of the queue, so minted never exceeds locked. The gas
+//! the rest, a cancelled one refunded to its sender only if its home
+//! gateway really sent it, and no gateway takes deposits before a message
+//! of its peer proves the peer exists. A randomized run checks the value
+//! invariant after every step: what a gateway holds locked is exactly what
+//! the other side has minted plus what is in flight or queued, plus what
+//! owners cancelled out of the queue without a refund, so minted never
+//! exceeds locked, whatever forged messages the channels deliver. The gas
 //! of deposits against the stand-in is pinned here; spec 21 §8 states the
 //! gas through the real channels, which `tokens.rs` pins.
 
@@ -21,10 +23,12 @@ use solo_bridge::abi::{self, Value};
 use solo_bridge::tokens::{
     EthereumGatewayConfig, NATIVE, SoloGatewayConfig, TokenMessage, address_view,
     cancel_queued_calldata, claim_calldata, claim_to_calldata, deposit_calldata,
-    execute_queued_calldata, freeze_queued_calldata, set_lock_cap_calldata, set_mint_cap_calldata,
-    set_mint_limit_calldata, set_release_limit_calldata, unfreeze_queued_calldata, wrapped_token,
+    execute_queued_calldata, freeze_queued_calldata, refund_queued_calldata, set_lock_cap_calldata,
+    set_mint_cap_calldata, set_mint_limit_calldata, set_release_limit_calldata,
+    unfreeze_queued_calldata, wrapped_token,
 };
 use solo_trie::keccak256;
+use std::collections::{BTreeMap, BTreeSet};
 use support::eth::{ETH_CHAIN_ID, Eth, Outcome, init_code, selector, word_u64};
 use support::solo::create_address;
 
@@ -44,20 +48,31 @@ const BIG: u128 = 1 << 100;
 
 /// Gas of a `deposit` of ETH on `TokenGatewayOnEthereum`, the first one, as a transaction. The
 /// stand-in's nonce is no longer zero: the gateways' `HELLO`s came first.
-const DEPOSIT_ETH_GAS: u64 = 78_113;
+const DEPOSIT_ETH_GAS: u64 = 100_630;
 /// Gas of the first `deposit` of an ERC-20 there.
-const DEPOSIT_TOKEN_GAS: u64 = 136_102;
+const DEPOSIT_TOKEN_GAS: u64 = 158_619;
 /// Gas of a `deposit` that burns a wrapped token on the other side.
-const WITHDRAW_GAS: u64 = 56_186;
+const WITHDRAW_GAS: u64 = 78_509;
 /// Gas of the guardian's `freezeQueued` of a queued transfer (spec 21 §8).
 const FREEZE_GAS: u64 = 32_502;
 /// Gas of the owner's `cancelQueued` of a queued mint under a mint limit.
-const CANCEL_MINT_GAS: u64 = 51_116;
+const CANCEL_MINT_GAS: u64 = 51_105;
 /// Gas of the owner's `cancelQueued` of a queued release under a release limit.
-const CANCEL_RELEASE_GAS: u64 = 53_036;
+const CANCEL_RELEASE_GAS: u64 = 53_130;
+/// Gas of the owner's `refundQueued` of a queued mint under a mint limit: the
+/// cancellation and the `REFUND` sent through the stand-in.
+const REFUND_MINT_GAS: u64 = 61_888;
+/// Gas of the owner's `refundQueued` of a queued release under a release limit.
+const REFUND_RELEASE_GAS: u64 = 67_846;
 
 fn ok(outcome: &Outcome) {
     assert!(outcome.success, "{outcome:?}");
+}
+
+/// Whether `outcome` logged the event `signature`.
+fn logged(outcome: &Outcome, signature: &str) -> bool {
+    let topic = keccak256(signature.as_bytes());
+    outcome.logs.iter().any(|l| l.data.topics()[0].0 == topic)
 }
 
 fn reverted_with(outcome: &Outcome, error: &str) {
@@ -134,9 +149,18 @@ struct World {
     pending: Vec<Pending>,
     /// Transfers queued and not executed yet: `(gateway, id, ready at)`.
     queued: Vec<([u8; 20], u64, u64)>,
-    /// What owners cancelled out of the queue of honest transfers, by the
-    /// token's home gateway and the token: it stays locked there.
-    retired: std::collections::BTreeMap<([u8; 20], [u8; 20]), u128>,
+    /// What owners cancelled out of the queue of honest transfers without a
+    /// refund, by the token's home gateway and the token: it stays locked
+    /// there.
+    retired: BTreeMap<([u8; 20], [u8; 20]), u128>,
+    /// Queued transfers that forged messages made, as `(gateway, id)`.
+    forged_entries: BTreeSet<([u8; 20], u64)>,
+    /// What forged transfers still queued took, by the token's home gateway
+    /// and the token: a forged mint's amount queued away from home, a
+    /// forged release's taken out of `locked` at home.
+    forged_out: BTreeMap<([u8; 20], [u8; 20]), u128>,
+    /// The nonces of forged messages, whose refunds the home gateway refuses.
+    forged_nonces: BTreeSet<u64>,
 }
 
 impl World {
@@ -208,7 +232,10 @@ impl World {
             stk,
             pending: Vec::new(),
             queued: Vec::new(),
-            retired: std::collections::BTreeMap::new(),
+            retired: BTreeMap::new(),
+            forged_entries: BTreeSet::new(),
+            forged_out: BTreeMap::new(),
+            forged_nonces: BTreeSet::new(),
         };
         for (gateway, token) in [
             (on_eth, NATIVE),
@@ -250,8 +277,9 @@ impl World {
         self.record(o)
     }
 
-    /// The kind, token and amount of queued transfer `id` at `gateway`.
-    fn queued_entry(&mut self, gateway: [u8; 20], id: u64) -> (u64, [u8; 20], u128) {
+    /// Queued transfer `id` at `gateway`: its kind, token, amount, whether
+    /// a refund queued it, and its message's nonce.
+    fn queued_entry(&mut self, gateway: [u8; 20], id: u64) -> Entry {
         let out = self
             .eth
             .view(
@@ -260,35 +288,78 @@ impl World {
                 &abi::call("queued(uint256)", &[Value::uint(u128::from(id))]),
             )
             .output;
-        let token = out[12..32].try_into().unwrap();
-        let amount = u128::from_be_bytes(out[7 * 32 + 16..8 * 32].try_into().unwrap());
-        (word_u64(&out[32..64]), token, amount)
+        Entry {
+            kind: word_u64(&out[32..64]),
+            token: out[12..32].try_into().unwrap(),
+            amount: u128::from_be_bytes(out[8 * 32 + 16..9 * 32].try_into().unwrap()),
+            refund: word_u64(&out[3 * 32..4 * 32]) == 1,
+            nonce: word_u64(&out[4 * 32..5 * 32]),
+        }
     }
 
-    /// The owner cancels queued transfer `i` of [`World::queued`], an
-    /// honest one: what it carried stays locked at the token's home.
+    /// The home gateway of the token of a queued transfer of `kind` at
+    /// `gateway`: a mint's token is at home on the other side, a release's
+    /// here.
+    fn home_of(&self, gateway: [u8; 20], kind: u64) -> [u8; 20] {
+        match (kind, gateway == self.on_eth) {
+            (1, true) | (2, false) => self.on_solo,
+            _ => self.on_eth,
+        }
+    }
+
+    /// The owner cancels queued transfer `i` of [`World::queued`]: what an
+    /// honest one carried stays locked at the token's home, and a forged one
+    /// is gone.
     fn cancel(&mut self, i: usize) -> Outcome {
         let (gateway, id, _) = self.queued[i];
-        let (kind, token, amount) = self.queued_entry(gateway, id);
+        let e = self.queued_entry(gateway, id);
         let o = self.eth.call(OWNER, gateway, &cancel_queued_calldata(id));
         if o.success {
             self.queued.remove(i);
-            // A mint's token is at home on the other side; a release's here.
-            let home = match (kind, gateway == self.on_eth) {
-                (1, true) | (2, false) => self.on_solo,
-                _ => self.on_eth,
-            };
-            *self.retired.entry((home, token)).or_default() += amount;
+            let home = self.home_of(gateway, e.kind);
+            if self.forged_entries.remove(&(gateway, id)) {
+                *self.forged_out.get_mut(&(home, e.token)).unwrap() -= e.amount;
+            } else {
+                *self.retired.entry((home, e.token)).or_default() += e.amount;
+            }
         }
         o
     }
 
+    /// The owner cancels queued transfer `i` of [`World::queued`] and
+    /// refunds it: an honest one's value is in flight back to its sender,
+    /// and a forged one is gone, its refund to be refused.
+    fn refund(&mut self, i: usize) -> Outcome {
+        let (gateway, id, _) = self.queued[i];
+        let e = self.queued_entry(gateway, id);
+        let o = self.eth.call(OWNER, gateway, &refund_queued_calldata(id));
+        if o.success {
+            self.queued.remove(i);
+            if self.forged_entries.remove(&(gateway, id)) {
+                let home = self.home_of(gateway, e.kind);
+                *self.forged_out.get_mut(&(home, e.token)).unwrap() -= e.amount;
+            }
+        }
+        self.record(o)
+    }
+
     /// Delivers a message the paired gateway never sent, as a channel that
-    /// failed would: it is not in flight.
+    /// failed would: it is not in flight. What it queues is counted as
+    /// forged until the owner cancels or refunds it.
     fn forge(&mut self, p: &Pending) -> Outcome {
         let data = self.delivery(p);
         let o = self.eth.call(RELAYER, self.messenger, &data);
-        self.record(o)
+        let before = self.queued.len();
+        let o = self.record(o);
+        self.forged_nonces.insert(p.nonce);
+        let added: Vec<_> = self.queued.iter().skip(before).copied().collect();
+        for (gateway, id, _) in added {
+            let e = self.queued_entry(gateway, id);
+            let home = self.home_of(gateway, e.kind);
+            self.forged_entries.insert((gateway, id));
+            *self.forged_out.entry((home, e.token)).or_default() += e.amount;
+        }
+        o
     }
 
     /// Lets time pass until every queued transfer is ready and executes them.
@@ -380,6 +451,16 @@ impl World {
         self.u128_view(token, &abi::call("totalSupply()", &[]))
     }
 
+    /// What `gateway` recorded of the message it sent with `nonce`.
+    fn sent(&mut self, gateway: [u8; 20], nonce: u64) -> [u8; 32] {
+        let data = abi::call("sent(uint64)", &[Value::uint(u128::from(nonce))]);
+        self.eth
+            .view(RELAYER, gateway, &data)
+            .output
+            .try_into()
+            .unwrap()
+    }
+
     fn gateway_view(&mut self, gateway: [u8; 20], signature: &str, token: [u8; 20]) -> u128 {
         self.u128_view(gateway, &address_view(signature, &token))
     }
@@ -417,20 +498,50 @@ impl World {
                 {
                     Some(amount)
                 }
+                // An honest refund of a mint comes home to be released; of a
+                // release, it leaves home to be minted again.
+                TokenMessage::Refund {
+                    nonce,
+                    kind,
+                    token,
+                    amount,
+                    ..
+                } if token == origin
+                    && !self.forged_nonces.contains(&nonce)
+                    && ((kind == 1 && p.recipient == home) || (kind == 2 && p.sender == home)) =>
+                {
+                    Some(amount)
+                }
                 _ => None,
             })
             .sum();
         let mints_queued = self.gateway_view(away, "mintsQueued(address)", origin);
         let releases_queued = self.gateway_view(home, "releasesQueued(address)", origin);
         let retired = self.retired.get(&(home, origin)).copied().unwrap_or(0);
-        assert!(minted <= locked, "minted {minted} > locked {locked}");
-        assert_eq!(locked, minted + in_flight + mints_queued + retired);
+        // What forged transfers still queued took counts on the locked side:
+        // their owner cancels or refunds them, and both restore it.
+        let forged = self.forged_out.get(&(home, origin)).copied().unwrap_or(0);
+        assert!(
+            minted <= locked + forged,
+            "minted {minted} > locked {locked}"
+        );
+        assert_eq!(locked + forged, minted + in_flight + mints_queued + retired);
         let owed: u128 = recipients.iter().map(|r| self.owed(home, origin, *r)).sum();
         assert_eq!(
             self.balance_of(origin, home),
             locked + owed + releases_queued
         );
     }
+}
+
+/// A queued transfer as the gateway's `queued(id)` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Entry {
+    kind: u64,
+    token: [u8; 20],
+    amount: u128,
+    refund: bool,
+    nonce: u64,
 }
 
 /// The wrapped token of `origin` that `gateway` creates.
@@ -1180,9 +1291,10 @@ fn transfers_over_the_rate_limit_wait_in_the_queue() {
     assert_eq!(queued.output[12..32], NATIVE);
     assert_eq!(word_u64(&queued.output[32..64]), 1);
     assert_eq!(word_u64(&queued.output[64..96]), 0);
-    assert_eq!(queued.output[6 * 32 + 12..7 * 32], CAROL);
+    assert_eq!(word_u64(&queued.output[96..128]), 0);
+    assert_eq!(queued.output[7 * 32 + 12..8 * 32], CAROL);
     assert_eq!(
-        u128::from_be_bytes(queued.output[7 * 32 + 16..8 * 32].try_into().unwrap()),
+        u128::from_be_bytes(queued.output[8 * 32 + 16..9 * 32].try_into().unwrap()),
         25 * ETHER
     );
     // Not before its time, not twice, not an id never queued, not while paused.
@@ -1376,12 +1488,14 @@ fn one_queued_transfer_is_frozen_or_cancelled_alone() {
     // invariant holds exactly as it did before the forgery.
     ok(&w.eth.call(OWNER, on_solo, &unfreeze_queued_calldata(2)));
     ok(&w.eth.call(OWNER, on_solo, &freeze));
-    let cancelled = w.eth.call(OWNER, on_solo, &cancel_queued_calldata(2));
+    assert_eq!(w.queued.len(), 1);
+    let cancelled = w.cancel(0);
     ok(&cancelled);
     assert_eq!(cancelled.gas, CANCEL_MINT_GAS);
-    let topic = keccak256(b"QueueCancelled(uint256,uint64,uint8,address,address,address,uint256)");
-    assert!(cancelled.logs.iter().any(|l| l.data.topics()[0].0 == topic));
-    w.queued.clear();
+    assert!(logged(
+        &cancelled,
+        "QueueCancelled(uint256,uint64,uint8,address,address,address,uint256)"
+    ));
     assert_eq!(w.gateway_view(on_solo, "mintsQueued(address)", NATIVE), 0);
     assert_eq!(w.balance_of(weth, STRANGER), 0);
     w.check(on_eth, NATIVE, &[]);
@@ -1419,7 +1533,7 @@ fn one_queued_transfer_is_frozen_or_cancelled_alone() {
     let (_, id, _) = w.queued[0];
     ok(&w.eth.call(GUARDIAN, on_eth, &freeze_queued_calldata(id)));
     assert_eq!(w.cancel(0).gas, CANCEL_RELEASE_GAS);
-    w.retired.clear();
+    assert!(w.retired.is_empty());
     assert_eq!(w.gateway_view(on_eth, "locked(address)", NATIVE), locked);
     ok(&w.deposit(BOB, on_solo, weth, DAVE, ETHER / 2));
     w.deliver_all();
@@ -1444,6 +1558,182 @@ fn one_queued_transfer_is_frozen_or_cancelled_alone() {
     ok(&w.cancel(0));
     assert_eq!(w.retired.get(&(on_eth, NATIVE)), Some(&(4 * ETHER)));
     w.check(on_eth, NATIVE, &[]);
+
+    // Refunded instead, an honest transfer goes back to its sender, because
+    // its home gateway recorded sending it: a cancelled mint's ETH is
+    // released to Alice on Ethereum, a cancelled release's burned ETH is
+    // minted to Bob on Solo again. Releases now queue above 0.1 ETH.
+    ok(&w.eth.call(
+        OWNER,
+        on_eth,
+        &set_release_limit_calldata(&NATIVE, ETHER / 10, 1_000),
+    ));
+    let (alice, bob) = (w.eth.balance(ALICE), w.balance_of(weth, BOB));
+    ok(&w.deposit(BOB, on_solo, weth, DAVE, ETHER / 2));
+    ok(&w.deposit(ALICE, on_eth, NATIVE, CAROL, 3 * ETHER));
+    let mint_nonce = w.pending[1].nonce;
+    let identity = |kind: u8, from: [u8; 20], to: [u8; 20], amount: u128| {
+        keccak256(&abi::encode(&[
+            Value::uint(u128::from(kind)),
+            Value::address(&NATIVE),
+            Value::address(&from),
+            Value::address(&to),
+            Value::uint(amount),
+        ]))
+    };
+    assert_eq!(
+        w.sent(on_eth, mint_nonce),
+        identity(1, ALICE, CAROL, 3 * ETHER)
+    );
+    let release_nonce = w.pending[0].nonce;
+    assert_eq!(
+        w.sent(on_solo, release_nonce),
+        identity(2, BOB, DAVE, ETHER / 2)
+    );
+    assert_eq!(w.sent(on_eth, release_nonce), [0; 32]);
+    w.deliver_all();
+    assert_eq!(
+        w.queued.iter().map(|q| q.0).collect::<Vec<_>>(),
+        [on_eth, on_solo]
+    );
+    // Only the owner refunds, and only what is queued.
+    let (_, mint_id, _) = w.queued[1];
+    for who in [STRANGER, GUARDIAN] {
+        reverted_with(
+            &w.eth.call(who, on_solo, &refund_queued_calldata(mint_id)),
+            "NotOwner()",
+        );
+    }
+    reverted_with(
+        &w.eth.call(OWNER, on_solo, &refund_queued_calldata(99)),
+        "NothingQueued()",
+    );
+    let refunded = w.refund(1);
+    ok(&refunded);
+    assert_eq!(refunded.gas, REFUND_MINT_GAS);
+    assert!(logged(&refunded, "RefundRequested(uint256,uint64,uint64)"));
+    let back = w.pending[0].clone();
+    assert_eq!(
+        TokenMessage::decode(&back.payload),
+        Some(TokenMessage::Refund {
+            nonce: mint_nonce,
+            kind: 1,
+            token: NATIVE,
+            from: ALICE,
+            to: CAROL,
+            amount: 3 * ETHER,
+        })
+    );
+    assert_eq!((back.sender, back.recipient), (on_solo, on_eth));
+    w.check(on_eth, NATIVE, &[]);
+    let refunded = w.refund(0);
+    ok(&refunded);
+    assert_eq!(refunded.gas, REFUND_RELEASE_GAS);
+    w.check(on_eth, NATIVE, &[]);
+    let paid = w.deliver(0);
+    ok(&paid);
+    assert!(logged(&paid, "Refunded(uint64,uint64)"));
+    w.deliver_all();
+    w.check(on_eth, NATIVE, &[]);
+    assert_eq!(w.sent(on_eth, mint_nonce), [0; 32]);
+    assert_eq!(w.sent(on_solo, release_nonce), [0; 32]);
+    // Alice's refund waits for the release limit; a transfer that a refund
+    // queued is not refunded in turn.
+    let i = w.queued.iter().position(|q| q.0 == on_eth).unwrap();
+    let (_, id, _) = w.queued[i];
+    let entry = w.queued_entry(on_eth, id);
+    assert!(entry.refund);
+    assert_eq!((entry.amount, entry.nonce), (3 * ETHER, back.nonce));
+    reverted_with(
+        &w.eth.call(OWNER, on_eth, &refund_queued_calldata(id)),
+        "NotRefundable()",
+    );
+    w.execute_all();
+    assert_eq!(w.eth.balance(ALICE), alice);
+    assert_eq!(w.balance_of(weth, BOB), bob);
+    assert_eq!(w.eth.balance(CAROL), 0);
+    w.check(on_eth, NATIVE, &[]);
+    // Paid once: the same refund delivered again, as no channel does, is
+    // refused, and the message counts as delivered.
+    let again = w.forge(&back);
+    ok(&again);
+    assert!(logged(&again, "RefundRefused(uint64,uint64)"));
+    assert_eq!(w.eth.balance(ALICE), alice);
+
+    // A refund of a forged transfer pays nothing, whatever it names: a mint
+    // no deposit locked, a release no burn freed, and a mint that takes the
+    // nonce of a message really sent but asks more than it did. The
+    // undelivered honest message whose nonce the forgery took is lost to the
+    // channel and stays locked, as a vetoed one does.
+    ok(&w.deposit(ALICE, on_eth, NATIVE, BOB, ETHER));
+    let taken = w.pending.pop().unwrap();
+    *w.retired.entry((on_eth, NATIVE)).or_default() += ETHER;
+    let forgeries = [
+        Pending {
+            nonce: 1_002,
+            sender: on_eth,
+            recipient: on_solo,
+            payload: TokenMessage::Mint {
+                origin: NATIVE,
+                from: STRANGER,
+                to: STRANGER,
+                amount: 40 * ETHER,
+                name: b"Ether".to_vec(),
+                symbol: b"ETH".to_vec(),
+                decimals: 18,
+            }
+            .encode(),
+        },
+        Pending {
+            nonce: 1_003,
+            sender: on_solo,
+            recipient: on_eth,
+            payload: TokenMessage::Release {
+                token: NATIVE,
+                from: STRANGER,
+                to: STRANGER,
+                amount: 4 * ETHER,
+            }
+            .encode(),
+        },
+        Pending {
+            nonce: taken.nonce,
+            sender: on_eth,
+            recipient: on_solo,
+            payload: TokenMessage::Mint {
+                origin: NATIVE,
+                from: ALICE,
+                to: BOB,
+                amount: 30 * ETHER,
+                name: b"Ether".to_vec(),
+                symbol: b"ETH".to_vec(),
+                decimals: 18,
+            }
+            .encode(),
+        },
+    ];
+    let locked = w.gateway_view(on_eth, "locked(address)", NATIVE);
+    let supply = w.supply(weth);
+    for forged in &forgeries {
+        ok(&w.forge(forged));
+        let (gateway, id, _) = *w.queued.last().unwrap();
+        ok(&w.eth.call(GUARDIAN, gateway, &freeze_queued_calldata(id)));
+        w.check(on_eth, NATIVE, &[]);
+        ok(&w.refund(w.queued.len() - 1));
+        w.check(on_eth, NATIVE, &[]);
+        let refused = w.deliver(0);
+        ok(&refused);
+        assert!(logged(&refused, "RefundRefused(uint64,uint64)"));
+        assert!(!logged(&refused, "Refunded(uint64,uint64)"));
+        w.check(on_eth, NATIVE, &[]);
+    }
+    assert!(w.queued.is_empty() && w.pending.is_empty());
+    assert_eq!(w.gateway_view(on_eth, "locked(address)", NATIVE), locked);
+    assert_eq!(w.supply(weth), supply);
+    assert_eq!(w.eth.balance(STRANGER), 0);
+    assert_eq!(w.eth.balance(ALICE), alice - ETHER);
+    // The honest message's record stays: nothing refunded it.
+    assert_eq!(w.sent(on_eth, taken.nonce), identity(1, ALICE, BOB, ETHER));
 }
 
 /// A deterministic generator for the randomized run.
@@ -1508,8 +1798,12 @@ fn locked_always_covers_what_is_minted() {
     let mut executed = 0;
     let mut cancelled = 0;
     let mut refused_frozen = 0;
+    let mut refunded = 0;
+    let mut refunds_paid = 0;
+    let mut refunds_refused = 0;
+    let mut forged_nonce = 1_000_000;
     for _ in 0..600 {
-        let op = rng.below(17);
+        let op = rng.below(18);
         let amount =
             u128::from(rng.below(5_000) + 1) * if rng.below(2) == 0 { 1 } else { ETHER / 1_000 };
         match op {
@@ -1547,8 +1841,15 @@ fn locked_always_covers_what_is_minted() {
             }
             5..=8 if !w.pending.is_empty() => {
                 let i = usize::try_from(rng.below(w.pending.len() as u64)).unwrap();
-                if w.deliver(i).success {
+                let o = w.deliver(i);
+                if o.success {
                     delivered += 1;
+                }
+                if logged(&o, "Refunded(uint64,uint64)") {
+                    refunds_paid += 1;
+                }
+                if logged(&o, "RefundRefused(uint64,uint64)") {
+                    refunds_refused += 1;
                 }
             }
             9 => {
@@ -1587,14 +1888,67 @@ fn locked_always_covers_what_is_minted() {
                 let (gateway, id, _) = rng.pick(&w.queued);
                 ok(&w.eth.call(GUARDIAN, gateway, &freeze_queued_calldata(id)));
             }
+            // The owner never unfreezes a forgery.
             15 if !w.queued.is_empty() => {
                 let (gateway, id, _) = rng.pick(&w.queued);
-                ok(&w.eth.call(OWNER, gateway, &unfreeze_queued_calldata(id)));
+                if !w.forged_entries.contains(&(gateway, id)) {
+                    ok(&w.eth.call(OWNER, gateway, &unfreeze_queued_calldata(id)));
+                }
             }
-            16 if !w.queued.is_empty() && rng.below(8) == 0 => {
+            // The owner cancels one, or refunds it to its sender, which a
+            // transfer that a refund queued refuses.
+            16 if !w.queued.is_empty() && rng.below(4) == 0 => {
                 let i = usize::try_from(rng.below(w.queued.len() as u64)).unwrap();
-                ok(&w.cancel(i));
-                cancelled += 1;
+                let (gateway, id, _) = w.queued[i];
+                let refund = w.queued_entry(gateway, id).refund;
+                if rng.below(3) == 0 {
+                    ok(&w.cancel(i));
+                    cancelled += 1;
+                } else if refund {
+                    reverted_with(&w.refund(i), "NotRefundable()");
+                } else {
+                    ok(&w.refund(i));
+                    refunded += 1;
+                }
+            }
+            // A channel delivers a forged mint or release, over its limit so
+            // that it queues, and the guardian freezes it at once.
+            17 => {
+                let (home, origin) = rng.pick(&homes);
+                let away = if home == on_eth { on_solo } else { on_eth };
+                let amount = ETHER / 2 + amount;
+                let (sender, recipient, payload) = if rng.below(2) == 0 {
+                    let mint = TokenMessage::Mint {
+                        origin,
+                        from: STRANGER,
+                        to: STRANGER,
+                        amount,
+                        name: b"Forged".to_vec(),
+                        symbol: b"F".to_vec(),
+                        decimals: 18,
+                    };
+                    (home, away, mint)
+                } else {
+                    let release = TokenMessage::Release {
+                        token: origin,
+                        from: STRANGER,
+                        to: STRANGER,
+                        amount,
+                    };
+                    (away, home, release)
+                };
+                forged_nonce += 1;
+                let forged = Pending {
+                    nonce: forged_nonce,
+                    sender,
+                    recipient,
+                    payload: payload.encode(),
+                };
+                if w.forge(&forged).success {
+                    let (gateway, id, _) = *w.queued.last().unwrap();
+                    assert!(gateway == recipient && w.forged_entries.contains(&(gateway, id)));
+                    ok(&w.eth.call(GUARDIAN, gateway, &freeze_queued_calldata(id)));
+                }
             }
             _ => {
                 let (gateway, token) = rng.pick(&homes);
@@ -1624,7 +1978,19 @@ fn locked_always_covers_what_is_minted() {
     assert!(executed >= 10, "{executed}");
     assert!(cancelled >= 3, "{cancelled}");
     assert!(refused_frozen >= 1, "{refused_frozen}");
-    // Every transfer still queued runs once unfrozen.
+    assert!(refunded >= 5, "{refunded}");
+    assert!(refunds_paid >= 2, "{refunds_paid}");
+    assert!(refunds_refused >= 2, "{refunds_refused}");
+    // The owner refunds the forgeries still queued, and every other transfer
+    // still queued runs once unfrozen.
+    while let Some(i) = w
+        .queued
+        .iter()
+        .position(|(gateway, id, _)| w.forged_entries.contains(&(*gateway, *id)))
+    {
+        ok(&w.refund(i));
+    }
+    assert!(w.forged_out.values().all(|v| *v == 0));
     for (gateway, id, _) in w.queued.clone() {
         ok(&w.eth.call(OWNER, gateway, &unfreeze_queued_calldata(id)));
     }

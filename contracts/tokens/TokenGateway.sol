@@ -23,6 +23,10 @@ abstract contract TokenGateway {
     /// @notice Message kind: the sending gateway exists; its flag says whether it has heard from the
     /// receiving gateway, which answers if it has not.
     uint8 public constant HELLO = 3;
+    /// @notice Message kind: give back to its sender the value of a `MINT` or `RELEASE` this gateway
+    /// sent, which the receiving gateway queued and its owner cancelled; paid only if this gateway
+    /// recorded sending exactly that message and has not refunded it.
+    uint8 public constant REFUND = 4;
     /// @notice The token address that stands for the chain's native currency.
     address public constant NATIVE = address(0);
     /// @notice Gas a release gives the token's `transfer`, or the recipient of native currency.
@@ -79,11 +83,13 @@ abstract contract TokenGateway {
 
     /// @notice A mint or release over its limit, waiting until `readyAt` for anyone to execute it.
     /// `token` is the origin of a mint, the native token of a release. A frozen one waits until the
-    /// owner unfreezes or cancels it.
+    /// owner unfreezes or cancels it. `refund` marks one that a `REFUND` queued, which is not refunded
+    /// in turn.
     struct Transfer {
         address token;
         uint8 kind;
         bool frozen;
+        bool refund;
         uint64 nonce;
         uint64 readyAt;
         address from;
@@ -105,6 +111,10 @@ abstract contract TokenGateway {
     /// @notice Amount of each wrapped token (by its origin) waiting in the queue to be minted, which
     /// its mint cap counts.
     mapping(address origin => uint256) public mintsQueued;
+    /// @notice What each `MINT` and `RELEASE` this gateway sent asked, by the channel's nonce:
+    /// `keccak256(abi.encode(kind, token, from, to, amount))`, `token` as the message names it.
+    /// Cleared when a refund of the message is paid, so that it is paid once.
+    mapping(uint64 nonce => bytes32) public sent;
 
     uint256 private transient entered;
 
@@ -129,6 +139,9 @@ abstract contract TokenGateway {
     event QueueCancelled(
         uint256 indexed id, uint64 indexed nonce, uint8 kind, address token, address from, address to, uint256 amount
     );
+    event RefundRequested(uint256 indexed id, uint64 indexed nonce, uint64 refundNonce);
+    event Refunded(uint64 indexed nonce, uint64 indexed original);
+    event RefundRefused(uint64 indexed nonce, uint64 indexed original);
     event PeerConfirmed();
     event Paused(address indexed by);
     event Unpaused();
@@ -154,6 +167,7 @@ abstract contract TokenGateway {
     error NothingQueued();
     error NotReady(uint64 readyAt);
     error Frozen();
+    error NotRefundable();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -203,10 +217,12 @@ abstract contract TokenGateway {
         if (to == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
         bytes memory payload;
+        bytes32 identity;
         if (isWrapped[token]) {
             if (msg.value != 0) revert WrongValue();
             BridgedToken(token).burn(msg.sender, amount);
             payload = abi.encode(RELEASE, originOf[token], msg.sender, to, amount);
+            identity = keccak256(payload);
         } else {
             uint256 total = locked[token] + amount;
             if (total > lockCap[token]) revert CapExceeded(token);
@@ -222,8 +238,10 @@ abstract contract TokenGateway {
             locked[token] = total;
             (string memory name, string memory symbol, uint8 decimals) = _metadata(token);
             payload = abi.encode(MINT, token, msg.sender, to, amount, name, symbol, decimals);
+            identity = keccak256(abi.encode(MINT, token, msg.sender, to, amount));
         }
         nonce = _send(payload);
+        sent[nonce] = identity;
         emit Deposited(nonce, token, msg.sender, to, amount);
     }
 
@@ -278,20 +296,23 @@ abstract contract TokenGateway {
     /// freeing its room under the mint cap, a release goes back into `locked`, and the limit gets back
     /// what the transfer took of it. Nothing is sent to anyone. For a forged message this restores the
     /// gateway as it was before, so honest transfers are not held behind it; for an honest one the
-    /// value stays held where it was locked, as for a vetoed message. The owner.
+    /// value stays held where it was locked, as for a vetoed message, unless the owner refunds it
+    /// instead (`refundQueued`). The owner.
     function cancelQueued(uint256 id) external onlyOwner {
+        _cancel(id, queued[id]);
+    }
+
+    /// @notice Cancels queued transfer `id` as `cancelQueued` does, then asks the paired gateway,
+    /// which sent its message, to give the value back to the message's sender: a `REFUND` naming the
+    /// message's nonce and what it asked. The paired gateway pays only for a message it recorded
+    /// sending exactly so and has not refunded, so a refund of a forged message pays nothing. Not for
+    /// a transfer that a refund queued. The owner.
+    function refundQueued(uint256 id) external onlyOwner returns (uint64 refundNonce) {
         Transfer memory t = queued[id];
-        if (t.amount == 0) revert NothingQueued();
-        delete queued[id];
-        if (t.kind == MINT) {
-            mintsQueued[t.token] -= t.amount;
-            _unschedule(mintLimit[t.token], t.amount);
-        } else {
-            releasesQueued[t.token] -= t.amount;
-            locked[t.token] += t.amount;
-            _unschedule(releaseLimit[t.token], t.amount);
-        }
-        emit QueueCancelled(id, t.nonce, t.kind, t.token, t.from, t.to, t.amount);
+        if (t.refund) revert NotRefundable();
+        _cancel(id, t);
+        refundNonce = _send(abi.encode(REFUND, t.nonce, t.kind, t.token, t.from, t.to, t.amount));
+        emit RefundRequested(id, t.nonce, refundNonce);
     }
 
     /// @notice Sends the paired gateway a `HELLO` again, while none of its messages has arrived: for a
@@ -371,35 +392,72 @@ abstract contract TokenGateway {
         if (kind == MINT) {
             (, address origin, address from, address to, uint256 amount, string memory name, string memory symbol, uint8 decimals)
             = abi.decode(payload, (uint8, address, address, address, uint256, string, string, uint8));
-            _mint(nonce, origin, from, to, amount, _wrapped(origin, name, symbol, decimals));
+            _mint(nonce, origin, from, to, amount, _wrapped(origin, name, symbol, decimals), false);
         } else if (kind == RELEASE) {
             (, address token, address from, address to, uint256 amount) =
                 abi.decode(payload, (uint8, address, address, address, uint256));
-            locked[token] -= amount;
-            uint64 readyAt = _schedule(releaseLimit[token], amount);
-            if (readyAt > block.timestamp) {
-                releasesQueued[token] += amount;
-                _queue(Transfer(token, RELEASE, false, nonce, readyAt, from, to, amount));
-            } else {
-                _release(nonce, token, from, to, amount);
-            }
+            _payOut(nonce, token, from, to, amount, false);
         } else if (kind == HELLO) {
             (, bool heard) = abi.decode(payload, (uint8, bool));
             if (!heard) _send(abi.encode(HELLO, true));
+        } else if (kind == REFUND) {
+            _refund(nonce, payload);
         } else {
             revert UnknownMessage();
         }
     }
 
+    /// @dev Pays a `REFUND` (message `nonce`) of message `original` this gateway sent, if it recorded
+    /// sending exactly what the refund names and has not refunded it: a `MINT` it sent locked the
+    /// token here, which is released to its sender; a `RELEASE` it sent burned the wrapped token,
+    /// which is minted to its sender again. Each under its limit and cap, as a release or mint is.
+    /// Anything else is refused, and the message counts as delivered.
+    function _refund(uint64 nonce, bytes calldata payload) private {
+        (, uint64 original, uint8 kind, address token, address from, address to, uint256 amount) =
+            abi.decode(payload, (uint8, uint64, uint8, address, address, address, uint256));
+        if (sent[original] != keccak256(abi.encode(kind, token, from, to, amount))) {
+            emit RefundRefused(nonce, original);
+            return;
+        }
+        delete sent[original];
+        emit Refunded(nonce, original);
+        if (kind == MINT) {
+            _payOut(nonce, token, from, from, amount, true);
+        } else {
+            _mint(nonce, token, from, from, amount, wrappedToken(token), true);
+        }
+    }
+
+    /// @dev Takes `amount` of the native `token` out of `locked` and releases it to `to`, or queues
+    /// the release if its limit does not allow it now.
+    function _payOut(uint64 nonce, address token, address from, address to, uint256 amount, bool refund) private {
+        locked[token] -= amount;
+        uint64 readyAt = _schedule(releaseLimit[token], amount);
+        if (readyAt > block.timestamp) {
+            releasesQueued[token] += amount;
+            _queue(Transfer(token, RELEASE, false, refund, nonce, readyAt, from, to, amount));
+        } else {
+            _release(nonce, token, from, to, amount);
+        }
+    }
+
     /// @dev Mints `amount` of `token`, the wrapped token of `origin`, to `to`, or queues the mint if its
     /// limit does not allow it now; refuses it over the mint cap, which counts what is queued.
-    function _mint(uint64 nonce, address origin, address from, address to, uint256 amount, address token) private {
+    function _mint(
+        uint64 nonce,
+        address origin,
+        address from,
+        address to,
+        uint256 amount,
+        address token,
+        bool refund
+    ) private {
         uint256 queuedAmount = mintsQueued[origin];
         if (BridgedToken(token).totalSupply() + queuedAmount + amount > mintCap[origin]) revert CapExceeded(origin);
         uint64 readyAt = _schedule(mintLimit[origin], amount);
         if (readyAt > block.timestamp) {
             mintsQueued[origin] = queuedAmount + amount;
-            _queue(Transfer(origin, MINT, false, nonce, readyAt, from, to, amount));
+            _queue(Transfer(origin, MINT, false, refund, nonce, readyAt, from, to, amount));
         } else {
             BridgedToken(token).mint(to, amount);
             emit Minted(nonce, origin, token, from, to, amount);
@@ -453,6 +511,21 @@ abstract contract TokenGateway {
         limit.updated = uint64(block.timestamp);
         limit.amount = amount;
         limit.window = window;
+    }
+
+    /// @dev Deletes queued transfer `id`, holding `t`, and undoes what its delivery did here.
+    function _cancel(uint256 id, Transfer memory t) private {
+        if (t.amount == 0) revert NothingQueued();
+        delete queued[id];
+        if (t.kind == MINT) {
+            mintsQueued[t.token] -= t.amount;
+            _unschedule(mintLimit[t.token], t.amount);
+        } else {
+            releasesQueued[t.token] -= t.amount;
+            locked[t.token] += t.amount;
+            _unschedule(releaseLimit[t.token], t.amount);
+        }
+        emit QueueCancelled(id, t.nonce, t.kind, t.token, t.from, t.to, t.amount);
     }
 
     function _queue(Transfer memory t) private {

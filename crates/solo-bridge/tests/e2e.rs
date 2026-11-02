@@ -30,9 +30,9 @@ use solo_abi::staking::{
 use solo_abi::{Decode, Encode};
 use solo_bridge::abi::{self, Value};
 use solo_bridge::{
-    InboxConfig, Submission, execute_calldata, finality_proof, group_key, light_client_v2_args,
-    message_hash, rotations_from, sent_messages, slot_proof, submission_covering,
-    submission_covering_key, verifier_v2_args,
+    Error, InboxConfig, Skip, Submission, execute_calldata, finality_proof, group_key,
+    light_client_v2_args, message_hash, rotations_from, sent_messages, slot_proof,
+    submission_covering, submission_covering_key, verifier_v2_args,
 };
 use solo_node::keystore::Keystore;
 use solo_node::{HISTORY_KEYS_PER_BLOCK, Node, NodeConfig, Sim, validator_id};
@@ -682,8 +682,20 @@ fn a_light_client_follows_the_group_key_across_epochs() {
     let mut latest = 0;
     for r in &rotations {
         assert_eq!(r.from, current);
-        let submission = submission_covering_key(&mut sim.nodes[0], latest + 1, current)
-            .unwrap()
+        let covering = submission_covering_key(&mut sim.nodes[0], latest + 1, current).unwrap();
+        // The newer key sets' certificates, which the client does not take yet, are passed
+        // over with the reason instead of sent to revert; at first the newest heights hold them.
+        assert!(
+            covering
+                .skipped
+                .iter()
+                .all(|(_, skip)| matches!(skip, Skip::OtherKeySet(Some(id)) if *id > current)),
+            "{:?}",
+            covering.skipped
+        );
+        assert!(current != 0 || !covering.skipped.is_empty());
+        let submission = covering
+            .submission
             .expect("a certificate of the current key");
         let outcome = eth.call(RELAYER, client, &submission.calldata());
         assert!(outcome.success, "key set {current}: {outcome:?}");
@@ -709,7 +721,13 @@ fn a_light_client_follows_the_group_key_across_epochs() {
     );
     let submission = submission_covering_key(&mut sim.nodes[0], latest + 1, current)
         .unwrap()
+        .submission
         .expect("a certificate of the newest key");
+    // A key set the chain never adopted has no group key to check against.
+    assert!(matches!(
+        submission_covering_key(&mut sim.nodes[0], latest + 1, 1_000),
+        Err(Error::UnknownKeySet(1_000))
+    ));
     assert!(eth.call(RELAYER, client, &submission.calldata()).success);
     let root = eth
         .view(
