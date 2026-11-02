@@ -1018,3 +1018,43 @@ fn a_state_sync_whose_peers_are_dropped_gives_up() {
         std::thread::sleep(Duration::from_millis(2));
     }
 }
+
+#[test]
+fn a_hello_of_another_genesis_is_heard_though_its_peer_closes_at_once() {
+    use solo_node::statesync::{StateSync, SyncConfig};
+    let keys = keys(1);
+    let dir = solo_scratch::Scratch::new("net", "foreign");
+    let mut sync = StateSync::new(SyncConfig {
+        chain_id: CHAIN_ID,
+        trust: solo_store::Trust::Genesis(Sim::validator_set(&keys)),
+        genesis_hash: None,
+        dir: dir.to_path_buf(),
+    })
+    .unwrap();
+    let mut transport =
+        Transport::bind("127.0.0.1:0", peer_key(1), CHAIN_ID, [7; 32], vec![]).unwrap();
+    let elsewhere = Chain {
+        chain_id: CHAIN_ID,
+        genesis: [8; 32],
+    };
+    // The Hello and the close arrive together, as from a node that refuses
+    // this one's genesis as soon as it reads it.
+    let mut peer = raw_peer::Wire::dial(transport.local_addr().unwrap(), elsewhere, [3; 32]);
+    peer.send_clear(&peer.hello(validator_id(&peer_key(4))));
+    drop(peer);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut clock = 0;
+    let why = loop {
+        clock += 1;
+        transport.poll_sync(&mut sync, clock);
+        if let Some(why) = transport.sync_stalled(clock) {
+            break why;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the Hello was not heard"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(why, "a peer is on a chain with another genesis block");
+}

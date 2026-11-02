@@ -341,6 +341,9 @@ struct Conn {
     /// The address this connection was dialled at, if we dialled it.
     dialled: Option<SocketAddr>,
     dead: bool,
+    /// The peer closed, or reading failed: the connection dies once the
+    /// frames it sent before are taken.
+    closed: bool,
     /// What peer exchange dialled this connection for, if it did.
     target: Option<Target>,
     /// Where an accepted connection comes from.
@@ -375,6 +378,7 @@ impl Conn {
             peer: None,
             dialled: None,
             dead: false,
+            closed: false,
             target: None,
             remote: None,
             hello_by_ms: now_ms + HANDSHAKE_MS,
@@ -393,12 +397,14 @@ impl Conn {
     }
 
     fn read(&mut self) {
-        self.dead |= !read_available(&mut self.stream, &mut self.inbuf);
+        self.closed |= !read_available(&mut self.stream, &mut self.inbuf);
     }
 
     /// The next whole frame read: the peer's `Hello` in the clear until the
     /// session is agreed, sealed frames after it. A frame that is too long,
-    /// does not open or does not decode closes the connection.
+    /// does not open or does not decode closes the connection, and so does
+    /// a closed one once its frames are taken: a peer that sends its
+    /// `Hello` and closes, as one of another genesis does, is still heard.
     fn next_frame(&mut self) -> Option<Frame> {
         if self.dead {
             return None;
@@ -407,10 +413,12 @@ impl Conn {
             Some(session) => session.open(&mut self.inbuf),
             None => take_frame(&mut self.inbuf, HELLO_LEN),
         };
-        taken.unwrap_or_else(|_| {
+        let frame = taken.unwrap_or_else(|_| {
             self.dead = true;
             None
-        })
+        });
+        self.dead |= frame.is_none() && self.closed;
+        frame
     }
 
     fn flush(&mut self) {
