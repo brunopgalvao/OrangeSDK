@@ -5,10 +5,14 @@
 //!
 //! A frame on the wire is a `u32` little-endian length followed by a
 //! [`Frame`] in the canonical encoding (spec 06 §2). The first frame on
-//! every connection is `Hello`, the second `Auth` (spec 09 §3): each end
-//! signs both ends' fresh nonces with its node key, so a peer is known by
-//! an id only once it has proved it holds that id's key. A peer on another
-//! chain, or that fails or omits the proof, is disconnected.
+//! every connection is `Hello`, in the clear, with a fresh nonce and a
+//! fresh key; every frame after it is sealed under the session the two
+//! fresh keys agree (spec 09 §3a, [`crate::session`]). The second is
+//! `Auth` (spec 09 §3): each end signs both ends' nonces and fresh keys with
+//! its node key, so a peer is known by an id only once it has proved it
+//! holds that id's key, and the session is bound to that proof. A peer on
+//! another chain or protocol version, that fails or omits the proof, or
+//! whose frame does not open, is disconnected.
 //!
 //! With [`Transport::enable_discovery`] a node also runs peer exchange
 //! (spec 09 §5a): it trades signed address records with its peers, keeps
@@ -31,10 +35,15 @@ use solo_metrics::{Direction, Traffic};
 use crate::extension::Outbound;
 use crate::node::{Node, NodeError};
 use crate::peers::{self, PeerRecord, PeerTable};
+use crate::session::{Ephemeral, Session, Side, VERSION};
 use crate::statesync::StateSync;
 
-/// Largest frame accepted, in bytes.
+/// Largest frame accepted, in bytes, before it is sealed (spec 09 §2).
 pub const MAX_FRAME: usize = 16 << 20;
+
+/// Length of an encoded `Hello`, the one frame sent in the clear; a longer
+/// frame before the session is agreed closes the connection.
+pub const HELLO_LEN: usize = 1 + 2 + 32 + 8 + 32 + 32 + 33;
 
 /// How often a lost outbound peer is redialled.
 pub const REDIAL_MS: u64 = 500;
@@ -52,20 +61,20 @@ pub const SYNC_PEER_WAIT_MS: u64 = 60_000;
 /// Domain of a handshake's signature.
 const HELLO_DOMAIN: &[u8] = b"SOLO-HELLO";
 
-/// What an end's `Auth` signs (spec 09 §3):
-/// `keccak256("SOLO-HELLO" ‖ chain_id ‖ genesis ‖ signer_nonce ‖ verifier_nonce)`.
+/// What an end's `Auth` signs (spec 09 §3): `keccak256("SOLO-HELLO" ‖
+/// version ‖ chain_id ‖ genesis ‖ signer_nonce ‖ verifier_nonce ‖
+/// signer_ephemeral ‖ verifier_ephemeral)`, where `signer` is what the
+/// signer's `Hello` committed to and `verifier` what the other end's did.
 #[must_use]
-pub fn hello_digest(
-    chain_id: u64,
-    genesis: &[u8; 32],
-    signer_nonce: &[u8; 32],
-    verifier_nonce: &[u8; 32],
-) -> [u8; 32] {
+pub fn hello_digest(chain_id: u64, genesis: &[u8; 32], signer: &Side, verifier: &Side) -> [u8; 32] {
     let mut preimage = HELLO_DOMAIN.to_vec();
+    preimage.extend_from_slice(&VERSION.to_le_bytes());
     preimage.extend_from_slice(&chain_id.to_le_bytes());
     preimage.extend_from_slice(genesis);
-    preimage.extend_from_slice(signer_nonce);
-    preimage.extend_from_slice(verifier_nonce);
+    preimage.extend_from_slice(&signer.nonce);
+    preimage.extend_from_slice(&verifier.nonce);
+    preimage.extend_from_slice(&signer.ephemeral);
+    preimage.extend_from_slice(&verifier.ephemeral);
     solo_host::hash::keccak256(&preimage)
 }
 
@@ -92,10 +101,12 @@ pub fn fresh_key() -> std::io::Result<k256::ecdsa::SigningKey> {
 #[allow(missing_docs)]
 pub enum Frame {
     Hello {
+        version: u16,
         id: [u8; 32],
         chain_id: u64,
         genesis: [u8; 32],
         nonce: [u8; 32],
+        ephemeral: [u8; 33],
     },
     Message {
         topic: u16,
@@ -133,13 +144,16 @@ impl Encode for Frame {
     fn encode(&self, e: &mut Encoder) {
         match self {
             Frame::Hello {
+                version,
                 id,
                 chain_id,
                 genesis,
                 nonce,
+                ephemeral,
             } => {
                 e.raw(&[0]);
-                e.put(id).put(chain_id).put(genesis).put(nonce);
+                e.put(version).put(id).put(chain_id).put(genesis);
+                e.put(nonce).put(ephemeral);
             }
             Frame::Message { topic, payload } => {
                 e.raw(&[1]);
@@ -196,10 +210,12 @@ impl Decode for Frame {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         Ok(match d.raw(1)?[0] {
             0 => Frame::Hello {
+                version: d.get()?,
                 id: d.get()?,
                 chain_id: d.get()?,
                 genesis: d.get()?,
                 nonce: d.get()?,
+                ephemeral: d.get()?,
             },
             1 => Frame::Message {
                 topic: d.get()?,
@@ -249,21 +265,34 @@ pub fn frame_bytes(frame: &Frame) -> Vec<u8> {
 /// A message naming the problem.
 pub fn take_frames(buf: &mut Vec<u8>) -> Result<Vec<Frame>, String> {
     let mut frames = Vec::new();
-    while let Some(header) = buf.get(..4) {
-        let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        if len > MAX_FRAME {
-            return Err(format!("frame of {len} bytes exceeds the limit"));
-        }
-        if buf.len() < 4 + len {
-            break;
-        }
-        let Ok(frame) = Frame::from_bytes(&buf[4..4 + len]) else {
-            return Err("undecodable frame".to_owned());
-        };
+    while let Some(frame) = take_frame(buf, MAX_FRAME)? {
         frames.push(frame);
-        buf.drain(..4 + len);
     }
     Ok(frames)
+}
+
+/// Splits the frame in the clear at the front of `buf` off it, if it is all
+/// there. `Err` means the stream is unusable (a frame longer than `max`, or
+/// one that does not decode) and the connection must close.
+///
+/// # Errors
+/// A message naming the problem.
+pub fn take_frame(buf: &mut Vec<u8>, max: usize) -> Result<Option<Frame>, String> {
+    let Some(header) = buf.get(..4) else {
+        return Ok(None);
+    };
+    let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    if len > max {
+        return Err(format!("frame of {len} bytes exceeds the limit"));
+    }
+    if buf.len() < 4 + len {
+        return Ok(None);
+    }
+    let Ok(frame) = Frame::from_bytes(&buf[4..4 + len]) else {
+        return Err("undecodable frame".to_owned());
+    };
+    buf.drain(..4 + len);
+    Ok(Some(frame))
 }
 
 /// Reads everything available into `inbuf`. Returns `false` once the peer
@@ -298,10 +327,15 @@ struct Conn {
     stream: TcpStream,
     inbuf: Vec<u8>,
     outbuf: Vec<u8>,
-    /// This end's nonce for the connection's handshake.
-    nonce: [u8; 32],
-    /// The id and nonce the peer's `Hello` named, until its `Auth` proves them.
-    claimed: Option<([u8; 32], [u8; 32])>,
+    /// What this end's `Hello` committed it to: its nonce and fresh key.
+    side: Side,
+    /// This end's fresh secret, until the peer's `Hello` agrees the session.
+    ephemeral: Option<Ephemeral>,
+    /// The keys every frame after the `Hello`s is sealed with (spec 09 §3a).
+    session: Option<Session>,
+    /// The id the peer's `Hello` named and what it committed to, until its
+    /// `Auth` proves them.
+    claimed: Option<([u8; 32], Side)>,
     /// The peer, once its handshake completed (spec 09 §3).
     peer: Option<[u8; 32]>,
     /// The address this connection was dialled at, if we dialled it.
@@ -321,14 +355,22 @@ struct Conn {
 }
 
 impl Conn {
-    fn new(stream: TcpStream, nonce: [u8; 32], hello: &Frame, now_ms: u64) -> Conn {
+    fn new(
+        stream: TcpStream,
+        side: Side,
+        ephemeral: Ephemeral,
+        hello: &Frame,
+        now_ms: u64,
+    ) -> Conn {
         let _ = stream.set_nonblocking(true);
         let _ = stream.set_nodelay(true);
         Conn {
             stream,
             inbuf: Vec::new(),
             outbuf: frame_bytes(hello),
-            nonce,
+            side,
+            ephemeral: Some(ephemeral),
+            session: None,
             claimed: None,
             peer: None,
             dialled: None,
@@ -342,12 +384,33 @@ impl Conn {
         }
     }
 
+    /// Queues `frame` sealed under the session; a connection without one,
+    /// or whose counter is spent, is closed instead.
     fn send(&mut self, frame: &Frame) {
-        self.outbuf.extend_from_slice(&frame_bytes(frame));
+        let sealed = self.session.as_mut().and_then(|s| s.seal(frame));
+        self.dead |= sealed.is_none();
+        self.outbuf.extend(sealed.unwrap_or_default());
     }
 
     fn read(&mut self) {
         self.dead |= !read_available(&mut self.stream, &mut self.inbuf);
+    }
+
+    /// The next whole frame read: the peer's `Hello` in the clear until the
+    /// session is agreed, sealed frames after it. A frame that is too long,
+    /// does not open or does not decode closes the connection.
+    fn next_frame(&mut self) -> Option<Frame> {
+        if self.dead {
+            return None;
+        }
+        let taken = match self.session.as_mut() {
+            Some(session) => session.open(&mut self.inbuf),
+            None => take_frame(&mut self.inbuf, HELLO_LEN),
+        };
+        taken.unwrap_or_else(|_| {
+            self.dead = true;
+            None
+        })
     }
 
     fn flush(&mut self) {
@@ -471,9 +534,9 @@ pub struct Transport {
     id: [u8; 32],
     chain_id: u64,
     genesis: [u8; 32],
-    /// The secret every connection's nonce is derived from, and the next counter.
+    /// The secret every connection's nonce and fresh key are drawn from,
+    /// replaced by its hash at every draw.
     seed: [u8; 32],
-    next_nonce: u64,
     peers: Vec<SocketAddr>,
     last_dial_ms: Option<u64>,
     /// Requests this node is serving: local id to `(peer, the peer's id)`.
@@ -518,7 +581,6 @@ impl Transport {
             chain_id,
             genesis,
             seed,
-            next_nonce: 0,
             peers,
             last_dial_ms: None,
             serving: BTreeMap::new(),
@@ -568,21 +630,30 @@ impl Transport {
         self.id
     }
 
-    /// A new connection over `stream`, with a nonce of its own and this
-    /// node's `Hello` queued.
+    /// A new connection over `stream`, with a nonce and a fresh key of its
+    /// own and this node's `Hello` queued. Both are drawn from a seed that
+    /// is replaced by its hash first, so that what the node holds later
+    /// tells nothing of the keys of the connections it opened before.
     fn open(&mut self, stream: TcpStream, now_ms: u64) -> Conn {
-        self.next_nonce += 1;
-        let mut preimage = self.seed.to_vec();
-        preimage.extend_from_slice(&self.next_nonce.to_le_bytes());
-        let nonce = solo_host::hash::keccak256(&preimage);
+        let draw = |label: &[u8], seed: &[u8; 32]| {
+            solo_host::hash::keccak256(&[label, seed.as_slice()].concat())
+        };
+        self.seed = draw(b"SOLO-SEED", &self.seed);
+        let ephemeral = Ephemeral::from_seed(&draw(b"SOLO-EPHEMERAL", &self.seed));
+        let side = Side {
+            nonce: draw(b"SOLO-NONCE", &self.seed),
+            ephemeral: ephemeral.public(),
+        };
         let hello = Frame::Hello {
+            version: VERSION,
             id: self.id,
             chain_id: self.chain_id,
             genesis: self.genesis,
-            nonce,
+            nonce: side.nonce,
+            ephemeral: side.ephemeral,
         };
         self.traffic.frame(Direction::Out, "hello");
-        Conn::new(stream, nonce, &hello, now_ms)
+        Conn::new(stream, side, ephemeral, &hello, now_ms)
     }
 
     /// The peer table, when peer exchange runs.
@@ -740,37 +811,53 @@ impl Transport {
     }
 
     /// A frame on connection `index` before its handshake completed (spec
-    /// 09 §3): first a `Hello` for this chain and genesis, which this end
-    /// answers with its `Auth`, then the peer's `Auth`, which must recover
-    /// to the id its `Hello` named. Anything else closes the connection.
+    /// 09 §3): first a `Hello` of this version, chain and genesis, which
+    /// agrees the session (§3a) and which this end answers with its `Auth`,
+    /// then the peer's `Auth`, which must recover to the id its `Hello`
+    /// named. Anything else closes the connection, and so does a `Hello`
+    /// that repeats this end's own nonce or fresh key (a connection looped
+    /// back on itself) or whose key is not a point of the curve.
     fn handshake(&mut self, index: usize, frame: Frame, now_ms: u64) {
         let conn = &mut self.conns[index];
         match (conn.claimed, frame) {
             (
                 None,
                 Frame::Hello {
+                    version,
                     id,
                     chain_id,
                     genesis,
                     nonce,
+                    ephemeral,
                 },
-            ) if chain_id == self.chain_id && genesis == self.genesis => {
-                conn.claimed = Some((id, nonce));
-                let digest = hello_digest(self.chain_id, &self.genesis, &conn.nonce, &nonce);
+            ) if version == VERSION && chain_id == self.chain_id && genesis == self.genesis => {
+                let theirs = Side { nonce, ephemeral };
+                let looped = nonce == conn.side.nonce || ephemeral == conn.side.ephemeral;
+                conn.session = conn.ephemeral.take().filter(|_| !looped).and_then(|e| {
+                    Session::new(e, self.chain_id, &self.genesis, &conn.side, &theirs)
+                });
+                conn.claimed = Some((id, theirs));
+                let digest = hello_digest(self.chain_id, &self.genesis, &conn.side, &theirs);
                 // A key signs any digest; a failure would send a proof the peer refuses.
                 let signature = crate::sign_recoverable(&self.key, &digest).unwrap_or([0; 65]);
+                // Without a session this closes the connection and sends nothing.
                 conn.send(&Frame::Auth { signature });
                 self.traffic.frame(Direction::Out, "auth");
             }
-            (Some((id, nonce)), Frame::Auth { signature })
+            (Some((id, theirs)), Frame::Auth { signature })
                 if peers::recover_id(
-                    &hello_digest(self.chain_id, &self.genesis, &nonce, &conn.nonce),
+                    &hello_digest(self.chain_id, &self.genesis, &theirs, &conn.side),
                     &signature,
                 ) == Some(id) =>
             {
                 self.authenticated(index, id, now_ms);
             }
-            (None, Frame::Hello { chain_id, .. }) if chain_id == self.chain_id => {
+            (
+                None,
+                Frame::Hello {
+                    version, chain_id, ..
+                },
+            ) if version == VERSION && chain_id == self.chain_id => {
                 self.foreign = true;
                 conn.dead = true;
             }
@@ -1048,7 +1135,8 @@ impl Transport {
         self.redial(now_ms);
         self.discover(now_ms);
         for i in 0..self.conns.len() {
-            for frame in self.read_frames(i) {
+            self.read_in(i);
+            while let Some(frame) = self.next_frame(i) {
                 self.handle_syncing(i, frame, sync, now_ms);
             }
         }
@@ -1074,21 +1162,21 @@ impl Transport {
         self.flush_all();
     }
 
-    /// Reads what connection `i` has and splits off its complete frames;
-    /// a connection that sends a bad frame is marked dead.
-    fn read_frames(&mut self, i: usize) -> Vec<Frame> {
+    /// Reads what connection `i` has.
+    fn read_in(&mut self, i: usize) {
         let before = self.conns[i].inbuf.len();
         self.conns[i].read();
         let read = self.conns[i].inbuf.len() - before;
         self.traffic.bytes(Direction::In, read);
-        let frames = take_frames(&mut self.conns[i].inbuf).unwrap_or_else(|_| {
-            self.conns[i].dead = true;
-            Vec::new()
-        });
-        for frame in &frames {
-            self.traffic.frame(Direction::In, frame.kind());
-        }
-        frames
+    }
+
+    /// The next whole frame connection `i` has read, one at a time, since
+    /// the peer's `Hello` changes how the frames after it are read; a
+    /// connection that sends a bad frame is marked dead.
+    fn next_frame(&mut self, i: usize) -> Option<Frame> {
+        let frame = self.conns[i].next_frame()?;
+        self.traffic.frame(Direction::In, frame.kind());
+        Some(frame)
     }
 
     /// Writes what every connection has queued.
@@ -1124,7 +1212,8 @@ impl Transport {
         self.redial(now_ms);
         self.discover(now_ms);
         for i in 0..self.conns.len() {
-            for frame in self.read_frames(i) {
+            self.read_in(i);
+            while let Some(frame) = self.next_frame(i) {
                 self.handle(i, frame, node, now_ms)?;
             }
         }

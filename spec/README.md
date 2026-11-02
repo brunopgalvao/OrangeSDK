@@ -14,7 +14,7 @@ This directory is normative. An implementation that disagrees with it is wrong; 
 | 06 | [Driver interface](06-driver-interface.md) — inputs and effects of the consensus state machine, kernel versions and the switchover between kernels | draft |
 | 07 | [Conformance](07-conformance.md) — test vectors, differential oracles, coverage requirements | draft |
 | 08 | [Simplex driver](08-simplex-driver.md) — the reference kernel's consensus: views, stake-weighted votes, epochs, view synchronization, vote and threshold certificates, equivocation evidence, persistence | draft |
-| 09 | [Peer-to-peer transport](09-p2p.md) — TCP framing, handshake, mapping between frames and driver inputs and effects | draft |
+| 09 | [Peer-to-peer transport](09-p2p.md) — TCP framing, handshake, sealed frames, mapping between frames and driver inputs and effects | draft |
 | 10 | [State commitment](10-state-commitment.md) — the binary Merkle trie behind `storage_commit`, its proofs and their verification | draft |
 | 11 | [Telemetry](11-telemetry.md) — metrics endpoint and names, emitted metrics, status document, alert and health semantics | draft |
 | 12 | [Threshold certificates](12-threshold-certificates.md) — threshold BLS over BLS12-381, the DKG and resharing, the finality certificate (versions 1 and 2), the rotation message, and their verification on Ethereum | draft |
