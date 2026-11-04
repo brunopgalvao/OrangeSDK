@@ -210,8 +210,12 @@ impl Scheduler {
                 // before (see the soak's report of 2026-11-04). An observer
                 // signs nothing and may start from either.
                 let validator = self.cluster.role(target) != Role::Observer;
+                // Peers keep the blocks of the last DRIVER_RETENTION heights
+                // (spec 22 §8.1): a node further behind joins from a
+                // snapshot, so catching up from nothing is for young chains.
+                let young = self.best() + 200 < solo_node::DRIVER_RETENTION;
                 let wipe = self.rng.chance(1, 4) && (syncable || !validator);
-                let sync = wipe && syncable && (validator || self.rng.chance(1, 2));
+                let sync = wipe && syncable && (validator || !young || self.rng.chance(1, 2));
                 let down = self.secs(2, 20);
                 self.kill_restart(&[target], down, wipe, sync)
             }
