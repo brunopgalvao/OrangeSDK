@@ -6,6 +6,7 @@
 #[path = "support/raw_peer.rs"]
 mod raw_peer;
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
@@ -1119,4 +1120,207 @@ fn a_hello_of_another_genesis_is_heard_though_its_peer_closes_at_once() {
         std::thread::sleep(Duration::from_millis(2));
     };
     assert_eq!(why, "a peer is on a chain with another genesis block");
+}
+
+/// A transaction a node accepted while it had no peer reaches the peers it
+/// connects to later (spec 09 §4): sent when it became pending, it went to
+/// nobody, and an observer, which never proposes, would hold it for ever.
+/// Found by the soak test (`crates/solo-cli/tests/soak`) isolating an
+/// observer that had accepted transactions.
+#[test]
+fn a_transaction_accepted_without_peers_reaches_the_peers_that_connect_later() {
+    let keys = keys(1);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys);
+    let start = Instant::now();
+    let epoch = 1_000_000;
+    let open = |key: Option<SigningKey>| {
+        let mut node = Node::open(
+            &kernel,
+            &genesis,
+            NodeConfig {
+                now_ms: epoch,
+                key,
+                ..NodeConfig::default()
+            },
+        )
+        .unwrap();
+        node.start(None).unwrap();
+        node
+    };
+    let validator = open(Some(keys[0].clone()));
+    let genesis_hash = validator.genesis_hash();
+    let listening = Transport::bind(
+        "127.0.0.1:0",
+        keys[0].clone(),
+        CHAIN_ID,
+        genesis_hash,
+        vec![],
+    )
+    .unwrap();
+    let dial = vec![listening.local_addr().unwrap()];
+    let mut observer = open(None);
+    let to = address(&keys[0]);
+    // Submitted before the observer's transport ever ran: no peer yet.
+    let tx_hash = observer.submit(&transfer(&keys[0], to, 5)).unwrap();
+    let alone = Transport::bind(
+        "127.0.0.1:0",
+        fresh_key().unwrap(),
+        CHAIN_ID,
+        genesis_hash,
+        dial,
+    )
+    .unwrap();
+    let mut nodes = vec![validator, observer];
+    let mut transports = vec![listening, alone];
+    let landed = pump(
+        &mut nodes,
+        &mut transports,
+        start,
+        epoch,
+        Duration::from_mins(2),
+        |nodes, _| nodes[0].receipt(&tx_hash).unwrap().is_some(),
+    );
+    assert!(
+        landed,
+        "the validator finalized {} blocks without the observer's transaction",
+        nodes[0].finalized.len()
+    );
+    // And a peer already holding it is not sent it again in a loop: both
+    // pools are empty once the block carried it.
+    let drained = pump(
+        &mut nodes,
+        &mut transports,
+        start,
+        epoch,
+        Duration::from_mins(1),
+        |nodes, _| nodes.iter().all(|n| n.mempool().is_empty()),
+    );
+    assert!(drained);
+}
+
+/// A validator killed after its driver state recorded a finalized height
+/// and before its journal did (the driver store writes the state first,
+/// so that a restart never forgets a vote) comes back with tables that
+/// lack its finalized head. Every block its peers sent it then failed to
+/// chain onto a head it could not name, and it stayed at that height for
+/// good. The host now takes the head from the block log in chain state
+/// before the driver starts (spec 08 §7). Found by the soak test
+/// (`crates/solo-cli/tests/soak`, seed 7), whose validator v0 stopped at
+/// block 2691 after a kill -9.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_validator_whose_journal_lost_its_finalized_head_catches_up() {
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys);
+    let start = Instant::now();
+    let epoch = 1_000_000;
+    let dir = solo_scratch::Scratch::new("net", "lost-head");
+    let open = |key: &SigningKey, persisted, store, now| {
+        Node::open(
+            &kernel,
+            &genesis,
+            NodeConfig {
+                now_ms: now,
+                key: Some(key.clone()),
+                persisted,
+                store,
+                ..NodeConfig::default()
+            },
+        )
+        .unwrap()
+    };
+    let disk = solo_node::StoreConfig::Disk(dir.to_path_buf());
+    let mut nodes = Vec::new();
+    let mut transports: Vec<Transport> = Vec::new();
+    for (i, key) in keys.iter().enumerate() {
+        let store = if i == 3 {
+            disk.clone()
+        } else {
+            solo_node::StoreConfig::Memory
+        };
+        let mut node = open(key, BTreeMap::new(), store, epoch);
+        node.start(None).unwrap();
+        let peers = transports.iter().map(|t| t.local_addr().unwrap()).collect();
+        let genesis_hash = node.genesis_hash();
+        transports.push(
+            Transport::bind("127.0.0.1:0", key.clone(), CHAIN_ID, genesis_hash, peers).unwrap(),
+        );
+        nodes.push(node);
+    }
+    let up = pump(
+        &mut nodes,
+        &mut transports,
+        start,
+        epoch,
+        Duration::from_mins(3),
+        |nodes, _| nodes.iter().all(|n| n.finalized.len() >= 10),
+    );
+    assert!(up);
+    // Validator 3 stops; what its journal lost is its finalized head.
+    let mut lost = nodes.pop().unwrap();
+    drop(transports.pop());
+    let state = lost.persisted_driver_state.clone();
+    let finalized = lost.simplex_state().unwrap().finalized_height;
+    assert_eq!(lost.block_number().unwrap(), finalized);
+    let mut tables = lost.persisted();
+    let at = |prefix: &[u8]| [prefix, &finalized.to_le_bytes()[..]].concat();
+    let head = tables.remove(&at(b"final/")).unwrap();
+    assert!(
+        tables
+            .remove(&[b"prop/".as_slice(), &head].concat())
+            .is_some()
+    );
+    assert!(tables.remove(&at(b"cert/")).is_some());
+    drop(lost);
+    // The others go on without it.
+    let ahead = finalized + 20;
+    let past = pump(
+        &mut nodes,
+        &mut transports,
+        start,
+        epoch,
+        Duration::from_mins(3),
+        |nodes, _| {
+            nodes
+                .iter()
+                .all(|n| n.finalized.last().is_some_and(|h| *h >= ahead))
+        },
+    );
+    assert!(past);
+    // Back, it takes its head from the block log and syncs the rest.
+    let now = epoch + u64::try_from(start.elapsed().as_millis()).unwrap();
+    let mut back = open(&keys[3], tables, disk, now);
+    back.start(state).unwrap();
+    assert_eq!(back.persisted().get(&at(b"final/")), Some(&head));
+    let peers = transports.iter().map(|t| t.local_addr().unwrap()).collect();
+    let genesis_hash = back.genesis_hash();
+    transports.push(
+        Transport::bind(
+            "127.0.0.1:0",
+            keys[3].clone(),
+            CHAIN_ID,
+            genesis_hash,
+            peers,
+        )
+        .unwrap(),
+    );
+    nodes.push(back);
+    let caught = pump(
+        &mut nodes,
+        &mut transports,
+        start,
+        epoch,
+        Duration::from_mins(3),
+        |nodes, _| nodes[3].finalized.last().is_some_and(|h| *h >= ahead),
+    );
+    assert!(
+        caught,
+        "{:?}",
+        nodes
+            .iter()
+            .map(|n| n.finalized.last().copied())
+            .collect::<Vec<_>>()
+    );
 }

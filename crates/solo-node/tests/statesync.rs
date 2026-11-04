@@ -558,7 +558,7 @@ fn lying_peers_are_banned_and_the_sync_completes_from_honest_ones() {
         (
             "an unverified header",
             header(|h| h.links.0.clear()),
-            "a snapshot header that does not verify under the node's trust",
+            "the links do not join the head to the anchoring proposal",
         ),
         (
             "too deep",
@@ -1078,4 +1078,152 @@ fn a_join_survives_its_only_server_restarting_and_reports_a_failure() {
         sim.join_from_peers(1, v1(), &genesis, blocked.to_path_buf(), trust),
         Err(NodeError::Store(_))
     ));
+}
+
+/// The key set whose threshold certificate vouches for `offer`'s snapshot
+/// on `node`.
+fn certifying_key_set(node: &Node, offer: &Offer) -> u64 {
+    let request = SyncRequest::Manifest { epoch: offer.epoch }.to_bytes();
+    let SyncResponse::Manifest(m) = SyncResponse::from_bytes(&node.answer_sync(&request)).unwrap()
+    else {
+        panic!("no manifest of epoch {}", offer.epoch)
+    };
+    let header = solo_store::SnapshotHeader::from_bytes(&m.header).unwrap();
+    u64::from_be_bytes(header.certificate[1..9].try_into().unwrap())
+}
+
+/// A joiner trusts the chain's current group key, while the newest
+/// snapshot its peers offer is certified by the key set before it (the key
+/// was handed off to after that snapshot was exported). The snapshot is set
+/// aside, not held against the honest peer, and the next one, which the
+/// key certifies, is fetched (spec 22 §7.4). Before, the peer was banned
+/// and the node stopped once no peer was left. Found by the soak test
+/// (`crates/solo-cli/tests/soak`), whose fresh observers kept failing to
+/// sync on a chain rotating its key every epoch. A key that certifies
+/// nothing the peers serve still ends the sync: a peer is banned at its
+/// second set-aside manifest, and one offering only set-aside snapshots no
+/// longer counts.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_snapshot_older_than_the_trusted_key_is_set_aside_for_a_newer_one() {
+    let validators: Vec<SigningKey> = (1..=4u8)
+        .map(|i| SigningKey::from_slice(&[0x70 + i; 32]).unwrap())
+        .collect();
+    let genesis = support::staking_genesis(&validators);
+    let template = NodeConfig {
+        now_ms: 10_000,
+        ..NodeConfig::default()
+    };
+    let dir = scratch("set-aside-source");
+    let stores = [StoreConfig::Disk(dir.to_path_buf())];
+    let mut sim = Sim::with_stores(v1(), &genesis, &validators, 0, &template, 20, &stores).unwrap();
+    sim.nodes[0].serve_snapshots(SMALL).unwrap();
+    // Two served snapshots, certified by different key sets.
+    let rotated = sim
+        .run_until(800 * SLOT_MS, |s| {
+            let node = &s.nodes[0];
+            let offers = node.snapshot_server().unwrap().offers();
+            offers.len() == 2
+                && certifying_key_set(node, &offers[0]) != certifying_key_set(node, &offers[1])
+        })
+        .unwrap();
+    assert!(rotated, "{:?}", sim.finalized_heights().unwrap());
+    let node = &sim.nodes[0];
+    let offers = node.snapshot_server().unwrap().offers();
+    let (newer, older) = (offers[0], offers[1]);
+    let key_id = certifying_key_set(node, &newer);
+    let record = node
+        .state_get(&[solo_abi::staking::keys::KEY_SET, &key_id.to_be_bytes()].concat())
+        .map(|b| solo_abi::staking::KeySetRecord::from_bytes(&b).unwrap())
+        .unwrap();
+    let current = Trust::Key(record.key_set[..96].try_into().unwrap());
+    let join = |name: &str, trust: Trust| {
+        let target = scratch(name);
+        let config = NodeConfig {
+            now_ms: 1_000,
+            store: StoreConfig::Disk(target.to_path_buf()),
+            ..NodeConfig::default()
+        };
+        let mut joiner = Node::open(v1(), &genesis, config).unwrap();
+        let sync = StateSync::new(joiner.sync_config(trust).unwrap()).unwrap();
+        (target, sync)
+    };
+    // At first the peer offers only the older snapshot, as it did before
+    // it exported the newer one; later both.
+    let at_first_older = || -> Behaviour {
+        let mut asked = 0;
+        Box::new(move |r, answer| {
+            Some(match r {
+                SyncRequest::Offers => {
+                    asked += 1;
+                    if asked == 1 {
+                        SyncResponse::Offers(vec![older]).to_bytes()
+                    } else {
+                        answer
+                    }
+                }
+                _ => answer,
+            })
+        })
+    };
+    let (_target, mut sync) = join("set-aside-current", current.clone());
+    let mut peers = [at_first_older()];
+    drive(&mut sync, node, &mut peers, 0, 3_000, &all(1));
+    let events = sync.take_events();
+    assert_eq!(
+        sync.done().map(|s| s.header.epoch),
+        Some(newer.epoch),
+        "{:?} {events:?}",
+        sync.failed()
+    );
+    assert_eq!(
+        events[..3],
+        [
+            SyncEvent::Target(older),
+            SyncEvent::SetAside {
+                peer: peer(0),
+                epoch: older.epoch
+            },
+            SyncEvent::Target(newer),
+        ],
+        "{events:?}"
+    );
+    assert!(banned(&events).is_empty(), "{events:?}");
+    // A peer that offers only a set-aside snapshot no longer counts, and is
+    // not banned for it.
+    let (_target, mut sync) = join("set-aside-stale", current);
+    let only_older: Behaviour = Box::new(move |r, answer| {
+        Some(match r {
+            SyncRequest::Offers => SyncResponse::Offers(vec![older]).to_bytes(),
+            _ => answer,
+        })
+    });
+    let mut peers = [only_older];
+    drive(&mut sync, node, &mut peers, 0, 500, &all(1));
+    assert!(sync.done().is_none() && sync.failed().is_none());
+    assert!(sync.drops(&peer(0)));
+    assert!(banned(&sync.take_events()).is_empty());
+    // A key that certifies neither: the peer's second such manifest bans it.
+    let other = solo_bls::SecretKey::generate(&[7; 32], b"")
+        .unwrap()
+        .public_key()
+        .to_bytes();
+    let (_target, mut sync) = join("set-aside-wrong", Trust::Key(other));
+    let mut peers = [honest()];
+    drive(&mut sync, node, &mut peers, 0, 3_000, &all(1));
+    let events = sync.take_events();
+    assert!(sync.done().is_none(), "{events:?}");
+    assert!(sync.drops(&peer(0)));
+    assert_eq!(
+        banned(&events),
+        vec![(
+            peer(0),
+            "a snapshot whose certificate the trusted key does not verify"
+        )],
+        "{events:?}"
+    );
+    assert!(events.contains(&SyncEvent::SetAside {
+        peer: peer(0),
+        epoch: newer.epoch
+    }));
 }

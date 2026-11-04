@@ -58,6 +58,10 @@ pub const HANDSHAKE_MS: u64 = 5_000;
 /// (spec 09 §6).
 pub const SYNC_PEER_WAIT_MS: u64 = 60_000;
 
+/// The most raw transaction bytes a node sends a peer whose handshake just
+/// completed, of the pending transactions it already holds (spec 09 §4).
+pub const POOL_SYNC_BYTES: usize = 4 << 20;
+
 /// Domain of a handshake's signature.
 const HELLO_DOMAIN: &[u8] = b"SOLO-HELLO";
 
@@ -355,6 +359,9 @@ struct Conn {
     /// When the peer's last `GetPeers`, and its last `Peers`, were handled.
     last_get_ms: Option<u64>,
     last_peers_ms: Option<u64>,
+    /// The handshake completed since the last poll: the peer is owed the
+    /// pending transactions the pool holds (spec 09 §4).
+    owed_pool: bool,
 }
 
 impl Conn {
@@ -385,6 +392,7 @@ impl Conn {
             next_exchange_ms: 0,
             last_get_ms: None,
             last_peers_ms: None,
+            owed_pool: false,
         }
     }
 
@@ -893,6 +901,7 @@ impl Transport {
     fn authenticated(&mut self, index: usize, id: [u8; 32], now_ms: u64) {
         let conn = &mut self.conns[index];
         conn.peer = Some(id);
+        conn.owed_pool = true;
         let Some(x) = self.exchange.as_mut() else {
             return;
         };
@@ -1204,6 +1213,33 @@ impl Transport {
         }
     }
 
+    /// Sends every peer whose handshake completed since the last poll the
+    /// pending transactions the pool holds, by sender and nonce, up to
+    /// [`POOL_SYNC_BYTES`]: a transaction is gossiped once, when it becomes
+    /// pending, and one that became pending while this node had no peer, or
+    /// before this peer connected, would otherwise never reach it.
+    fn send_pool(&mut self, node: &Node) {
+        let pool = node.mempool();
+        for conn in self.conns.iter_mut().filter(|c| c.owed_pool) {
+            conn.owed_pool = false;
+            let mut bytes = 0usize;
+            let owed = pool
+                .iter()
+                .filter(|tx| pool.is_pending(tx))
+                .take_while(|tx| {
+                    bytes += tx.raw.len();
+                    bytes <= POOL_SYNC_BYTES
+                });
+            for tx in owed {
+                let frame = Frame::Tx {
+                    raw: tx.raw.clone(),
+                };
+                conn.send(&frame);
+                self.traffic.frame(Direction::Out, frame.kind());
+            }
+        }
+    }
+
     fn broadcast(&mut self, frame: &Frame) {
         for conn in self.conns.iter_mut().filter(|c| c.peer.is_some()) {
             conn.send(frame);
@@ -1267,6 +1303,7 @@ impl Transport {
                 Outbound::Disseminate { .. } | Outbound::PeerScore { .. } => {}
             }
         }
+        self.send_pool(node);
         for raw in node.take_tx_gossip() {
             self.broadcast(&Frame::Tx { raw });
         }

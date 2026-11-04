@@ -58,6 +58,18 @@ pub const FORMAT: u32 = 1;
 /// compacted when it is opened.
 pub const COMPACTION_SLACK: u64 = 8 << 20;
 
+/// The most memory the engine's page cache takes (spec 22 §8): the engine's
+/// own default is 1 GiB, which a node grows into within an hour of blocks,
+/// pages it wrote once and never reads again included.
+pub const CACHE_BYTES: usize = 64 << 20;
+
+/// The engine, its page cache bounded by [`CACHE_BYTES`].
+fn builder() -> redb::Builder {
+    let mut builder = redb::Builder::new();
+    builder.set_cache_size(CACHE_BYTES);
+    builder
+}
+
 const STATE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state");
 const NODES: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("nodes");
 const HISTORY: TableDefinition<(&[u8], u64), &[u8]> = TableDefinition::new("history");
@@ -580,7 +592,8 @@ impl DiskStore {
         if !path.exists() {
             Self::create(dir, &path)?;
         }
-        let database = Database::create(&path)
+        let database = builder()
+            .create(&path)
             .map_err(redb::Error::from)
             .map_err(db)?;
         Self::over(path, database)
@@ -594,7 +607,8 @@ impl DiskStore {
         let creating = dir.join(CREATING_FILE);
         // What an earlier crash left half laid out.
         let _ = std::fs::remove_file(&creating);
-        let mut database = Database::create(&creating)
+        let mut database = builder()
+            .create(&creating)
             .map_err(redb::Error::from)
             .map_err(db)?;
         Self::prepare(&mut database)?;
@@ -1621,6 +1635,12 @@ mod tests {
         o.commit();
         o.base_mut().seal(height, Some(&committed)).unwrap();
         committed.root()
+    }
+
+    #[test]
+    fn the_page_cache_is_bounded() {
+        // Spec 22 §8: the engine's default would let a node grow to 1 GiB.
+        assert_eq!(CACHE_BYTES, 64 << 20);
     }
 
     #[test]

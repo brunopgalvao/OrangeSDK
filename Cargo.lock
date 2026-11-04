@@ -3004,6 +3004,7 @@ dependencies = [
  "k256",
  "serde_json",
  "solo-abi",
+ "solo-fuzz",
  "solo-host",
  "solo-metrics",
  "solo-node",

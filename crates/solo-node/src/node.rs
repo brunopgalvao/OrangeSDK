@@ -96,13 +96,6 @@ pub const BLOCK_KERNEL_GAS: i64 = 1 << 35;
 /// [`HISTORY_KEYS_PER_BLOCK`] keys each on average.
 pub const STATE_HISTORY: usize = 1024;
 
-/// How many of the driver's latest metric emissions [`Node::metrics`]
-/// keeps: between this many and twice as many. The telemetry holds every
-/// value the node exports (spec 11); the list is for tests and tools that
-/// look at recent emissions, and a node that kept every one grew by every
-/// step it ran, tens of kilobytes a block, for as long as it ran.
-pub const METRIC_HISTORY: usize = 16_384;
-
 /// A [`NodeConfig::state_history`] that keeps the state of every block,
 /// however many keys they write.
 pub const ARCHIVE: usize = usize::MAX;
@@ -118,6 +111,22 @@ pub const DRIVER_RETENTION: u64 = 1024;
 /// enough that they stay within a few dozen heights of the retention, and
 /// rarely enough that the pass over them costs nothing per block.
 pub const PRUNE_EVERY: u64 = 64;
+
+/// How many of its latest executed blocks, finalized heights and driver
+/// metrics a node keeps in [`Node::executed`], [`Node::finalized`] and
+/// [`Node::metrics`]: at least this many, at most twice as many. Kept
+/// whole, the three grew by about a hundred bytes a block for as long as
+/// the node ran.
+pub const KEPT_RECORDS: usize = 4096;
+
+/// Appends `item` to `records`, dropping the oldest once there are twice
+/// `kept`, down to `kept`: memory stays bounded, and the drop is amortized.
+pub fn keep_latest<T>(records: &mut Vec<T>, item: T, kept: usize) {
+    records.push(item);
+    if records.len() > 2 * kept {
+        records.drain(..records.len() - kept);
+    }
+}
 
 /// Key writes of history a node keeps per block of its window, by default
 /// (spec 20 §5.1). A node keeps at most `state_history` times this many:
@@ -219,16 +228,17 @@ pub struct Node {
     pub(crate) kernel: [u8; 32],
     services: Rc<RefCell<NodeServices>>,
     pool: Mempool,
-    /// Blocks executed, in order, as `(height, block hash)`.
+    /// The latest blocks executed, in order, as `(height, block hash)`; see
+    /// [`KEPT_RECORDS`] and [`Node::blocks_executed`].
     pub executed: Vec<(u64, [u8; 32])>,
-    /// Heights finalized, in order.
+    /// The latest heights finalized, in order; see [`KEPT_RECORDS`].
     pub finalized: Vec<u64>,
-    /// Metrics the driver emitted, in order: the latest `metric_history`
-    /// at least, older ones dropped.
+    /// The latest metrics the driver emitted; see [`KEPT_RECORDS`].
     pub metrics: Vec<(Vec<u8>, i64)>,
-    /// How many of the latest metric emissions `metrics` keeps, at least
-    /// (up to twice as many); [`METRIC_HISTORY`] unless changed.
-    pub metric_history: usize,
+    /// Blocks executed since the node opened, all of them.
+    executed_count: u64,
+    /// Blocks finalized since the node opened, all of them.
+    finalized_count: u64,
     /// The last state the driver asked to persist.
     pub persisted_driver_state: Option<Vec<u8>>,
     /// Gas budget for each kernel call; see [`KERNEL_GAS`].
@@ -336,7 +346,8 @@ impl Node {
             executed: Vec::new(),
             finalized: Vec::new(),
             metrics: Vec::new(),
-            metric_history: METRIC_HISTORY,
+            executed_count: 0,
+            finalized_count: 0,
             persisted_driver_state: None,
             kernel_gas: KERNEL_GAS,
             query_gas: config.query_gas,
@@ -392,6 +403,9 @@ impl Node {
     fn take_up(&mut self, kernel: Option<[u8; 32]>) -> Result<(), NodeError> {
         let head = self.exec.state().base().head();
         self.opened_at = head;
+        // What the node holds is finalized (spec 22 §5): its status says so
+        // from the start, not from the next block it finalizes.
+        self.telemetry.resumed_at(head);
         // The loaded kernel's view of the upgrade state serves to find the
         // gates the kernel that wrote the store imports.
         let status = self.upgrade_status().unwrap_or_default();
@@ -573,7 +587,7 @@ impl Node {
         if self.export_job.is_some() {
             return;
         }
-        let finalized = self.finalized.len();
+        let finalized = self.finalized_count;
         let latest = self
             .chain_store()
             .and_then(|s| s.get(solo_abi::chain::keys::SNAPSHOT_LATEST))
@@ -707,6 +721,12 @@ impl Node {
             Some(input) => self.step(input),
             None => Ok(()),
         }
+    }
+
+    /// Blocks this node executed since it opened.
+    #[must_use]
+    pub fn blocks_executed(&self) -> u64 {
+        self.executed_count
     }
 
     /// The highest height the host saw finalized: what it opened at, or
@@ -885,11 +905,52 @@ impl Node {
     /// # Errors
     /// See [`NodeError`].
     pub fn start(&mut self, resumed_state: Option<Vec<u8>>) -> Result<(), NodeError> {
+        self.restore_head(resumed_state.as_deref());
         let now_ms = self.now_ms();
         self.step(Input::Started {
             now_ms,
             resumed_state,
         })
+    }
+
+    /// Puts back the finalized head the driver's state records when its
+    /// tables lack it, from the block log in chain state (spec 08 §7): the
+    /// driver store writes the state before the journal, so that a restart
+    /// never forgets a vote, and a crash between the two leaves a state
+    /// that names a head its tables do not hold. The driver chains every
+    /// block it is sent onto that head, and without it took none again.
+    fn restore_head(&mut self, resumed: Option<&[u8]>) {
+        let Some(height) = resumed
+            .and_then(|b| solo_abi::chain::SimplexState::from_bytes(b).ok())
+            .map(|s| s.finalized_height.to_le_bytes())
+        else {
+            return;
+        };
+        let at = |prefix: &[u8]| [prefix, &height[..]].concat();
+        let final_key = at(b"final/");
+        let held = self.services.borrow().persisted.contains_key(&final_key);
+        let logged = self.state_get(&at(solo_store::snapshot::LOG_PROPOSAL));
+        let Some(proposal) = logged.filter(|_| !held) else {
+            return;
+        };
+        let hash = keccak256(&proposal);
+        let mut writes = vec![
+            ([b"prop/".as_slice(), &hash].concat(), proposal),
+            (final_key, hash.to_vec()),
+        ];
+        writes.extend(
+            [
+                (solo_store::snapshot::LOG_CERTIFICATE, b"cert/".as_slice()),
+                (solo_store::snapshot::LOG_THRESHOLD, b"bcert/".as_slice()),
+            ]
+            .iter()
+            .filter_map(|(log, table)| self.state_get(&at(log)).map(|v| (at(table), v))),
+        );
+        let mut services = self.services.borrow_mut();
+        for (key, value) in writes {
+            services.persisted.insert(key.clone(), value.clone());
+            services.persist_writes.push((key, value));
+        }
     }
 
     /// Delivers one input to the driver and applies every resulting effect,
@@ -1011,7 +1072,8 @@ impl Node {
                 .to_bytes();
                 self.call_unit(exports::FINALIZE_BLOCK, &args)?;
                 self.exec.state_mut().base_mut().flush()?;
-                self.finalized.push(height);
+                keep_latest(&mut self.finalized, height, KEPT_RECORDS);
+                self.finalized_count += 1;
                 if height.is_multiple_of(PRUNE_EVERY) {
                     self.prune_tables(height);
                 }
@@ -1039,10 +1101,7 @@ impl Node {
             }
             Effect::Metric { name, value } => {
                 self.telemetry.driver_metric(&name, value);
-                if self.metrics.len() >= 2 * self.metric_history.max(1) {
-                    self.metrics.drain(..self.metric_history.max(1));
-                }
-                self.metrics.push((name, value));
+                keep_latest(&mut self.metrics, (name, value), KEPT_RECORDS);
                 None
             }
             // Admission is implicit in `submit`.
@@ -1147,7 +1206,8 @@ impl Node {
         // The next block's base fee follows from this one (spec 23 §3).
         self.refresh_fees()?;
         self.reset_pool()?;
-        self.executed.push((height, block_hash));
+        keep_latest(&mut self.executed, (height, block_hash), KEPT_RECORDS);
+        self.executed_count += 1;
         let summary = &result.summary;
         self.telemetry
             .block_executed(height, summary.tx_count, summary.gas_used);

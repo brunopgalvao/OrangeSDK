@@ -245,3 +245,57 @@ pub fn include(node: &mut Node, raw: &[u8]) -> Receipt {
     run_until(node, 10, &mut |n| n.receipt(&hash).unwrap().is_some());
     node.receipt(&hash).unwrap().unwrap()
 }
+
+/// A staking chain of `keys` in epochs of four blocks with a DKG phase per
+/// block, so that a threshold key exists from epoch 1 on.
+pub fn staking_genesis(validators: &[SigningKey]) -> Genesis {
+    let params = GenesisParams {
+        slot_ms: SLOT_MS,
+        max_txs: 8,
+        allocations: Seq(validators
+            .iter()
+            .map(|k| Allocation {
+                address: solo_node::validator_id(k)[12..].try_into().unwrap(),
+                balance: 100 * ETHER,
+                ..Allocation::default()
+            })
+            .chain([Allocation {
+                address: alice().address,
+                balance: 100 * ETHER,
+                ..Allocation::default()
+            }])
+            .collect()),
+        staking: solo_abi::staking::StakingParams {
+            epoch_blocks: 4,
+            unbonding_epochs: 4,
+            min_stake: 0,
+            max_validators: 0,
+            dkg_phase_blocks: 1,
+            max_key_age: 2,
+            keys: Seq(validators
+                .iter()
+                .map(|k| solo_abi::staking::ValidatorKey {
+                    id: solo_node::validator_id(k),
+                    dkg_key: solo_node::keystore::encryption_key(k).to_vec(),
+                })
+                .collect()),
+        },
+        ..GenesisParams::default()
+    };
+    let set = solo_abi::chain::ValidatorSet {
+        validators: Seq(validators
+            .iter()
+            .map(|k| solo_abi::chain::Validator {
+                id: solo_node::validator_id(k),
+                weight: 1_000,
+            })
+            .collect()),
+    };
+    Genesis {
+        chain_id: CHAIN_ID,
+        fee_schedule: vec![],
+        modules: Seq(vec![]),
+        params: params.to_bytes(),
+        validators: set.to_bytes(),
+    }
+}

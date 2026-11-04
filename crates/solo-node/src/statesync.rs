@@ -20,7 +20,7 @@
 //! answers, and sends the requests it returns. [`SnapshotServer`] is the
 //! serving side.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -506,7 +506,7 @@ pub struct SnapshotServer {
     served: Vec<Served>,
     /// How many finalized heights the node had when it last looked for a
     /// newer record; none yet at first.
-    pub(crate) checked: usize,
+    pub(crate) checked: u64,
 }
 
 impl SnapshotServer {
@@ -523,7 +523,7 @@ impl SnapshotServer {
             dir: dir.to_path_buf(),
             limits,
             served: Vec::new(),
-            checked: usize::MAX,
+            checked: u64::MAX,
         };
         for entry in fs::read_dir(dir).map_err(io)? {
             let path = entry.map_err(io)?.path();
@@ -603,6 +603,15 @@ pub enum SyncEvent {
         /// How many.
         slices: usize,
     },
+    /// An offer whose certificate the trusted key does not verify, set
+    /// aside for the rest of the sync: it may predate the key set the node
+    /// trusts (spec 22 §7.4).
+    SetAside {
+        /// The peer that sent its manifest.
+        peer: [u8; 32],
+        /// Its epoch.
+        epoch: u64,
+    },
     /// A peer it no longer asks, and why.
     Banned {
         /// The peer.
@@ -611,6 +620,21 @@ pub enum SyncEvent {
         why: &'static str,
     },
 }
+
+/// Why [`SnapshotHeader::verify`] refuses a threshold certificate that is
+/// well formed and the anchoring proposal's but signed by another key set
+/// than the trusted one.
+const UNTRUSTED_CERTIFICATE: &str =
+    "the threshold certificate does not verify under the trusted key";
+
+/// Why it refuses a vote certificate under a trusted group key: a peer of
+/// an earlier version exported it while its newest blocks lacked their
+/// threshold certificates (spec 22 §7.1).
+const VOTE_UNDER_KEY: &str =
+    "a vote certificate needs the genesis validator set, and only a chain without staking keeps it";
+
+/// A manifest whose certificate the trusted key does not verify.
+const UNTRUSTED: &str = "a snapshot whose certificate the trusted key does not verify";
 
 /// What a joining node knows of a peer.
 #[derive(Debug, Default)]
@@ -622,6 +646,11 @@ struct Peer {
     strikes: u32,
     banned: bool,
     busy: usize,
+    /// Manifests of its that the trusted key did not verify.
+    untrusted: u32,
+    /// Its last offers were all set aside: it keeps the sync going no
+    /// more than a banned peer, until it offers something else.
+    stale: bool,
 }
 
 /// What a request asked for.
@@ -702,6 +731,8 @@ pub struct StateSync {
     saved: Option<Manifest>,
     /// Whether the manifest of the target is asked for, in that phase.
     manifest_asked: bool,
+    /// Offers whose certificate the trusted key did not verify.
+    set_aside: BTreeSet<(u64, u64, Hash)>,
     events: Vec<SyncEvent>,
 }
 
@@ -725,6 +756,7 @@ impl StateSync {
             phase: Phase::Discover,
             saved,
             manifest_asked: false,
+            set_aside: BTreeSet::new(),
             events: Vec::new(),
         })
     }
@@ -750,7 +782,15 @@ impl StateSync {
     /// Whether `peer` is no longer asked during this sync (spec 09 §6).
     #[must_use]
     pub fn drops(&self, peer: &[u8; 32]) -> bool {
-        self.peers.get(peer).is_some_and(|p| p.banned)
+        self.peers.get(peer).is_some_and(|p| p.banned || p.stale)
+    }
+
+    /// Whether every one of `offers` is set aside, and there is one.
+    fn all_set_aside(set_aside: &BTreeSet<(u64, u64, Hash)>, offers: &[Offer]) -> bool {
+        !offers.is_empty()
+            && offers
+                .iter()
+                .all(|o| set_aside.contains(&(o.epoch, o.height, o.state_root)))
     }
 
     /// Slices verified and slices in all, once a manifest is accepted.
@@ -847,6 +887,7 @@ impl StateSync {
         p.strikes = 0;
         match (pending.asked, SyncResponse::from_bytes(payload)) {
             (Asked::Offers, Ok(SyncResponse::Offers(offers))) => {
+                p.stale = Self::all_set_aside(&self.set_aside, &offers);
                 p.offers = Some(offers);
                 p.answered_ms = now_ms;
                 self.first_answer.get_or_insert(now_ms);
@@ -936,7 +977,9 @@ impl StateSync {
         let mut tally: BTreeMap<(u64, u64, Hash), (usize, Offer)> = BTreeMap::new();
         for offer in peers.iter().filter_map(|p| p.offers.as_ref()).flatten() {
             let key = (offer.epoch, offer.height, offer.state_root);
-            tally.entry(key).or_insert((0, *offer)).0 += 1;
+            if !self.set_aside.contains(&key) {
+                tally.entry(key).or_insert((0, *offer)).0 += 1;
+            }
         }
         let Some((_, offer)) = tally
             .into_iter()
@@ -1008,7 +1051,12 @@ impl StateSync {
         }
         header
             .verify(self.config.chain_id, &self.config.trust)
-            .map_err(|_| "a snapshot header that does not verify under the node's trust")?;
+            .map_err(|e| match e.check() {
+                Some(UNTRUSTED_CERTIFICATE | VOTE_UNDER_KEY) => UNTRUSTED,
+                why => {
+                    why.unwrap_or("a snapshot header that does not verify under the node's trust")
+                }
+            })?;
         if manifest.depth > MAX_DEPTH || manifest.slices.len() != 1 << manifest.depth {
             return Err("a manifest of the wrong shape");
         }
@@ -1037,6 +1085,29 @@ impl StateSync {
                     Ok(()) => self.enter_fetch(offer, header, manifest.clone(), BTreeMap::new()),
                     Err(e) => self.phase = Phase::Failed(e.to_string()),
                 }
+            }
+            // The key the node trusts may be newer than the snapshot's
+            // certificate: the snapshot is set aside, and the next epoch's
+            // may verify. A peer whose second manifest fails so is banned.
+            Err(UNTRUSTED) => {
+                self.set_aside
+                    .insert((offer.epoch, offer.height, offer.state_root));
+                for p in self.peers.values_mut() {
+                    if let Some(offers) = &p.offers {
+                        p.stale = Self::all_set_aside(&self.set_aside, offers);
+                    }
+                }
+                let p = self.peers.get_mut(&peer).expect("asked peers are known");
+                p.untrusted += 1;
+                if p.untrusted > 1 {
+                    self.ban(peer, Asked::Manifest, UNTRUSTED);
+                } else {
+                    self.events.push(SyncEvent::SetAside {
+                        peer,
+                        epoch: offer.epoch,
+                    });
+                }
+                self.rediscover();
             }
             Err(why) => {
                 self.ban(peer, Asked::Manifest, why);

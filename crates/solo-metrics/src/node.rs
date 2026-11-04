@@ -671,6 +671,18 @@ impl NodeMetrics {
         self.registry.set(&FINALIZED, &[], float(height));
     }
 
+    /// Records the height a node took up from its chain store or a
+    /// snapshot (spec 22 §5, §7): its head and finalized height until it
+    /// executes and finalizes a block of its own. No counter moves, and the
+    /// head's age still counts from the open.
+    pub fn resumed_at(&mut self, height: u64) {
+        self.head = height;
+        self.finalized = height;
+        self.registry.set(&HEAD, &[], float(height));
+        self.registry.set(&BEST_KNOWN, &[], float(height));
+        self.registry.set(&FINALIZED, &[], float(height));
+    }
+
     /// Records the transport's view: the peer count and the traffic it
     /// counted since the last call, which this drains.
     pub fn p2p(&mut self, peers: usize, traffic: &mut Traffic) {
@@ -856,6 +868,15 @@ mod tests {
         assert_eq!(r(&m, &BLOCK_TRANSACTIONS, &[]), Some(2.0));
         assert_eq!(r(&m, &BLOCK_GAS, &[]), Some(42_000.0));
         assert_eq!(r(&m, &BLOCKS_FINALIZED, &[]), Some(1.0));
+        // A resumed height sets the gauges, not the counters.
+        let mut resumed = m.clone();
+        resumed.resumed_at(9);
+        assert_eq!((resumed.head(), resumed.finalized()), (9, 9));
+        assert_eq!(r(&resumed, &HEAD, &[]), Some(9.0));
+        assert_eq!(r(&resumed, &BEST_KNOWN, &[]), Some(9.0));
+        assert_eq!(r(&resumed, &FINALIZED, &[]), Some(9.0));
+        assert_eq!(r(&resumed, &BLOCKS_FINALIZED, &[]), Some(1.0));
+        assert_eq!(r(&resumed, &BLOCKS_EXECUTED, &[]), Some(1.0));
         m.kernel_call("kernel_query", Duration::from_millis(2), 500, None);
         m.kernel_call(
             "kernel_driver_step",
