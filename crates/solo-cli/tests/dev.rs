@@ -402,6 +402,12 @@ fn in_process_node_stops_on_blocks_and_on_request() {
         &["--blocks", "1", "--query-gas", "100000000"],
     ))
     .unwrap();
+    // A genesis that names its time keeps it, in memory too.
+    let dated = genesis_file(
+        "inproc-dated.json",
+        &GENESIS.replacen('{', r#"{"timestamp": 1792800000,"#, 1),
+    );
+    run(&dev_args(&dated, &["--blocks", "1"])).unwrap();
     // The node keeps the state history the flags ask for: its own window,
     // every block as an archive node, or the default.
     for (flags, expected) in [

@@ -1301,13 +1301,7 @@ mod tests {
     fn an_empty_run_merges_as_nothing() {
         let empty = scratch("empty.run");
         std::fs::write(&empty, []).unwrap();
-        let mut seen = 0;
-        merge_runs(&[empty], &mut |_, _, _| {
-            seen += 1;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(seen, 0);
+        merge_runs(&[empty], &mut |_, _, _| Err(SnapshotError::Cancelled)).unwrap();
     }
 
     /// Under a key-set trust (spec 22 §7.5), the certificate must be of a
