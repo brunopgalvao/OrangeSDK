@@ -41,6 +41,8 @@ pub const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a node may take to answer after its process started: a state
 /// sync runs before the RPC is up.
 pub const START_GRACE: Duration = Duration::from_mins(2);
+/// How long a node syncing its state from peers may go without RPC.
+pub const SYNC_GRACE: Duration = Duration::from_mins(6);
 pub const RSS_GROWTH: u64 = 3;
 pub const RSS_SLACK: u64 = 384 * 1024;
 pub const FD_SLACK: u64 = 256;
@@ -194,8 +196,13 @@ impl Checker {
             .and_then(|body| serde_json::from_str::<Value>(&body).ok());
         let Some(doc) = parsed else {
             let since = watch.last_ok.unwrap_or(m.started).max(m.resumed);
-            let grace = if m.syncs || watch.last_ok.is_none() {
-                START_GRACE.max(Duration::from_secs(30))
+            // A state sync serves no RPC until it has the state; on a chain
+            // rotating its key every epoch it may go through several
+            // snapshots, and it either ends or stops the node (spec 09 §6).
+            let grace = if m.syncs {
+                SYNC_GRACE
+            } else if watch.last_ok.is_none() {
+                START_GRACE
             } else {
                 Duration::from_secs(30)
             };
