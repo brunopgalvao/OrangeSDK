@@ -705,7 +705,8 @@ fn effects_injected_by_hand() {
     // Only the latest emissions are kept: a node that kept them all grew
     // with every step for as long as it ran.
     let kept = solo_node::KEPT_RECORDS;
-    for value in 0..3 * kept as i64 {
+    let last = i64::try_from(3 * kept).unwrap() - 1;
+    for value in 0..=last {
         node.apply_effect(Effect::Metric {
             name: b"n".to_vec(),
             value,
@@ -714,10 +715,7 @@ fn effects_injected_by_hand() {
         assert!(node.metrics.len() <= 2 * kept, "{}", node.metrics.len());
     }
     assert!(node.metrics.len() >= kept);
-    assert_eq!(
-        node.metrics.last(),
-        Some(&(b"n".to_vec(), 3 * kept as i64 - 1))
-    );
+    assert_eq!(node.metrics.last(), Some(&(b"n".to_vec(), last)));
     assert_eq!(
         node.apply_effect(Effect::SetTimer {
             timer_id: propose_timer(1),
