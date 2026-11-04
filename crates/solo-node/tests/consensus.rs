@@ -458,6 +458,24 @@ fn views(sim: &Sim) -> Vec<u64> {
     (0..sim.nodes.len()).map(|i| simplex(sim, i).view).collect()
 }
 
+/// Runs a new chain's validators past its first view: each starts without a
+/// signing record and times view 1 out at once, and their timeout votes
+/// move them all into view 2 with nothing signed but those, and with
+/// nothing proposed yet (spec 08 §7b).
+fn past_genesis(sim: &mut Sim) {
+    assert!(
+        sim.run_until(SLOT_MS / 2, |s| views(s).iter().all(|v| *v == 2))
+            .unwrap()
+    );
+    for i in 0..sim.nodes.len() {
+        let s = simplex(sim, i);
+        assert!(
+            (s.tip_height, s.voted, s.timed_out) == (0, false, false),
+            "{s:?}"
+        );
+    }
+}
+
 /// Consensus messages `node` queued for `peer` alone, drained with the rest of its outbound.
 fn sends(node: &mut Node, peer: &[u8; 32]) -> Vec<ConsensusMessage> {
     node.take_outbound()
@@ -1253,19 +1271,20 @@ fn a_held_proposal_gets_its_vote_once_it_can() {
     let kernel = kernel_module();
     let genesis = genesis(&keys, address(&keys[0]));
     let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
-    // Node 3 leads none of views 1 to 3; the test hands it every message.
-    let node = &mut sim.nodes[3];
+    past_genesis(&mut sim);
+    // Node 0 leads none of views 2 to 4; the test hands it every message.
+    let node = &mut sim.nodes[0];
     let from = |i: usize| validator_id(&keys[i]);
     let now = node.now_ms();
     let p1 = Proposal {
-        view: 1,
+        view: 2,
         height: 1,
         timestamp_ms: now,
         ..Proposal::default()
     };
     let h1 = keccak256(&p1.to_bytes());
     let p2 = Proposal {
-        view: 2,
+        view: 3,
         height: 2,
         parent: h1,
         timestamp_ms: now + 1,
@@ -1273,56 +1292,56 @@ fn a_held_proposal_gets_its_vote_once_it_can() {
     };
     let h2 = keccak256(&p2.to_bytes());
     let p3 = Proposal {
-        view: 3,
+        view: 4,
         height: 3,
         parent: h2,
         timestamp_ms: now + 2,
         ..Proposal::default()
     };
     let state = |node: &Node| node.simplex_state().unwrap();
-    node.deliver(from(0), TOPIC, propose(&keys[0], p1)).unwrap();
+    node.deliver(from(1), TOPIC, propose(&keys[1], p1)).unwrap();
     assert!(state(node).voted);
-    // The proposal of view 2 arrives before the votes that end view 1.
-    node.deliver(from(1), TOPIC, propose(&keys[1], p2.clone()))
+    // The proposal of view 3 arrives before the votes that end view 2.
+    node.deliver(from(2), TOPIC, propose(&keys[2], p2.clone()))
         .unwrap();
-    assert_eq!(state(node).view, 1);
-    for i in [0, 1] {
-        node.deliver(from(i), TOPIC, vote(&keys[i], 1, h1)).unwrap();
+    assert_eq!(state(node).view, 2);
+    for i in [1, 2] {
+        node.deliver(from(i), TOPIC, vote(&keys[i], 2, h1)).unwrap();
     }
-    let s = state(node);
-    assert_eq!((s.view, s.tip_height), (2, 1));
-    assert!(s.voted, "entering view 2 votes for its held proposal");
-    // View 2 times out here, so the tip stays at height 1, and the proposal
-    // of view 3, on the proposal of view 2, does not extend it.
-    for i in [0, 1, 2] {
-        node.deliver(from(i), TOPIC, vote(&keys[i], 2, [0; 32]))
-            .unwrap();
-    }
-    node.deliver(from(2), TOPIC, propose(&keys[2], p3)).unwrap();
     let s = state(node);
     assert_eq!((s.view, s.tip_height), (3, 1));
+    assert!(s.voted, "entering view 3 votes for its held proposal");
+    // View 3 times out here, so the tip stays at height 1, and the proposal
+    // of view 4, on the proposal of view 3, does not extend it.
+    for i in [1, 2, 3] {
+        node.deliver(from(i), TOPIC, vote(&keys[i], 3, [0; 32]))
+            .unwrap();
+    }
+    node.deliver(from(3), TOPIC, propose(&keys[3], p3)).unwrap();
+    let s = state(node);
+    assert_eq!((s.view, s.tip_height), (4, 1));
     assert!(!s.voted);
-    // The notarization of view 2 arrives: its proposal becomes the tip, and
-    // the held proposal of view 3 extends it.
+    // The notarization of view 3 arrives: its proposal becomes the tip, and
+    // the held proposal of view 4 extends it.
     let certificate = ConsensusMessage::Certificate {
         certificate: Certificate {
             kind: KIND_VOTE,
-            view: 2,
+            view: 3,
             hash: h2,
-            votes: Seq([0usize, 1, 2]
+            votes: Seq([1usize, 2, 3]
                 .iter()
                 .map(|&i| SignedVote {
                     validator: u32::try_from(i).unwrap(),
-                    signature: signed(&keys[i], KIND_VOTE, 2, h2).signature,
+                    signature: signed(&keys[i], KIND_VOTE, 3, h2).signature,
                 })
                 .collect()),
         },
         proposal: Some(p2),
     };
-    node.deliver(from(0), TOPIC, certificate.to_bytes())
+    node.deliver(from(1), TOPIC, certificate.to_bytes())
         .unwrap();
     let s = state(node);
-    assert_eq!((s.view, s.tip_height), (3, 2));
+    assert_eq!((s.view, s.tip_height), (4, 2));
     assert!(s.voted, "the new tip lets it vote for the held proposal");
 }
 
@@ -1338,39 +1357,40 @@ fn a_leader_behind_the_tip_is_sent_the_tip() {
     let kernel = kernel_module();
     let genesis = genesis(&keys, address(&keys[0]));
     let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    past_genesis(&mut sim);
     let node = &mut sim.nodes[3];
     let from = |i: usize| validator_id(&keys[i]);
     let now = node.now_ms();
     let p1 = Proposal {
-        view: 1,
+        view: 2,
         height: 1,
         timestamp_ms: now,
         ..Proposal::default()
     };
     let h1 = keccak256(&p1.to_bytes());
-    node.deliver(from(0), TOPIC, propose(&keys[0], p1.clone()))
+    node.deliver(from(1), TOPIC, propose(&keys[1], p1.clone()))
         .unwrap();
-    for i in [0, 1] {
-        node.deliver(from(i), TOPIC, vote(&keys[i], 1, h1)).unwrap();
+    for i in [1, 2] {
+        node.deliver(from(i), TOPIC, vote(&keys[i], 2, h1)).unwrap();
     }
     let s = node.simplex_state().unwrap();
-    assert_eq!((s.view, s.tip_height), (2, 1));
+    assert_eq!((s.view, s.tip_height), (3, 1));
     node.take_outbound();
-    // The leader of view 2 proposes height 1 again, on the genesis.
+    // The leader of view 3 proposes height 1 again, on the genesis.
     let behind = Proposal {
-        view: 2,
+        view: 3,
         height: 1,
         timestamp_ms: now + 1,
         ..Proposal::default()
     };
-    node.deliver(from(1), TOPIC, propose(&keys[1], behind))
+    node.deliver(from(2), TOPIC, propose(&keys[2], behind))
         .unwrap();
-    let sent = sends(node, &from(1));
+    let sent = sends(node, &from(2));
     assert!(
         sent.iter().any(|m| matches!(
             m,
             ConsensusMessage::Certificate { certificate, proposal: Some(p) }
-                if certificate.view == 1 && certificate.hash == h1 && *p == p1
+                if certificate.view == 2 && certificate.hash == h1 && *p == p1
         )),
         "{sent:?}"
     );
@@ -1407,14 +1427,93 @@ fn a_restarted_leader_does_not_propose_twice_in_a_view() {
     assert_agreement(&sim, &[0, 1, 2, 3]);
 }
 
+/// A leader that loses its data right after proposing, while the network
+/// cannot leave its view, comes back with nothing and does not propose in
+/// that view again (spec 08 §7b): the one validator it hears is no quorum
+/// to witness, so it signs nothing but timeout votes; once the network
+/// heals it witnesses the view and signs again two views later. Without
+/// the guard it caught up into the view it led and proposed a second block
+/// in it, which validator 1 recorded as an equivocation.
+#[test]
+fn a_wiped_leader_does_not_propose_again_in_its_view() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, address(&keys[0]));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    // Validators 2 and 3 are cut off from everyone while the cut lasts.
+    let cut = Rc::new(Cell::new(false));
+    let on = cut.clone();
+    sim.filter_links(Some(Box::new(move |from, to, _| {
+        (!on.get() || (from < 2 && to < 2)).then_some(0)
+    })));
+    assert!(
+        sim.run_until(20 * SLOT_MS, |s| {
+            let state = simplex(s, 0);
+            state.view > 4 && leader(state.view, 4) == 0 && !state.voted
+        })
+        .unwrap()
+    );
+    let view = simplex(&sim, 0).view;
+    // It proposes in the view it leads; only validator 1 hears it and votes: no quorum.
+    cut.set(true);
+    assert!(
+        sim.run_until(4 * SLOT_MS, |s| simplex(s, 0).voted && simplex(s, 1).voted)
+            .unwrap()
+    );
+    // It loses its data, comes back with its key alone, and catches up from validator 1
+    // into that view, which validator 1 keeps timing out.
+    sim.crash(0);
+    sim.advance(2 * SLOT_MS).unwrap();
+    sim.revive_from_scratch(0, kernel, &genesis).unwrap();
+    assert!(
+        sim.run_until(20 * SLOT_MS, |s| simplex(s, 0).view == view)
+            .unwrap(),
+        "{:?}",
+        views(&sim)
+    );
+    sim.advance(10 * SLOT_MS).unwrap();
+    assert!(sim.nodes.iter().all(|n| equivocations(n) == 0));
+    cut.set(false);
+    let height = sim.nodes[1].finalized_height().unwrap();
+    assert!(
+        sim.run_until(60 * SLOT_MS, |s| s
+            .finalized_heights()
+            .unwrap()
+            .iter()
+            .all(|h| *h >= height + 6))
+            .unwrap(),
+        "{:?} in views {:?}",
+        sim.finalized_heights().unwrap(),
+        views(&sim)
+    );
+    assert!(sim.nodes.iter().all(|n| equivocations(n) == 0));
+    assert!(sim.nodes[2].evidence(0).unwrap().is_empty());
+    // It leads and proposes again in a later view.
+    let mine = (height + 1..=height + 6).any(|h| {
+        let mut k = b"final/".to_vec();
+        k.extend_from_slice(&h.to_le_bytes());
+        let hash = sim.nodes[2].persisted()[&k].clone();
+        let p =
+            Proposal::from_bytes(&sim.nodes[2].persisted()[&[b"prop/".as_slice(), &hash].concat()])
+                .unwrap();
+        p.view > view + 1 && leader(p.view, 4) == 0
+    });
+    assert!(mine);
+    assert_agreement(&sim, &[0, 1, 2, 3]);
+}
+
 /// A leader whose tip the other validators lack is voted for within a few
 /// message delays (spec 08 §5a, tip fetching). Votes for the proposal of
-/// view 1 reach only validator 1, the leader of view 2: it alone notarizes
-/// view 1 and proposes on it, and the others hold neither the notarization
-/// nor a tip the proposal of view 2 extends. Each asks validator 1 for its
-/// tip as the proposal arrives and votes once the certificate is in. Before
-/// tip fetching they waited for their view-1 timeout (3 slots, more after
-/// backoff) to make their messages stale and draw the certificate that way:
+/// view 2, the first view after the genesis view, reach only validator 2,
+/// the leader of view 3: it alone notarizes view 2 and proposes on it, and
+/// the others hold neither the notarization nor a tip the proposal of view
+/// 3 extends. Each asks validator 2 for its tip as the proposal arrives and
+/// votes once the certificate is in. Before tip fetching they waited for
+/// their view timeout (3 slots, more after backoff) to make their messages
+/// stale and draw the certificate that way (measured when chains began
+/// with view 1's proposal):
 /// every node finalized 840 ms after the heal, against 440 ms with it, most
 /// of which is the leader of view 2 waiting out its slot.
 #[test]
@@ -1425,20 +1524,21 @@ fn a_leader_whose_tip_the_others_lack_is_voted_promptly() {
     let kernel = kernel_module();
     let genesis = genesis(&keys, address(&keys[0]));
     let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
-    // Validator 0 proposes in view 1, and its proposal reaches everyone ...
-    assert!(sim.run_until(4 * SLOT_MS, |s| simplex(s, 0).voted).unwrap());
-    // ... but from then on only validator 1 hears anything, the votes included, until it
-    // notarizes view 1.
+    past_genesis(&mut sim);
+    // Validator 1 proposes in view 2, and its proposal reaches everyone ...
+    assert!(sim.run_until(4 * SLOT_MS, |s| simplex(s, 1).voted).unwrap());
+    // ... but from then on only validator 2 hears anything, the votes included, until it
+    // notarizes view 2.
     let cut = Rc::new(Cell::new(true));
     let open = cut.clone();
     sim.filter_links(Some(Box::new(move |_, to, _| {
-        (to == 1 || !open.get()).then_some(0)
+        (to == 2 || !open.get()).then_some(0)
     })));
-    assert!(sim.run_until(SLOT_MS, |s| simplex(s, 1).view == 2).unwrap());
+    assert!(sim.run_until(SLOT_MS, |s| simplex(s, 2).view == 3).unwrap());
     cut.set(false);
-    for i in [0, 2, 3] {
+    for i in [0, 1, 3] {
         let s = simplex(&sim, i);
-        assert_eq!((s.view, s.tip_height), (1, 0), "node {i} lacks the tip");
+        assert_eq!((s.view, s.tip_height), (2, 0), "node {i} lacks the tip");
     }
     let healed = sim.now_ms;
     assert!(
@@ -1471,37 +1571,38 @@ fn a_held_vote_that_completes_a_quorum_notarizes() {
     let kernel = kernel_module();
     let genesis = genesis(&keys, address(&keys[0]));
     let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    past_genesis(&mut sim);
     let node = &mut sim.nodes[3];
     let from = |i: usize| validator_id(&keys[i]);
     let now = node.now_ms();
     let p1 = Proposal {
-        view: 1,
+        view: 2,
         height: 1,
         timestamp_ms: now,
         ..Proposal::default()
     };
     let h1 = keccak256(&p1.to_bytes());
     let p2 = Proposal {
-        view: 2,
+        view: 3,
         height: 2,
         parent: h1,
         timestamp_ms: now + 1,
         ..Proposal::default()
     };
     let h2 = keccak256(&p2.to_bytes());
-    node.deliver(from(0), TOPIC, propose(&keys[0], p1)).unwrap();
-    // The proposal of view 2 and two votes for it arrive while node 3 is in view 1.
-    node.deliver(from(1), TOPIC, propose(&keys[1], p2)).unwrap();
-    for i in [0, 1] {
-        node.deliver(from(i), TOPIC, vote(&keys[i], 2, h2)).unwrap();
+    node.deliver(from(1), TOPIC, propose(&keys[1], p1)).unwrap();
+    // The proposal of view 3 and two votes for it arrive while node 3 is in view 2.
+    node.deliver(from(2), TOPIC, propose(&keys[2], p2)).unwrap();
+    for i in [1, 2] {
+        node.deliver(from(i), TOPIC, vote(&keys[i], 3, h2)).unwrap();
     }
-    // View 1 is notarized: node 3 enters view 2, votes for the held proposal, and its
+    // View 2 is notarized: node 3 enters view 3, votes for the held proposal, and its
     // vote is the third.
-    for i in [0, 1] {
-        node.deliver(from(i), TOPIC, vote(&keys[i], 1, h1)).unwrap();
+    for i in [1, 2] {
+        node.deliver(from(i), TOPIC, vote(&keys[i], 2, h1)).unwrap();
     }
     let s = node.simplex_state().unwrap();
-    assert_eq!((s.view, s.tip_view, s.tip_hash), (3, 2, h2));
+    assert_eq!((s.view, s.tip_view, s.tip_hash), (4, 3, h2));
 }
 
 /// The messages of tip fetching (spec 08 §5a): a validator that holds the

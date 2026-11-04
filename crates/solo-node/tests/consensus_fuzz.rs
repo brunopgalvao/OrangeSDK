@@ -1,8 +1,10 @@
 //! Seeded schedules of faults for the Simplex driver (spec 08) over the
 //! simulated network: partitions, lossy links, delays that reorder
 //! messages, and validators crashing and restarting from what they
-//! persisted, in random phases. Safety always holds: no two nodes ever
-//! finalize different blocks at one height. Liveness holds once the faults
+//! persisted, or now and then from nothing, their data wiped, in random
+//! phases. Safety always holds: no two nodes ever finalize different blocks
+//! at one height, and no validator, a wiped one included, ever signs two
+//! things in one view (spec 08 §7b, §9). Liveness holds once the faults
 //! end: with the network healed and every validator back, every node
 //! finalizes new blocks. See `solo-fuzz` for the long mode (each case is a
 //! few seconds of a debug build).
@@ -81,6 +83,20 @@ impl Finalized {
     }
 }
 
+/// No node has seen any validator sign two things in one view: every
+/// validator here is honest, the wiped one included.
+fn no_equivocations(sim: &Sim) {
+    for (i, node) in sim.nodes.iter().enumerate() {
+        assert!(
+            !node
+                .metrics
+                .iter()
+                .any(|(name, _)| name == b"equivocations"),
+            "node {i} saw an equivocation"
+        );
+    }
+}
+
 /// One phase's faults on the links, drawing from its own generator.
 fn faults(r: &mut Rng) -> Option<solo_node::sim::LinkFilter> {
     let mut rng = Rng::new(r.u64());
@@ -119,12 +135,19 @@ fn schedule(r: &mut Rng) {
     let mut sim = Sim::new(kernel, &genesis, &keys, 1, &config, 20).unwrap();
     let mut seen = Finalized::default();
     let mut down = [false; VALIDATORS];
+    // At most one validator comes back wiped in a case: one that forgot what
+    // it signed counts as faulty until its guard ends (spec 08 §7b), and one
+    // is all four validators tolerate.
+    let mut wiped = false;
     for _ in 0..2 + r.below(4) {
         sim.filter_links(faults(r));
         // Crash a validator, or bring a crashed one back.
         if r.chance(1, 2) {
             let i = r.index(VALIDATORS);
-            if down[i] {
+            if down[i] && !wiped && r.chance(1, 3) {
+                sim.revive_from_scratch(i, kernel, &genesis).unwrap();
+                wiped = true;
+            } else if down[i] {
                 sim.revive(i, kernel, &genesis).unwrap();
             } else {
                 seen.check(&sim);
@@ -134,6 +157,7 @@ fn schedule(r: &mut Rng) {
         }
         sim.advance(SLOT_MS * (2 + r.below(8))).unwrap();
         seen.check(&sim);
+        no_equivocations(&sim);
     }
     // Heal: every validator back, every link clean.
     sim.filter_links(None);
@@ -152,6 +176,7 @@ fn schedule(r: &mut Rng) {
         })
         .unwrap();
     seen.check(&sim);
+    no_equivocations(&sim);
     eprintln!(
         "healed: finalized {target} after {} ms",
         sim.now_ms - healed

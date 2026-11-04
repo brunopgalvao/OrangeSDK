@@ -120,7 +120,7 @@ SOLO_TRUST_FROM=10.0.0.10:8545,10.0.0.11:8545
 
 **Logs.** Under systemd the node logs to journald (`SyslogIdentifier=solo-node`); cap it with `SystemMaxUse=2G` in `/etc/systemd/journald.conf`. In the container, the json-file driver rotates at 5 × 50 MB. `solo-ops logs <host>` and `solo-ops collect-logs <dir>` read either.
 
-**Key backups.** `solo-ops backup-keys <dir>` pulls a tar of each host's key directory (mode 0600) to move offline. Never run one consensus key on two hosts at once: both would vote, which is equivocation, and the chain slashes it (spec 15). A validator restored on a new host from its key alone, without its old `driver.state` and `persist.log`, may vote again in a view it voted in; restore only after the old host is certainly dead and a view has passed (spec 22 §7.3), or move the whole data directory with the key.
+**Key backups.** `solo-ops backup-keys <dir>` pulls a tar of each host's key directory (mode 0600) to move offline. Never run one consensus key on two hosts at once: both would vote, which is equivocation, and the chain slashes it (spec 15). A validator restored on a new host from its key alone, without its old `driver.state` and `persist.log`, starts under the signing guard (spec 08 §7b): it replays or syncs the chain signing nothing but timeout votes, and signs again two views after it has seen a quorum of the stake sign in one, past any view its old host can have signed in. That covers a host that is gone, not one that still runs: restore only once the old host is certainly dead, or move the whole data directory with the key.
 
 ## 5. Deploy
 

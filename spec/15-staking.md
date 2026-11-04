@@ -206,7 +206,7 @@ Nothing in `dkg` can make a block invalid.
 
 ### 6.3 Duties, confirmation and adoption
 
-After executing each block `h` (and at start), a node with a consensus key looks at the run of `epoch(h + 1)` and the phase `h + 1` falls in, and sends, as long as chain state lacks it:
+After executing each block `h` (and at start), a node with a consensus key looks at the run of `epoch(h + 1)` and the phase `h + 1` falls in, and sends, as long as chain state lacks it (and not while it catches up, 08 §7b: while its chain state is behind its view's epoch, or while its signing guard has witnessed no view; it sends nothing of rotation either then, §6.6):
 
 | Phase | Who | What |
 |---|---|---|
