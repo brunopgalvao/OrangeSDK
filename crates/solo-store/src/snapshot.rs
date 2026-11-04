@@ -1244,6 +1244,19 @@ mod tests {
         assert_eq!(SnapshotError::Cancelled.check(), None);
     }
 
+    #[test]
+    fn an_empty_run_merges_as_nothing() {
+        let empty = scratch("empty.run");
+        std::fs::write(&empty, []).unwrap();
+        let mut seen = 0;
+        merge_runs(&[empty], &mut |_, _, _| {
+            seen += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, 0);
+    }
+
     /// A proposal at `height` anchoring `anchor` with `root`.
     fn proposal(height: u64, anchor: u64, root: [u8; 32]) -> Proposal {
         Proposal {
