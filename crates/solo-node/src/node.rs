@@ -723,14 +723,14 @@ impl Node {
         }
     }
 
-    /// The highest height the host saw finalized: what it opened at, or
-    /// the last `FinalizeBlock`.
     /// Blocks this node executed since it opened.
     #[must_use]
     pub fn blocks_executed(&self) -> u64 {
         self.executed_count
     }
 
+    /// The highest height the host saw finalized: what it opened at, or
+    /// the last `FinalizeBlock`.
     fn host_finalized(&self) -> u64 {
         self.finalized.last().copied().unwrap_or(self.opened_at)
     }
@@ -905,11 +905,52 @@ impl Node {
     /// # Errors
     /// See [`NodeError`].
     pub fn start(&mut self, resumed_state: Option<Vec<u8>>) -> Result<(), NodeError> {
+        self.restore_head(resumed_state.as_deref());
         let now_ms = self.now_ms();
         self.step(Input::Started {
             now_ms,
             resumed_state,
         })
+    }
+
+    /// Puts back the finalized head the driver's state records when its
+    /// tables lack it, from the block log in chain state (spec 08 §7): the
+    /// driver store writes the state before the journal, so that a restart
+    /// never forgets a vote, and a crash between the two leaves a state
+    /// that names a head its tables do not hold. The driver chains every
+    /// block it is sent onto that head, and without it took none again.
+    fn restore_head(&mut self, resumed: Option<&[u8]>) {
+        let Some(height) = resumed
+            .and_then(|b| solo_abi::chain::SimplexState::from_bytes(b).ok())
+            .map(|s| s.finalized_height.to_le_bytes())
+        else {
+            return;
+        };
+        let at = |prefix: &[u8]| [prefix, &height[..]].concat();
+        let final_key = at(b"final/");
+        let held = self.services.borrow().persisted.contains_key(&final_key);
+        let logged = self.state_get(&at(solo_store::snapshot::LOG_PROPOSAL));
+        let Some(proposal) = logged.filter(|_| !held) else {
+            return;
+        };
+        let hash = keccak256(&proposal);
+        let mut writes = vec![
+            ([b"prop/".as_slice(), &hash].concat(), proposal),
+            (final_key, hash.to_vec()),
+        ];
+        writes.extend(
+            [
+                (solo_store::snapshot::LOG_CERTIFICATE, b"cert/".as_slice()),
+                (solo_store::snapshot::LOG_THRESHOLD, b"bcert/".as_slice()),
+            ]
+            .iter()
+            .filter_map(|(log, table)| self.state_get(&at(log)).map(|v| (at(table), v))),
+        );
+        let mut services = self.services.borrow_mut();
+        for (key, value) in writes {
+            services.persisted.insert(key.clone(), value.clone());
+            services.persist_writes.push((key, value));
+        }
     }
 
     /// Delivers one input to the driver and applies every resulting effect,
