@@ -216,14 +216,19 @@ pub fn describe_event(event: &solo_node::statesync::SyncEvent) -> String {
     }
 }
 
-/// Why a state sync stopped for want of peers, with what its trust says of
+/// Why a state sync stopped, if it did: its own failure, or the transport's
+/// reason for want of peers (spec 09 §6) with what the sync's trust says of
 /// the snapshots they offered, if anything (spec 22 §7.5).
-#[must_use]
-pub fn stalled(why: &str, hint: Option<String>) -> String {
-    match hint {
+pub fn stopped<'a>(
+    failed: Option<&'a str>,
+    stalled: impl FnOnce() -> Option<&'a str>,
+    hint: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let why = failed.or_else(stalled)?;
+    Some(match failed.map_or_else(hint, |_| None) {
         Some(hint) => format!("state sync: {why}: {hint}"),
         None => format!("state sync: {why}"),
-    }
+    })
 }
 
 /// Fetches a snapshot from the peers `transport` connects to, before the
@@ -248,11 +253,9 @@ pub fn sync_from_peers(
         for event in sync.take_events() {
             eprintln!("state sync: {}", describe_event(&event));
         }
-        if let Some(why) = sync.failed() {
-            return Err(format!("state sync: {why}"));
-        }
-        if let Some(why) = transport.sync_stalled(now()) {
-            return Err(stalled(why, sync.hint()));
+        let stall = || transport.sync_stalled(now());
+        if let Some(why) = stopped(sync.failed(), stall, || sync.hint()) {
+            return Err(why);
         }
         if let Some(snapshot) = sync.done() {
             return Ok(snapshot.clone());

@@ -234,6 +234,14 @@ fn messages_round_trip_and_bad_ones_are_refused() {
         SyncResponse::from_bytes(&answer_unserved(&[9])).unwrap(),
         SyncResponse::Unavailable
     );
+    // Nor does it hold chain state to answer for handoffs from.
+    let handoffs = answer_unserved(&SyncRequest::Handoffs { from: 1, to: 4 }.to_bytes());
+    assert_eq!(
+        SyncResponse::from_bytes(&handoffs).unwrap(),
+        SyncResponse::Handoffs(vec![])
+    );
+    assert!(SyncRequest::from_bytes(&[4]).is_err());
+    assert!(SyncResponse::from_bytes(&[5]).is_err());
     // Depths and slices.
     assert_eq!(depth_for(0, 8), 0);
     assert_eq!(depth_for(8, 8), 0);

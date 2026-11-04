@@ -1,7 +1,7 @@
 //! `solo node --sync-from-peers` stops with the reason when no peer can
 //! serve it (spec 09 §6), instead of waiting for ever.
 
-use solo_cli::snapshot::sync_from_peers;
+use solo_cli::snapshot::{stopped, sync_from_peers};
 use solo_node::net::SYNC_PEER_WAIT_MS;
 use solo_node::statesync::SyncConfig;
 use std::cell::Cell;
@@ -28,10 +28,17 @@ fn a_sync_without_peers_stops() {
         sync_from_peers(config, &mut transport, &now).unwrap_err(),
         "state sync: no peer to sync from in time"
     );
-    // A trust too old for what the peers offered says so (spec 22 §7.5).
+    // A sync's own failure comes first; a trust too old for what the peers
+    // offered says so when they ran out (spec 22 §7.5).
+    let old = || Some("too old".to_owned());
+    assert_eq!(stopped(None, || None, old), None);
     assert_eq!(
-        solo_cli::snapshot::stalled("no peer to sync from in time", Some("too old".to_owned())),
-        "state sync: no peer to sync from in time: too old"
+        stopped(None, || Some("no peer to sync from in time"), old).as_deref(),
+        Some("state sync: no peer to sync from in time: too old")
+    );
+    assert_eq!(
+        stopped(Some("another genesis"), || None, old).as_deref(),
+        Some("state sync: another genesis")
     );
 }
 
