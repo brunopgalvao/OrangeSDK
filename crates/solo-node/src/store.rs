@@ -12,7 +12,10 @@
 //! before it sends anything the driver produced ([`crate::Transport::poll`]),
 //! so a vote a peer holds is always a vote the node remembers after a
 //! restart. The journal is rewritten from the live tables once it outgrows
-//! them by more than [`COMPACTION_SLACK`].
+//! twice them by more than [`COMPACTION_SLACK`], which is looked at each
+//! time the journal has grown by [`COMPACTION_CHECK`]: measuring the tables
+//! costs a pass over them, too much for every sync, which comes before
+//! every send.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -29,6 +32,10 @@ pub const JOURNAL_FILE: &str = "persist.log";
 /// rewritten from them.
 pub const COMPACTION_SLACK: u64 = 1 << 20;
 
+/// How much the journal grows between two looks at whether it should be
+/// compacted.
+pub const COMPACTION_CHECK: u64 = COMPACTION_SLACK / 4;
+
 /// The node-local tables and driver state.
 pub type Tables = BTreeMap<Vec<u8>, Vec<u8>>;
 
@@ -44,6 +51,8 @@ pub struct DriverStore {
     pub(crate) pending: Vec<(Vec<u8>, Vec<u8>)>,
     /// The state as last written.
     last_state: Option<Vec<u8>>,
+    /// The journal length at which compaction is next looked at.
+    check_at: u64,
 }
 
 /// A record's length field: `persist_set` takes `u32` lengths (spec 05 §4.6).
@@ -79,6 +88,14 @@ fn replay(bytes: &[u8]) -> (Tables, u64) {
         at = key_end + value_len;
     }
     (tables, at as u64)
+}
+
+/// How many bytes `tables` take as journal records.
+fn serialized_len(tables: &Tables) -> u64 {
+    tables
+        .iter()
+        .map(|(key, value)| 8 + key.len() as u64 + value.len() as u64)
+        .sum()
 }
 
 /// The bytes of `tables` as journal records.
@@ -137,6 +154,7 @@ impl DriverStore {
             last_state: state.clone(),
             loaded: Some((tables, state)),
             pending: Vec::new(),
+            check_at: 0,
         })
     }
 
@@ -184,13 +202,17 @@ impl DriverStore {
             self.journal_len += bytes.len() as u64;
             self.pending.clear();
         }
-        let live_bytes = serialize(live);
-        if self.journal_len > 2 * live_bytes.len() as u64 + COMPACTION_SLACK {
+        if self.journal_len < self.check_at {
+            return Ok(());
+        }
+        if self.journal_len > 2 * serialized_len(live) + COMPACTION_SLACK {
+            let live_bytes = serialize(live);
             let path = self.dir.join(JOURNAL_FILE);
             replace(&path, &live_bytes)?;
             self.journal = open_journal(&path)?;
             self.journal_len = live_bytes.len() as u64;
         }
+        self.check_at = self.journal_len + COMPACTION_CHECK;
         Ok(())
     }
 }
@@ -209,6 +231,26 @@ const BY_VIEW: [&[u8]; 4] = [b"votes/", b"fin/", b"part/", b"notar/"];
 /// view ‖ validator`.
 const SIGNED: &[u8] = b"sig/";
 
+/// What the reference kernel's driver keeps of each DKG run it took part
+/// in (spec 15 §6.4): what it sent in each phase, `dkg/out/ ‖ epoch ‖
+/// phase`; its rotation share, `dkg/rshare2/ ‖ active ‖ target`; and the
+/// handoff it combined, `dkg/handoff/ ‖ target ‖ epoch`; ids and epochs
+/// big-endian. Each prefix with where, after it, the epoch it is pruned by
+/// lies.
+const BY_RUN: [(&[u8], usize); 3] = [(b"dkg/out/", 0), (b"dkg/rshare2/", 8), (b"dkg/handoff/", 8)];
+
+/// How many epochs of DKG runs, counting back from the newest the tables
+/// hold, a node keeps the records of (spec 22 §8.1). A run is over within
+/// the epoch after its own; the margin covers any key age.
+pub const DKG_RETENTION: u64 = 256;
+
+/// The epoch a DKG run record of `key` belongs to, if it is one.
+fn run_epoch(key: &[u8]) -> Option<u64> {
+    let (prefix, at) = BY_RUN.iter().find(|(p, _)| key.starts_with(p))?;
+    let bytes = key.get(prefix.len() + at..prefix.len() + at + 8)?;
+    Some(u64::from_be_bytes(bytes.try_into().ok()?))
+}
+
 /// The `u64` that starts at `at` in `bytes`, little-endian.
 fn le64(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
@@ -218,10 +260,12 @@ fn le64(bytes: &[u8], at: usize) -> Option<u64> {
 /// finalized height (spec 22 §8.1): the proposals of heights below it, the
 /// hash and certificates of every finalized height below it, and the
 /// votes, partials, notarizations and first signatures of the views below
-/// the view of the proposal finalized at `cutoff`. Everything else (the
-/// driver state, the entry and tip certificates, evidence, the DKG pool)
-/// stays. Returns how many entries went.
+/// the view of the proposal finalized at `cutoff`; and the records of the
+/// DKG runs more than [`DKG_RETENTION`] epochs older than the newest.
+/// Everything else (the driver state, the entry and tip certificates,
+/// evidence, the DKG pool) stays. Returns how many entries went.
 pub fn prune_tables(tables: &mut Tables, cutoff: u64) -> usize {
+    let newest_run = tables.keys().filter_map(|k| run_epoch(k)).max();
     let view_at = tables
         .get(&[b"final/".as_slice(), &cutoff.to_le_bytes()].concat())
         .and_then(|hash| tables.get(&[b"prop/".as_slice(), hash].concat()))
@@ -241,6 +285,9 @@ pub fn prune_tables(tables: &mut Tables, cutoff: u64) -> usize {
         }
         if key.starts_with(SIGNED) {
             return !below_view(SIGNED.len() + 1);
+        }
+        if let (Some(epoch), Some(newest)) = (run_epoch(key), newest_run) {
+            return epoch + DKG_RETENTION >= newest;
         }
         true
     });
@@ -291,11 +338,38 @@ mod tests {
         t.insert(b"final/x".to_vec(), vec![7]);
         t.insert(b"prop/short".to_vec(), vec![8]);
         t.insert(b"votes/x".to_vec(), vec![9]);
+        // DKG run records: epochs 3 and 300 of each kind; 3 is more than
+        // DKG_RETENTION epochs older than 300. A record too short to name
+        // its epoch, and the pool, stay.
+        let run = |prefix: &[u8], epoch: u64, at: usize| {
+            let mut key = prefix.to_vec();
+            key.extend(vec![0; at]);
+            key.extend(epoch.to_be_bytes());
+            key.push(1);
+            key
+        };
+        for epoch in [3, 300] {
+            t.insert(run(b"dkg/out/", epoch, 0), vec![10]);
+            t.insert(run(b"dkg/rshare2/", epoch, 8), vec![10]);
+            t.insert(run(b"dkg/handoff/", epoch, 8), vec![10]);
+        }
+        t.insert(b"dkg/out/x".to_vec(), vec![11]);
+        t.insert(b"dkg/pool".to_vec(), vec![12]);
         let all = t.len();
         // Below height 4 and view 40 everything goes: three heights of nine
-        // entries each and the fork's proposal.
-        assert_eq!(prune_tables(&mut t, 4), 3 * 9 + 1);
-        assert_eq!(t.len(), all - 28);
+        // entries each and the fork's proposal; and the three records of
+        // the old DKG run.
+        assert_eq!(prune_tables(&mut t, 4), 3 * 9 + 1 + 3);
+        assert_eq!(t.len(), all - 31);
+        for kept in [
+            run(b"dkg/out/", 300, 0),
+            run(b"dkg/rshare2/", 300, 8),
+            run(b"dkg/handoff/", 300, 8),
+            b"dkg/out/x".to_vec(),
+            b"dkg/pool".to_vec(),
+        ] {
+            assert!(t.contains_key(&kept), "{kept:?}");
+        }
         for h in 4..=6u64 {
             assert!(t.contains_key(&at(b"final/", h)));
             assert!(t.contains_key(&at(b"notar/", 10 * h)));
@@ -382,14 +456,28 @@ mod tests {
         let mut store = DriverStore::open(&dir).unwrap();
         let value = vec![7u8; 4096];
         let live = tables(&[(b"k", &value)]);
-        // Rewriting one key past the slack leaves a journal of one record.
-        for _ in 0..300 {
+        // The tables are measured once, at the first sync, and then not
+        // again until the journal has grown by COMPACTION_CHECK: a sync
+        // comes before every send, and a pass over large tables each time
+        // cost a node most of its time and memory (found by the soak test).
+        store.pending.push((b"k".to_vec(), value.clone()));
+        store.sync(Some(b"s"), &live).unwrap();
+        assert_eq!(store.check_at, 4105 + COMPACTION_CHECK);
+        store.sync(Some(b"s"), &live).unwrap();
+        assert_eq!(store.check_at, 4105 + COMPACTION_CHECK);
+        // Rewriting one key past the slack leaves a journal of one record,
+        // looked at every COMPACTION_CHECK bytes of journal.
+        for _ in 0..399 {
             store.pending.push((b"k".to_vec(), value.clone()));
             store.sync(Some(b"s"), &live).unwrap();
         }
-        // 300 records would be 1 231 500 bytes; the rewrite kept the bound.
+        // 400 records would be 1 642 000 bytes; the rewrite kept the bound.
         let len = fs::metadata(dir.join(JOURNAL_FILE)).unwrap().len();
-        assert!(len <= 2 * 4105 + COMPACTION_SLACK, "{len}");
+        assert!(
+            len <= 2 * 4105 + COMPACTION_SLACK + COMPACTION_CHECK + 4105,
+            "{len}"
+        );
+        assert!(len < 400 * 4105, "{len}");
         assert_eq!((len % 4105, store.journal_len), (0, len));
         // Appends continue on the rewritten journal.
         store.pending.push((b"j".to_vec(), b"2".to_vec()));
