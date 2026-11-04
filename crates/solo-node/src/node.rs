@@ -112,6 +112,22 @@ pub const DRIVER_RETENTION: u64 = 1024;
 /// rarely enough that the pass over them costs nothing per block.
 pub const PRUNE_EVERY: u64 = 64;
 
+/// How many of its latest executed blocks, finalized heights and driver
+/// metrics a node keeps in [`Node::executed`], [`Node::finalized`] and
+/// [`Node::metrics`]: at least this many, at most twice as many. Kept
+/// whole, the three grew by about a hundred bytes a block for as long as
+/// the node ran.
+pub const KEPT_RECORDS: usize = 4096;
+
+/// Appends `item` to `records`, dropping the oldest once there are twice
+/// `kept`, down to `kept`: memory stays bounded, and the drop is amortized.
+pub fn keep_latest<T>(records: &mut Vec<T>, item: T, kept: usize) {
+    records.push(item);
+    if records.len() > 2 * kept {
+        records.drain(..records.len() - kept);
+    }
+}
+
 /// Key writes of history a node keeps per block of its window, by default
 /// (spec 20 §5.1). A node keeps at most `state_history` times this many:
 /// when the blocks of its window wrote more committed keys than that in
@@ -212,12 +228,17 @@ pub struct Node {
     pub(crate) kernel: [u8; 32],
     services: Rc<RefCell<NodeServices>>,
     pool: Mempool,
-    /// Blocks executed, in order, as `(height, block hash)`.
+    /// The latest blocks executed, in order, as `(height, block hash)`; see
+    /// [`KEPT_RECORDS`] and [`Node::blocks_executed`].
     pub executed: Vec<(u64, [u8; 32])>,
-    /// Heights finalized, in order.
+    /// The latest heights finalized, in order; see [`KEPT_RECORDS`].
     pub finalized: Vec<u64>,
-    /// Metrics the driver emitted.
+    /// The latest metrics the driver emitted; see [`KEPT_RECORDS`].
     pub metrics: Vec<(Vec<u8>, i64)>,
+    /// Blocks executed since the node opened, all of them.
+    executed_count: u64,
+    /// Blocks finalized since the node opened, all of them.
+    finalized_count: u64,
     /// The last state the driver asked to persist.
     pub persisted_driver_state: Option<Vec<u8>>,
     /// Gas budget for each kernel call; see [`KERNEL_GAS`].
@@ -325,6 +346,8 @@ impl Node {
             executed: Vec::new(),
             finalized: Vec::new(),
             metrics: Vec::new(),
+            executed_count: 0,
+            finalized_count: 0,
             persisted_driver_state: None,
             kernel_gas: KERNEL_GAS,
             query_gas: config.query_gas,
@@ -564,7 +587,7 @@ impl Node {
         if self.export_job.is_some() {
             return;
         }
-        let finalized = self.finalized.len();
+        let finalized = self.finalized_count;
         let latest = self
             .chain_store()
             .and_then(|s| s.get(solo_abi::chain::keys::SNAPSHOT_LATEST))
@@ -702,6 +725,12 @@ impl Node {
 
     /// The highest height the host saw finalized: what it opened at, or
     /// the last `FinalizeBlock`.
+    /// Blocks this node executed since it opened.
+    #[must_use]
+    pub fn blocks_executed(&self) -> u64 {
+        self.executed_count
+    }
+
     fn host_finalized(&self) -> u64 {
         self.finalized.last().copied().unwrap_or(self.opened_at)
     }
@@ -1002,7 +1031,8 @@ impl Node {
                 .to_bytes();
                 self.call_unit(exports::FINALIZE_BLOCK, &args)?;
                 self.exec.state_mut().base_mut().flush()?;
-                self.finalized.push(height);
+                keep_latest(&mut self.finalized, height, KEPT_RECORDS);
+                self.finalized_count += 1;
                 if height.is_multiple_of(PRUNE_EVERY) {
                     self.prune_tables(height);
                 }
@@ -1030,7 +1060,7 @@ impl Node {
             }
             Effect::Metric { name, value } => {
                 self.telemetry.driver_metric(&name, value);
-                self.metrics.push((name, value));
+                keep_latest(&mut self.metrics, (name, value), KEPT_RECORDS);
                 None
             }
             // Admission is implicit in `submit`.
@@ -1135,7 +1165,8 @@ impl Node {
         // The next block's base fee follows from this one (spec 23 §3).
         self.refresh_fees()?;
         self.reset_pool()?;
-        self.executed.push((height, block_hash));
+        keep_latest(&mut self.executed, (height, block_hash), KEPT_RECORDS);
+        self.executed_count += 1;
         let summary = &result.summary;
         self.telemetry
             .block_executed(height, summary.tx_count, summary.gas_used);

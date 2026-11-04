@@ -506,7 +506,7 @@ pub struct SnapshotServer {
     served: Vec<Served>,
     /// How many finalized heights the node had when it last looked for a
     /// newer record; none yet at first.
-    pub(crate) checked: usize,
+    pub(crate) checked: u64,
 }
 
 impl SnapshotServer {
@@ -523,7 +523,7 @@ impl SnapshotServer {
             dir: dir.to_path_buf(),
             limits,
             served: Vec::new(),
-            checked: usize::MAX,
+            checked: u64::MAX,
         };
         for entry in fs::read_dir(dir).map_err(io)? {
             let path = entry.map_err(io)?.path();

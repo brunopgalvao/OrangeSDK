@@ -257,6 +257,7 @@ fn transfers_make_blocks() {
     assert_eq!(node.block_number().unwrap(), 1);
     assert_eq!(node.finalized_height().unwrap(), 1);
     assert_eq!(node.executed.len(), 1);
+    assert_eq!(node.blocks_executed(), 1);
     assert_eq!(node.finalized, vec![1]);
     assert!(node.mempool().is_empty());
     assert_eq!(
@@ -810,4 +811,22 @@ fn a_small_query_cap_does_not_blind_the_host() {
     assert!(node.block_number().unwrap_err().is_out_of_gas());
     assert!(node.evidence(0).unwrap_err().is_out_of_gas());
     assert_eq!(node.query_gas, 1_000);
+}
+
+/// A node keeps the latest of its executed blocks, finalized heights and
+/// driver metrics, not all of them: kept whole they grew for as long as the
+/// node ran, about a hundred bytes a block. Between `kept` and twice as
+/// many stay, the newest last.
+#[test]
+fn records_keep_the_latest_and_stay_bounded() {
+    assert_eq!(solo_node::KEPT_RECORDS, 4096);
+    let mut records = Vec::new();
+    for i in 0..9u32 {
+        solo_node::keep_latest(&mut records, i, 2);
+        assert!((1..=4).contains(&records.len()), "{records:?}");
+        assert_eq!(records.last(), Some(&i));
+    }
+    // The fifth drops them down to two, 3 and 4; 5 and 6 join them, the
+    // eighth drops them to 6 and 7 again, and 8 joins.
+    assert_eq!(records, vec![6, 7, 8]);
 }

@@ -25,8 +25,8 @@ pub use extension::{NodeExtension, NodeServices, Outbound, sign_recoverable, val
 pub use mempool::{MAX_TX_BYTES, Mempool, PoolError, PoolLimits, PoolTx};
 pub use net::{Discovery, Transport};
 pub use node::{
-    ARCHIVE, BLOCK_KERNEL_GAS, DRIVER_RETENTION, HISTORY_KEYS_PER_BLOCK, Node, NodeConfig,
-    NodeError, PRUNE_EVERY, STATE_HISTORY, SubmitError,
+    ARCHIVE, BLOCK_KERNEL_GAS, DRIVER_RETENTION, HISTORY_KEYS_PER_BLOCK, KEPT_RECORDS, Node,
+    NodeConfig, NodeError, PRUNE_EVERY, STATE_HISTORY, SubmitError, keep_latest,
 };
 pub use sim::Sim;
 pub use state::{ChainState, StoreConfig};

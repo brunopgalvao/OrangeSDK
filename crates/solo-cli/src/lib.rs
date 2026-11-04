@@ -955,11 +955,12 @@ pub(crate) fn run_inner(
         // same before it sends (spec 08 §7).
         report(node.sync_store());
         report_switches(node, &mut switches_seen);
-        let executed = node.executed.len();
-        if executed as u64 > seen.get() {
-            seen.set(executed as u64);
-            let (height, hash) = node.executed[executed - 1];
-            eprintln!("block {height} {}", solo_rpc::methods::data(&hash));
+        let executed = node.blocks_executed();
+        if executed > seen.get()
+            && let Some((height, hash)) = node.executed.last()
+        {
+            seen.set(executed);
+            eprintln!("block {height} {}", solo_rpc::methods::data(hash));
         }
     }));
     solo_rpc::http::serve(&listener, &mut rpc, |rpc| {
