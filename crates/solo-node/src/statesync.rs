@@ -1045,9 +1045,11 @@ impl StateSync {
         }
         header
             .verify(self.config.chain_id, &self.config.trust)
-            .map_err(|e| match e {
-                SnapshotError::Verify(UNTRUSTED_CERTIFICATE) => UNTRUSTED,
-                _ => "a snapshot header that does not verify under the node's trust",
+            .map_err(|e| match e.check() {
+                Some(UNTRUSTED_CERTIFICATE) => UNTRUSTED,
+                why => {
+                    why.unwrap_or("a snapshot header that does not verify under the node's trust")
+                }
             })?;
         if manifest.depth > MAX_DEPTH || manifest.slices.len() != 1 << manifest.depth {
             return Err("a manifest of the wrong shape");

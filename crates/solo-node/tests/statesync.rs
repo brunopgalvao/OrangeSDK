@@ -558,7 +558,7 @@ fn lying_peers_are_banned_and_the_sync_completes_from_honest_ones() {
         (
             "an unverified header",
             header(|h| h.links.0.clear()),
-            "a snapshot header that does not verify under the node's trust",
+            "the links do not join the head to the anchoring proposal",
         ),
         (
             "too deep",

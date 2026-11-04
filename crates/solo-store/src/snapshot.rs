@@ -341,6 +341,18 @@ impl fmt::Display for SnapshotError {
 
 impl std::error::Error for SnapshotError {}
 
+impl SnapshotError {
+    /// Why a check refused the snapshot, for a verification failure; none
+    /// for any other error.
+    #[must_use]
+    pub fn check(&self) -> Option<&'static str> {
+        match self {
+            SnapshotError::Verify(why) => Some(why),
+            _ => None,
+        }
+    }
+}
+
 impl From<StoreError> for SnapshotError {
     fn from(e: StoreError) -> SnapshotError {
         SnapshotError::Store(e.to_string())
@@ -1196,6 +1208,12 @@ mod tests {
 
     fn scratch(name: &str) -> PathBuf {
         solo_scratch::Scratch::new("snapshot-unit", name).keep()
+    }
+
+    #[test]
+    fn a_verification_failure_names_its_check() {
+        assert_eq!(SnapshotError::Verify("x").check(), Some("x"));
+        assert_eq!(SnapshotError::Cancelled.check(), None);
     }
 
     /// A proposal at `height` anchoring `anchor` with `root`.
