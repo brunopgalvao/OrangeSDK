@@ -28,4 +28,26 @@ fn a_sync_without_peers_stops() {
         sync_from_peers(config, &mut transport, &now).unwrap_err(),
         "state sync: no peer to sync from in time"
     );
+    // A trust too old for what the peers offered says so (spec 22 §7.5).
+    assert_eq!(
+        solo_cli::snapshot::stalled("no peer to sync from in time", Some("too old".to_owned())),
+        "state sync: no peer to sync from in time: too old"
+    );
+}
+
+/// A node too far behind to catch up from its peers' blocks says so once
+/// when that starts, and once when it ends (spec 09 §6a, step 6).
+#[test]
+fn a_sync_alert_is_logged_when_it_changes() {
+    use solo_cli::sync_alert_change as change;
+    assert_eq!(change(None, None), None);
+    assert_eq!(
+        change(None, Some("block 1 is no longer kept")).as_deref(),
+        Some("catch-up: block 1 is no longer kept")
+    );
+    assert_eq!(change(Some("a"), Some("b")), None);
+    assert_eq!(
+        change(Some("a"), None).as_deref(),
+        Some("catch-up: peers serve the blocks this node needs again")
+    );
 }

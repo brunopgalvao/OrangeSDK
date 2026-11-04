@@ -116,7 +116,7 @@ fn lie(r: &mut Rng, request: &SyncRequest, answer: Vec<u8>, last: &mut Vec<u8>) 
                 }
                 SyncResponse::Offers(offers).to_bytes()
             }
-            (_, SyncResponse::Unavailable) => answer.clone(),
+            (_, SyncResponse::Unavailable | SyncResponse::Handoffs(_)) => answer.clone(),
         },
     };
     *last = answer;

@@ -40,6 +40,7 @@ use solo_host::Storage;
 use solo_trie::{Hash, NODE_LEN, Proof, SortedRoot, keccak256};
 
 use crate::disk::{DiskStore, NotKept, StoreError};
+use crate::keychain::KeyChain;
 
 /// The first eight bytes of a snapshot file.
 pub const MAGIC: &[u8; 8] = b"SOLOSNAP";
@@ -174,6 +175,11 @@ impl SnapshotHeader {
                 "the anchoring proposal anchors no height above the snapshot",
             ));
         }
+        if let Trust::KeySet(chain) = trust
+            && self.epoch > chain.horizon()
+        {
+            return Err(SnapshotError::Verify(PAST_HORIZON));
+        }
         let hash = keccak256(&self.anchor_proposal);
         self.verify_certificate(&proposal, &hash, chain_id, trust)?;
         let record = SnapshotRecord {
@@ -259,10 +265,14 @@ impl SnapshotHeader {
                     "the threshold certificate is not the anchoring proposal's",
                 ));
             }
-            let Trust::Key(key) = trust else {
-                return Err(SnapshotError::Verify(
-                    "a threshold certificate needs a trusted group key",
-                ));
+            let key = match trust {
+                Trust::Key(key) => key,
+                Trust::KeySet(chain) => return verify_reached(bytes, chain_id, chain),
+                Trust::Genesis(_) => {
+                    return Err(SnapshotError::Verify(
+                        "a threshold certificate needs a trusted group key",
+                    ));
+                }
             };
             let group_key = PublicKey::from_bytes(key)
                 .ok()
@@ -274,9 +284,7 @@ impl SnapshotHeader {
                         "the threshold certificate does not decode",
                     ))?;
             if !certificate.verify(chain_id, &group_key) {
-                return Err(SnapshotError::Verify(
-                    "the threshold certificate does not verify under the trusted key",
-                ));
+                return Err(SnapshotError::Verify(NOT_TRUSTED));
             }
             return Ok(());
         }
@@ -297,12 +305,57 @@ impl SnapshotHeader {
     }
 }
 
+/// Why a snapshot past the trusted key set's horizon is refused (spec 22
+/// §7.5).
+pub const PAST_HORIZON: &str = "the snapshot is past the trusted key set's horizon";
+/// Why a certificate of a key set older than the trusted one is refused.
+pub const OLDER_KEY_SET: &str =
+    "the threshold certificate is of a key set older than the trusted one";
+/// Why a certificate of a key set not reached yet is refused: handoffs to
+/// it are needed first (spec 22 §7.4, step 2).
+pub const NOT_REACHED: &str =
+    "the threshold certificate's key set is not reached from the trusted one";
+/// Why a certificate that a reached key set's group key does not verify is
+/// refused.
+pub const NOT_ITS_KEY: &str =
+    "the threshold certificate does not verify under its key set's group key";
+/// Why a certificate that the trusted key does not verify is refused.
+pub const NOT_TRUSTED: &str = "the threshold certificate does not verify under the trusted key";
+
+/// Checks a threshold certificate under a key-set trust (spec 22 §7.5): a
+/// version-2 certificate of a reached key set, verifying under its key.
+fn verify_reached(bytes: &[u8], chain_id: u64, chain: &KeyChain) -> Result<(), SnapshotError> {
+    let certificate = CertificateV2::from_bytes(bytes)
+        .ok()
+        .ok_or(SnapshotError::Verify(
+            "the threshold certificate does not decode as version 2",
+        ))?;
+    if certificate.key_id < chain.id() {
+        return Err(SnapshotError::Verify(OLDER_KEY_SET));
+    }
+    let key = chain
+        .key(certificate.key_id)
+        .ok_or(SnapshotError::Verify(NOT_REACHED))?;
+    let verifies = PublicKey::from_bytes(key).is_ok_and(|key| certificate.verify(chain_id, &key));
+    match (verifies, certificate.key_id == chain.id()) {
+        (true, _) => Ok(()),
+        // The trusted key set's own: the operator's key may be the wrong one.
+        (false, true) => Err(SnapshotError::Verify(NOT_TRUSTED)),
+        (false, false) => Err(SnapshotError::Verify(NOT_ITS_KEY)),
+    }
+}
+
 /// What a verifier trusts (spec 22 §7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Trust {
     /// A group key of the chain's threshold key (spec 15 §6): the snapshot's
     /// certificate must be a threshold certificate that verifies under it.
     Key([u8; 96]),
+    /// A key set of the chain's threshold key, by id and group key, and the
+    /// key sets reached from it by verified handoffs (spec 22 §7.5): the
+    /// certificate must be a version-2 certificate of a reached key set, for
+    /// a snapshot within the trusted key set's horizon.
+    KeySet(KeyChain),
     /// The genesis validator set, for a chain without staking, whose set
     /// never changes: the certificate must be a finalize vote certificate
     /// of that set.
@@ -1242,6 +1295,109 @@ mod tests {
     fn a_verification_failure_names_its_check() {
         assert_eq!(SnapshotError::Verify("x").check(), Some("x"));
         assert_eq!(SnapshotError::Cancelled.check(), None);
+    }
+
+    /// Under a key-set trust (spec 22 §7.5), the certificate must be of a
+    /// reached key set and verify under its key, for a snapshot within the
+    /// trusted key set's horizon; each refusal names its check.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_key_set_trust_takes_certificates_of_the_key_sets_it_reaches() {
+        use solo_abi::rotation::Handoff;
+        use solo_bls::SecretKey;
+        use solo_bls::certificate::rotation_message;
+        const CHAIN: u64 = 7;
+        let secret = |i: u64| {
+            let mut ikm = [5u8; 32];
+            ikm[..8].copy_from_slice(&i.to_be_bytes());
+            SecretKey::generate(&ikm, b"").unwrap()
+        };
+        let anchoring = proposal(30, 25, [1; 32]).to_bytes();
+        let hash = keccak256(&anchoring);
+        // A header certified by key set `id`, signed with `signer`'s key.
+        let header = |epoch: u64, id: u64, signer: u64| SnapshotHeader {
+            chain_id: CHAIN,
+            epoch,
+            height: 20,
+            anchor_proposal: anchoring.clone(),
+            certificate: CertificateV2 {
+                key_id: id,
+                height: 30,
+                block_hash: hash,
+                signature: secret(signer)
+                    .sign(&solo_bls::certificate::message_v2(CHAIN, id, 30, &hash)),
+            }
+            .to_bytes()
+            .to_vec(),
+            ..SnapshotHeader::default()
+        };
+        let trust = |chain: KeyChain| Trust::KeySet(chain);
+        let anchor = || KeyChain::new(4, secret(4).public_key().to_bytes(), 3);
+        let check = |h: &SnapshotHeader, t: &Trust| h.verify(CHAIN, t).unwrap_err();
+        // The trusted key set's own certificate passes check 3: the proof,
+        // missing here, is the first check to fail.
+        let passed = SnapshotError::Verify("the record's proof does not decode");
+        assert_eq!(check(&header(5, 4, 4), &trust(anchor())), passed);
+        assert_eq!(
+            check(&header(7, 4, 4), &trust(anchor())),
+            SnapshotError::Verify(PAST_HORIZON)
+        );
+        assert_eq!(
+            check(&header(5, 3, 3), &trust(anchor())),
+            SnapshotError::Verify(OLDER_KEY_SET)
+        );
+        assert_eq!(
+            check(&header(5, 5, 5), &trust(anchor())),
+            SnapshotError::Verify(NOT_REACHED)
+        );
+        assert_eq!(
+            check(&header(5, 4, 9), &trust(anchor())),
+            SnapshotError::Verify(NOT_TRUSTED)
+        );
+        let garbage = KeyChain::new(4, [0xFF; 96], 3);
+        assert_eq!(
+            check(&header(5, 4, 4), &trust(garbage)),
+            SnapshotError::Verify(NOT_TRUSTED)
+        );
+        // A key set reached by a handoff: its own certificate passes, one its
+        // key does not verify is refused.
+        let mut reached = anchor();
+        let next = secret(5).public_key();
+        reached
+            .extend(
+                CHAIN,
+                &[Handoff {
+                    from: 4,
+                    to: 5,
+                    key: next.to_bytes().to_vec(),
+                    signature: secret(4)
+                        .sign(&rotation_message(CHAIN, 5, &next))
+                        .to_bytes()
+                        .to_vec(),
+                    height: 21,
+                }],
+            )
+            .unwrap();
+        assert_eq!(check(&header(6, 5, 5), &trust(reached.clone())), passed);
+        assert_eq!(
+            check(&header(6, 5, 4), &trust(reached)),
+            SnapshotError::Verify(NOT_ITS_KEY)
+        );
+        // Version 1 says no key set, and a vote certificate no key at all.
+        let mut v1 = header(5, 4, 4);
+        v1.certificate = [&[1u8][..], &v1.certificate[9..]].concat();
+        assert_eq!(
+            check(&v1, &trust(anchor())),
+            SnapshotError::Verify("the threshold certificate does not decode as version 2")
+        );
+        let mut votes = header(5, 4, 4);
+        votes.certificate = certificate(hash).to_bytes();
+        assert_eq!(
+            check(&votes, &trust(anchor())),
+            SnapshotError::Verify(
+                "a vote certificate needs the genesis validator set, and only a chain without staking keeps it"
+            )
+        );
     }
 
     /// A proposal at `height` anchoring `anchor` with `root`.

@@ -537,6 +537,53 @@ fn driver_tables_are_pruned_below_the_retention_and_the_latest_snapshot() {
     }
 }
 
+/// A node further behind than its peers keep blocks, started without a
+/// snapshot, cannot catch up from them: they answer its requests with
+/// their finalized height and no blocks. It says so, in `/status` and to
+/// its operator, naming the way back (spec 22 §8.1, spec 09 §6a step 6),
+/// where it used to sit at height 0 without a word. Found by the soak test
+/// (`crates/solo-cli/tests/soak`, codex ADR 0055).
+#[test]
+fn a_node_behind_what_its_peers_keep_says_why_it_cannot_catch_up() {
+    let validators = keys(1);
+    let genesis = genesis(&validators, epochs_of_four(), 10);
+    let dir = scratch("far-behind");
+    let template = NodeConfig {
+        now_ms: 1_000,
+        ..NodeConfig::default()
+    };
+    let stores = [StoreConfig::Disk(dir.to_path_buf())];
+    let mut sim = Sim::with_stores(v1(), &genesis, &validators, 1, &template, 20, &stores).unwrap();
+    // The validator keeps no more driver tables than its latest snapshot
+    // needs; the observer is away while it prunes block 1.
+    sim.nodes[0].driver_retention = 0;
+    sim.crash(1);
+    let pruned = sim
+        .run_until(400 * SLOT_MS, |s| {
+            s.nodes[0].finalized_height().unwrap() >= 70
+        })
+        .unwrap();
+    assert!(pruned);
+    assert!(!table_heights(&sim.nodes[0]).contains(&1));
+    sim.revive_from_scratch(1, v1(), &genesis).unwrap();
+    assert_eq!(sim.nodes[1].sync_alert(), None);
+    let said = sim
+        .run_until(40 * SLOT_MS, |s| s.nodes[1].sync_alert().is_some())
+        .unwrap();
+    assert!(said);
+    let alert = sim.nodes[1].sync_alert().unwrap();
+    assert!(
+        alert.starts_with("block 1 is no longer kept by its peers (one has finalized ")
+            && alert.ends_with(
+                "restart it over an empty data directory with --sync-from-peers or --snapshot"
+            ),
+        "{alert}"
+    );
+    assert_eq!(sim.nodes[1].status().unwrap().sync_alert, Some(alert));
+    assert_eq!(sim.nodes[1].finalized_height().unwrap(), 0);
+    assert_eq!(sim.nodes[0].status().unwrap().sync_alert, None);
+}
+
 #[test]
 fn a_fresh_node_imports_a_snapshot_serves_it_and_syncs_forward() {
     let dir = scratch("import-source");

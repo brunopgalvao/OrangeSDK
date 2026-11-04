@@ -27,7 +27,10 @@ use std::path::{Path, PathBuf};
 
 use solo_abi::chain::keys;
 use solo_abi::codec::{Decode, DecodeError, Decoder, Encode, Encoder, Seq};
-use solo_store::{Snapshot, SnapshotError, SnapshotHeader, Trust};
+use solo_abi::rotation::{Handoff, keys as rotation_keys};
+use solo_store::keychain::MAX_HANDOFFS;
+use solo_store::snapshot::{NOT_REACHED, NOT_TRUSTED, OLDER_KEY_SET, PAST_HORIZON};
+use solo_store::{KeyChain, Snapshot, SnapshotError, SnapshotHeader, Trust};
 use solo_trie::{EMPTY, Hash, NODE_LEN, SortedRoot, branch_hash, keccak256, leaf_hash};
 
 /// Most bytes of keys and values in one page of a slice.
@@ -82,6 +85,9 @@ pub enum SyncRequest {
         slice: u32,
         after: Option<Hash>,
     },
+    /// The recorded handoffs from key set `from` on, up to the one into
+    /// `to` (spec 22 §7.4).
+    Handoffs { from: u64, to: u64 },
 }
 
 /// A snapshot a peer serves.
@@ -136,6 +142,8 @@ pub enum SyncResponse {
     },
     /// The epoch asked for is not served.
     Unavailable,
+    /// Recorded handoffs, in chain order.
+    Handoffs(Vec<Handoff>),
 }
 
 impl Encode for SyncRequest {
@@ -154,6 +162,10 @@ impl Encode for SyncRequest {
                 e.raw(&[2]);
                 e.put(epoch).put(slice).put(after);
             }
+            SyncRequest::Handoffs { from, to } => {
+                e.raw(&[3]);
+                e.put(from).put(to);
+            }
         }
     }
 }
@@ -167,6 +179,10 @@ impl Decode for SyncRequest {
                 epoch: d.get()?,
                 slice: d.get()?,
                 after: d.get()?,
+            },
+            3 => SyncRequest::Handoffs {
+                from: d.get()?,
+                to: d.get()?,
             },
             tag => return Err(DecodeError::BadTag(tag)),
         })
@@ -272,6 +288,10 @@ impl Encode for SyncResponse {
                 e.put(&Seq(entries.clone())).put(more);
             }
             SyncResponse::Unavailable => e.raw(&[3]),
+            SyncResponse::Handoffs(handoffs) => {
+                e.raw(&[4]);
+                e.put(&Seq(handoffs.clone()));
+            }
         }
     }
 }
@@ -286,6 +306,7 @@ impl Decode for SyncResponse {
                 more: d.get()?,
             },
             3 => SyncResponse::Unavailable,
+            4 => SyncResponse::Handoffs(d.get::<Seq<Handoff>>()?.0),
             tag => return Err(DecodeError::BadTag(tag)),
         })
     }
@@ -468,9 +489,29 @@ impl Served {
     }
 }
 
+/// The handoffs a node whose chain state `state` reads answers `Handoffs {
+/// from, to }` with (spec 22 §7.4): the one recorded out of `from`, then the
+/// one out of its target, and so on, ending after the first into `to` or
+/// above, after [`MAX_HANDOFFS`], or at a key set with none recorded (or
+/// one that does not decode).
+pub fn handoffs_from(state: impl Fn(&[u8]) -> Option<Vec<u8>>, from: u64, to: u64) -> Vec<Handoff> {
+    let mut out = Vec::new();
+    let mut at = from;
+    while out.len() < MAX_HANDOFFS
+        && at < to
+        && let Some(h) = state(&[rotation_keys::HANDOFF, &at.to_be_bytes()[..]].concat())
+            .and_then(|b| Handoff::from_bytes(&b).ok())
+    {
+        at = h.to;
+        out.push(h);
+    }
+    out
+}
+
 /// The answer to the request `payload` from the snapshots `served`, newest
 /// first: `Unavailable` for an epoch not served, a slice not in it or a
-/// file that can no longer be read, and for a request that does not decode.
+/// file that can no longer be read, and for a request that does not decode;
+/// no handoffs, since a server alone holds no chain state.
 fn answer(served: &[Served], payload: &[u8]) -> Vec<u8> {
     let find = |epoch: u64| served.iter().find(|s| s.snapshot.header.epoch == epoch);
     let response = match SyncRequest::from_bytes(payload) {
@@ -485,6 +526,7 @@ fn answer(served: &[Served], payload: &[u8]) -> Vec<u8> {
         }) => find(epoch)
             .and_then(|s| s.page(slice, after).ok())
             .unwrap_or(SyncResponse::Unavailable),
+        Ok(SyncRequest::Handoffs { .. }) => SyncResponse::Handoffs(Vec::new()),
         Err(_) => SyncResponse::Unavailable,
     };
     response.to_bytes()
@@ -612,6 +654,21 @@ pub enum SyncEvent {
         /// Its epoch.
         epoch: u64,
     },
+    /// Offers of an epoch past the trusted key set's horizon (spec 22
+    /// §7.5), never fetched: the trust is too old for them.
+    PastHorizon {
+        /// Their epoch.
+        epoch: u64,
+        /// The last epoch the trust reaches.
+        horizon: u64,
+    },
+    /// Handoffs verified from the trusted key set (spec 22 §7.5).
+    Followed {
+        /// How many in this answer.
+        handoffs: usize,
+        /// The key set they reached.
+        key_set: u64,
+    },
     /// A peer it no longer asks, and why.
     Banned {
         /// The peer.
@@ -621,12 +678,6 @@ pub enum SyncEvent {
     },
 }
 
-/// Why [`SnapshotHeader::verify`] refuses a threshold certificate that is
-/// well formed and the anchoring proposal's but signed by another key set
-/// than the trusted one.
-const UNTRUSTED_CERTIFICATE: &str =
-    "the threshold certificate does not verify under the trusted key";
-
 /// Why it refuses a vote certificate under a trusted group key: a peer of
 /// an earlier version exported it while its newest blocks lacked their
 /// threshold certificates (spec 22 §7.1).
@@ -635,6 +686,19 @@ const VOTE_UNDER_KEY: &str =
 
 /// A manifest whose certificate the trusted key does not verify.
 const UNTRUSTED: &str = "a snapshot whose certificate the trusted key does not verify";
+
+/// A manifest whose certificate is of a key set the node has not reached
+/// yet: it asks for the handoffs into it (spec 22 §7.4, step 2).
+const NEEDS_HANDOFFS: &str = "a snapshot whose key set needs handoffs";
+
+/// A certificate of a key set between reached ones that no handoff reached.
+pub const OFF_CHAIN: &str = "a threshold certificate of a key set no handoff reached";
+/// An answer with more handoffs than an answer holds.
+pub const TOO_MANY: &str = "an answer of more than MAX_HANDOFFS handoffs";
+/// A handoff past the key set asked for.
+pub const PASSES_OVER: &str = "a handoff chain that passes over the certificate's key set";
+/// A short answer that does not reach the key set asked for.
+pub const STOPS_SHORT: &str = "a handoff chain that stops short of the certificate's key set";
 
 /// What a joining node knows of a peer.
 #[derive(Debug, Default)]
@@ -646,6 +710,10 @@ struct Peer {
     strikes: u32,
     banned: bool,
     busy: usize,
+    /// Requests for handoffs it let time out since it last answered one:
+    /// while any, it is the last asked for a manifest, which an answer to the
+    /// manifest alone would not change (that resets its strikes).
+    late_handoffs: u32,
     /// Manifests of its that the trusted key did not verify.
     untrusted: u32,
     /// Its last offers were all set aside: it keeps the sync going no
@@ -659,6 +727,7 @@ enum Asked {
     Offers,
     Manifest,
     Slice(u32),
+    Handoffs,
 }
 
 #[derive(Debug)]
@@ -733,6 +802,13 @@ pub struct StateSync {
     manifest_asked: bool,
     /// Offers whose certificate the trusted key did not verify.
     set_aside: BTreeSet<(u64, u64, Hash)>,
+    /// A manifest held while the handoffs into its key set are fetched: its
+    /// sender, the manifest and that key set (spec 22 §7.4, step 2).
+    held: Option<([u8; 32], Manifest, u64)>,
+    /// Whether the handoffs for the held manifest are asked for.
+    handoffs_asked: bool,
+    /// Epochs offered past the trust's horizon, reported once each.
+    past_horizon: BTreeSet<u64>,
     events: Vec<SyncEvent>,
 }
 
@@ -747,6 +823,19 @@ impl StateSync {
         let saved = fs::read(config.dir.join("manifest"))
             .ok()
             .and_then(|b| Manifest::from_bytes(&b).ok());
+        let mut config = config;
+        // Handoffs an earlier run verified, verified again; they go if they
+        // no longer do.
+        if let Trust::KeySet(chain) = &mut config.trust
+            && let Ok(bytes) = fs::read(config.dir.join("handoffs"))
+        {
+            let followed = Seq::<Handoff>::from_bytes(&bytes)
+                .ok()
+                .is_some_and(|h| chain.extend(config.chain_id, &h.0).is_ok());
+            if !followed {
+                let _ = fs::remove_file(config.dir.join("handoffs"));
+            }
+        }
         Ok(StateSync {
             config,
             peers: BTreeMap::new(),
@@ -757,6 +846,9 @@ impl StateSync {
             saved,
             manifest_asked: false,
             set_aside: BTreeSet::new(),
+            held: None,
+            handoffs_asked: false,
+            past_horizon: BTreeSet::new(),
             events: Vec::new(),
         })
     }
@@ -785,12 +877,50 @@ impl StateSync {
         self.peers.get(peer).is_some_and(|p| p.banned || p.stale)
     }
 
-    /// Whether every one of `offers` is set aside, and there is one.
-    fn all_set_aside(set_aside: &BTreeSet<(u64, u64, Hash)>, offers: &[Offer]) -> bool {
-        !offers.is_empty()
-            && offers
-                .iter()
-                .all(|o| set_aside.contains(&(o.epoch, o.height, o.state_root)))
+    /// The trusted key set and those reached from it, under a key-set
+    /// trust.
+    fn key_chain(&self) -> Option<&KeyChain> {
+        match &self.config.trust {
+            Trust::KeySet(chain) => Some(chain),
+            _ => None,
+        }
+    }
+
+    /// The same, to extend.
+    fn key_chain_mut(&mut self) -> Option<&mut KeyChain> {
+        match &mut self.config.trust {
+            Trust::KeySet(chain) => Some(chain),
+            _ => None,
+        }
+    }
+
+    /// The last epoch the trust reaches, under a key-set trust.
+    fn horizon(&self) -> Option<u64> {
+        self.key_chain().map(KeyChain::horizon)
+    }
+
+    /// Whether `offer` is never fetched: set aside, or past the horizon.
+    fn unusable(&self, offer: &Offer) -> bool {
+        self.set_aside
+            .contains(&(offer.epoch, offer.height, offer.state_root))
+            || self.horizon().is_some_and(|h| offer.epoch > h)
+    }
+
+    /// Whether every one of `offers` is never fetched, and there is one.
+    fn all_unusable(&self, offers: &[Offer]) -> bool {
+        !offers.is_empty() && offers.iter().all(|o| self.unusable(o))
+    }
+
+    /// Why a sync that found no peer to sync from in time may have, for the
+    /// operator: the trust is too old for every snapshot offered.
+    #[must_use]
+    pub fn hint(&self) -> Option<String> {
+        let (epoch, chain) = (self.past_horizon.last()?, self.key_chain()?);
+        Some(format!(
+            "peers offer epoch {epoch}, past the horizon of the trusted key set {} (epoch {}): trust a newer key set (solo snapshot trust-key)",
+            chain.id(),
+            chain.horizon()
+        ))
     }
 
     /// Slices verified and slices in all, once a manifest is accepted.
@@ -857,6 +987,20 @@ impl StateSync {
         if let Some(request) = manifest {
             out.push(self.send(sources[0], now_ms, Asked::Manifest, &request));
         }
+        if let Some((holder, _, wanted)) = &self.held
+            && !self.handoffs_asked
+        {
+            let (holder, wanted) = (*holder, *wanted);
+            if connected.contains(&holder) {
+                self.handoffs_asked = true;
+                let from = self.key_chain().map_or(0, KeyChain::tip);
+                let request = SyncRequest::Handoffs { from, to: wanted };
+                out.push(self.send(holder, now_ms, Asked::Handoffs, &request));
+            } else {
+                // Its sender left: the manifest is asked again of another.
+                self.requeue(holder, Asked::Handoffs);
+            }
+        }
         self.schedule(now_ms, &sources, &mut out);
         // Nobody offers the target any more: choose again.
         let stranded = self.target().is_some_and(|t| {
@@ -887,10 +1031,16 @@ impl StateSync {
         p.strikes = 0;
         match (pending.asked, SyncResponse::from_bytes(payload)) {
             (Asked::Offers, Ok(SyncResponse::Offers(offers))) => {
-                p.stale = Self::all_set_aside(&self.set_aside, &offers);
+                let stale = self.all_unusable(&offers);
+                let p = self.peers.get_mut(&peer).expect("asked peers are known");
+                p.stale = stale;
                 p.offers = Some(offers);
                 p.answered_ms = now_ms;
                 self.first_answer.get_or_insert(now_ms);
+            }
+            (Asked::Handoffs, Ok(SyncResponse::Handoffs(handoffs))) => {
+                p.late_handoffs = 0;
+                self.on_handoffs(peer, &handoffs);
             }
             (Asked::Manifest, Ok(SyncResponse::Manifest(manifest))) => {
                 self.on_manifest(peer, &manifest);
@@ -954,7 +1104,7 @@ impl StateSync {
             })
             .copied()
             .collect();
-        sources.sort_by_key(|id| self.peers[id].busy);
+        sources.sort_by_key(|id| (self.peers[id].late_handoffs, self.peers[id].busy));
         sources
     }
 
@@ -975,10 +1125,20 @@ impl StateSync {
             return;
         }
         let mut tally: BTreeMap<(u64, u64, Hash), (usize, Offer)> = BTreeMap::new();
+        let mut past = Vec::new();
         for offer in peers.iter().filter_map(|p| p.offers.as_ref()).flatten() {
             let key = (offer.epoch, offer.height, offer.state_root);
-            if !self.set_aside.contains(&key) {
+            if self.horizon().is_some_and(|h| offer.epoch > h) {
+                past.push(offer.epoch);
+            } else if !self.set_aside.contains(&key) {
                 tally.entry(key).or_insert((0, *offer)).0 += 1;
+            }
+        }
+        if let Some(horizon) = self.horizon() {
+            for epoch in past {
+                if self.past_horizon.insert(epoch) {
+                    self.events.push(SyncEvent::PastHorizon { epoch, horizon });
+                }
             }
         }
         let Some((_, offer)) = tally
@@ -1052,7 +1212,8 @@ impl StateSync {
         header
             .verify(self.config.chain_id, &self.config.trust)
             .map_err(|e| match e.check() {
-                Some(UNTRUSTED_CERTIFICATE | VOTE_UNDER_KEY) => UNTRUSTED,
+                Some(NOT_TRUSTED | VOTE_UNDER_KEY | OLDER_KEY_SET | PAST_HORIZON) => UNTRUSTED,
+                Some(NOT_REACHED) => NEEDS_HANDOFFS,
                 why => {
                     why.unwrap_or("a snapshot header that does not verify under the node's trust")
                 }
@@ -1092,10 +1253,13 @@ impl StateSync {
             Err(UNTRUSTED) => {
                 self.set_aside
                     .insert((offer.epoch, offer.height, offer.state_root));
-                for p in self.peers.values_mut() {
-                    if let Some(offers) = &p.offers {
-                        p.stale = Self::all_set_aside(&self.set_aside, offers);
-                    }
+                let stale: Vec<([u8; 32], bool)> = self
+                    .peers
+                    .iter()
+                    .filter_map(|(id, p)| Some((*id, self.all_unusable(p.offers.as_ref()?))))
+                    .collect();
+                for (id, stale) in stale {
+                    self.peers.get_mut(&id).expect("listed").stale = stale;
                 }
                 let p = self.peers.get_mut(&peer).expect("asked peers are known");
                 p.untrusted += 1;
@@ -1109,10 +1273,68 @@ impl StateSync {
                 }
                 self.rediscover();
             }
+            // A newer key set than any reached: its handoffs first.
+            Err(NEEDS_HANDOFFS) => {
+                let header = SnapshotHeader::from_bytes(&manifest.header).expect("verified above");
+                let wanted =
+                    u64::from_be_bytes(header.certificate[1..9].try_into().expect("97 bytes"));
+                if wanted < self.key_chain().map_or(0, KeyChain::tip) {
+                    self.ban(peer, Asked::Manifest, OFF_CHAIN);
+                    self.rediscover();
+                } else {
+                    self.held = Some((peer, manifest.clone(), wanted));
+                    self.handoffs_asked = false;
+                }
+            }
             Err(why) => {
                 self.ban(peer, Asked::Manifest, why);
                 self.rediscover();
             }
+        }
+    }
+
+    /// Takes the handoffs `peer` sent for the held manifest (spec 22 §7.4,
+    /// step 2): verified, they reach further, and the manifest is judged
+    /// once they reach its key set.
+    fn on_handoffs(&mut self, peer: [u8; 32], handoffs: &[Handoff]) {
+        let (holder, manifest, wanted) = self
+            .held
+            .take()
+            .expect("handoffs are asked for a held manifest");
+        self.handoffs_asked = false;
+        let chain_id = self.config.chain_id;
+        let chain = self
+            .key_chain_mut()
+            .expect("handoffs are followed under a key-set trust");
+        let checked = if handoffs.len() > MAX_HANDOFFS {
+            Err(TOO_MANY)
+        } else if handoffs.iter().any(|h| h.to > wanted) {
+            Err(PASSES_OVER)
+        } else {
+            chain.extend(chain_id, handoffs)
+        };
+        if let Err(why) = checked {
+            self.ban(peer, Asked::Handoffs, why);
+            return;
+        }
+        let tip = chain.tip();
+        let all = Seq(chain.handoffs().to_vec()).to_bytes();
+        if !handoffs.is_empty() {
+            self.events.push(SyncEvent::Followed {
+                handoffs: handoffs.len(),
+                key_set: tip,
+            });
+            if let Err(e) = fs::write(self.config.dir.join("handoffs"), all) {
+                self.phase = Phase::Failed(e.to_string());
+                return;
+            }
+        }
+        if tip == wanted {
+            self.on_manifest(holder, &manifest);
+        } else if handoffs.len() == MAX_HANDOFFS {
+            self.held = Some((holder, manifest, wanted));
+        } else {
+            self.ban(peer, Asked::Handoffs, STOPS_SHORT);
         }
     }
 
@@ -1351,6 +1573,7 @@ impl StateSync {
         let p = self.peers.get_mut(&pending.peer).expect("known");
         p.busy -= 1;
         if strike {
+            p.late_handoffs += u32::from(pending.asked == Asked::Handoffs);
             p.strikes += 1;
             if p.strikes >= MAX_STRIKES {
                 self.ban(pending.peer, pending.asked, "requests that time out");
@@ -1365,6 +1588,11 @@ impl StateSync {
         match asked {
             Asked::Offers => self.peers.get_mut(&peer).expect("known").asked = false,
             Asked::Manifest => self.manifest_asked = false,
+            Asked::Handoffs => {
+                self.held = None;
+                self.handoffs_asked = false;
+                self.manifest_asked = false;
+            }
             Asked::Slice(slice) => {
                 // Once: a banned peer's slices go back when it is banned.
                 if let Phase::Fetch(f) = &mut self.phase
@@ -1430,6 +1658,8 @@ impl StateSync {
             p.asked = false;
         }
         self.first_answer = None;
+        self.held = None;
+        self.handoffs_asked = false;
         // The same target chosen again resumes from the slices on disk.
         self.saved = fs::read(self.config.dir.join("manifest"))
             .ok()
@@ -1516,6 +1746,80 @@ mod tests {
             BTreeMap::new(),
         );
         assert_eq!(none.done().unwrap().header.entries, 0);
+    }
+
+    /// A chain of `n` handoffs on chain 1 from key set 0, each to the next
+    /// id, and the trust of key set 0.
+    fn handoffs(n: usize) -> (Vec<Handoff>, Trust) {
+        let secret = |i: usize| {
+            let mut ikm = [7u8; 32];
+            ikm[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            solo_bls::SecretKey::generate(&ikm, b"").unwrap()
+        };
+        let chain = (0..n)
+            .map(|i| {
+                let to = i as u64 + 1;
+                let next = secret(i + 1).public_key();
+                let message = solo_bls::certificate::rotation_message(1, to, &next);
+                Handoff {
+                    from: i as u64,
+                    to,
+                    key: next.to_bytes().to_vec(),
+                    signature: secret(i).sign(&message).to_bytes().to_vec(),
+                    height: 0,
+                }
+            })
+            .collect();
+        let trust = Trust::KeySet(KeyChain::new(0, secret(0).public_key().to_bytes(), 10_000));
+        (chain, trust)
+    }
+
+    fn holding(dir: &Path, trust: Trust, wanted: u64) -> StateSync {
+        let mut s = StateSync::new(SyncConfig {
+            chain_id: 1,
+            trust,
+            genesis_hash: None,
+            dir: dir.to_path_buf(),
+        })
+        .unwrap();
+        s.peers.insert([1; 32], Peer::default());
+        s.phase = Phase::Manifest(offer());
+        let manifest = Manifest {
+            header: Vec::new(),
+            depth: 0,
+            slices: Vec::new(),
+        };
+        s.held = Some(([1; 32], manifest, wanted));
+        s
+    }
+
+    /// An answer of `MAX_HANDOFFS` that does not reach the key set wanted is
+    /// followed by another request from where it ended; once the key set is
+    /// reached, the held manifest is judged. A disk that refuses the
+    /// handoffs ends the sync.
+    #[test]
+    fn a_full_answer_of_handoffs_is_followed_by_another() {
+        let dir = solo_scratch::Scratch::new("statesync-unit", "paging");
+        let (chain, trust) = handoffs(MAX_HANDOFFS + 1);
+        let mut s = holding(&dir, trust.clone(), MAX_HANDOFFS as u64 + 1);
+        s.on_handoffs([1; 32], &chain[..MAX_HANDOFFS]);
+        assert!(s.held.is_some() && !s.handoffs_asked);
+        assert_eq!(s.key_chain().map(KeyChain::tip), Some(MAX_HANDOFFS as u64));
+        s.on_handoffs([1; 32], &chain[MAX_HANDOFFS..]);
+        assert!(s.held.is_none());
+        assert_eq!(
+            s.take_events().last(),
+            Some(&SyncEvent::Banned {
+                peer: [1; 32],
+                why: "a manifest whose header does not decode"
+            })
+        );
+        assert!(sync(&dir.join("genesis"), None).key_chain_mut().is_none());
+        let blocked = dir.join("blocked");
+        fs::create_dir_all(blocked.join("handoffs")).unwrap();
+        let mut s = holding(&blocked, trust, 1);
+        s.on_handoffs([1; 32], &chain[..1]);
+        assert!(s.failed().is_some());
     }
 
     #[test]

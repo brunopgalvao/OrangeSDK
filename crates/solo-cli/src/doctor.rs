@@ -107,6 +107,10 @@ pub fn parse_status(text: &str) -> Result<Status, String> {
                     activation_height: p.get("activationHeight")?.as_u64()?,
                 }),
             },
+            sync_alert: match v.get("syncAlert") {
+                None | Some(Value::Null) => None,
+                Some(why) => Some(why.as_str()?.to_owned()),
+            },
         })
     };
     status().ok_or_else(|| "status: a field is missing or has the wrong type".to_owned())

@@ -5,18 +5,22 @@
 //! the snapshot of an epoch (the latest recorded, by default) from a stopped
 //! node's data directory: its chain store and its driver tables.
 //! `solo snapshot verify --snapshot <file> --genesis <genesis.json>
-//! [--trust-key <0x 96 bytes>]` checks a file and prints what it holds.
+//! [--trust-key <id>:<0x 96 bytes> | <0x 96 bytes>]` checks a file and prints what it holds.
 //! `solo snapshot import --snapshot <file> --data-dir <dir> --kernel <kernel>
 //! --genesis <genesis.json> [--trust-key <0x 96 bytes>]` verifies it and
 //! loads it into a fresh data directory, which `solo node --data-dir <dir>`
 //! then starts from; `solo node --snapshot <file>` does both in one go.
 //!
-//! `solo snapshot trust-key --rpc <addr,...>` prints the group key of the
-//! active key set that every node named reports, for `--trust-key`.
+//! `solo snapshot trust-key --rpc <addr,...>` prints the active key set
+//! that every node named reports, as `<id>:<0x group key>`, for
+//! `--trust-key`.
 //!
-//! The trust: `--trust-key` names a group key of the chain's threshold key
-//! (spec 15 §6), which a threshold certificate must verify under; without
-//! it the genesis validator set is trusted, and the certificate must be
+//! The trust: `--trust-key` names a key set of the chain's threshold key
+//! (spec 15 §6) by id and group key, from which a node that syncs from its
+//! peers follows the chain's handoffs to the snapshot's key set within the
+//! key set's horizon (spec 22 §7.5), or a bare group key, which a threshold
+//! certificate must verify under; without it the genesis validator set is
+//! trusted, and the certificate must be
 //! that set's votes. Only a chain without staking keeps its genesis set for
 //! good, so a chain with staking needs `--trust-key`: validators that have
 //! since left could otherwise sign a history of their own.
@@ -27,7 +31,7 @@ use solo_abi::Decode;
 use solo_abi::chain::{GenesisParams, ValidatorSet};
 use solo_abi::types::Genesis;
 use solo_node::{Node, NodeConfig, StoreConfig};
-use solo_store::{Snapshot, Trust};
+use solo_store::{KeyChain, Snapshot, Trust};
 
 use crate::{arg, load_kernel, parse_genesis, parse_number};
 
@@ -35,15 +39,42 @@ use crate::{arg, load_kernel, parse_genesis, parse_number};
 /// chain without staking.
 ///
 /// # Errors
-/// A message when the key is not 96 bytes of hex, when it is missing on a
-/// chain with staking, or when the genesis set does not decode.
+/// A message when the key is not 96 bytes of hex, or the key set's id not a
+/// number, when a key set is named on a chain without a threshold key, when
+/// the key is missing on a chain with staking, or when the genesis set does
+/// not decode.
 pub fn trust(args: &[String], genesis: &Genesis) -> Result<Trust, String> {
-    match arg(args, "--trust-key") {
-        Some(hex) => solo_rpc::methods::parse_hex(&hex)
+    let key = |hex: &str| {
+        solo_rpc::methods::parse_hex(hex)
             .ok()
             .and_then(|b| <[u8; 96]>::try_from(b).ok())
-            .map(Trust::Key)
-            .ok_or_else(|| "--trust-key must be 96 bytes of 0x hex".to_owned()),
+            .ok_or_else(|| {
+                "--trust-key must be 96 bytes of 0x hex, or <key set id>:<them>".to_owned()
+            })
+    };
+    match arg(args, "--trust-key") {
+        Some(text) => match text.split_once(':') {
+            None => key(&text).map(Trust::Key),
+            Some((id, hex)) => {
+                let id: u64 = id
+                    .parse()
+                    .map_err(|_| format!("--trust-key: {id} is not a key set id"))?;
+                let staking = GenesisParams::from_bytes(&genesis.params)
+                    .map(|p| p.staking)
+                    .unwrap_or_default();
+                if staking.epoch_blocks == 0 || staking.dkg_phase_blocks == 0 {
+                    return Err(
+                        "--trust-key names a key set, and this chain has no threshold key"
+                            .to_owned(),
+                    );
+                }
+                Ok(Trust::KeySet(KeyChain::new(
+                    id,
+                    key(hex)?,
+                    staking.unbonding_epochs,
+                )))
+            }
+        },
         None if GenesisParams::from_bytes(&genesis.params)
             .is_ok_and(|p| p.staking.epoch_blocks != 0) =>
         {
@@ -172,10 +203,26 @@ pub fn describe_event(event: &solo_node::statesync::SyncEvent) -> String {
             "epoch {epoch} set aside: its certificate from peer {} is not the trusted key's; waiting for a newer snapshot",
             solo_rpc::methods::data(peer)
         ),
+        SyncEvent::PastHorizon { epoch, horizon } => format!(
+            "epoch {epoch} offered, past the trusted key set's horizon (epoch {horizon}): not fetched; trust a newer key set to fetch it"
+        ),
+        SyncEvent::Followed { handoffs, key_set } => {
+            format!("{handoffs} handoffs verified, reaching key set {key_set}")
+        }
         SyncEvent::Banned { peer, why } => format!(
             "peer {} no longer asked: {why}",
             solo_rpc::methods::data(peer)
         ),
+    }
+}
+
+/// Why a state sync stopped for want of peers, with what its trust says of
+/// the snapshots they offered, if anything (spec 22 §7.5).
+#[must_use]
+pub fn stalled(why: &str, hint: Option<String>) -> String {
+    match hint {
+        Some(hint) => format!("state sync: {why}: {hint}"),
+        None => format!("state sync: {why}"),
     }
 }
 
@@ -201,8 +248,11 @@ pub fn sync_from_peers(
         for event in sync.take_events() {
             eprintln!("state sync: {}", describe_event(&event));
         }
-        if let Some(why) = sync.failed().or_else(|| transport.sync_stalled(now())) {
+        if let Some(why) = sync.failed() {
             return Err(format!("state sync: {why}"));
+        }
+        if let Some(why) = transport.sync_stalled(now()) {
+            return Err(stalled(why, sync.hint()));
         }
         if let Some(snapshot) = sync.done() {
             return Ok(snapshot.clone());
@@ -238,7 +288,9 @@ fn trust_key(args: &[String]) -> Result<String, String> {
             said.join(", ")
         ));
     }
-    Ok(first.clone())
+    let (_, key, key_id) = &keys[0];
+    let key_id = crate::client::quantity(key_id).map_err(|e| format!("{}: {e}", keys[0].0))?;
+    Ok(format!("{key_id}:{key}"))
 }
 
 /// Runs `solo snapshot <subcommand>` and returns what it prints.

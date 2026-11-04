@@ -94,6 +94,7 @@ fn status_json_without_a_validator() {
         kernel_hash: [0xAB; 32],
         active_gates: 0,
         pending_upgrade: None,
+        sync_alert: None,
     };
     let v = status_json(&status);
     assert_eq!(v["validator"], Value::Null);
@@ -104,6 +105,15 @@ fn status_json_without_a_validator() {
     assert_eq!(v["kernelHash"], format!("0x{}", "ab".repeat(32)));
     assert_eq!(v["activeGates"], serde_json::json!([]));
     assert_eq!(v["pendingUpgrade"], Value::Null);
+    assert_eq!(v["syncAlert"], Value::Null);
+    let behind = status_json(&Status {
+        sync_alert: Some("block 1 is no longer kept by its peers".to_owned()),
+        ..status.clone()
+    });
+    assert_eq!(
+        behind["syncAlert"],
+        "block 1 is no longer kept by its peers"
+    );
     let blocked = status_json(&Status {
         upgrade_alert: Some("cannot load".to_owned()),
         missing_gates: 0b101,

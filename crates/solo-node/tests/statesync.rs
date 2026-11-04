@@ -831,7 +831,7 @@ fn discovery_takes_the_newest_epoch_and_drops_a_forged_one() {
                 slices: vec![Summary::Empty],
             })
             .to_bytes(),
-            SyncRequest::Slice { .. } => answer,
+            SyncRequest::Slice { .. } | SyncRequest::Handoffs { .. } => answer,
         })
     });
     let older = offers[1];
@@ -1226,4 +1226,275 @@ fn a_snapshot_older_than_the_trusted_key_is_set_aside_for_a_newer_one() {
         peer: peer(0),
         epoch: newer.epoch
     }));
+}
+
+/// A staking chain whose unbonding period is `unbonding_epochs`.
+fn staking_chain(validators: &[SigningKey], unbonding_epochs: u64) -> Genesis {
+    let mut genesis = support::staking_genesis(validators);
+    let mut params = solo_abi::chain::GenesisParams::from_bytes(&genesis.params).unwrap();
+    params.staking.unbonding_epochs = unbonding_epochs;
+    genesis.params = params.to_bytes();
+    genesis
+}
+
+/// The active key set of `node`'s chain state: its id and group key.
+fn active_key_set(node: &Node) -> Option<(u64, [u8; 96])> {
+    let id = u64::from_bytes(&node.state_get(solo_abi::staking::keys::ACTIVE)?).ok()?;
+    let key = node.state_get(solo_abi::staking::keys::GROUP_KEY)?;
+    Some((id, key.try_into().ok()?))
+}
+
+/// How a lying peer rewrites the handoffs it sends.
+type Lie = fn(&mut Vec<solo_abi::rotation::Handoff>);
+
+/// A peer that answers honestly except that it rewrites its handoffs with
+/// `lie`.
+fn handoff_lie(lie: Lie) -> Behaviour {
+    Box::new(move |request, answer| {
+        Some(
+            match (request, SyncResponse::from_bytes(&answer).unwrap()) {
+                (SyncRequest::Handoffs { .. }, SyncResponse::Handoffs(mut h)) => {
+                    lie(&mut h);
+                    SyncResponse::Handoffs(h).to_bytes()
+                }
+                _ => answer,
+            },
+        )
+    })
+}
+
+/// A joiner that trusts a key set several rotations older than the one
+/// that certifies the newest snapshot its peers serve follows the chain's
+/// handoffs from it, verifying each, and fetches that snapshot (spec 22
+/// §7.5). Before, it could verify only a snapshot certified by the very key
+/// it trusted: the soak test (`crates/solo-cli/tests/soak`) had to hand
+/// each joiner the newest key and retry when the chain rotated past it. A
+/// peer that serves a forged or broken chain of handoffs is banned with the
+/// check it failed, and the sync completes from an honest one; a trust too
+/// old for every snapshot offered fetches none and says why.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_joiner_trusting_an_old_key_set_follows_the_handoffs_to_the_newest_snapshot() {
+    use solo_abi::rotation::Handoff;
+    use solo_node::statesync::{PASSES_OVER, STOPS_SHORT, TOO_MANY};
+    use solo_store::KeyChain;
+    use solo_store::keychain::{BAD_SIGNATURE, NOT_FROM_REACHED, NOT_INCREASING};
+    let validators: Vec<SigningKey> = (1..=4u8)
+        .map(|i| SigningKey::from_slice(&[0x70 + i; 32]).unwrap())
+        .collect();
+    let genesis = staking_chain(&validators, 8);
+    let template = NodeConfig {
+        now_ms: 10_000,
+        ..NodeConfig::default()
+    };
+    let dir = scratch("handoffs-source");
+    let stores = [StoreConfig::Disk(dir.to_path_buf())];
+    let mut sim = Sim::with_stores(v1(), &genesis, &validators, 0, &template, 20, &stores).unwrap();
+    sim.nodes[0].serve_snapshots(SMALL).unwrap();
+    // The first active key set is the trust, as an operator would have
+    // looked it up then.
+    assert!(
+        sim.run_until(800 * SLOT_MS, |s| active_key_set(&s.nodes[0]).is_some())
+            .unwrap()
+    );
+    let (anchor, anchor_key) = active_key_set(&sim.nodes[0]).unwrap();
+    // Several rotations later, the newest snapshot is certified by a key
+    // set at least three handoffs on.
+    let rotated = sim
+        .run_until(3_000 * SLOT_MS, |s| {
+            let node = &s.nodes[0];
+            node.snapshot_server()
+                .unwrap()
+                .offers()
+                .first()
+                .is_some_and(|o| certifying_key_set(node, o) >= anchor + 3)
+        })
+        .unwrap();
+    assert!(rotated, "{:?}", sim.finalized_heights().unwrap());
+    let node = &sim.nodes[0];
+    let newest = node.snapshot_server().unwrap().offers()[0];
+    let certifying = certifying_key_set(node, &newest);
+    assert!(newest.epoch <= anchor + 7, "{newest:?} {anchor}");
+    let trust = || Trust::KeySet(KeyChain::new(anchor, anchor_key, 8));
+    let join = |name: &str, trust: Trust| {
+        let target = scratch(name);
+        let config = NodeConfig {
+            now_ms: 1_000,
+            store: StoreConfig::Disk(target.to_path_buf()),
+            ..NodeConfig::default()
+        };
+        let mut joiner = Node::open(v1(), &genesis, config).unwrap();
+        let sync = StateSync::new(joiner.sync_config(trust).unwrap()).unwrap();
+        (target, joiner, sync)
+    };
+    // Under the old key alone, the newest snapshot is never verified.
+    let (_target, _, mut sync) = join("handoffs-bare", Trust::Key(anchor_key));
+    let mut peers = [honest()];
+    drive(&mut sync, node, &mut peers, 0, 3_000, &all(1));
+    assert!(sync.done().is_none());
+    // Under the key set, the handoffs reach the certifying key set.
+    let (target, mut joiner, mut sync) = join("handoffs-honest", trust());
+    let mut peers = [honest()];
+    drive(&mut sync, node, &mut peers, 0, 3_000, &all(1));
+    let events = sync.take_events();
+    assert_eq!(
+        sync.done().map(|s| s.header.epoch),
+        Some(newest.epoch),
+        "{:?} {events:?}",
+        sync.failed()
+    );
+    assert!(banned(&events).is_empty(), "{events:?}");
+    let followed: Vec<(usize, u64)> = events
+        .iter()
+        .filter_map(|e| match e {
+            SyncEvent::Followed { handoffs, key_set } => Some((*handoffs, *key_set)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(followed.last().map(|f| f.1), Some(certifying), "{events:?}");
+    assert!(followed.iter().map(|f| f.0).sum::<usize>() >= 3);
+    finish(&mut joiner, sync.done().unwrap()).unwrap();
+    assert_eq!(joiner.block_number().unwrap(), newest.height);
+    assert!(!target.join("statesync").exists());
+
+    // Peers that lie about the handoffs are banned, each naming the check
+    // it failed, and an honest one completes the sync.
+    let cases: [(Lie, &str); 6] = [
+        // A signature altered.
+        (|h| h[0].signature[47] ^= 1, BAD_SIGNATURE),
+        // A key set handed off to a key of the forger's own.
+        (
+            |h| {
+                let forger = solo_bls::SecretKey::generate(&[9; 32], b"").unwrap();
+                h[0].key = forger.public_key().to_bytes().to_vec();
+            },
+            BAD_SIGNATURE,
+        ),
+        // A link left out.
+        (|h| drop(h.remove(1)), NOT_FROM_REACHED),
+        // Nothing at all.
+        (Vec::clear, STOPS_SHORT),
+        // A handoff past the certificate's key set.
+        (|h| h.last_mut().unwrap().to += 1, PASSES_OVER),
+        // Ids that do not increase.
+        (|h| h[0].to = h[0].from, NOT_INCREASING),
+    ];
+    for (i, (lie, check)) in cases.into_iter().enumerate() {
+        let (_target, _, mut sync) = join(&format!("handoffs-lie-{i}"), trust());
+        let mut peers = [handoff_lie(lie), honest()];
+        drive(&mut sync, node, &mut peers, 0, 3_000, &all(2));
+        let events = sync.take_events();
+        assert_eq!(
+            banned(&events),
+            vec![(peer(0), check)],
+            "case {i}: {events:?}"
+        );
+        assert_eq!(
+            sync.done().map(|s| s.header.epoch),
+            Some(newest.epoch),
+            "case {i}: {events:?}"
+        );
+    }
+    // More handoffs than an answer holds.
+    let (_target, _, mut sync) = join("handoffs-flood", trust());
+    let mut peers = [handoff_lie(|h| *h = vec![h[0].clone(); 257]), honest()];
+    drive(&mut sync, node, &mut peers, 0, 3_000, &all(2));
+    assert_eq!(banned(&sync.take_events()), vec![(peer(0), TOO_MANY)]);
+    assert!(sync.done().is_some());
+
+    // A certificate of a key set between two reached ones that no handoff
+    // reached: the chain never made it active.
+    let forger = solo_bls::SecretKey::generate(&[9; 32], b"").unwrap();
+    let next = solo_bls::SecretKey::generate(&[10; 32], b"")
+        .unwrap()
+        .public_key();
+    let mut skipping = KeyChain::new(0, forger.public_key().to_bytes(), 100);
+    let to = certifying + 1;
+    let message = solo_bls::certificate::rotation_message(genesis.chain_id, to, &next);
+    let skip = Handoff {
+        from: 0,
+        to,
+        key: next.to_bytes().to_vec(),
+        signature: forger.sign(&message).to_bytes().to_vec(),
+        height: 0,
+    };
+    skipping.extend(genesis.chain_id, &[skip]).unwrap();
+    let (_target, _, mut sync) = join("handoffs-off-chain", Trust::KeySet(skipping));
+    let mut peers = [honest()];
+    drive(&mut sync, node, &mut peers, 0, 300, &all(1));
+    assert_eq!(
+        banned(&sync.take_events()),
+        vec![(peer(0), solo_node::statesync::OFF_CHAIN)]
+    );
+
+    // A restarted sync keeps the handoffs it verified, and verifies them
+    // again; a file of them that does not verify goes.
+    let (target, mut restarted, mut sync) = join("handoffs-restart", trust());
+    let mut peers = [honest()];
+    drive(&mut sync, node, &mut peers, 0, 3, &all(1));
+    let saved = target.join("statesync").join("handoffs");
+    assert!(saved.exists(), "{:?}", sync.take_events());
+    drop(sync);
+    let mut sync = StateSync::new(restarted.sync_config(trust()).unwrap()).unwrap();
+    drive(&mut sync, node, &mut peers, 0, 3_000, &all(1));
+    let events = sync.take_events();
+    assert!(sync.done().is_some(), "{events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SyncEvent::Followed { .. })),
+        "{events:?}"
+    );
+    std::fs::write(&saved, b"not handoffs").unwrap();
+    let _ = StateSync::new(restarted.sync_config(trust()).unwrap()).unwrap();
+    assert!(!saved.exists());
+
+    // The peer that sent the manifest leaves before it is asked for the
+    // handoffs: another is asked for the manifest, then for them.
+    let (_target, _, mut sync) = join("handoffs-leaves", trust());
+    let mut peers = [honest(), honest()];
+    let first_then_second = |round: usize| if round < 2 { vec![0] } else { vec![1] };
+    drive(&mut sync, node, &mut peers, 0, 3_000, &first_then_second);
+    let events = sync.take_events();
+    assert!(sync.done().is_some(), "{events:?}");
+    assert!(banned(&events).is_empty(), "{events:?}");
+
+    // One that answers for the manifest but never for the handoffs is asked
+    // for the manifest last after its first silence, so the sync goes on
+    // from another (its answers to manifests would reset its strikes).
+    let (_target, _, mut sync) = join("handoffs-silent", trust());
+    let silent: Behaviour = Box::new(|request, answer| {
+        (!matches!(request, SyncRequest::Handoffs { .. })).then_some(answer)
+    });
+    let mut peers = [silent, honest()];
+    let (now, _) = drive(&mut sync, node, &mut peers, 0, 8_000, &all(2));
+    let events = sync.take_events();
+    assert!(sync.done().is_some(), "{events:?}");
+    assert!(banned(&events).is_empty(), "{events:?}");
+    assert!(now < 20_000, "{now}");
+
+    // A trust too old for every snapshot offered fetches none, and says so.
+    let (_target, _, mut sync) = join(
+        "handoffs-horizon",
+        Trust::KeySet(KeyChain::new(anchor, anchor_key, 1)),
+    );
+    let mut peers = [honest()];
+    drive(&mut sync, node, &mut peers, 0, 500, &all(1));
+    let events = sync.take_events();
+    assert!(sync.done().is_none() && sync.failed().is_none());
+    assert!(sync.drops(&peer(0)));
+    assert!(
+        events.contains(&SyncEvent::PastHorizon {
+            epoch: newest.epoch,
+            horizon: anchor
+        }),
+        "{events:?}"
+    );
+    assert!(
+        sync.hint().unwrap().contains(&format!(
+            "past the horizon of the trusted key set {anchor} (epoch {anchor})"
+        )),
+        "{:?}",
+        sync.hint()
+    );
 }

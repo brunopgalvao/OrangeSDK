@@ -368,3 +368,64 @@ fn a_silent_peer_is_replaced_and_waited_for_longer() {
     assert_eq!(c.in_flight(), 0);
     assert_eq!(c.poll(at + 2 * MAX_WAIT_MS, 9, &mut out), None);
 }
+
+/// No blocks from a peer that has finalized the first one asked for: it
+/// pruned them (spec 22 §8.1), and the host says why the node cannot catch
+/// up (spec 09 §6a, step 6) until an answer brings blocks or the node
+/// finalizes past the height by other means. Before, such a node sat at
+/// its height without a word.
+#[test]
+fn a_peer_that_pruned_the_blocks_asked_for_raises_the_alert() {
+    let mut c = CatchUp::default();
+    let mut out = Vec::new();
+    c.on_request(A, 1, ask(1), 0, &mut out);
+    sent(&mut out);
+    assert_eq!(c.alert(), None);
+    let pruned = |fin: u64| {
+        SyncResponse {
+            finalized_height: fin,
+            ..SyncResponse::default()
+        }
+        .to_bytes()
+    };
+    assert_eq!(c.on_response(HOST_IDS, pruned(2_000), 5, &mut out), None);
+    assert_eq!(
+        c.alert().as_deref(),
+        Some(
+            "block 1 is no longer kept by its peers (one has finalized 2000): this node is further behind than its peers keep blocks; restart it over an empty data directory with --sync-from-peers or --snapshot"
+        )
+    );
+    // An answer with a certificate and no blocks says nothing new.
+    c.poll(10, 0, &mut out);
+    assert_eq!(sent(&mut out), vec![(A, HOST_IDS + 1, 1)]);
+    let empty = SyncResponse {
+        certificate: Some(Certificate::default()),
+        ..SyncResponse::default()
+    };
+    c.on_response(HOST_IDS + 1, empty.to_bytes(), 15, &mut out);
+    assert!(c.alert().is_some());
+    // One with blocks clears it.
+    c.poll(20, 0, &mut out);
+    assert_eq!(sent(&mut out), vec![(A, HOST_IDS + 2, 1)]);
+    let (_, heights) = handed(c.on_response(HOST_IDS + 2, answer(1, 4, 2_000), 25, &mut out));
+    assert_eq!(heights, vec![1, 2, 3, 4]);
+    assert_eq!(c.alert(), None);
+    // Raised again further on, it clears once the node finalizes past it.
+    // The host asked ahead for the blocks after them.
+    c.settle(4);
+    let ahead = sent(&mut out);
+    c.on_request(A, 2, ask(5), 30, &mut out);
+    assert!(out.is_empty());
+    let (_, id, _) = *ahead.iter().find(|(_, _, from)| *from == 5).unwrap();
+    c.on_response(id, pruned(2_000), 35, &mut out);
+    assert!(c.alert().unwrap().starts_with("block 5 "));
+    c.poll(40, 4, &mut out);
+    assert!(c.alert().is_some());
+    c.poll(45, 5, &mut out);
+    assert_eq!(c.alert(), None);
+    // A peer that has not finalized the height asked for is only behind.
+    c.on_request(A, 3, ask(6), 50, &mut out);
+    let (_, id, _) = sent(&mut out).pop().unwrap();
+    c.on_response(id, pruned(5), 55, &mut out);
+    assert_eq!(c.alert(), None);
+}

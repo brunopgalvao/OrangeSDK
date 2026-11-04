@@ -157,6 +157,7 @@ impl Node {
                     code_hash: p.code_hash,
                     activation_height: p.activation_height,
                 }),
+            sync_alert: self.sync_alert(),
         })
     }
 }
