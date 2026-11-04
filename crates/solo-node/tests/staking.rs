@@ -546,6 +546,90 @@ fn validators_restarted_from_their_tables_replay_their_own_chain() {
     }
 }
 
+/// The proposer of the block `node` finalized at `height`: the leader of
+/// its proposal's view in the set of that view's epoch.
+fn proposer_of(node: &mut Node, height: u64) -> [u8; 32] {
+    let hash = finalized_hash(node, height);
+    let proposal =
+        Proposal::from_bytes(&node.persisted()[&[b"prop/".as_slice(), &hash].concat()]).unwrap();
+    let set = set_of(node, view_epoch(proposal.view)).unwrap();
+    set[leader(proposal.view, set.len())]
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_wiped_validator_replays_the_chain_without_signing_where_it_signed() {
+    // Epochs of 8 blocks with a threshold key. Validator 0 leads the first view of every
+    // epoch (spec 08 §2), so a copy of it that forgot what it signed would propose again
+    // in each of them while it replays the chain, and once caught up it could sign in
+    // the views it signed in just before it lost its data (spec 08 §7b).
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, &[0, 1, 2, 3], &[STAKE; 4], &staking(8, 2));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    let past = |s: &mut Sim| {
+        s.nodes
+            .iter_mut()
+            .all(|n| n.finalized_height().unwrap() >= 26)
+    };
+    assert!(sim.run_until(300 * SLOT_MS, past).unwrap());
+    let view = sim.nodes[0].simplex_state().unwrap().view;
+    // Its data directory is wiped while it is down: it comes back with its key alone, at
+    // genesis and in view 1, and catches up from its peers' blocks.
+    sim.crash(0);
+    sim.advance(2 * SLOT_MS).unwrap();
+    sim.revive_from_scratch(0, kernel, &genesis).unwrap();
+    assert_eq!(sim.nodes[0].finalized_height().unwrap(), 0);
+    let fresh = sim.nodes[0].simplex_state().unwrap();
+    assert!(
+        fresh.view == 1 && fresh.timed_out && !fresh.voted,
+        "{fresh:?}"
+    );
+    let head = sim.nodes[1].finalized_height().unwrap();
+    let caught = sim
+        .run_until(300 * SLOT_MS, |s| {
+            s.nodes[0].finalized_height().unwrap() >= head
+        })
+        .unwrap();
+    assert!(caught, "{:?}", sim.finalized_heights().unwrap());
+    // Two epochs on, it has proposed blocks again in views past the ones it signed in.
+    let target = sim.nodes[1].finalized_height().unwrap() + 16;
+    let on = sim
+        .run_until(300 * SLOT_MS, |s| {
+            s.finalized_heights().unwrap().iter().all(|h| *h >= target)
+        })
+        .unwrap();
+    assert!(on, "{:?}", sim.finalized_heights().unwrap());
+    let me = validator_id(&keys[0]);
+    let proposed: Vec<u64> = (head + 1..=target)
+        .filter(|&h| proposer_of(&mut sim.nodes[1], h) == me)
+        .collect();
+    assert!(!proposed.is_empty());
+    let first = &sim.nodes[1].persisted()[&[
+        b"prop/".as_slice(),
+        &finalized_hash(&sim.nodes[1], proposed[0]),
+    ]
+    .concat()];
+    assert!(Proposal::from_bytes(first).unwrap().view > view);
+    // Nobody saw it sign two things in one view, and it was never slashed.
+    for (i, node) in sim.nodes.iter().enumerate() {
+        assert!(
+            !node
+                .metrics
+                .iter()
+                .any(|(name, _)| name == b"equivocations"),
+            "node {i} saw an equivocation"
+        );
+    }
+    for i in 0..4 {
+        assert!(sim.nodes[i].evidence(0).unwrap().is_empty(), "node {i}");
+    }
+    let record = record_of(&mut sim.nodes[1], &keys[0]);
+    assert!(!record.jailed);
+    assert_eq!(record.stake, u128::from(STAKE) * GWEI);
+    assert_agreement(&sim);
+}
+
 #[test]
 fn a_lone_validator_comes_back_from_its_tables_past_the_first_epoch() {
     // One validator in epochs of 8 blocks: nobody holds the chain but
@@ -1727,19 +1811,26 @@ fn an_epoch_end_finalized_by_a_suffix_and_a_restarted_shareholder() {
         .run_until(80 * SLOT_MS, |s| adopted(s, &[0, 1, 2], 0))
         .unwrap();
     assert!(done, "{:?}", sim.finalized_heights().unwrap());
-    // The last block of an epoch a few blocks on.
-    let end = (sim.nodes[0].finalized_height().unwrap() + 4).div_ceil(24) * 24;
-    // The third node goes down right after its block vote for that block: the others
-    // notarize it, but its finalize quorum never forms.
-    let voted = sim
-        .run_until(200 * SLOT_MS, |s| {
-            s.nodes[2]
-                .simplex_state()
-                .is_some_and(|st| st.voted && st.tip_height + 1 == end)
-        })
-        .unwrap();
-    assert!(voted, "{:?}", sim.finalized_heights().unwrap());
-    let view = sim.nodes[2].simplex_state().unwrap().view;
+    // The last block of an epoch a few blocks on, proposed in a view whose next view
+    // validator 3 leads, which has no node: the view after the block's times out.
+    let mut end = (sim.nodes[0].finalized_height().unwrap() + 4).div_ceil(24) * 24;
+    let view = loop {
+        // The third node goes down right after its block vote for that block: the
+        // others notarize it, but its finalize quorum never forms.
+        let voted = sim
+            .run_until(200 * SLOT_MS, |s| {
+                s.nodes[2]
+                    .simplex_state()
+                    .is_some_and(|st| st.voted && st.tip_height + 1 == end)
+            })
+            .unwrap();
+        assert!(voted, "{:?}", sim.finalized_heights().unwrap());
+        let view = sim.nodes[2].simplex_state().unwrap().view;
+        if leader(view + 1, 4) == 3 {
+            break view;
+        }
+        end += 24;
+    };
     sim.crash(2);
     let notarized = sim
         .run_until(20 * SLOT_MS, |s| {

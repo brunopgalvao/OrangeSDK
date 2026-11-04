@@ -2,8 +2,10 @@
 //! (spec 15, spec 08, codex ADR 0047 and 0048): bonds, unbonds, withdrawals,
 //! delegations, a validator joining and leaving, equivocations that slash
 //! and jail, across epoch boundaries and DKG phases, while links partition,
-//! drop and delay messages and validators crash and restart. Throughout, no
-//! two nodes finalize different blocks at one height. Once the faults end:
+//! drop and delay messages and validators crash and restart, now and then
+//! with their data wiped. Throughout, no two nodes finalize different blocks
+//! at one height, and a wiped validator is never slashed: it signs nothing
+//! again in a view it may have signed in (spec 08 §7b). Once the faults end:
 //! every node finalizes again; a fresh key set is adopted and the active key
 //! hands off to it; every epoch's run either made a key set or left an
 //! earlier key in force, its defined fallback; the staking address holds
@@ -410,6 +412,7 @@ fn native(sim: &mut Sim) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn schedule(r: &mut Rng) {
     let keys: Vec<SigningKey> = (1..=NODES + 1)
         .map(|i| SigningKey::from_slice(&[0x50 + u8::try_from(i).unwrap(); 32]).unwrap())
@@ -445,12 +448,21 @@ fn schedule(r: &mut Rng) {
     };
     let mut seen = Finalized::default();
     let mut down = [false; NODES];
+    // At most one node, never the one that equivocates, comes back with its
+    // data wiped in a case: it counts as faulty until its signing guard ends,
+    // beside the equivocator (spec 08 §7b).
+    let mut wiped = None;
     for _ in 0..3 + r.below(4) {
         sim.filter_links(faults(r));
         // At most one node down at a time beside the faults on the links.
         if r.chance(1, 2) {
             let i = r.index(NODES);
-            if down[i] {
+            if down[i] && wiped.is_none() && byzantine != Some(i) && r.chance(1, 3) {
+                sim.revive_from_scratch(i, kernel, &genesis).unwrap();
+                sim.nodes[i].set_backend(solo_host::Backend::Native);
+                down[i] = false;
+                wiped = Some(i);
+            } else if down[i] {
                 sim.revive(i, kernel, &genesis).unwrap();
                 sim.nodes[i].set_backend(solo_host::Backend::Native);
                 down[i] = false;
@@ -506,6 +518,15 @@ fn schedule(r: &mut Rng) {
         "no key after epoch {healed_epoch}: {:?}",
         sim.finalized_heights().unwrap()
     );
+    if let Some(w) = wiped {
+        let id = validator_id(&keys[w]);
+        let jailed = status(&mut sim.nodes[0])
+            .records
+            .0
+            .iter()
+            .any(|e| e.id == id && e.record.jailed);
+        assert!(!jailed, "the wiped node {w} was slashed");
+    }
     let delegator = address(&keys[DELEGATOR]);
     for i in 0..NODES {
         let node = &mut sim.nodes[i];

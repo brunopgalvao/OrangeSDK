@@ -755,6 +755,30 @@ record! {
 }
 
 record! {
+    /// A validator that signed in `view`, as an index into the set of the
+    /// view's epoch: an entry of [`SigningGuard::live`].
+    LiveSigner {
+        /// The view the validator signed a proposal, a vote or a timeout vote in.
+        view: u64,
+        /// Its index in the set of the view's epoch.
+        validator: u32,
+    }
+}
+
+record! {
+    /// The signing guard of a node that started without a signing record
+    /// (spec 08 §7b), persisted under `simplex/guard` while it lasts.
+    SigningGuard {
+        /// The first view in which this node saw signers holding more than two
+        /// thirds of the stake sign, each delivering its message itself; zero
+        /// until it has.
+        witnessed: u64,
+        /// The signers seen so far, while `witnessed` is zero.
+        live: Seq<LiveSigner>,
+    }
+}
+
+record! {
     /// Asks a peer for finalized blocks from `from_height` on (spec 08 §7).
     SyncRequest {
         /// First height wanted.
@@ -1270,6 +1294,18 @@ mod tests {
         roundtrip(&fetch);
         assert_eq!(fetch.to_bytes().len(), 74);
         assert_eq!(consensus::KIND_FETCH, 4);
+    }
+
+    #[test]
+    fn the_signing_guard_roundtrips() {
+        roundtrip(&SigningGuard::default());
+        roundtrip(&SigningGuard {
+            witnessed: 7,
+            live: Seq(vec![LiveSigner {
+                view: 3,
+                validator: 1,
+            }]),
+        });
     }
 
     #[test]

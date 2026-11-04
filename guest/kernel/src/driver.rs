@@ -20,8 +20,8 @@ use solo_abi::chain::consensus::{
 };
 use solo_abi::chain::{
     BLOCK_GAS_LIMIT, BlockHeader, Certificate, ConsensusMessage, Evidence, GenesisParams,
-    Participation, Proposal, Signature, SignedHash, SignedVote, SimplexState, SyncRequest,
-    SyncResponse, keys,
+    LiveSigner, Participation, Proposal, Signature, SignedHash, SignedVote, SigningGuard,
+    SimplexState, SyncRequest, SyncResponse, keys,
 };
 use solo_abi::codec::Seq;
 use solo_abi::staking::{MAX_DKG, PartialShare, epoch_end, epoch_of, first_view, view_epoch};
@@ -62,6 +62,11 @@ const LOG_CERTIFICATE: &[u8] = b"local/log/cert/";
 const LOG_THRESHOLD: &[u8] = b"local/log/bcert/";
 /// Heights the block log keeps behind the finalized head.
 const LOG_WINDOW: u64 = 64;
+/// The signing guard of a node that started without a signing record
+/// (spec 08 §7b), while it lasts; an empty value once it is over.
+const GUARD_KEY: &[u8] = b"simplex/guard";
+/// Most signers the signing guard counts at once.
+const LIVE_CAP: usize = 256;
 const ZERO: Hash = [0; 32];
 
 /// The anchor a leader puts in its proposal (spec 08 §5): its executed
@@ -134,11 +139,17 @@ type Set = Vec<(Hash, u64)>;
 /// thirds of the set's total weight (spec 08 §1). Repeated or out-of-range
 /// indices count nothing.
 fn is_quorum(set: &Set, votes: &[SignedVote]) -> bool {
+    weighs_quorum(set, votes.iter().map(|v| v.validator))
+}
+
+/// Whether the distinct validators of `indices` into `set` weigh more than
+/// two thirds of its total weight.
+fn weighs_quorum(set: &Set, indices: impl Iterator<Item = u32>) -> bool {
     let total: u128 = set.iter().map(|v| u128::from(v.1)).sum();
     let mut seen = alloc::vec![false; set.len()];
     let mut weight = 0u128;
-    for vote in votes {
-        let i = vote.validator as usize;
+    for validator in indices {
+        let i = validator as usize;
         if let Some(slot) = seen.get_mut(i)
             && !*slot
         {
@@ -256,8 +267,98 @@ impl Ctx {
         set.iter().position(|v| v.0 == id).map(|i| i as u32)
     }
 
+    /// Signs `kind(view, hash)` with the consensus key, unless the signing
+    /// guard forbids it (spec 08 §7b): it never forbids a timeout vote, which
+    /// conflicts with nothing.
     fn sign(&self, kind: u8, view: u64, hash: &Hash) -> Option<Signature> {
+        if !(kind == KIND_VOTE && *hash == ZERO) && self.guarded(view) {
+            return None;
+        }
         persist::sign(KEY_ROLE, &self.message_hash(kind, view, hash))
+    }
+
+    /// The signing guard, while it lasts.
+    fn guard() -> Option<SigningGuard> {
+        persist::get_raw(GUARD_KEY)
+            .filter(|b| !b.is_empty())
+            .map(|b| SigningGuard::from_bytes(&b).unwrap_or_else(|_| solo_guest::trap()))
+    }
+
+    /// Whether the signing guard keeps this node from proposing, voting for
+    /// a proposal or finalizing in `view` (spec 08 §7b): until it has
+    /// witnessed a view `w`, in every view; then in the views up to `w + 1`
+    /// and, with epochs, in the first view of the epoch after `w`'s, the
+    /// views a record it lost can have covered.
+    fn guarded(&self, view: u64) -> bool {
+        Self::guard().is_some_and(|g| {
+            g.witnessed == 0
+                || view < g.witnessed + 2
+                || (self.params.staking.epoch_blocks != 0
+                    && view == first_view(view_epoch(g.witnessed) + 1))
+        })
+    }
+
+    /// Ends the signing guard once the current view is past every view it
+    /// covers (spec 08 §7b).
+    fn expire_guard(&self) {
+        let view = self.s.view;
+        if Self::guard().is_some_and(|g| {
+            g.witnessed != 0
+                && view >= g.witnessed + 2
+                && (self.params.staking.epoch_blocks == 0
+                    || view > first_view(view_epoch(g.witnessed) + 1))
+        }) {
+            persist::set_raw(GUARD_KEY, &[]);
+        }
+    }
+
+    /// Counts `validator`'s proposal, block vote or timeout vote of `view`
+    /// toward the view the signing guard witnesses (spec 08 §7b): when the
+    /// guard has witnessed none yet, `view` is the current view or a later
+    /// one of the current epoch, and the message came from its signer itself
+    /// (`own` for this node's own). Once the signers of one view weigh a
+    /// quorum, that view is witnessed; when it is view 1 and nothing has been
+    /// executed, the chain is new and the guard ends there.
+    fn witness(&mut self, view: u64, validator: u32, own: bool) {
+        let Some(mut g) = Self::guard() else { return };
+        let delivered = own
+            || self
+                .peer
+                .is_some_and(|p| self.set.get(validator as usize).is_some_and(|v| v.0 == p));
+        if g.witnessed != 0
+            || view < self.s.view
+            || self.view_epoch(view) != self.epoch
+            || !delivered
+        {
+            return;
+        }
+        let current = self.s.view;
+        g.live.0.retain(|e| e.view >= current);
+        if !g
+            .live
+            .0
+            .iter()
+            .any(|e| (e.view, e.validator) == (view, validator))
+        {
+            g.live.0.push(LiveSigner { view, validator });
+            g.live.0.sort_by_key(|e| e.view);
+            g.live.0.truncate(LIVE_CAP);
+        }
+        let signers = g
+            .live
+            .0
+            .iter()
+            .filter(|e| e.view == view)
+            .map(|e| e.validator);
+        if weighs_quorum(&self.set, signers) {
+            if view == 1 && state::height().unwrap_or(0) == 0 {
+                persist::set_raw(GUARD_KEY, &[]);
+                return;
+            }
+            g.witnessed = view;
+            g.live = Seq(Vec::new());
+        }
+        persist::set(GUARD_KEY, &g);
     }
 
     /// Learns this node's validator index by signing a fixed message; none
@@ -480,6 +581,7 @@ impl Ctx {
     /// votes twice in one view.
     fn arm(&mut self) {
         let view = self.s.view;
+        self.expire_guard();
         // A sync that never answered is retried on the next trigger.
         self.s.sync_pending = false;
         self.s.proposing = false;
@@ -490,7 +592,7 @@ impl Ctx {
             timer_id: timeout_timer(view),
             deadline_ms: self.s.now_ms + self.timeout_ms(),
         });
-        if self.is_leader(view) && !self.s.voted && !self.s.timed_out {
+        if self.is_leader(view) && !self.s.voted && !self.s.timed_out && !self.guarded(view) {
             let at = self.s.tip_timestamp_ms + slot;
             if at <= self.s.now_ms {
                 self.request_mempool();
@@ -537,7 +639,12 @@ impl Ctx {
                     deadline_ms: now_ms + self.timeout_ms(),
                 });
             }
-        } else if self.is_leader(view) && !self.s.proposing && !self.s.voted && !self.s.timed_out {
+        } else if self.is_leader(view)
+            && !self.s.proposing
+            && !self.s.voted
+            && !self.s.timed_out
+            && !self.guarded(view)
+        {
             self.request_mempool();
         }
     }
@@ -661,6 +768,7 @@ impl Ctx {
                     return;
                 }
                 self.observe(KIND_PROPOSE, view, proposer, SignedHash { hash, signature });
+                self.witness(view, proposer, false);
                 if view < self.s.view {
                     self.forward_certificates(view, proposer);
                     if self.view_epoch(view) == self.epoch {
@@ -688,6 +796,7 @@ impl Ctx {
                     return;
                 };
                 self.observe(KIND_VOTE, view, validator, SignedHash { hash, signature });
+                self.witness(view, validator, false);
                 Self::add_vote(
                     b"votes/",
                     view,
@@ -853,6 +962,7 @@ impl Ctx {
             && fits
             && !self.s.voted
             && !self.s.timed_out
+            && !self.guarded(proposal.view)
         {
             self.s.voted = true;
             self.cast(KIND_VOTE, proposal.view, hash);
@@ -1122,6 +1232,7 @@ impl Ctx {
             signature,
         };
         if kind != KIND_FINALIZE {
+            self.witness(view, me, true);
             self.broadcast(&ConsensusMessage::Vote {
                 view,
                 hash,
@@ -1654,6 +1765,14 @@ impl Ctx {
             return;
         }
         dkg::pool_prune(executed);
+        // Catching up is verification only (spec 08 §7b): no DKG message
+        // while chain state is behind the node's view, or while the signing
+        // guard has witnessed no view.
+        if self.view_epoch(self.s.view) != self.epoch
+            || Self::guard().is_some_and(|g| g.witnessed == 0)
+        {
+            return;
+        }
         let Some(me) = dkg::my_id(self.chain_id) else {
             return;
         };
@@ -1675,10 +1794,12 @@ pub fn step(input: &Input) -> Seq<Effect> {
             now_ms,
             resumed_state,
         } => {
+            let mut recorded = persist::get_raw(STATE_KEY).is_some();
             if let Some(bytes) = resumed_state
                 && let Ok(restored) = SimplexState::from_bytes(bytes)
             {
                 c.s = restored;
+                recorded = true;
             }
             c.s.now_ms = *now_ms;
             // Chain state is the truth about what has been executed. A node that
@@ -1706,8 +1827,27 @@ pub fn step(input: &Input) -> Seq<Effect> {
                 c.s.tip_timestamp_ms = (*now_ms).max(c.params.genesis_time_ms());
             }
             c.s.me = c.identify();
+            // A node with no driver state record (a fresh or wiped data
+            // directory, or a snapshot) cannot know what it signed: it starts
+            // under the signing guard, unless its own stake is a quorum, when
+            // no quorum it could witness need include anyone else (spec 08 §7b).
+            let alone =
+                c.s.me
+                    .is_some_and(|me| weighs_quorum(&c.set, core::iter::once(me)));
+            let guarded = !recorded && !alone;
+            if guarded {
+                persist::set(GUARD_KEY, &SigningGuard::default());
+            }
             c.catch_up_epoch();
             c.arm();
+            if guarded && executed == 0 && c.s.me.is_some() {
+                // At genesis it times view 1 out at once: what it signed
+                // there, if this chain is older than its record, it cannot
+                // know, and its peers learn that it is here (spec 08 §7b).
+                c.s.timed_out = true;
+                c.cast(KIND_VOTE, c.s.view, ZERO);
+                c.check_timeout(c.s.view);
+            }
             c.dkg_step(executed);
             c.start_replay(executed, remembered);
         }

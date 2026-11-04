@@ -10,10 +10,10 @@
 //! be cut and slowed. A load generator (`load.rs`) sends value transfers
 //! and calls to a counter contract to random live nodes. The scheduler
 //! (`faults.rs`) draws from the seed: kill -9 and restart, with the data
-//! directory kept or wiped (a wiped observer catches up from its peers'
-//! blocks or syncs state from their snapshots, `--sync-from-peers`; a wiped
-//! validator always syncs, from a snapshot newer than its kill, since from
-//! nothing it would sign again in views it signed in);
+//! directory kept or wiped (a wiped node catches up from its peers' blocks
+//! or syncs state from their snapshots, `--sync-from-peers`; a wiped
+//! validator does either under its signing guard, spec 08 §7b, which keeps
+//! it from signing again in the views it signed in before its wipe);
 //! graceful restarts through `solo_stop`; one node isolated; partitions,
 //! with and without a quorum; slow links; SIGSTOP; more validators down
 //! than the network tolerates; flapping links; fresh observers joining

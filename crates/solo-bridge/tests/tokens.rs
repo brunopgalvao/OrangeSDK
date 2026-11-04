@@ -91,9 +91,9 @@ const DEPOSIT_ETH_GAS: u64 = 123_994;
 /// Of the first `deposit` of an ERC-20 there.
 const DEPOSIT_TOKEN_GAS: u64 = 181_983;
 /// Of the delivery on Solo whose mint creates wrapped ETH (the inbox's proofs included).
-const FIRST_MINT_GAS: u64 = 833_068;
+const FIRST_MINT_GAS: u64 = 833_056;
 /// Of a delivery on Solo whose wrapped token exists.
-const MINT_GAS: u64 = 109_990;
+const MINT_GAS: u64 = 109_978;
 /// Of a withdrawal on Solo: the burn and the send through the outbox.
 const BURN_GAS: u64 = 120_033;
 /// Of a deposit of Solo's currency on Solo.
