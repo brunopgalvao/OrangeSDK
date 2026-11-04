@@ -15,6 +15,7 @@ pub use crate::hex::{
     data, parse_address, parse_big, parse_hash, parse_hex, parse_quantity, parse_word, quantity,
     quantity_be,
 };
+use crate::indexed::By;
 use crate::proof;
 use crate::views::{self, Destination, Position, created_address, decode_or_blank};
 
@@ -167,6 +168,14 @@ pub struct Rpc {
     pub max_log_range: u64,
     /// Most requests one batch may carry; [`MAX_BATCH`] unless changed.
     pub max_batch: usize,
+    /// The installed filters of `eth_newFilter` and its kin.
+    pub(crate) filters: crate::filters::Filters,
+    /// How long a filter lives without being polled;
+    /// [`crate::filters::FILTER_TIMEOUT`] unless changed.
+    pub filter_timeout: std::time::Duration,
+    /// Most filters installed at once; [`crate::filters::MAX_FILTERS`]
+    /// unless changed.
+    pub max_filters: usize,
     /// Set by `solo_stop`; the server loop exits when it sees it.
     pub stopped: bool,
 }
@@ -182,6 +191,9 @@ impl Rpc {
             oracle: crate::fees::Oracle::default(),
             max_log_range: MAX_LOG_RANGE,
             max_batch: MAX_BATCH,
+            filters: crate::filters::Filters::default(),
+            filter_timeout: crate::filters::FILTER_TIMEOUT,
+            max_filters: crate::filters::MAX_FILTERS,
             stopped: false,
         }
     }
@@ -338,7 +350,10 @@ impl Rpc {
     /// The header of the block whose hash is `hash`, the genesis block's
     /// included: the kernel indexes every block it stores by its hash
     /// (spec 20 §3.1).
-    fn header_by_hash(&mut self, hash: &[u8; 32]) -> Result<Option<BlockHeader>, RpcError> {
+    pub(crate) fn header_by_hash(
+        &mut self,
+        hash: &[u8; 32],
+    ) -> Result<Option<BlockHeader>, RpcError> {
         Ok(self.node.block_by_hash(hash)?)
     }
 
@@ -348,9 +363,15 @@ impl Rpc {
             "eth_chainId" => json!(quantity(u128::from(self.node.chain_id()?))),
             "net_version" => json!(self.node.chain_id()?.to_string()),
             "web3_clientVersion" => json!("solo/0.0.1"),
+            "web3_sha3" => json!(data(&keccak256(&parse_hex(param_str(params, 0)?)?))),
+            "net_listening" => json!(true),
+            "net_peerCount" => json!(quantity(u128::from(self.node.status()?.peers))),
             "eth_blockNumber" => json!(quantity(u128::from(self.block_number()?))),
             "eth_gasPrice" => json!(quantity(self.gas_price()?)),
             "eth_maxPriorityFeePerGas" => json!(quantity(self.suggest_tip()?)),
+            // No blob transaction is accepted (§2.1): the blob base fee
+            // stays at its minimum.
+            "eth_blobBaseFee" => json!(quantity(1)),
             "eth_syncing" => json!(false),
             "solo_stop" => {
                 self.stopped = true;
@@ -444,8 +465,30 @@ impl Rpc {
                     None => Value::Null,
                 }
             }
+            "eth_getBlockTransactionCountByNumber" => self.transaction_count(By::Number, params)?,
+            "eth_getBlockTransactionCountByHash" => self.transaction_count(By::Hash, params)?,
+            "eth_getTransactionByBlockNumberAndIndex" => self.transaction_at(By::Number, params)?,
+            "eth_getTransactionByBlockHashAndIndex" => self.transaction_at(By::Hash, params)?,
+            "eth_getUncleCountByBlockNumber" => self.uncle_count(By::Number, params)?,
+            "eth_getUncleCountByBlockHash" => self.uncle_count(By::Hash, params)?,
+            "eth_getUncleByBlockNumberAndIndex" | "eth_getUncleByBlockHashAndIndex" => Value::Null,
             "eth_getLogs" => self.logs(&Filter::parse(params.first())?)?,
             "eth_feeHistory" => self.fee_history(params)?,
+            "eth_newFilter" => self.new_log_filter(params)?,
+            "eth_newBlockFilter" => self.new_block_filter()?,
+            "eth_newPendingTransactionFilter" => self.new_pending_filter()?,
+            "eth_getFilterChanges" => self.filter_changes(params)?,
+            "eth_getFilterLogs" => self.filter_logs(params)?,
+            "eth_uninstallFilter" => self.uninstall_filter(params)?,
+            // Subscriptions need a connection that stays open; this server
+            // answers one request per connection, so it answers as geth
+            // does over HTTP (§8.1).
+            "eth_subscribe" | "eth_unsubscribe" => {
+                return Err(RpcError::with_code(
+                    -32601,
+                    "notifications not supported".into(),
+                ));
+            }
             "txpool_status" => crate::txpool::status(self.node.mempool()),
             "txpool_content" => crate::txpool::content(self.node.mempool()),
             "solo_getFinalityProof" => crate::bridge::finality_proof(&mut self.node, params)?,
@@ -777,7 +820,7 @@ impl Rpc {
         Ok(Value::Array(out))
     }
 
-    fn transaction_by_hash(&mut self, hash: &[u8; 32]) -> Result<Value, RpcError> {
+    pub(crate) fn transaction_by_hash(&mut self, hash: &[u8; 32]) -> Result<Value, RpcError> {
         if let Some(receipt) = self.node.receipt(hash)? {
             // A system receipt has no transaction.
             let Some(raw) = self.node.transaction(hash)? else {
@@ -861,8 +904,20 @@ impl Rpc {
         }
     }
 
-    fn logs(&mut self, filter: &Filter) -> Result<Value, RpcError> {
+    /// `eth_getLogs`.
+    pub(crate) fn logs(&mut self, filter: &Filter) -> Result<Value, RpcError> {
         let (from, to) = self.filter_heights(&filter.blocks)?;
+        self.scan_logs(filter, from, to).map(Value::Array)
+    }
+
+    /// The logs `filter` matches in the blocks `from..=to`, which exist; the
+    /// node's background work runs before each block.
+    pub(crate) fn scan_logs(
+        &mut self,
+        filter: &Filter,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<Value>, RpcError> {
         let mut out = Vec::new();
         for height in from..=to {
             self.run_background();
@@ -898,7 +953,7 @@ impl Rpc {
                 }
             }
         }
-        Ok(Value::Array(out))
+        Ok(out)
     }
 }
 
