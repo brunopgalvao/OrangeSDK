@@ -533,6 +533,16 @@ fn votes_certify(
 /// Which trust a certificate needs: the key set a threshold certificate
 /// names, or none for a vote certificate. An export links the head to the
 /// lowest proposal whose certificate needs the same trust as the latest's.
+/// Whether `certificate`, a threshold or a vote certificate, certifies
+/// `proposal` itself, whose encoding is `bytes`, rather than a descendant.
+fn certifies(certificate: &[u8], proposal: &Proposal, bytes: &[u8]) -> bool {
+    let hash = keccak256(bytes);
+    match threshold_certificate(certificate) {
+        Some(t) => t.height == proposal.height && t.block_hash == hash,
+        None => Certificate::from_bytes(certificate).is_ok_and(|c| c.hash == hash),
+    }
+}
+
 fn trust_class(certificate: &[u8]) -> Option<u64> {
     threshold_certificate(certificate).map(|c| c.key_id)
 }
@@ -964,7 +974,10 @@ impl Snapshot {
             let certificate = tables
                 .get(&height_key(b"bcert/", height))
                 .or_else(|| tables.get(&height_key(b"cert/", height)));
-            let Some(certificate) = certificate else {
+            // A certificate that finalized several blocks at once is kept
+            // under each of their heights, but certifies the last alone;
+            // a verifier holds it to the proposal it names (spec 22 §7.2).
+            let Some(certificate) = certificate.filter(|c| certifies(c, &proposal, bytes)) else {
                 continue;
             };
             candidates.push((height, bytes, certificate, trie, proposal));
@@ -1259,6 +1272,17 @@ mod tests {
 
     /// Enters `p` as finalized at its height in `tables`, with a vote
     /// certificate unless `certified` is false.
+    /// A version-2 threshold certificate of key set 2 for `p`, its
+    /// signature not checked by the exporter.
+    fn threshold(p: &Proposal) -> Vec<u8> {
+        let mut out = vec![2];
+        out.extend(2u64.to_be_bytes());
+        out.extend(p.height.to_be_bytes());
+        out.extend(keccak256(&p.to_bytes()));
+        out.extend([2; 48]);
+        out
+    }
+
     fn finalize(tables: &mut Tables, p: &Proposal, certified: bool) {
         let bytes = p.to_bytes();
         let hash = keccak256(&bytes);
@@ -1474,11 +1498,28 @@ mod tests {
         assert_eq!(snapshot.header.entries, 2);
         // When the latest candidate has a threshold certificate, the lowest
         // with one of the same key set is taken over a lower one with votes.
-        tables.insert(height_key(b"bcert/", 300), vec![2; 97]);
+        tables.insert(
+            height_key(b"bcert/", 300),
+            threshold(&proposal(300, 3, root3)),
+        );
         finalize(&mut tables, &proposal(10, 3, root3), true);
-        tables.insert(height_key(b"bcert/", 10), vec![2; 97]);
+        // A certificate kept under 10 that finalized 11 with it certifies
+        // 11, not 10: 10 does not do, and 300 is next, whose links the
+        // tables lack from 11 on.
+        tables.insert(
+            height_key(b"bcert/", 10),
+            threshold(&proposal(11, 3, root3)),
+        );
+        assert!(why(export(&s, &tables, Some(0), "n")).contains("the proposal of block 11"));
+        tables.insert(
+            height_key(b"bcert/", 10),
+            threshold(&proposal(10, 3, root3)),
+        );
         let snapshot = export(&s, &tables, Some(0), "m").unwrap();
-        assert_eq!(snapshot.header.certificate, vec![2; 97]);
+        assert_eq!(
+            snapshot.header.certificate,
+            threshold(&proposal(10, 3, root3))
+        );
         assert_eq!(
             snapshot.header.anchor_proposal,
             proposal(10, 3, root3).to_bytes()
