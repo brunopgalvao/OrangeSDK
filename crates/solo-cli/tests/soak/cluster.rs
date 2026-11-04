@@ -324,6 +324,7 @@ impl Cluster {
         m.generation += 1;
         m.frozen = false;
         m.started = Instant::now();
+        m.resumed = m.started;
         m.fresh = fresh;
         m.syncs = sync;
         let (label, generation) = (m.label.clone(), m.generation);
@@ -437,6 +438,7 @@ impl Cluster {
         let mut w = self.world.lock().unwrap();
         if w.members[id].frozen {
             w.members[id].frozen = false;
+            w.members[id].resumed = Instant::now();
             let label = w.members[id].label.clone();
             w.log(format!("thaw {label} (SIGCONT)"));
         }
@@ -550,6 +552,7 @@ fn member(id: usize, role: Role, label: String, rpc: &str, started: Instant) -> 
         frozen: false,
         impaired: false,
         started,
+        resumed: started,
         fresh: true,
         syncs: false,
         retired: false,

@@ -193,7 +193,7 @@ impl Checker {
             .ok()
             .and_then(|body| serde_json::from_str::<Value>(&body).ok());
         let Some(doc) = parsed else {
-            let since = watch.last_ok.unwrap_or(m.started);
+            let since = watch.last_ok.unwrap_or(m.started).max(m.resumed);
             let grace = if m.syncs || watch.last_ok.is_none() {
                 START_GRACE.max(Duration::from_secs(30))
             } else {

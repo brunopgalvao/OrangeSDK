@@ -39,6 +39,8 @@ pub struct Member {
     pub impaired: bool,
     /// When its current process started.
     pub started: Instant,
+    /// When it last started or was thawed: frozen time is no silence.
+    pub resumed: Instant,
     /// Whether its current process started from an empty data directory.
     pub fresh: bool,
     /// Whether it syncs its state from peers on this start.
