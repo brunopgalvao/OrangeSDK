@@ -12,18 +12,12 @@ use std::path::Path;
 
 use k256::ecdsa::SigningKey;
 use solo_abi::chain::consensus::{KIND_FINALIZE, signing_preimage};
-use solo_abi::chain::{
-    Allocation, Certificate, GenesisParams, Proposal, UpgradeParams, Validator, ValidatorSet, keys,
-};
-use solo_abi::codec::Seq;
-use solo_abi::staking::{KeySetRecord, StakingParams, ValidatorKey, keys as skeys};
+use solo_abi::chain::{Certificate, Proposal, UpgradeParams, ValidatorSet, keys};
+use solo_abi::staking::{KeySetRecord, keys as skeys};
 use solo_abi::types::Genesis;
 use solo_abi::{Decode, Encode};
 use solo_host::hash::keccak256;
-use solo_node::keystore::encryption_key;
-use solo_node::{
-    ARCHIVE, Node, NodeConfig, NodeError, STATE_HISTORY, Sim, StoreConfig, validator_id,
-};
+use solo_node::{ARCHIVE, Node, NodeConfig, NodeError, STATE_HISTORY, Sim, StoreConfig};
 use solo_scratch::Scratch;
 use solo_store::{Entries, Snapshot, SnapshotError, Trust};
 use support::{CHAIN_ID, ETHER, SLOT_MS, Wallet, alice, genesis, include, keys, v1};
@@ -705,66 +699,12 @@ fn a_validator_joins_a_network_from_a_snapshot() {
     );
 }
 
-/// A staking chain of `keys` in epochs of four blocks with a DKG phase per
-/// block, so that a threshold key exists from epoch 1 on.
-fn staking_genesis(validators: &[SigningKey]) -> Genesis {
-    let params = GenesisParams {
-        slot_ms: SLOT_MS,
-        max_txs: 8,
-        allocations: Seq(validators
-            .iter()
-            .map(|k| Allocation {
-                address: validator_id(k)[12..].try_into().unwrap(),
-                balance: 100 * ETHER,
-                ..Allocation::default()
-            })
-            .chain([Allocation {
-                address: alice().address,
-                balance: 100 * ETHER,
-                ..Allocation::default()
-            }])
-            .collect()),
-        staking: StakingParams {
-            epoch_blocks: 4,
-            unbonding_epochs: 4,
-            min_stake: 0,
-            max_validators: 0,
-            dkg_phase_blocks: 1,
-            max_key_age: 2,
-            keys: Seq(validators
-                .iter()
-                .map(|k| ValidatorKey {
-                    id: validator_id(k),
-                    dkg_key: encryption_key(k).to_vec(),
-                })
-                .collect()),
-        },
-        ..GenesisParams::default()
-    };
-    let set = ValidatorSet {
-        validators: Seq(validators
-            .iter()
-            .map(|k| Validator {
-                id: validator_id(k),
-                weight: 1_000,
-            })
-            .collect()),
-    };
-    Genesis {
-        chain_id: CHAIN_ID,
-        fee_schedule: vec![],
-        modules: Seq(vec![]),
-        params: params.to_bytes(),
-        validators: set.to_bytes(),
-    }
-}
-
 #[test]
 fn a_threshold_certificate_vouches_for_a_staking_chains_snapshot() {
     let validators: Vec<SigningKey> = (1..=4u8)
         .map(|i| SigningKey::from_slice(&[0x70 + i; 32]).unwrap())
         .collect();
-    let genesis = staking_genesis(&validators);
+    let genesis = support::staking_genesis(&validators);
     let template = NodeConfig {
         now_ms: 10_000,
         ..NodeConfig::default()

@@ -1217,4 +1217,11 @@ fn a_node_fetches_its_state_from_a_peer_that_serves_snapshots() {
         })
         .ends_with("no longer asked: lies")
     );
+    assert!(
+        snapshot::describe_event(&SyncEvent::SetAside {
+            peer: [1; 32],
+            epoch: 4
+        })
+        .starts_with("epoch 4 set aside: its certificate from peer 0x0101")
+    );
 }

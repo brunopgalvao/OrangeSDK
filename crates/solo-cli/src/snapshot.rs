@@ -165,6 +165,10 @@ pub fn describe_event(event: &solo_node::statesync::SyncEvent) -> String {
         SyncEvent::Resumed { slices } => {
             format!("{slices} slices verified by an earlier run kept")
         }
+        SyncEvent::SetAside { peer, epoch } => format!(
+            "epoch {epoch} set aside: its certificate from peer {} is not the trusted key's; waiting for a newer snapshot",
+            solo_rpc::methods::data(peer)
+        ),
         SyncEvent::Banned { peer, why } => format!(
             "peer {} no longer asked: {why}",
             solo_rpc::methods::data(peer)
