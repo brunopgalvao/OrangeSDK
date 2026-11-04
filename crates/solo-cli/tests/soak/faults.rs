@@ -153,6 +153,41 @@ impl Scheduler {
         (0..self.cluster.shape.validators + self.cluster.shape.standbys).collect()
     }
 
+    /// The highest head a running node reports now.
+    fn live_head(&self) -> u64 {
+        let rpcs: Vec<String> = {
+            let w = self.world.lock().unwrap();
+            (0..self.cluster.procs.len())
+                .filter(|i| self.cluster.running(*i))
+                .map(|i| w.members[i].rpc.clone())
+                .collect()
+        };
+        rpcs.iter()
+            .filter_map(|r| {
+                rpc::call(r, "eth_blockNumber", &json!([]), Duration::from_secs(2)).ok()
+            })
+            .filter_map(|n| rpc::q64(&n))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The newest epoch whose snapshot a running node other than `except`
+    /// serves, from the files in its data directory.
+    fn newest_served(&self, except: &[usize]) -> Option<u64> {
+        (0..self.cluster.procs.len())
+            .filter(|i| !except.contains(i) && self.cluster.running(*i))
+            .filter_map(|i| std::fs::read_dir(self.cluster.procs[i].dir.join("snapshots")).ok())
+            .flatten()
+            .filter_map(|e| {
+                let name = e.ok()?.file_name().into_string().ok()?;
+                name.strip_prefix("epoch-")?
+                    .strip_suffix(".snap")?
+                    .parse()
+                    .ok()
+            })
+            .max()
+    }
+
     fn best(&self) -> u64 {
         self.world.lock().unwrap().chain.scanned
     }
@@ -318,17 +353,28 @@ impl Scheduler {
             self.mode(Mode::Severe);
         }
         self.set_impaired(targets, true);
+        // The highest head any node, the targets included, has executed:
+        // the scanned height can lag it by tens of blocks, and the targets
+        // may have voted up to it.
+        let at = self.best().max(self.live_head());
         for &t in targets {
             self.cluster.kill(t);
         }
-        let at = self.best();
         let mut ok = self.pause(down);
         if ok && wipe {
-            // Until a snapshot of an epoch that ended after the kill is
-            // served (spec 22 §7.4: exported once a certificate covers it).
+            // Until a peer serves a snapshot of an epoch that ended well
+            // after the kill (spec 22 §7.4: exported once a certificate
+            // covers it), so that a joiner, which takes the newest epoch
+            // offered and follows handoffs to its key set (§7.5), never
+            // comes back below a view it voted in. Waiting on heights alone
+            // was not enough once a joiner no longer needed the newest key:
+            // an older snapshot it would have set aside verified, and the
+            // wiped validator equivocated (seed 2).
             let epoch = self.cluster.shape.epoch_blocks;
-            let after = (at / epoch + 1) * epoch + epoch / 2;
-            ok = self.wait_for(Duration::from_mins(3), |s| s.best() >= after.max(at + 10));
+            let need = (at + 8).div_ceil(epoch) - 1;
+            ok = self.wait_for(Duration::from_mins(3), |s| {
+                s.best() >= at + 10 && s.newest_served(targets) >= Some(need)
+            });
         }
         for &t in targets {
             if !self.cluster.running(t) {
