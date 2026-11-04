@@ -627,6 +627,12 @@ pub enum SyncEvent {
 const UNTRUSTED_CERTIFICATE: &str =
     "the threshold certificate does not verify under the trusted key";
 
+/// Why it refuses a vote certificate under a trusted group key: a peer of
+/// an earlier version exported it while its newest blocks lacked their
+/// threshold certificates (spec 22 §7.1).
+const VOTE_UNDER_KEY: &str =
+    "a vote certificate needs the genesis validator set, and only a chain without staking keeps it";
+
 /// A manifest whose certificate the trusted key does not verify.
 const UNTRUSTED: &str = "a snapshot whose certificate the trusted key does not verify";
 
@@ -1046,7 +1052,7 @@ impl StateSync {
         header
             .verify(self.config.chain_id, &self.config.trust)
             .map_err(|e| match e.check() {
-                Some(UNTRUSTED_CERTIFICATE) => UNTRUSTED,
+                Some(UNTRUSTED_CERTIFICATE | VOTE_UNDER_KEY) => UNTRUSTED,
                 why => {
                     why.unwrap_or("a snapshot header that does not verify under the node's trust")
                 }

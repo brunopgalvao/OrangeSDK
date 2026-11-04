@@ -969,7 +969,7 @@ impl Snapshot {
             };
             candidates.push((height, bytes, certificate, trie, proposal));
         }
-        let class = candidates
+        let latest = candidates
             .last()
             .map(|(_, _, certificate, _, _)| trust_class(certificate))
             .ok_or_else(|| {
@@ -978,6 +978,24 @@ impl Snapshot {
                     record.height
                 ))
             })?;
+        // The newest threshold certificate's key set; on a chain with a
+        // threshold key a vote certificate vouches for nothing a verifier
+        // accepts (spec 22 §7.2, check 3), and the newest blocks often have
+        // their vote certificate before their threshold one.
+        let threshold = candidates
+            .iter()
+            .rev()
+            .find_map(|(_, _, certificate, _, _)| trust_class(certificate));
+        let class = match threshold {
+            Some(key_set) => Some(key_set),
+            None if store.get(solo_abi::staking::keys::ACTIVE).is_some() => {
+                return Err(SnapshotError::Export(format!(
+                    "no threshold certificate covers a proposal anchoring a kept height above block {} yet",
+                    record.height
+                )));
+            }
+            None => latest,
+        };
         let (height, bytes, certificate, trie, _) = candidates
             .into_iter()
             .find(|(_, _, certificate, _, _)| trust_class(certificate) == class)

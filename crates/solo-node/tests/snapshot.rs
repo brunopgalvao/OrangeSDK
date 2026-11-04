@@ -772,4 +772,38 @@ fn a_threshold_certificate_vouches_for_a_staking_chains_snapshot() {
         Err(SnapshotError::Verify(_))
     ));
     assert!(!snapshot.header.head_threshold.is_empty() || snapshot.header.height < 8);
+    // The newest finalized block has its vote certificate before its
+    // threshold one: the export still takes a threshold certificate, an
+    // earlier block's, not the vote certificate no verifier of a staking
+    // chain accepts. Found by the soak test (`crates/solo-cli/tests/soak`,
+    // seed 7), whose fresh observers refused every peer's snapshot.
+    let node = &sim.nodes[0];
+    let mut tables = node.persisted();
+    let newest = tables
+        .keys()
+        .filter_map(|k| k.strip_prefix(b"bcert/".as_slice()))
+        .filter_map(|h| h.try_into().ok().map(u64::from_le_bytes))
+        .max()
+        .unwrap();
+    tables.remove(&[b"bcert/".as_slice(), &newest.to_le_bytes()].concat());
+    let store = node.chain_store().unwrap();
+    let older = scratch("threshold-older.snap");
+    let exported = solo_store::Snapshot::export(store, &tables, None, &older).unwrap();
+    assert_eq!(exported.header.certificate.len(), 97);
+    exported.verify(CHAIN_ID, &Trust::Key(group_key)).unwrap();
+    // With no threshold certificate above the record, it waits for one.
+    let record = exported.header.height;
+    tables.retain(|k, _| {
+        k.strip_prefix(b"bcert/".as_slice())
+            .and_then(|h| h.try_into().ok().map(u64::from_le_bytes))
+            .is_none_or(|h| h <= record)
+    });
+    let waiting = scratch("threshold-none.snap");
+    let refused = solo_store::Snapshot::export(store, &tables, None, &waiting).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("no threshold certificate covers"),
+        "{refused}"
+    );
 }
