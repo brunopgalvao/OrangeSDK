@@ -79,6 +79,7 @@ fn status_json_without_a_validator() {
     let status = Status {
         version: VERSION.to_owned(),
         chain_id: 5,
+        chain_name: "tangerine".to_owned(),
         head: 7,
         head_age_seconds: 1.5,
         finalized: 6,
@@ -96,6 +97,7 @@ fn status_json_without_a_validator() {
     };
     let v = status_json(&status);
     assert_eq!(v["validator"], Value::Null);
+    assert_eq!(v["chainName"], "tangerine");
     assert_eq!(v["upgradeAlert"], Value::Null);
     assert_eq!(v["missingGates"], serde_json::json!([]));
     assert_eq!(v["kernelVersion"], 1);

@@ -134,6 +134,7 @@ impl Node {
         Ok(Status {
             version: VERSION.to_owned(),
             chain_id,
+            chain_name: self.chain_name(),
             head: self.telemetry.head(),
             head_age_seconds: self.telemetry.head_age_seconds(),
             finalized: self.telemetry.finalized(),

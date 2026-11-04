@@ -267,6 +267,11 @@ fn the_status_carries_upgrade_alerts() {
     // A node of an earlier release sends neither field: nothing to report.
     let plain = parse_status(body).unwrap();
     assert_eq!((plain.upgrade_alert, plain.missing_gates), (None, 0));
+    assert_eq!(plain.chain_name, "");
+    assert_eq!(
+        with("\"chainName\":\"tangerine\"").unwrap().chain_name,
+        "tangerine"
+    );
     let clear = with("\"upgradeAlert\":null,\"missingGates\":[]").unwrap();
     assert_eq!((clear.upgrade_alert, clear.missing_gates), (None, 0));
     let blocked = with("\"upgradeAlert\":\"cannot load\",\"missingGates\":[0,2,63]").unwrap();
@@ -282,6 +287,7 @@ fn the_status_carries_upgrade_alerts() {
     );
     for bad in [
         "\"upgradeAlert\":5",
+        "\"chainName\":5",
         "\"missingGates\":3",
         "\"missingGates\":[64]",
         "\"missingGates\":[\"0\"]",

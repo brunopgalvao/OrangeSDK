@@ -109,6 +109,7 @@ Dropping is the "MAY drop" of 05 §4.7; it never changes what the instance obser
 |---|---|---|
 | `version` | string | Node release, as in `solo_build_info`. |
 | `chainId` | number | Chain id from the kernel. |
+| `chainName` | string | The chain's name (20 §3.4) from its genesis parameters, or `""` for a chain without one. |
 | `head` | number | `ethereum_blockchain_height`. |
 | `headAgeSeconds` | number | `solo_chain_head_age_seconds`. |
 | `finalized` | number | `solo_chain_finalized_height`. |
@@ -124,7 +125,7 @@ Dropping is the "MAY drop" of 05 §4.7; it never changes what the instance obser
 | `activeGates` | array of numbers | The gates active for the next block that this host serves (13 §8.6), ascending; empty when there are none. |
 | `pendingUpgrade` | object or null | The pending kernel upgrade (13 §4) as `{"codeHash": string, "activationHeight": number}`, or `null` while none is pending. |
 
-Fields are only ever added; a client ignores fields it does not know, and reads the fields an earlier release does not send as absent: `upgradeAlert` and `pendingUpgrade` as `null`, `missingGates` and `activeGates` as empty, `kernelVersion` as `0` and `kernelHash` as zero.
+Fields are only ever added; a client ignores fields it does not know, and reads the fields an earlier release does not send as absent: `upgradeAlert` and `pendingUpgrade` as `null`, `missingGates` and `activeGates` as empty, `kernelVersion` as `0`, `kernelHash` as zero and `chainName` as `""`.
 
 ## 7. Alerts and the health verdict
 

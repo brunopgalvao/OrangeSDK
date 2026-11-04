@@ -21,7 +21,12 @@
 //! learns the network from its `--peer`s and `--bootstrap` addresses, keeps
 //! up to `--outbound-peers` connections it dials itself and `--max-peers` in
 //! all, and advertises `--advertise` (by default its listen address) in a
-//! record signed with its key.
+//! record signed with its key: a validator's consensus key, or an
+//! observer's `--node-key-file` (an observer without one dials with a key
+//! fresh at every start and advertises nothing). It also dials the genesis
+//! file's `bootnodes` (see [`ceremony`]). `--no-rpc-stop` refuses
+//! `solo_stop`, for a node whose JSON-RPC faces the public; it is stopped
+//! by a signal instead.
 //! The genesis file is
 //! JSON: `{"chainId": 1337, "slotMs": 400, "maxTxs": 64,
 //! "alloc": {"0x<address>": "<wei>"}, "validators": ["0x<32-byte id>"]}`.
@@ -44,6 +49,9 @@
 //! see [`fees`]: without it the base fee is zero, as a development chain
 //! wants it.
 //!
+//! `solo key generate` and `solo genesis` run the genesis ceremony of a
+//! network of several operators (see [`ceremony`]).
+//!
 //! `solo upgrade` stages and proposes a kernel upgrade through governance
 //! (see [`upgrade`]), and `solo devnet` runs a network of validator
 //! processes on one machine and watches it (see [`devnet`]).
@@ -51,6 +59,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bridge;
+pub mod ceremony;
 pub mod client;
 pub mod devnet;
 pub mod doctor;
@@ -113,9 +122,13 @@ pub const DEFAULT_RPC: &str = "127.0.0.1:8545";
 /// Usage line printed on a command-line mistake.
 pub const USAGE: &str = "usage:
   solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive] [--data-dir <dir>]
-  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--snapshot <file> | --sync-from-peers] [--trust-key <0x 96 bytes>] [--serve-snapshots] [--listen 127.0.0.1:30333] [--peer <addr>]... [--bootstrap <addr>]... [--max-peers 32] [--outbound-peers 8] [--advertise <addr>] [--no-discovery] [--rpc 127.0.0.1:8545] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
-  solo key  <64 hex>
-  solo snapshot export --data-dir <dir> --out <file> [--epoch <n>] | verify --snapshot <file> --genesis <genesis.json> [--trust-key <0x 96 bytes>] | import --snapshot <file> --data-dir <dir> --kernel <kernel> --genesis <genesis.json> [--trust-key <0x 96 bytes>]
+  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--snapshot <file> | --sync-from-peers] [--trust-key <0x 96 bytes>] [--serve-snapshots] [--listen 127.0.0.1:30333] [--peer <addr>]... [--bootstrap <addr>]... [--max-peers 32] [--outbound-peers 8] [--advertise <addr>] [--no-discovery] [--node-key-file <path>] [--rpc 127.0.0.1:8545] [--no-rpc-stop] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
+  solo key  <64 hex> | --key-file <path> | generate --out <path>
+  solo genesis operator --key-file <key> --name <name> --chain-id <id> [--p2p <ip:port>] --out <card.json>
+  solo genesis assemble --template <template.json> --kernel <kernel> --operator <card.json>... [--bootnode <ip:port>]... [--genesis-time <unix seconds>] [--operator-funding <wei>] --out <genesis.json>
+  solo genesis hash --genesis <genesis.json> --kernel <kernel>
+  solo genesis verify --genesis <genesis.json> --kernel <kernel> --hash <0x genesis hash> [--key-file <key>] [--operator <card.json>]...
+  solo snapshot export --data-dir <dir> --out <file> [--epoch <n>] | verify --snapshot <file> --genesis <genesis.json> [--trust-key <0x 96 bytes>] | import --snapshot <file> --data-dir <dir> --kernel <kernel> --genesis <genesis.json> [--trust-key <0x 96 bytes>] | trust-key --rpc <addr,...>
   solo gov  submit <target> <0x calldata> | vote <id> yes|no | execute <id> | veto <id> | pause <target> | set-guardian <address> | set-mode stake | set-params <voting> <timelock> <quorumBps> <deposit> | set-fee-params <denominator> <elasticity> <minBaseFee> <treasury|burn>
   solo doctor [--rpc 127.0.0.1:8545] [--max-head-age <s>] [--max-finality-lag <blocks>] [--min-peers <n>] [--max-mempool <txs>] [--max-call-ms <ms>]
   solo upgrade --kernel <kernel.elf|kernel.solo> (--key <64 hex> | --key-file <path>) [--rpc 127.0.0.1:8545] [--delay <blocks>] [--required-gates <g,g,...>] [--timeout <s>]
@@ -157,6 +170,7 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
         }
     }
     let modules = modules::parse_modules(&v, &mut allocations)?;
+    ceremony::bootnodes(&v)?;
     let params = GenesisParams {
         slot_ms,
         max_txs: u32::try_from(max_txs)
@@ -169,6 +183,7 @@ pub fn parse_genesis(text: &str) -> Result<Genesis, String> {
         governance: gov::parse_governance(&v)?,
         fees: fees::parse_fees(&v)?,
         genesis_time: parse_timestamp(&v)?,
+        name: parse_name(&v)?,
     };
     let mut validators = Vec::new();
     match v.get("validators") {
@@ -288,6 +303,22 @@ fn parse_timestamp(v: &Value) -> Result<u64, String> {
         "genesis: timestamp must be Unix seconds, a number or a decimal or 0x hex string"
             .to_owned(),
     )
+}
+
+/// The chain's `name` (spec 20 §3.4): lower-case letters, digits and `-`,
+/// starting with a letter, at most 32 bytes; empty, no name, without one.
+fn parse_name(v: &Value) -> Result<Vec<u8>, String> {
+    let Some(value) = v.get("name") else {
+        return Ok(Vec::new());
+    };
+    value
+        .as_str()
+        .map(|n| n.as_bytes().to_vec())
+        .filter(|n| !n.is_empty() && solo_abi::chain::valid_chain_name(n))
+        .ok_or(format!(
+            "genesis: name must be 1 to {} bytes of lower-case letters, digits and '-', starting with a letter",
+            solo_abi::chain::MAX_CHAIN_NAME
+        ))
 }
 
 /// `genesis` with the genesis time `seconds`, for a `solo dev` chain that
@@ -525,6 +556,7 @@ fn parse_addresses(args: &[String], flag: &str) -> Result<Vec<std::net::SocketAd
 fn discovery(
     args: &[String],
     key: Option<k256::ecdsa::SigningKey>,
+    genesis_bootnodes: &[std::net::SocketAddr],
 ) -> Result<Option<solo_node::Discovery>, String> {
     let defaults = solo_node::Discovery::default();
     let limit = |flag: &str, default: usize| -> Result<usize, String> {
@@ -543,10 +575,20 @@ fn discovery(
                 .ok_or_else(|| format!("--advertise {text}: expected an ip:port peers can dial"))?,
         ),
     };
+    // The genesis file's bootnodes after the node's own, less the node
+    // itself: a bootnode reads the genesis that lists it.
+    let own = [arg(args, "--listen"), arg(args, "--advertise")];
+    let mut bootstrap = parse_addresses(args, "--bootstrap")?;
+    for addr in genesis_bootnodes {
+        let me = own.iter().flatten().any(|a| *a == addr.to_string());
+        if !me && !bootstrap.contains(addr) {
+            bootstrap.push(*addr);
+        }
+    }
     let discovery = solo_node::Discovery {
         key,
         advertise,
-        bootstrap: parse_addresses(args, "--bootstrap")?,
+        bootstrap,
         max_peers: limit("--max-peers", defaults.max_peers)?,
         outbound: limit("--outbound-peers", defaults.outbound)?,
         peer_file: arg(args, "--data-dir")
@@ -574,11 +616,8 @@ fn discovery(
 fn tool_output(command: &str, args: &[String]) -> Option<Result<String, CliError>> {
     Some(
         match command {
-            "key" => args
-                .get(2)
-                .ok_or_else(|| "key: expected 64 hex digits".to_owned())
-                .and_then(|hex| parse_key(hex))
-                .map(|key| describe_key(&key)),
+            "key" => key_command(args),
+            "genesis" => ceremony::run(args),
             "doctor" => doctor::run(args),
             "gov" => gov::parse(args.get(2..).unwrap_or(&[])).map(|call| gov::describe(&call)),
             "upgrade" => upgrade::run(args),
@@ -589,24 +628,42 @@ fn tool_output(command: &str, args: &[String]) -> Option<Result<String, CliError
     )
 }
 
+/// `solo key <64 hex>`, `solo key --key-file <path>` (the public half of a
+/// key, without the secret on the command line) and `solo key generate
+/// --out <path>` (see [`ceremony::generate_key`]).
+fn key_command(args: &[String]) -> Result<String, String> {
+    if args.get(2).map(String::as_str) == Some("generate") {
+        return ceremony::generate_key(args);
+    }
+    if args.iter().any(|a| a == "--key-file") {
+        return key_argument(args).map(|key| describe_key(&key.expect("--key-file given")));
+    }
+    args.get(2)
+        .ok_or_else(|| "key: expected 64 hex digits".to_owned())
+        .and_then(|hex| parse_key(hex))
+        .map(|key| describe_key(&key))
+}
+
 /// The peer-to-peer transport of `solo node`, bound to `--listen`.
 fn bind_transport(
     args: &[String],
     node: &solo_node::Node,
-    chain_id: u64,
+    (chain_id, genesis_bootnodes): (u64, &[std::net::SocketAddr]),
     peers: Vec<std::net::SocketAddr>,
 ) -> Result<solo_node::Transport, CliError> {
     let listen_arg = arg(args, "--listen");
     let listen = listen_arg.as_deref().unwrap_or(DEFAULT_LISTEN);
-    // A validator proves its id with its consensus key; an observer with a
-    // key of its own, fresh at every start (spec 09 §3).
-    let key = match node.services_key() {
+    // A validator proves its id with its consensus key; an observer with
+    // the key of `--node-key-file`, the same at every start, or a fresh one
+    // (spec 09 §3). Only a node with a lasting key advertises a record.
+    let lasting = node.services_key().or(node_key(args)?);
+    let key = match lasting.clone() {
         Some(key) => key,
         None => solo_node::net::fresh_key()
             .ok()
             .ok_or("node key: the operating system gave no randomness")?,
     };
-    let discovery = discovery(args, node.services_key())?;
+    let discovery = discovery(args, lasting, genesis_bootnodes)?;
     let genesis = node.genesis_hash();
     let mut t = match solo_node::Transport::bind(listen, key, chain_id, genesis, peers) {
         Ok(t) => t,
@@ -620,6 +677,23 @@ fn bind_transport(
         eprintln!("peer exchange on, {bootstrap} bootstrap address(es)");
     }
     Ok(t)
+}
+
+/// The node key `--node-key-file` names: an observer's lasting identity on
+/// the transport, so that its peers' tables keep it across its restarts. A
+/// validator's node key is its consensus key (spec 09 §3).
+fn node_key(args: &[String]) -> Result<Option<k256::ecdsa::SigningKey>, String> {
+    let Some(path) = arg(args, "--node-key-file") else {
+        return Ok(None);
+    };
+    if args.iter().any(|a| a == "--key" || a == "--key-file") {
+        return Err(
+            "--node-key-file is for a node without a consensus key: a validator's node key is its consensus key"
+                .to_owned(),
+        );
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+    parse_key(text.trim()).map(Some)
 }
 
 /// A driver store, if any, with the tables and the state it holds from a
@@ -777,7 +851,7 @@ fn report_driver_state(node: &solo_node::Node, resumed: Option<&[u8]>, opened_at
 fn bind_rpc(
     rpc_addr: &str,
     command: &str,
-    chain_id: u64,
+    (chain_id, name): (u64, &str),
     key: Option<&k256::ecdsa::SigningKey>,
 ) -> Result<std::net::TcpListener, CliError> {
     let listener = match solo_rpc::http::bind(rpc_addr) {
@@ -789,8 +863,13 @@ fn bind_rpc(
     let validator = key.map_or("none (observer)".to_owned(), |k| {
         solo_rpc::methods::data(&solo_node::validator_id(k))
     });
+    let name = if name.is_empty() {
+        String::new()
+    } else {
+        format!(" ({name})")
+    };
     eprintln!(
-        "solo {command} node: chain id {chain_id}, validator {validator}, JSON-RPC on http://{bound}"
+        "solo {command} node: chain id {chain_id}{name}, validator {validator}, JSON-RPC on http://{bound}"
     );
     Ok(listener)
 }
@@ -828,6 +907,7 @@ fn check_options(args: &[String], command: &str) -> Result<(), CliError> {
             "--no-discovery",
             "--key",
             "--key-file",
+            "--node-key-file",
         ] {
             if args.iter().any(|a| a == flag) {
                 let why = if flag.starts_with("--key") {
@@ -854,17 +934,23 @@ fn check_options(args: &[String], command: &str) -> Result<(), CliError> {
 /// genesis names no time, starts now; with a data directory the genesis is
 /// the file's, so that a restart and the snapshot commands, which read the
 /// file, find the same chain (spec 20 §3.4).
-fn genesis_argument(args: &[String], command: &str) -> Result<Genesis, CliError> {
+fn genesis_argument(
+    args: &[String],
+    command: &str,
+) -> Result<(Genesis, Vec<std::net::SocketAddr>), CliError> {
     let genesis_path = arg(args, "--genesis").ok_or("--genesis is required")?;
     let genesis_text = match std::fs::read_to_string(&genesis_path) {
         Ok(text) => text,
         Err(e) => return Err(format!("{genesis_path}: {e}").into()),
     };
     let genesis = parse_genesis(&genesis_text)?;
+    // `parse_genesis` read the JSON and its bootnodes.
+    let v: Value = serde_json::from_str(&genesis_text).expect("valid JSON");
+    let bootnodes = ceremony::bootnodes(&v)?;
     if command == "dev" && arg(args, "--data-dir").is_none() {
-        return Ok(timed(genesis, unix_ms() / 1000));
+        return Ok((timed(genesis, unix_ms() / 1000), bootnodes));
     }
-    Ok(genesis)
+    Ok((genesis, bootnodes))
 }
 
 pub(crate) fn run_inner(
@@ -884,7 +970,7 @@ pub(crate) fn run_inner(
     }
     check_options(args, command)?;
     let kernel = load_kernel(&arg(args, "--kernel").ok_or("--kernel is required")?)?;
-    let genesis = genesis_argument(args, command)?;
+    let (genesis, bootnodes) = genesis_argument(args, command)?;
     let rpc_arg = arg(args, "--rpc");
     let rpc_addr = rpc_arg.as_deref().unwrap_or(DEFAULT_RPC);
     let max_blocks = parse_number(args, "--blocks")?;
@@ -920,7 +1006,7 @@ pub(crate) fn run_inner(
     )?;
     let chain_id = node.chain_id().unwrap_or(0);
     let mut transport = if command == "node" {
-        Some(bind_transport(args, &node, chain_id, peers)?)
+        Some(bind_transport(args, &node, (chain_id, &bootnodes), peers)?)
     } else {
         None
     };
@@ -933,8 +1019,10 @@ pub(crate) fn run_inner(
     }
     node.start(resumed.clone())?;
     report_driver_state(&node, resumed.as_deref(), opened_at);
+    let chain_name = node.chain_name();
     let mut rpc = solo_rpc::Rpc::new(node);
-    let listener = bind_rpc(rpc_addr, command, chain_id, key.as_ref())?;
+    rpc.stop_allowed = !args.iter().any(|a| a == "--no-rpc-stop");
+    let listener = bind_rpc(rpc_addr, command, (chain_id, &chain_name), key.as_ref())?;
     let mut last_tick = Instant::now();
     let mut switches_seen = 0usize;
     let blocks_seen = Rc::new(Cell::new(0u64));

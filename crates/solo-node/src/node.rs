@@ -1308,6 +1308,16 @@ impl Node {
         self.exec.state().base().genesis_root().unwrap_or_default()
     }
 
+    /// The chain's name (spec 20 §3.4) from the genesis parameters in its
+    /// state, empty for a chain without one.
+    #[must_use]
+    pub fn chain_name(&self) -> String {
+        self.state_get(b"meta/params")
+            .and_then(|b| solo_abi::chain::GenesisParams::from_bytes(&b).ok())
+            .map(|p| String::from_utf8_lossy(&p.name).into_owned())
+            .unwrap_or_default()
+    }
+
     /// The genesis hash its handshakes name (spec 09 §3): what the chain
     /// state holds at `bnum/` ‖ 0 (spec 22 §7.3), zero when it holds no
     /// 32-byte hash there.

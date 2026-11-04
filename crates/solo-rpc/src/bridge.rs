@@ -85,3 +85,25 @@ pub fn outbox_proof(node: &mut Node, params: &[Value]) -> Result<Value, RpcError
         "siblings": p.siblings.iter().map(|s| data(s)).collect::<Vec<_>>(),
     }))
 }
+
+/// `solo_getGroupKey()`: the active key set of the node's chain at its head
+/// (spec 15 §6), `{keyId, groupKey}` with the 96-byte group key a
+/// threshold certificate of that set verifies under: what a joining node
+/// trusts its snapshot by (spec 22 §7.2); `null` before the chain adopted
+/// its first key set, or on a chain without one.
+#[must_use]
+pub fn group_key(node: &Node) -> Value {
+    use solo_abi::Decode as _;
+    use solo_abi::staking::keys;
+    let id = node
+        .state_get(keys::ACTIVE)
+        .and_then(|b| u64::from_bytes(&b).ok());
+    let key = node.state_get(keys::GROUP_KEY).filter(|k| k.len() == 96);
+    match (id, key) {
+        (Some(id), Some(key)) => json!({
+            "keyId": quantity(u128::from(id)),
+            "groupKey": data(&key),
+        }),
+        _ => Value::Null,
+    }
+}

@@ -198,6 +198,8 @@ fn a_relayer_gets_the_handoffs_of_a_rotating_key() {
     let mut rpc = Rpc::new(staking_node(&alice, 16));
     let mut now = 1_000;
     let mut rotation = Value::Null;
+    // No key set is active before the first DKG completes.
+    assert_eq!(ok(&mut rpc, "solo_getGroupKey", json!([])), Value::Null);
     for _ in 0..80 {
         now += SLOT_MS;
         rpc.node_mut().tick(now).unwrap();
@@ -227,6 +229,10 @@ fn a_relayer_gets_the_handoffs_of_a_rotating_key() {
         calldata[..4],
         solo_bridge::abi::selector("rotate(uint64,bytes,bytes)")
     );
+    // The key set handed off to is the active one, with the key the handoff names.
+    let active = ok(&mut rpc, "solo_getGroupKey", json!([]));
+    assert_eq!(active["keyId"], rotation["to"]);
+    assert_eq!(active["groupKey"], rotation["key"]);
     assert_eq!(
         ok(&mut rpc, "solo_getRotation", json!(["0x63"])),
         Value::Null

@@ -11,6 +11,9 @@
 //! loads it into a fresh data directory, which `solo node --data-dir <dir>`
 //! then starts from; `solo node --snapshot <file>` does both in one go.
 //!
+//! `solo snapshot trust-key --rpc <addr,...>` prints the group key of the
+//! active key set that every node named reports, for `--trust-key`.
+//!
 //! The trust: `--trust-key` names a group key of the chain's threshold key
 //! (spec 15 §6), which a threshold certificate must verify under; without
 //! it the genesis validator set is trusted, and the certificate must be
@@ -204,6 +207,36 @@ pub fn sync_from_peers(
     }
 }
 
+/// `solo snapshot trust-key --rpc <addr,...>`: the group key of the active
+/// key set (`solo_getGroupKey`, spec 17 §7) that every node named reports,
+/// for `--trust-key`. Nodes that disagree, as they may for a moment around
+/// a key handoff, or one that reports none, fail the command with what
+/// each said, so that one node alone never decides what a joiner trusts
+/// unless it is the only one named.
+fn trust_key(args: &[String]) -> Result<String, String> {
+    let list = arg(args, "--rpc").ok_or("--rpc <addr,...> is required")?;
+    let mut keys = Vec::new();
+    for rpc in list.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+        let answer = crate::client::call(rpc, "solo_getGroupKey", &serde_json::json!([]))?;
+        let key = answer["groupKey"]
+            .as_str()
+            .ok_or_else(|| format!("{rpc}: the chain has adopted no threshold key yet"))?;
+        keys.push((rpc.to_owned(), key.to_owned(), answer["keyId"].clone()));
+    }
+    let (_, first, _) = keys.first().ok_or("--rpc names no node")?;
+    if keys.iter().any(|(_, key, _)| key != first) {
+        let said: Vec<String> = keys
+            .iter()
+            .map(|(rpc, key, id)| format!("{rpc}: key set {id} {}", &key[..18]))
+            .collect();
+        return Err(format!(
+            "the nodes report different keys; ask again: {}",
+            said.join(", ")
+        ));
+    }
+    Ok(first.clone())
+}
+
 /// Runs `solo snapshot <subcommand>` and returns what it prints.
 ///
 /// # Errors
@@ -213,6 +246,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
         "export" => export(args),
         "verify" => verify_command(args),
         "import" => import(args),
+        "trust-key" => trust_key(args),
         _ => Err(crate::USAGE.to_owned()),
     }
 }

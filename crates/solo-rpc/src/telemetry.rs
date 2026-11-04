@@ -13,6 +13,7 @@ pub fn status_json(s: &Status) -> Value {
     json!({
         "version": s.version,
         "chainId": s.chain_id,
+        "chainName": s.chain_name,
         "head": s.head,
         "headAgeSeconds": s.head_age_seconds,
         "finalized": s.finalized,

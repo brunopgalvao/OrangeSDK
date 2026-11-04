@@ -211,7 +211,8 @@ pub fn slot_key(address: &Address, slot: &Hash) -> Vec<u8> {
 /// the bridge out: the driver reads them on every step, the accounts already
 /// hold the allocations, and the bridge's namespace its state (spec 18 §4.1).
 ///
-/// Traps on an account with storage but neither code nor nonce. revm leaves
+/// Traps on a name that is not a chain name (spec 20 §3.4), and on an
+/// account with storage but neither code nor nonce. revm leaves
 /// out EIP-7610, so a CREATE could land on such an account and its slots would
 /// show through the new contract; refusing it here keeps every account with
 /// storage out of a creation's reach (see `evm::commit`).
@@ -219,6 +220,10 @@ pub fn init(genesis: &Genesis) {
     set(keys::CHAIN_ID, &genesis.chain_id);
     let mut params =
         GenesisParams::from_bytes(&genesis.params).unwrap_or_else(|_| solo_guest::trap());
+    // A name, when there is one, is a chain name (spec 20 §3.4).
+    if !solo_abi::chain::valid_chain_name(&params.name) {
+        solo_guest::trap();
+    }
     let allocations = core::mem::take(&mut params.allocations.0);
     params.bridge_in = solo_abi::bridge_in::BridgeInParams::default();
     set(b"meta/params", &params);

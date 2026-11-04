@@ -72,6 +72,10 @@ pub fn parse_status(text: &str) -> Result<Status, String> {
         Some(Status {
             version: v.get("version")?.as_str()?.to_owned(),
             chain_id: u("chainId")?,
+            chain_name: match v.get("chainName") {
+                None => String::new(),
+                Some(name) => name.as_str()?.to_owned(),
+            },
             head: u("head")?,
             head_age_seconds: f("headAgeSeconds")?,
             finalized: u("finalized")?,

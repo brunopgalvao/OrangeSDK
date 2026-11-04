@@ -86,6 +86,7 @@ use solo_host::hash::keccak256;
 use solo_metrics::Status;
 use solo_rpc::methods::data;
 
+use crate::ceremony::Operator;
 use crate::client::{self, poll_until};
 use crate::upgrade::parse_gates;
 use crate::{CliError, arg, load_kernel, parse_genesis, parse_key};
@@ -178,7 +179,7 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 /// Writes a key file that its owner alone can read.
-fn write_secret(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_secret(path: &Path, bytes: &[u8]) -> Result<(), String> {
     // The mode applies to a file being created: an old one goes first.
     let _ = fs::remove_file(path);
     let mut options = File::options();
@@ -373,42 +374,36 @@ fn init(args: &[String]) -> Result<String, String> {
         .iter()
         .map(|k| data(&solo_node::validator_id(k)))
         .collect();
-    let mut alloc = serde_json::Map::new();
-    alloc.insert(FUNDED.to_owned(), json!(FUNDING));
-    for key in keys.iter().chain(std::iter::once(&governance)) {
-        alloc.insert(data(&client::address(key)), json!(OPERATOR_FUNDING));
-    }
-    let mut genesis = json!({
+    // The template of a ceremony (see `crate::ceremony`), its operators the
+    // devnet's validators, in node order.
+    let mut template = json!({
         "chainId": chain_id,
         "timestamp": genesis_time,
         "slotMs": slot_ms,
         "maxTxs": 64,
-        "alloc": alloc,
-        "validators": ids,
+        "alloc": {
+            FUNDED: FUNDING,
+            data(&client::address(&governance)): OPERATOR_FUNDING,
+        },
         "governance": data(&client::address(&governance)),
         "upgradeDelay": upgrade_delay,
         "epochBlocks": epoch_blocks,
         "fees": crate::fees::production_json(),
     });
     if epoch_blocks != 0 {
-        let dkg_keys: serde_json::Map<String, Value> = keys
-            .iter()
-            .zip(&ids)
-            .map(|(k, id)| {
-                (
-                    id.clone(),
-                    Value::from(data(&solo_node::keystore::encryption_key(k))),
-                )
-            })
-            .collect();
-        genesis["staking"] = json!({
+        template["staking"] = json!({
             "epochBlocks": epoch_blocks,
             "dkgPhaseBlocks": dkg_phase_blocks,
             "unbondingEpochs": 4,
             "maxKeyAge": 2,
-            "keys": dkg_keys,
         });
     }
+    let operators: Vec<Operator> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| Operator::of_key(k, &format!("node-{i}"), None))
+        .collect();
+    let genesis = crate::ceremony::assemble(&template, &operators, OPERATOR_FUNDING, &[])?;
     let genesis_text = serde_json::to_string_pretty(&genesis).expect("json");
     // What the node will read, parsed as a node parses it and run through
     // `kernel_init` once, so that a genesis the kernel refuses fails here

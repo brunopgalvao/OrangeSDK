@@ -178,6 +178,10 @@ pub struct Rpc {
     pub max_filters: usize,
     /// Set by `solo_stop`; the server loop exits when it sees it.
     pub stopped: bool,
+    /// Whether `solo_stop` is served; a node whose JSON-RPC faces the
+    /// public turns it off (`solo node --no-rpc-stop`) and is stopped by a
+    /// signal instead. On unless changed.
+    pub stop_allowed: bool,
 }
 
 impl Rpc {
@@ -195,6 +199,7 @@ impl Rpc {
             filter_timeout: crate::filters::FILTER_TIMEOUT,
             max_filters: crate::filters::MAX_FILTERS,
             stopped: false,
+            stop_allowed: true,
         }
     }
 
@@ -373,6 +378,12 @@ impl Rpc {
             // stays at its minimum.
             "eth_blobBaseFee" => json!(quantity(1)),
             "eth_syncing" => json!(false),
+            "solo_stop" if !self.stop_allowed => {
+                return Err(RpcError::with_code(
+                    -32601,
+                    "method not found: solo_stop (this node serves it to nobody)".into(),
+                ));
+            }
             "solo_stop" => {
                 self.stopped = true;
                 json!(true)
@@ -494,6 +505,7 @@ impl Rpc {
             "solo_getFinalityProof" => crate::bridge::finality_proof(&mut self.node, params)?,
             "solo_getOutboxProof" => crate::bridge::outbox_proof(&mut self.node, params)?,
             "solo_getRotation" => crate::bridge::rotation(&mut self.node, params)?,
+            "solo_getGroupKey" => crate::bridge::group_key(&self.node),
             "solo_getGovernance" => crate::governance::governance(&mut self.node)?,
             "solo_getProposals" => crate::governance::proposals(&mut self.node)?,
             "solo_getProposal" => crate::governance::proposal(&mut self.node, params)?,

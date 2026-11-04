@@ -127,8 +127,13 @@ pub fn summary(status: &Status) -> String {
     } else {
         "no p2p".to_owned()
     };
+    let name = if status.chain_name.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", status.chain_name)
+    };
     format!(
-        "solo {}: chain {}, head {} ({:.1}s ago), finalized {}, {peers}, mempool {}, up {:.0}s",
+        "solo {}: chain {}{name}, head {} ({:.1}s ago), finalized {}, {peers}, mempool {}, up {:.0}s",
         status.version,
         status.chain_id,
         status.head,
@@ -148,6 +153,7 @@ mod tests {
         Status {
             version: "0.0.1".to_owned(),
             chain_id: 1337,
+            chain_name: String::new(),
             head: 40,
             head_age_seconds: 0.25,
             finalized: 40,
@@ -181,6 +187,11 @@ mod tests {
             summary(&status()),
             "solo 0.0.1: chain 1337, head 40 (0.2s ago), finalized 40, 3 peers, mempool 2, up 12s"
         );
+        let named = Status {
+            chain_name: "tangerine".to_owned(),
+            ..status()
+        };
+        assert!(summary(&named).starts_with("solo 0.0.1: chain 1337 (tangerine), head 40"));
         let dev = Status {
             p2p: false,
             peers: 0,

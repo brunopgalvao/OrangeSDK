@@ -427,6 +427,8 @@ pub struct Status {
     pub version: String,
     /// Chain id from the kernel.
     pub chain_id: u64,
+    /// The chain's name (spec 20 §3.4), empty for a chain without one.
+    pub chain_name: String,
     /// Last executed height.
     pub head: u64,
     /// Seconds since the head last advanced.
@@ -1016,6 +1018,7 @@ mod tests {
         let s = Status {
             version: VERSION.to_owned(),
             chain_id: 1,
+            chain_name: String::new(),
             head: 2,
             head_age_seconds: 0.5,
             finalized: 2,

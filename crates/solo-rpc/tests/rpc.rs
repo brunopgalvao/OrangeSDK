@@ -139,6 +139,13 @@ fn static_and_info_methods() {
     );
     assert_eq!(ok(&mut rpc, "eth_syncing", json!([])), json!(false));
     assert!(!rpc.stopped);
+    // A node whose RPC faces the public serves `solo_stop` to nobody.
+    rpc.stop_allowed = false;
+    let (code, message) = err(&mut rpc, "solo_stop", json!([]));
+    assert_eq!(code, -32601);
+    assert!(message.contains("solo_stop"), "{message}");
+    assert!(!rpc.stopped);
+    rpc.stop_allowed = true;
     assert_eq!(ok(&mut rpc, "solo_stop", json!([])), json!(true));
     assert!(rpc.stopped);
     assert_eq!(ok(&mut rpc, "eth_accounts", json!([])), json!([]));

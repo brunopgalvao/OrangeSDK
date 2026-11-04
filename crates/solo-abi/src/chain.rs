@@ -91,6 +91,33 @@ pub struct GenesisParams {
     /// Encoded only when it is not zero, so parameters without a time
     /// encode, and hash, exactly as before it existed.
     pub genesis_time: u64,
+    /// The chain's name (spec 20 §3.4), ASCII, empty for none: at most
+    /// [`MAX_CHAIN_NAME`] bytes of lower-case letters, digits and `-`,
+    /// starting with a letter ([`valid_chain_name`]). Encoded after the
+    /// genesis time only when it is not empty, the time then encoded even
+    /// when zero, so parameters without a name encode, and hash, exactly
+    /// as before it existed.
+    pub name: Vec<u8>,
+}
+
+/// The longest chain name, in bytes.
+pub const MAX_CHAIN_NAME: usize = 32;
+
+/// Whether `name` is a chain name `kernel_init` accepts (spec 20 §3.4):
+/// empty (no name), or at most [`MAX_CHAIN_NAME`] bytes matching
+/// `[a-z][a-z0-9-]*`.
+#[must_use]
+pub fn valid_chain_name(name: &[u8]) -> bool {
+    match name.split_first() {
+        None => true,
+        Some((first, rest)) => {
+            name.len() <= MAX_CHAIN_NAME
+                && first.is_ascii_lowercase()
+                && rest
+                    .iter()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        }
+    }
 }
 
 impl Encode for GenesisParams {
@@ -103,14 +130,18 @@ impl Encode for GenesisParams {
         self.bridge_in.encode(e);
         self.governance.encode(e);
         self.fees.encode(e);
-        if self.genesis_time != 0 {
+        if self.genesis_time != 0 || !self.name.is_empty() {
             self.genesis_time.encode(e);
+        }
+        if !self.name.is_empty() {
+            self.name.encode(e);
         }
     }
 }
 
 impl Decode for GenesisParams {
-    /// Parameters that end after `fees` have no genesis time: zero.
+    /// Parameters that end after `fees` have no genesis time, zero, and
+    /// parameters that end after the time no name.
     fn decode(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let mut p = GenesisParams {
             slot_ms: d.get()?,
@@ -122,9 +153,13 @@ impl Decode for GenesisParams {
             governance: d.get()?,
             fees: d.get()?,
             genesis_time: 0,
+            name: Vec::new(),
         };
         if d.remaining() != 0 {
             p.genesis_time = d.get()?;
+        }
+        if d.remaining() != 0 {
+            p.name = d.get()?;
         }
         Ok(p)
     }
@@ -1048,6 +1083,7 @@ mod tests {
             },
             fees: crate::fees::FeeParams::production(),
             genesis_time: 1_792_800_000,
+            name: b"tangerine".to_vec(),
         });
         // Without a time the parameters encode as before the field existed,
         // and such an encoding reads as no time.
@@ -1069,13 +1105,35 @@ mod tests {
         assert_eq!(
             GenesisParams {
                 genesis_time: u64::MAX,
-                ..untimed
+                ..untimed.clone()
             }
             .genesis_time_ms(),
             u64::MAX
         );
         let bytes = timed.to_bytes();
         assert!(GenesisParams::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        // A name follows the time, which is then encoded even when zero;
+        // parameters without one encode as before.
+        let named = GenesisParams {
+            name: b"tangerine".to_vec(),
+            ..untimed.clone()
+        };
+        assert_eq!(named.to_bytes().len(), untimed.to_bytes().len() + 8 + 1 + 9);
+        roundtrip(&named);
+        roundtrip(&GenesisParams {
+            name: b"tangerine".to_vec(),
+            ..timed.clone()
+        });
+        assert!(valid_chain_name(b""));
+        assert!(valid_chain_name(b"tangerine"));
+        assert!(valid_chain_name(b"t-2-x"));
+        assert!(valid_chain_name(&[b'a'; MAX_CHAIN_NAME]));
+        assert!(!valid_chain_name(&[b'a'; MAX_CHAIN_NAME + 1]));
+        assert!(!valid_chain_name(b"Tangerine"));
+        assert!(!valid_chain_name(b"1tangerine"));
+        assert!(!valid_chain_name(b"-t"));
+        assert!(!valid_chain_name(b"tan gerine"));
+        assert!(!valid_chain_name(b"tang_erine"));
         roundtrip(&BlockHeader {
             height: 1,
             parent_hash: [2; 32],
