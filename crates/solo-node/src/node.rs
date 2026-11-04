@@ -380,6 +380,9 @@ impl Node {
     fn take_up(&mut self, kernel: Option<[u8; 32]>) -> Result<(), NodeError> {
         let head = self.exec.state().base().head();
         self.opened_at = head;
+        // What the node holds is finalized (spec 22 §5): its status says so
+        // from the start, not from the next block it finalizes.
+        self.telemetry.resumed_at(head);
         // The loaded kernel's view of the upgrade state serves to find the
         // gates the kernel that wrote the store imports.
         let status = self.upgrade_status().unwrap_or_default();

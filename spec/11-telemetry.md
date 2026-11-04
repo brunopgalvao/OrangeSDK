@@ -34,10 +34,10 @@ Names follow EIP-2159 where it defines a metric (`ethereum_*`); every other name
 
 | Name | Type | Labels | Meaning |
 |---|---|---|---|
-| `ethereum_blockchain_height` | gauge | — | The current height of the canonical chain: the last block this node executed (EIP-2159). |
+| `ethereum_blockchain_height` | gauge | — | The current height of the canonical chain: the last block this node executed (EIP-2159), or, until it executes one, the height it took up from its chain store or a snapshot (22 §5, §7). |
 | `ethereum_best_known_block_number` | gauge | — | The estimated highest block available (EIP-2159). The node does not know a sync target, so this equals the head, as EIP-2159 prescribes for a node that is not syncing. |
 | `ethereum_peer_count` | gauge | — | Peers that completed the handshake (09 §3) (EIP-2159). Absent on a node without a peer-to-peer transport. |
-| `solo_chain_finalized_height` | gauge | — | The last height this node finalized. |
+| `solo_chain_finalized_height` | gauge | — | The last height this node finalized, or, until it finalizes one, the height it took up from its chain store or a snapshot, all of which is finalized (22 §5, §7). A restarted node therefore never reports a lower height than it held, while it waits for its peers. |
 | `solo_chain_head_age_seconds` | gauge | — | Seconds since the head last advanced, or since the node opened if it has executed no block. Computed at scrape time. |
 | `solo_chain_id` | gauge | — | The chain id the kernel reports (§2). Absent until the kernel has answered once, then kept. |
 | `solo_blocks_executed_total` | counter | — | Blocks this node executed (`ExecuteBlock` applied). |
