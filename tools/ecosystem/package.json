@@ -1,0 +1,17 @@
+{
+  "name": "solo-ecosystem",
+  "private": true,
+  "description": "Standard Ethereum clients (ethers, viem) against a Solo devnet",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/*.test.mjs"
+  },
+  "devDependencies": {
+    "ethers": "6.17.0",
+    "solc": "0.8.28",
+    "viem": "2.57.7"
+  }
+}
