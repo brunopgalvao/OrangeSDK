@@ -1,0 +1,57 @@
+# Standard Ethereum tooling against a freshly built `solo dev`: ethers,
+# viem and Foundry (tools/ecosystem, spec 20 §8.4). Runs when the node, the
+# RPC, the kernel fixtures or the suite change.
+name: ecosystem
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/**
+      - Cargo.lock
+      - Cargo.toml
+      - rust-toolchain.toml
+      - tools/ecosystem/**
+      - .github/workflows/ecosystem.yml
+  pull_request:
+    paths:
+      - crates/**
+      - Cargo.lock
+      - Cargo.toml
+      - rust-toolchain.toml
+      - tools/ecosystem/**
+      - .github/workflows/ecosystem.yml
+  workflow_dispatch:
+concurrency:
+  group: ecosystem-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  # The toolchain rust-toolchain.toml pins, without the RISC-V and wasm
+  # targets the host build does not need.
+  RUSTUP_TOOLCHAIN: 1.95.0
+  FOUNDRY_VERSION: v1.7.1
+jobs:
+  clients:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ecosystem-release
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tools/ecosystem/package-lock.json
+      - name: Install Foundry
+        run: |
+          curl -sSfL https://foundry.paradigm.xyz | bash
+          "$HOME/.foundry/bin/foundryup" --install "$FOUNDRY_VERSION"
+          echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
+      - run: timeout 1200 cargo build --release --locked -p solo-cli
+      - run: npm ci --no-audit --no-fund
+        working-directory: tools/ecosystem
+      - run: timeout 600 tools/ecosystem/run.sh

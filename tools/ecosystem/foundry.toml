@@ -1,0 +1,13 @@
+# The Foundry half of the ecosystem suite (foundry.sh): the token of
+# contracts/ and the deploy script of script/, built with the solc the
+# repository's contracts use.
+[profile.default]
+src = "contracts"
+script = "script"
+test = "script"
+out = "out"
+cache_path = "cache"
+libs = []
+solc_version = "0.8.28"
+evm_version = "prague"
+optimizer = true

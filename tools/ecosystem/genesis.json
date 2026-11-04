@@ -1,0 +1,9 @@
+{
+  "chainId": 1337,
+  "slotMs": 400,
+  "maxTxs": 64,
+  "fees": {"denominator": 125, "elasticity": 2, "minBaseFee": "1000000000"},
+  "alloc": {
+    "0x1a642f0e3c3af545e7acbd38b07251b3990914f1": "1000000000000000000000000"
+  }
+}

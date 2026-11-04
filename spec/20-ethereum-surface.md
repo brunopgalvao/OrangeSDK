@@ -7,7 +7,8 @@ Codex ADR 0003 makes Solo a Type 2 Ethereum chain: standard EVM bytecode at exac
 - the transaction types the kernel accepts, including EIP-7702 set-code transactions, and the one it refuses, EIP-4844 blob transactions (§2);
 - the block header: every block, the genesis block included, has an Ethereum header whose `keccak256` of the RLP is the block hash, with Merkle-Patricia transactions and receipts roots and a logs bloom, while the state root stays Solo's binary trie (§3); the genesis block's hash and the chain id identify the chain (§3.4);
 - `eth_getProof`, which answers with spec 10 proofs in EIP-1186's response shape (§4);
-- historical state: the state methods answer at any block within a retention window, or at every block on an archive node (§5).
+- historical state: the state methods answer at any block within a retention window, or at every block on an archive node (§5);
+- the polled filters and the smaller methods standard clients call, the differences from geth that remain, and the suite of standard clients that checks them (§8).
 
 It extends codex ADR 0020, which specified the RPC with state at the head only and Solo's own block commitments; §3 and §5 replace its points 2 and 5. What this document does not change: proposals, anchors and threshold certificates (spec 08, 12, 17) keep their formats, since none of them carries the block hash or the receipts root; the state commitment is spec 10's.
 
@@ -248,3 +249,36 @@ The execution-spec state tests run set-code transactions through the kernel's ow
 - A node without a data directory keeps its history in memory and has none from before it started; while blocks write heavily a window is shorter than `state_history` (§5.1). A node started from a snapshot has no state from before the snapshot (22 §7).
 - The pool's rules for delegation are geth's, plus the take's rule for authorities ahead (§2.4); a pool of another host may differ without affecting consensus (14 §1).
 - Proposals are not run before they are made: a delegated account's code can spend the account's balance, or move its nonce by creating a contract, during another sender's transaction, and a later transaction of that account in the same block is then recorded as failed (06 §5.1) where a geth builder would have left it out; so is a transaction priced below the base fee of the block it lands in (23 §10).
+- The RPC serves no subscriptions, no tracing and no access-list generation (§8.3).
+
+## 8. Filters and the client surface
+
+What standard clients call beyond the methods above, as they call it over HTTP. `tools/ecosystem` runs ethers 6, viem 2 and Foundry (`cast`, `forge create`, `forge script`, `cast run`) against `solo dev`, and CI runs it on every change (§8.4).
+
+### 8.1 Filters
+
+The reference host serves geth's polled filters: `eth_newFilter(filter)`, `eth_newBlockFilter()` and `eth_newPendingTransactionFilter()` return an id, `eth_getFilterChanges(id)` returns what the filter matches since its last poll, `eth_getFilterLogs(id)` every log a log filter matches over its range, and `eth_uninstallFilter(id)` whether the filter existed. ethers' `contract.on`, viem's `createContractEventFilter`, `createBlockFilter` and `watchContractEvent` use them.
+
+- **Ids** are 16 bytes as `0x` hex, the `keccak256` of a per-server random seed and a counter, so that one client cannot guess another's id and drain or remove its filter.
+- **Cursor.** A filter remembers the first height it has not reported, the head plus one when it is installed. A poll reports the blocks from there to the head, at most `max_log_range` of them (10 000 by default, as for `eth_getLogs`), and the next poll the rest.
+- **Log filters** take `eth_getLogs`' filter object (addresses, topics, `fromBlock`/`toBlock`, or `blockHash`). A poll reports the matching logs of the new blocks within the filter's numeric bounds: `earliest` and a number bound, a tag that moves with the head (`latest`, `pending`, `safe`, `finalized`) or none does not; a `fromBlock` above a numeric `toBlock` is refused with -32602 `invalid block range`. A filter on one block by hash has no changes. `eth_getFilterLogs` answers exactly as `eth_getLogs` with the filter object would, system receipts' logs included (§3.5). Logs never carry `removed: true`: a node executes a block only once it is finalized (spec 08 §5).
+- **Block filters** report the hashes of the new blocks, in order.
+- **Pending-transaction filters** report the hashes of transactions in the pool or in the new blocks that the last poll did not report, so a transaction mined between two polls is still reported once. One that enters and leaves the pool without being mined between two polls is not.
+- **Lifetime and bound.** A filter not polled for 5 minutes (geth's deadline) is dropped; a poll of either kind keeps it. At most 1 024 filters are installed at once; a further install is refused with -32000 `too many filters installed, the limit is 1024`, after expired ones are dropped. An unknown or dropped id gets -32000 `filter not found`, as does `eth_getFilterLogs` of a block or pending-transaction filter.
+
+### 8.2 Block positions and small methods
+
+As the execution API specifies them: `eth_getBlockTransactionCountByNumber` and `…ByHash` (null for a block that does not exist), `eth_getTransactionByBlockNumberAndIndex` and `…HashAndIndex` (the view of `eth_getTransactionByHash`; null for a missing block or index), `eth_getUncleCountByBlockNumber` and `…ByHash` (`0x0`, or null), `eth_getUncleByBlockNumberAndIndex` and `…HashAndIndex` (null: no block has uncles), `web3_sha3`, `net_listening` (true), `net_peerCount` (the handshaken peers of spec 09 §3, `0x0` without a transport) and `eth_blobBaseFee` (`0x1`: no blob transaction is accepted, §2.1).
+
+### 8.3 Compatibility notes
+
+Deliberate differences from geth, each found by the suite of §8.4:
+
+- **No subscriptions.** The server answers one request per connection (`Connection: close`), so it has no WebSocket and no `eth_subscribe`: it answers `eth_subscribe` and `eth_unsubscribe` with geth's answer over HTTP, -32601 `notifications not supported`. Clients poll: ethers' `JsonRpcProvider` and viem's `http` transport do so by default, through the filters of §8.1 or `eth_getLogs` and `eth_blockNumber`.
+- **No tracing, no access-list generation, no simulation.** `debug_*`, `trace_*`, `eth_createAccessList` and `eth_simulateV1` would need an inspector in the kernel's EVM; they get -32601. `cast run` works without them: it replays a transaction in Foundry's own EVM over historical state (§5), and the suite checks it charges the gas the kernel charged. `cast access-list` does not work.
+- **Methods geth removed** (`eth_coinbase`, `eth_mining`, `eth_hashrate`, `eth_protocolVersion`) and the node-held-key methods (`eth_sign`, `eth_sendTransaction`, `eth_signTransaction`; `eth_accounts` is empty) are not served.
+- **Client caches and short slots.** A block every 400 ms is shorter than some client caches: ethers 6 answers a request identical to one made in the last 250 ms from its cache (`cacheTimeout`), so a script that sends, waits for the receipt and sends again within that can sign with a stale pending nonce, which the node refuses as `nonce too low`, as it does against anvil or hardhat with automine. A client on a Solo chain sets `cacheTimeout: -1` (or manages nonces, as ethers' `NonceManager` does); viem has no such cache for nonces.
+
+### 8.4 The ecosystem suite
+
+`tools/ecosystem` (its README says how to run it) starts nothing itself: CI builds `solo`, starts `solo dev` with the suite's genesis (chain id 1337, a 1 gwei base-fee floor) and runs `npm test` (ethers 6.17.0 and viem 2.57.7, pinned, with solc-js 0.8.28) and `foundry.sh` (cast and forge) against it. Together they cover the chain id and blocks by number, hash and tag; balances and nonces, `pending` included; signed EIP-1559, EIP-155 legacy, EIP-2930 and EIP-7702 transactions and their receipts; an ERC-20 deployed with `forge create`, `forge script` (several transactions of one sender before any is mined) and both clients' factories, its calls, gas estimates and events through `eth_getLogs`, the filters of §8.1 and both clients' watchers; `eth_feeHistory`, `eth_maxPriorityFeePerGas` and the clients' fee estimates (spec 23 §7); `eth_getProof`; and revert reasons, a custom error and a revert string decoded by each client from `eth_call` and `eth_estimateGas`, and a reverted transaction reported as failed.
