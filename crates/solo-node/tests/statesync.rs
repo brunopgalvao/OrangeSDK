@@ -1097,6 +1097,12 @@ fn certifying_key_set(node: &Node, offer: &Offer) -> u64 {
         panic!("no manifest of epoch {}", offer.epoch)
     };
     let header = solo_store::SnapshotHeader::from_bytes(&m.header).unwrap();
+    // A vote certificate names no key set: the snapshot of an epoch that
+    // ended before the first key set was adopted carries one. A threshold
+    // certificate is version 2 and 97 bytes (spec 12).
+    if header.certificate.len() != 97 || header.certificate[0] != 2 {
+        return 0;
+    }
     u64::from_be_bytes(header.certificate[1..9].try_into().unwrap())
 }
 
