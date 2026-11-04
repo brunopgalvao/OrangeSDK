@@ -124,8 +124,9 @@ Dropping is the "MAY drop" of 05 §4.7; it never changes what the instance obser
 | `kernelHash` | string | The code hash (03 §1) of the running kernel, as `0x` hex. |
 | `activeGates` | array of numbers | The gates active for the next block that this host serves (13 §8.6), ascending; empty when there are none. |
 | `pendingUpgrade` | object or null | The pending kernel upgrade (13 §4) as `{"codeHash": string, "activationHeight": number}`, or `null` while none is pending. |
+| `syncAlert` | string or null | Why the node cannot catch up from its peers' blocks (09 §6a, step 6): a peer reported a finalized height at or above the next block the node needs and no longer holds that block, as a node further behind than its peers keep blocks finds (22 §8.1); the remedy, `--sync-from-peers` or `--snapshot`, is named. `null` otherwise. |
 
-Fields are only ever added; a client ignores fields it does not know, and reads the fields an earlier release does not send as absent: `upgradeAlert` and `pendingUpgrade` as `null`, `missingGates` and `activeGates` as empty, `kernelVersion` as `0`, `kernelHash` as zero and `chainName` as `""`.
+Fields are only ever added; a client ignores fields it does not know, and reads the fields an earlier release does not send as absent: `upgradeAlert`, `pendingUpgrade` and `syncAlert` as `null`, `missingGates` and `activeGates` as empty, `kernelVersion` as `0`, `kernelHash` as zero and `chainName` as `""`.
 
 ## 7. Alerts and the health verdict
 
@@ -152,7 +153,8 @@ The framework ships alert rules for Prometheus (`ops/alerts.yml`), a scrape conf
 4. `mempool` exceeds the mempool limit (default 1000, `--max-mempool`);
 5. any `solo_kernel_faults_total` series is above zero: a fault since the node opened;
 6. for any entrypoint but `kernel_init`, `kernel_migrate` and `kernel_version`, which run only at open or around a kernel switch, `solo_kernel_call_duration_seconds` `_sum / _count` exceeds the call-time limit (default 1 s, `--max-call-ms`): a mean since the node opened, where the alert uses a recent p99;
-7. `upgradeAlert` is not `null`, or `missingGates` is not empty: the node cannot run what the chain is upgrading to (13 §7.2).
+7. `upgradeAlert` is not `null`, or `missingGates` is not empty: the node cannot run what the chain is upgrading to (13 §7.2);
+8. `syncAlert` is not `null`: the node is too far behind to catch up from its peers' blocks (22 §8.1), and the reason names the remedy.
 
 The doctor prints a summary line and `healthy` and exits with status 0, or prints the summary, `unhealthy:` and the reasons to standard error and exits with status 2. A node it cannot reach, or whose answers do not parse, is reported the same way with the reason.
 
