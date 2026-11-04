@@ -18,8 +18,14 @@
 //! fee-on-transfer token and a deposit over the lock cap are refused, and a
 //! release to a recipient that refuses ETH is owed and claimed later. A
 //! deposit queued on Solo by its mint limit is cancelled and refunded by
-//! governance, and the refund crosses back to release Alice's ETH. Every
-//! balance at the end is exact, and minted never exceeds locked.
+//! governance, and the refund crosses back to release Alice's ETH. Then a
+//! dishonest sync committee finalizes a state in which a forged mint takes
+//! the nonce of Alice's next deposit: governance refunds the queued forgery,
+//! the refusal tells the Ethereum gateway the nonce is spent, and Alice's
+//! deposit, which can never arrive, is refunded to her; a mint of a token
+//! Solo does not list goes back; `SoloInbox`'s guardian vetoes Carol's
+//! deposit, anyone reports the veto to Solo and Carol is refunded there.
+//! Every balance at the end is exact, and minted never exceeds locked.
 
 mod support;
 
@@ -37,9 +43,10 @@ use solo_abi::staking::{StakingParams, StakingStatus, ValidatorKey, query as sta
 use solo_abi::types::Genesis;
 use solo_bridge::abi::{self, Value};
 use solo_bridge::tokens::{
-    EthereumGatewayConfig, NATIVE, SoloGatewayConfig, TokenMessage, address_view, claim_calldata,
-    deposit_calldata, refund_queued_calldata, set_lock_cap_calldata, set_mint_cap_calldata,
-    set_mint_limit_calldata, wrapped_token,
+    EthereumGatewayConfig, NATIVE, SoloGatewayConfig, TokenMessage, VOID, address_view,
+    claim_calldata, deposit_calldata, refund_queued_calldata, refund_spent_calldata,
+    report_vetoed_calldata, set_lock_cap_calldata, set_mint_cap_calldata, set_mint_limit_calldata,
+    wrapped_token,
 };
 use solo_bridge::{
     InboxConfig, execute_calldata, group_key, light_client_v2_args, sent_messages, slot_proof,
@@ -80,25 +87,33 @@ const BIG: u128 = 1 << 100;
 
 /// Transaction gas of the first `deposit` of ETH on Ethereum, through `EthereumOutbox`, whose
 /// nonce the gateway's `HELLO` and its answer moved from zero.
-const DEPOSIT_ETH_GAS: u64 = 124_005;
+const DEPOSIT_ETH_GAS: u64 = 123_994;
 /// Of the first `deposit` of an ERC-20 there.
-const DEPOSIT_TOKEN_GAS: u64 = 181_994;
+const DEPOSIT_TOKEN_GAS: u64 = 181_983;
 /// Of the delivery on Solo whose mint creates wrapped ETH (the inbox's proofs included).
-const FIRST_MINT_GAS: u64 = 832_800;
+const FIRST_MINT_GAS: u64 = 833_068;
 /// Of a delivery on Solo whose wrapped token exists.
-const MINT_GAS: u64 = 109_722;
+const MINT_GAS: u64 = 109_990;
 /// Of a withdrawal on Solo: the burn and the send through the outbox.
-const BURN_GAS: u64 = 120_010;
+const BURN_GAS: u64 = 120_033;
 /// Of a deposit of Solo's currency on Solo.
-const LOCK_NATIVE_GAS: u64 = 140_138;
+const LOCK_NATIVE_GAS: u64 = 140_161;
 /// Of `SoloInbox.execute` releasing ETH through the gateway on Ethereum.
-const RELEASE_GAS: u64 = 80_437;
+const RELEASE_GAS: u64 = 80_473;
 /// Of a withdrawal on Ethereum: the burn and the send through `EthereumOutbox`.
-const ETH_BURN_GAS: u64 = 108_893;
+const ETH_BURN_GAS: u64 = 108_882;
 /// Of the delivery on Solo that releases Solo's currency.
-const NATIVE_RELEASE_GAS: u64 = 100_178;
+const NATIVE_RELEASE_GAS: u64 = 100_237;
 /// Of `SoloInbox.execute` of a `REFUND` that releases ETH back to its depositor.
-const REFUND_GAS: u64 = 83_374;
+const REFUND_GAS: u64 = 83_459;
+/// Of the delivery on Solo of a `MINT` of a token the gateway does not list, which sends it back.
+const BOUNCE_GAS: u64 = 165_096;
+/// Of `refundSpent` on Ethereum releasing ETH whose message never arrives.
+const REFUND_SPENT_GAS: u64 = 47_304;
+/// Of `reportVetoed` on Ethereum, through `EthereumOutbox`.
+const REPORT_GAS: u64 = 114_641;
+/// Of the delivery on Solo of the `SPENT` it sends.
+const SPENT_GAS: u64 = 106_462;
 
 /// The Solo side: the simulated chain and its wallets' nonces.
 struct Solo {
@@ -1097,6 +1112,229 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
     assert_eq!(eth.balance(ALICE), alice_eth);
     let sent = abi::call("sent(uint64)", &[Value::uint(u128::from(refundable.nonce))]);
     assert_eq!(eth.view(RELAYER, eth_gateway, &sent).output, [0; 32]);
+
+    // Messages that never arrive (spec 21 §5.5c). Governance delists TKN on Solo. On Ethereum
+    // Alice deposits 1 ETH and 100 000 TKN for Bob; then the sync committee turns dishonest and
+    // finalizes a state in which the outbox slot of her ETH deposit holds a forged mint of 1 ETH
+    // to Mallory instead. On Solo the forgery is delivered under Alice's nonce and queued by the
+    // mint limit, and the TKN deposit, of a token Solo does not list, goes back at once.
+    assert_eq!(
+        solo.send(
+            &governance,
+            Some(solo_gateway),
+            0,
+            &set_mint_cap_calldata(&tkn, 0),
+            100_000
+        )
+        .status,
+        1
+    );
+    let honest = deposit(&mut eth, NATIVE, address(&bob), ETHER);
+    ok(&honest);
+    let honest = ethereum_messages(eth_outbox, &honest).remove(0);
+    let unlisted = deposit(&mut eth, tkn, address(&bob), 100_000);
+    ok(&unlisted);
+    let unlisted = ethereum_messages(eth_outbox, &unlisted).remove(0);
+    let forged = EthMessage {
+        payload: TokenMessage::Mint {
+            origin: NATIVE,
+            from: MALLORY,
+            to: MALLORY,
+            amount: ETHER,
+            name: b"Ether".to_vec(),
+            symbol: b"ETH".to_vec(),
+            decimals: 18,
+        }
+        .encode(),
+        ..honest.clone()
+    };
+    let mut forged_state = eth.state();
+    forged_state
+        .accounts
+        .get_mut(&eth_outbox)
+        .unwrap()
+        .storage
+        .insert(
+            inbox::slot(&Native, honest.nonce),
+            forged.hash(&Native, CHAIN_ID),
+        );
+    let submit = |solo: &mut Solo, attested: u64, block: u64, root: [u8; 32]| {
+        let update = beacon.update(
+            attested,
+            &beacon.header(block, root, [0; 32]),
+            false,
+            attested + 1,
+            32,
+        );
+        let applied = solo.send(
+            &relayer,
+            Some(LIGHT_CLIENT_ADDRESS),
+            0,
+            &client::submit_call(&update.encode_update(32), false),
+            UPDATE_GAS,
+        );
+        assert_eq!(applied.status, 1);
+        let root = solo.view(
+            LIGHT_CLIENT_ADDRESS,
+            &client::u64_call(ethabi::EXECUTION_ROOT, block),
+        );
+        let usable_at = u64::from_be_bytes(root[120..128].try_into().unwrap());
+        assert!(
+            solo.sim
+                .run_until(60 * SLOT_MS, |s| {
+                    let n = s.nodes[0].block_number().unwrap();
+                    s.nodes[0].block_by_number(n).unwrap().unwrap().timestamp_ms / 1000 > usable_at
+                })
+                .unwrap()
+        );
+    };
+    submit(&mut solo, 44, 40, forged_state.root());
+    let taken = solo.send(
+        &relayer,
+        Some(INBOX_ADDRESS),
+        0,
+        &delivery(&forged_state, &eth_outbox, 40, &forged),
+        DELIVER_GAS,
+    );
+    assert_eq!(taken.status, 1);
+    assert_eq!(solo.balance_of(weth, MALLORY), 0);
+    let bounced = solo.send(
+        &relayer,
+        Some(INBOX_ADDRESS),
+        0,
+        &delivery(&forged_state, &eth_outbox, 40, &unlisted),
+        DELIVER_GAS,
+    );
+    assert_eq!(bounced.status, 1);
+    gas.push(("BOUNCE_GAS", bounced.gas_used, BOUNCE_GAS));
+    assert_eq!(
+        solo.u128_view(wtkn, &abi::call("totalSupply()", &[])),
+        500_000
+    );
+    // Governance refunds the forgery it cannot tell from an honest transfer; Carol locks 1 SOLO
+    // for Dave.
+    let refunding = solo.send(
+        &governance,
+        Some(solo_gateway),
+        0,
+        &refund_queued_calldata(1),
+        300_000,
+    );
+    assert_eq!(refunding.status, 1);
+    let carol_before = solo.native(address(&carol));
+    let vetoed = solo.send(
+        &carol,
+        Some(solo_gateway),
+        ETHER,
+        &deposit_calldata(&NATIVE, &DAVE, ETHER),
+        300_000,
+    );
+    assert_eq!(vetoed.status, 1);
+    let to_eth: Vec<SoloMessage> = [&bounced, &refunding, &vetoed]
+        .iter()
+        .flat_map(|r| sent_messages(CHAIN_ID, &r.logs.0))
+        .map(|(m, _)| m)
+        .collect();
+    assert_eq!(to_eth.len(), 3);
+    assert_eq!(
+        TokenMessage::decode(&to_eth[1].payload),
+        Some(TokenMessage::Refund {
+            nonce: honest.nonce,
+            kind: 1,
+            token: NATIVE,
+            from: MALLORY,
+            to: MALLORY,
+            amount: ETHER,
+        })
+    );
+    prove_on_ethereum(
+        &mut solo,
+        &mut eth,
+        (light_client, solo_inbox),
+        &to_eth,
+        vetoed.height,
+    );
+    // `SoloInbox`'s guardian vetoes Carol's deposit, which will never be delivered now.
+    ok(&eth.call(
+        GUARDIAN,
+        solo_inbox,
+        &abi::call("veto(uint64)", &[Value::uint(u128::from(to_eth[2].nonce))]),
+    ));
+    eth.advance(DELAY);
+    // Alice's TKN comes back. The forgery's refund is refused, and it tells the Ethereum gateway
+    // that Alice's nonce was spent with no effect: her ETH deposit, which can never arrive now, is
+    // refunded to her.
+    let alice_tkn = eth_u128(&mut eth, tkn, &address_view("balanceOf(address)", &ALICE));
+    for m in &to_eth[..2] {
+        ok(&eth.call(RELAYER, solo_inbox, &execute_calldata(m)));
+    }
+    assert_eq!(
+        eth_u128(&mut eth, tkn, &address_view("balanceOf(address)", &ALICE)),
+        alice_tkn + 100_000
+    );
+    reverted_with(
+        &eth.call(RELAYER, solo_inbox, &execute_calldata(&to_eth[2])),
+        "NotPending()",
+    );
+    let alice_eth = eth.balance(ALICE);
+    let made_whole = eth.call(
+        ALICE,
+        eth_gateway,
+        &refund_spent_calldata(honest.nonce, 1, &NATIVE, &ALICE, &address(&bob), ETHER),
+    );
+    ok(&made_whole);
+    gas.push(("REFUND_SPENT_GAS", made_whole.gas, REFUND_SPENT_GAS));
+    assert_eq!(eth.balance(ALICE), alice_eth + ETHER);
+    // Anyone reports Carol's vetoed deposit to Solo, through `EthereumOutbox` and the honest
+    // committee's next update; her SOLO is refunded to her there. Alice's real message is proven
+    // against that state, but its nonce is spent: it is never delivered.
+    let report = eth.call(
+        RELAYER,
+        eth_gateway,
+        &report_vetoed_calldata(to_eth[2].nonce),
+    );
+    ok(&report);
+    gas.push(("REPORT_GAS", report.gas, REPORT_GAS));
+    let report_message = ethereum_messages(eth_outbox, &report).remove(0);
+    assert_eq!(
+        TokenMessage::decode(&report_message.payload),
+        Some(TokenMessage::Spent {
+            nonce: to_eth[2].nonce,
+            effect: VOID,
+        })
+    );
+    let state = eth.state();
+    submit(&mut solo, 52, 48, state.root());
+    let stranded = solo.raw(
+        &relayer,
+        Some(INBOX_ADDRESS),
+        0,
+        &delivery(&state, &eth_outbox, 48, &honest),
+        DELIVER_GAS,
+    );
+    assert!(matches!(
+        solo.sim.submit(0, &stranded),
+        Err(SubmitError::Rejected(reason::MESSAGE_DELIVERED))
+    ));
+    *solo.nonces.get_mut(&address(&relayer)).unwrap() -= 1;
+    let told = solo.send(
+        &relayer,
+        Some(INBOX_ADDRESS),
+        0,
+        &delivery(&state, &eth_outbox, 48, &report_message),
+        DELIVER_GAS,
+    );
+    assert_eq!(told.status, 1);
+    gas.push(("SPENT_GAS", told.gas_used, SPENT_GAS));
+    let refunded = solo.send(
+        &carol,
+        Some(solo_gateway),
+        0,
+        &refund_spent_calldata(to_eth[2].nonce, 1, &NATIVE, &address(&carol), &DAVE, ETHER),
+        300_000,
+    );
+    assert_eq!(refunded.status, 1);
+    assert_eq!(solo.native(address(&carol)), carol_before);
 
     // Every balance is exact, and on each side what is minted is what the other side locked.
     assert_eq!(eth.balance(ALICE), 96 * ETHER);

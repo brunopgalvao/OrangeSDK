@@ -9,7 +9,7 @@
 //! message's payload asks the receiving gateway to do, so that tooling can
 //! show it or check it before relaying.
 
-use solo_abi::bridge::OUTBOX_ADDRESS;
+use solo_abi::bridge::{Message, OUTBOX_ADDRESS};
 use solo_abi::bridge_in::INBOX_ADDRESS;
 use solo_abi::types::Address;
 use solo_trie::keccak256;
@@ -25,6 +25,16 @@ pub const HELLO: u8 = 3;
 /// Message kind: give back the value of a cancelled `MINT` or `RELEASE` to
 /// its sender (spec 21 §5.5b).
 pub const REFUND: u8 = 4;
+/// Message kind: a nonce of the receiving gateway's messages is spent in
+/// the sending gateway's inbox (spec 21 §5.5c).
+pub const SPENT: u8 = 5;
+/// The effect of a nonce spent without anything taking effect (spec 21
+/// §5.5c): vetoed, delivered elsewhere, or undone.
+pub const VOID: [u8; 32] = {
+    let mut w = [0; 32];
+    w[31] = 1;
+    w
+};
 /// The token address that stands for a chain's native currency.
 pub const NATIVE: Address = [0; 20];
 /// Bytes of a token's name and symbol that a deposit carries.
@@ -88,6 +98,29 @@ pub enum TokenMessage {
         /// Its amount.
         amount: u128,
     },
+    /// Nonce `nonce` of the receiving gateway's messages is spent in the
+    /// sending gateway's inbox by a message of identity `effect` (see
+    /// [`identity`]), or by nothing that took effect ([`VOID`]).
+    Spent {
+        /// The nonce spent.
+        nonce: u64,
+        /// What it was spent by.
+        effect: [u8; 32],
+    },
+}
+
+/// The identity of a message with `payload`, as the gateway that sent it
+/// records it in `sent` (spec 21 §5.3): the hash of the first five words of
+/// a `MINT`, which leaves out the metadata, and of the whole payload of
+/// anything else.
+#[must_use]
+pub fn identity(payload: &[u8]) -> [u8; 32] {
+    let mut kind = [0; 32];
+    kind[31] = MINT;
+    if payload.len() >= 5 * 32 && payload[..32] == kind {
+        return keccak256(&payload[..5 * 32]);
+    }
+    keccak256(payload)
 }
 
 fn word_address(word: &[u8]) -> Address {
@@ -111,8 +144,9 @@ impl TokenMessage {
     /// address to, uint256 amount, string name, string symbol, uint8
     /// decimals)`, `abi.encode(uint8 RELEASE, address token, address
     /// from, address to, uint256 amount)`, `abi.encode(uint8 HELLO, bool
-    /// heard)` or `abi.encode(uint8 REFUND, uint64 nonce, uint8 kind,
-    /// address token, address from, address to, uint256 amount)`.
+    /// heard)`, `abi.encode(uint8 REFUND, uint64 nonce, uint8 kind,
+    /// address token, address from, address to, uint256 amount)` or
+    /// `abi.encode(uint8 SPENT, uint64 nonce, bytes32 effect)`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         match self {
@@ -166,6 +200,14 @@ impl TokenMessage {
                 Value::address(to),
                 Value::uint(*amount),
             ]),
+            TokenMessage::Spent { nonce, effect } => [
+                abi::encode(&[
+                    Value::uint(u128::from(SPENT)),
+                    Value::uint(u128::from(*nonce)),
+                ]),
+                effect.to_vec(),
+            ]
+            .concat(),
         }
     }
 
@@ -199,6 +241,11 @@ impl TokenMessage {
                 from: address(4)?,
                 to: address(5)?,
                 amount: word_u128(word(6)?),
+            }
+        } else if kind == SPENT {
+            TokenMessage::Spent {
+                nonce: u64::from_be_bytes(word(1)?[24..32].try_into().ok()?),
+                effect: word(2)?.try_into().ok()?,
             }
         } else {
             TokenMessage::Release {
@@ -341,6 +388,64 @@ pub fn refund_queued_calldata(id: u64) -> Vec<u8> {
     abi::call("refundQueued(uint256)", &[Value::uint(u128::from(id))])
 }
 
+/// `refundSpent(nonce, kind, token, from, to, amount)`: refunds the `MINT`
+/// or `RELEASE` the gateway sent as message `nonce`, asking what the
+/// arguments say, once the paired gateway reported the nonce spent by
+/// something else; anyone may send it (spec 21 §5.5c).
+#[must_use]
+pub fn refund_spent_calldata(
+    nonce: u64,
+    kind: u8,
+    token: &Address,
+    from: &Address,
+    to: &Address,
+    amount: u128,
+) -> Vec<u8> {
+    abi::call(
+        "refundSpent(uint64,uint8,address,address,address,uint256)",
+        &[
+            Value::uint(u128::from(nonce)),
+            Value::uint(u128::from(kind)),
+            Value::address(token),
+            Value::address(from),
+            Value::address(to),
+            Value::uint(amount),
+        ],
+    )
+}
+
+/// `resendSpent(nonce, payload)`: sends again the `REFUND` or `SPENT` the
+/// gateway sent as message `nonce` with `payload`, once the paired gateway
+/// reported the nonce spent by something else; anyone may send it.
+#[must_use]
+pub fn resend_spent_calldata(nonce: u64, payload: &[u8]) -> Vec<u8> {
+    abi::call(
+        "resendSpent(uint64,bytes)",
+        &[
+            Value::uint(u128::from(nonce)),
+            Value::Bytes(payload.to_vec()),
+        ],
+    )
+}
+
+/// `reportVetoed(nonce)` on `TokenGatewayOnEthereum`: tells the gateway on
+/// Solo that `SoloInbox` vetoed its message `nonce`; anyone may send it.
+#[must_use]
+pub fn report_vetoed_calldata(nonce: u64) -> Vec<u8> {
+    abi::call("reportVetoed(uint64)", &[Value::uint(u128::from(nonce))])
+}
+
+/// `reportDelivered(message)` on `TokenGatewayOnEthereum`: tells the gateway
+/// on Solo what `SoloInbox` delivered as its message `message.nonce`;
+/// anyone may send it.
+#[must_use]
+pub fn report_delivered_calldata(message: &Message) -> Vec<u8> {
+    abi::call(
+        "reportDelivered((uint64,address,address,uint256,bytes))",
+        &[crate::message_value(message)],
+    )
+}
+
 /// The calldata of a gateway view that takes one address, such as
 /// `locked(address)`, `lockCap(address)`, `wrappedToken(address)` or a
 /// token's `balanceOf(address)`.
@@ -480,7 +585,11 @@ mod tests {
             TokenMessage::Hello { heard: false },
             TokenMessage::Hello { heard: true },
         ];
-        for m in [mint(), release.clone(), refund.clone()]
+        let spent = TokenMessage::Spent {
+            nonce: u64::MAX,
+            effect: [0xEF; 32],
+        };
+        for m in [mint(), release.clone(), refund.clone(), spent.clone()]
             .into_iter()
             .chain(hellos)
         {
@@ -513,8 +622,16 @@ mod tests {
             cases.push(huge);
         }
         let mut unknown = release.encode();
-        unknown[31] = 5;
+        unknown[31] = 6;
         cases.push(unknown);
+        // A spent nonce is three words, its nonce a u64.
+        let spent = spent.encode();
+        assert_eq!(spent.len(), 3 * 32);
+        assert_eq!(spent[31], SPENT);
+        let mut dirty = spent.clone();
+        dirty[32 + 23] = 1;
+        cases.push(dirty);
+        cases.push(spent[..2 * 32].to_vec());
         // A refund is seven words; its nonce a u64 and its kind a u8.
         let refunded = refund.encode();
         assert_eq!(refunded.len(), 7 * 32);
@@ -535,6 +652,34 @@ mod tests {
         for case in cases {
             assert_eq!(TokenMessage::decode(&case), None);
         }
+    }
+
+    #[test]
+    fn identities_are_what_the_sender_records() {
+        // A mint's leaves out the metadata; a release's, a refund's and a
+        // spent nonce's are the hash of the payload. A payload whose first
+        // word is a mint's but too short to be one is hashed whole.
+        let payload = mint().encode();
+        assert_eq!(identity(&payload), keccak256(&payload[..5 * 32]));
+        assert_eq!(VOID[..31], [0; 31]);
+        assert_eq!(VOID[31], 1);
+        for m in [
+            TokenMessage::Release {
+                token: NATIVE,
+                from: [4; 20],
+                to: [5; 20],
+                amount: 6,
+            },
+            TokenMessage::Spent {
+                nonce: 7,
+                effect: VOID,
+            },
+        ] {
+            let payload = m.encode();
+            assert_eq!(identity(&payload), keccak256(&payload));
+        }
+        assert_eq!(identity(&payload[..4 * 32]), keccak256(&payload[..4 * 32]));
+        assert_eq!(identity(&[]), keccak256(&[]));
     }
 
     #[test]
@@ -622,6 +767,51 @@ mod tests {
                 [0x87, 0x5d, 0x2f, 0x72],
                 &word(&[9]).to_vec(),
             ),
+            (
+                refund_spent_calldata(9, 1, &[2; 20], &[3; 20], &[4; 20], 5),
+                [0x4d, 0xcb, 0x3d, 0x0f],
+                &[
+                    word(&[9]),
+                    word(&[1]),
+                    word(&[2; 20]),
+                    word(&[3; 20]),
+                    word(&[4; 20]),
+                    word(&[5]),
+                ]
+                .concat(),
+            ),
+            (
+                resend_spent_calldata(9, &[0xAB]),
+                [0x61, 0x10, 0xda, 0x44],
+                &[word(&[9]), word(&[0x40]), word(&[1]), padded(&[0xAB])].concat(),
+            ),
+            (
+                report_vetoed_calldata(9),
+                [0xd4, 0x9b, 0xf8, 0xff],
+                &word(&[9]).to_vec(),
+            ),
+            (
+                report_delivered_calldata(&Message {
+                    nonce: 9,
+                    sender: [1; 20],
+                    recipient: [2; 20],
+                    value: 3,
+                    payload: vec![0xAB],
+                    ..Message::default()
+                }),
+                [0x00, 0x09, 0xc8, 0xba],
+                &[
+                    word(&[0x20]),
+                    word(&[9]),
+                    word(&[1; 20]),
+                    word(&[2; 20]),
+                    word(&[3]),
+                    word(&[0xa0]),
+                    word(&[1]),
+                    padded(&[0xAB]),
+                ]
+                .concat(),
+            ),
         ] {
             assert_eq!(calldata, [&selector[..], args].concat());
         }
@@ -653,11 +843,6 @@ mod tests {
         );
         let solo = SoloGatewayConfig::new(1, [2; 20], [3; 20], [4; 20], "Solo", "SOLO");
         assert_eq!((solo.outbox, solo.inbox), (OUTBOX_ADDRESS, INBOX_ADDRESS));
-        let padded = |text: &[u8]| {
-            let mut w = [0; 32];
-            w[..text.len()].copy_from_slice(text);
-            w
-        };
         assert_eq!(
             solo.constructor_args(),
             [
@@ -677,6 +862,13 @@ mod tests {
             ]
             .concat()
         );
+    }
+
+    /// `text` at the high end of a 32-byte word, as ABI bytes are padded.
+    fn padded(text: &[u8]) -> [u8; 32] {
+        let mut w = [0; 32];
+        w[..text.len()].copy_from_slice(text);
+        w
     }
 
     /// `bytes` as the low end of a 32-byte word.

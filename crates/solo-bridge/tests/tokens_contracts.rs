@@ -8,24 +8,30 @@
 //! until it allows them, one of them frozen or cancelled without stopping
 //! the rest, a cancelled one refunded to its sender only if its home
 //! gateway really sent it, and no gateway takes deposits before a message
-//! of its peer proves the peer exists. A randomized run checks the value
-//! invariant after every step: what a gateway holds locked is exactly what
-//! the other side has minted plus what is in flight or queued, plus what
-//! owners cancelled out of the queue without a refund, so minted never
-//! exceeds locked, whatever forged messages the channels deliver. The gas
+//! of its peer proves the peer exists. Honest messages that never arrive,
+//! their nonce taken by a forgery or vetoed in `SoloInbox`, are refunded or
+//! sent again once the receiving side reports the nonce spent, and a mint of
+//! a token the receiving side does not list goes back. A randomized run
+//! checks the value invariant after every step: what a gateway holds locked
+//! is exactly what the other side has minted plus what is in flight, queued
+//! or stranded, plus what owners cancelled out of the queue without a
+//! refund, so minted never exceeds locked, whatever forged messages the
+//! channels deliver. The gas
 //! of deposits against the stand-in is pinned here; spec 21 §8 states the
 //! gas through the real channels, which `tokens.rs` pins.
 
 mod support;
 
 use revm::primitives::Log;
+use solo_abi::bridge::Message as SoloMessage;
 use solo_bridge::abi::{self, Value};
 use solo_bridge::tokens::{
-    EthereumGatewayConfig, NATIVE, SoloGatewayConfig, TokenMessage, address_view,
+    EthereumGatewayConfig, NATIVE, SoloGatewayConfig, TokenMessage, VOID, address_view,
     cancel_queued_calldata, claim_calldata, claim_to_calldata, deposit_calldata,
-    execute_queued_calldata, freeze_queued_calldata, refund_queued_calldata, set_lock_cap_calldata,
-    set_mint_cap_calldata, set_mint_limit_calldata, set_release_limit_calldata,
-    unfreeze_queued_calldata, wrapped_token,
+    execute_queued_calldata, freeze_queued_calldata, identity, refund_queued_calldata,
+    refund_spent_calldata, report_delivered_calldata, report_vetoed_calldata,
+    resend_spent_calldata, set_lock_cap_calldata, set_mint_cap_calldata, set_mint_limit_calldata,
+    set_release_limit_calldata, unfreeze_queued_calldata, wrapped_token,
 };
 use solo_trie::keccak256;
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,22 +54,22 @@ const BIG: u128 = 1 << 100;
 
 /// Gas of a `deposit` of ETH on `TokenGatewayOnEthereum`, the first one, as a transaction. The
 /// stand-in's nonce is no longer zero: the gateways' `HELLO`s came first.
-const DEPOSIT_ETH_GAS: u64 = 100_630;
+const DEPOSIT_ETH_GAS: u64 = 100_631;
 /// Gas of the first `deposit` of an ERC-20 there.
-const DEPOSIT_TOKEN_GAS: u64 = 158_619;
+const DEPOSIT_TOKEN_GAS: u64 = 158_620;
 /// Gas of a `deposit` that burns a wrapped token on the other side.
-const WITHDRAW_GAS: u64 = 78_509;
+const WITHDRAW_GAS: u64 = 78_611;
 /// Gas of the guardian's `freezeQueued` of a queued transfer (spec 21 §8).
-const FREEZE_GAS: u64 = 32_502;
+const FREEZE_GAS: u64 = 32_525;
 /// Gas of the owner's `cancelQueued` of a queued mint under a mint limit.
-const CANCEL_MINT_GAS: u64 = 51_105;
+const CANCEL_MINT_GAS: u64 = 51_124;
 /// Gas of the owner's `cancelQueued` of a queued release under a release limit.
-const CANCEL_RELEASE_GAS: u64 = 53_130;
+const CANCEL_RELEASE_GAS: u64 = 53_112;
 /// Gas of the owner's `refundQueued` of a queued mint under a mint limit: the
-/// cancellation and the `REFUND` sent through the stand-in.
-const REFUND_MINT_GAS: u64 = 61_888;
+/// cancellation, and the `REFUND` sent through the stand-in and recorded.
+const REFUND_MINT_GAS: u64 = 79_786;
 /// Gas of the owner's `refundQueued` of a queued release under a release limit.
-const REFUND_RELEASE_GAS: u64 = 67_846;
+const REFUND_RELEASE_GAS: u64 = 85_699;
 
 fn ok(outcome: &Outcome) {
     assert!(outcome.success, "{outcome:?}");
@@ -161,6 +167,11 @@ struct World {
     forged_out: BTreeMap<([u8; 20], [u8; 20]), u128>,
     /// The nonces of forged messages, whose refunds the home gateway refuses.
     forged_nonces: BTreeSet<u64>,
+    /// Honest messages that will never arrive, a forgery having taken their
+    /// nonce or the inbox having vetoed them, until their sender refunds or
+    /// sends them again (spec 21 §5.5c): what they carry is still held as
+    /// it was in flight.
+    stranded: Vec<Pending>,
 }
 
 impl World {
@@ -236,6 +247,7 @@ impl World {
             forged_entries: BTreeSet::new(),
             forged_out: BTreeMap::new(),
             forged_nonces: BTreeSet::new(),
+            stranded: Vec::new(),
         };
         for (gateway, token) in [
             (on_eth, NATIVE),
@@ -351,7 +363,9 @@ impl World {
         let o = self.eth.call(RELAYER, self.messenger, &data);
         let before = self.queued.len();
         let o = self.record(o);
-        self.forged_nonces.insert(p.nonce);
+        if o.success {
+            self.forged_nonces.insert(p.nonce);
+        }
         let added: Vec<_> = self.queued.iter().skip(before).copied().collect();
         for (gateway, id, _) in added {
             let e = self.queued_entry(gateway, id);
@@ -360,6 +374,77 @@ impl World {
             *self.forged_out.entry((home, e.token)).or_default() += e.amount;
         }
         o
+    }
+
+    /// Takes pending message `i` out of flight: a forgery is about to take
+    /// its nonce, or the inbox vetoes it, so it never arrives.
+    fn strand(&mut self, i: usize) -> Pending {
+        let p = self.pending.remove(i);
+        self.stranded.push(p.clone());
+        p
+    }
+
+    /// `SoloInbox`'s guardian vetoes pending message `i`, sent from Solo.
+    fn veto(&mut self, i: usize) -> Pending {
+        let p = self.strand(i);
+        assert_eq!(p.recipient, self.on_eth);
+        let data = abi::call("veto(uint64)", &[Value::uint(u128::from(p.nonce))]);
+        ok(&self.eth.call(GUARDIAN, self.messenger, &data));
+        p
+    }
+
+    /// Anyone reports to the gateway on Solo that its message `nonce` was
+    /// vetoed, or, with `delivered`, what the inbox delivered with it.
+    fn report(&mut self, nonce: u64, delivered: Option<&Pending>) -> Outcome {
+        let data = match delivered {
+            None => report_vetoed_calldata(nonce),
+            Some(p) => report_delivered_calldata(&SoloMessage {
+                nonce: p.nonce,
+                sender: p.sender,
+                recipient: p.recipient,
+                payload: p.payload.clone(),
+                ..SoloMessage::default()
+            }),
+        };
+        let o = self.eth.call(STRANGER, self.on_eth, &data);
+        self.record(o)
+    }
+
+    /// Anyone asks the sender of stranded message `i` to refund it, or, for
+    /// a `REFUND` or `SPENT`, to send it again.
+    fn unstrand(&mut self, i: usize) -> Outcome {
+        let p = self.stranded[i].clone();
+        let data = match TokenMessage::decode(&p.payload).unwrap() {
+            TokenMessage::Mint {
+                origin,
+                from,
+                to,
+                amount,
+                ..
+            } => refund_spent_calldata(p.nonce, 1, &origin, &from, &to, amount),
+            TokenMessage::Release {
+                token,
+                from,
+                to,
+                amount,
+            } => refund_spent_calldata(p.nonce, 2, &token, &from, &to, amount),
+            _ => resend_spent_calldata(p.nonce, &p.payload),
+        };
+        let o = self.eth.call(STRANGER, p.sender, &data);
+        if o.success {
+            self.stranded.remove(i);
+        }
+        self.record(o)
+    }
+
+    /// What `gateway` was told spent its message `nonce`.
+    fn spent(&mut self, gateway: [u8; 20], nonce: u64) -> [u8; 32] {
+        let data = abi::call("spent(uint64)", &[Value::uint(u128::from(nonce))]);
+        self.eth
+            .view(RELAYER, gateway, &data)
+            .output
+            .try_into()
+            .unwrap()
     }
 
     /// Lets time pass until every queued transfer is ready and executes them.
@@ -473,21 +558,10 @@ impl World {
         self.u128_view(gateway, &data)
     }
 
-    /// The value invariant of spec 21 §6 for the token `origin` native to
-    /// the side of `home`, among `recipients`: locked equals minted plus in
-    /// flight plus queued to be minted, and the gateway holds what is
-    /// locked plus what is owed plus what is queued to be released.
-    fn check(&mut self, home: [u8; 20], origin: [u8; 20], recipients: &[[u8; 20]]) {
-        let away = if home == self.on_eth {
-            self.on_solo
-        } else {
-            self.on_eth
-        };
-        let wrapped = wrapped_of(away, origin);
-        let locked = self.gateway_view(home, "locked(address)", origin);
-        let minted = self.supply(wrapped);
-        let in_flight: u128 = self
-            .pending
+    /// What `messages` carry of the token `origin` native to the side of
+    /// `home`: mints leaving home, releases coming home, and honest refunds.
+    fn carried(&self, messages: &[Pending], home: [u8; 20], origin: [u8; 20]) -> u128 {
+        messages
             .iter()
             .filter_map(|p| match TokenMessage::decode(&p.payload)? {
                 TokenMessage::Mint {
@@ -514,7 +588,31 @@ impl World {
                 }
                 _ => None,
             })
-            .sum();
+            .sum()
+    }
+
+    /// What stranded messages carry of `origin`, native to the side of `home`.
+    fn stranded_amount(&self, home: [u8; 20], origin: [u8; 20]) -> u128 {
+        self.carried(&self.stranded, home, origin)
+    }
+
+    /// The value invariant of spec 21 §6 for the token `origin` native to
+    /// the side of `home`, among `recipients`: locked equals minted plus in
+    /// flight plus queued to be minted, and the gateway holds what is
+    /// locked plus what is owed plus what is queued to be released.
+    fn check(&mut self, home: [u8; 20], origin: [u8; 20], recipients: &[[u8; 20]]) {
+        let away = if home == self.on_eth {
+            self.on_solo
+        } else {
+            self.on_eth
+        };
+        let wrapped = wrapped_of(away, origin);
+        let locked = self.gateway_view(home, "locked(address)", origin);
+        let minted = self.supply(wrapped);
+        // A stranded message's value is held as it was in flight, until its
+        // sender refunds or sends it again.
+        let in_flight =
+            self.carried(&self.pending, home, origin) + self.carried(&self.stranded, home, origin);
         let mints_queued = self.gateway_view(away, "mintsQueued(address)", origin);
         let releases_queued = self.gateway_view(home, "releasesQueued(address)", origin);
         let retired = self.retired.get(&(home, origin)).copied().unwrap_or(0);
@@ -1663,11 +1761,10 @@ fn one_queued_transfer_is_frozen_or_cancelled_alone() {
     // A refund of a forged transfer pays nothing, whatever it names: a mint
     // no deposit locked, a release no burn freed, and a mint that takes the
     // nonce of a message really sent but asks more than it did. The
-    // undelivered honest message whose nonce the forgery took is lost to the
-    // channel and stays locked, as a vetoed one does.
+    // undelivered honest message whose nonce the forgery took never arrives:
+    // the channel delivers each nonce once.
     ok(&w.deposit(ALICE, on_eth, NATIVE, BOB, ETHER));
-    let taken = w.pending.pop().unwrap();
-    *w.retired.entry((on_eth, NATIVE)).or_default() += ETHER;
+    let taken = w.strand(w.pending.len() - 1);
     let forgeries = [
         Pending {
             nonce: 1_002,
@@ -1732,8 +1829,286 @@ fn one_queued_transfer_is_frozen_or_cancelled_alone() {
     assert_eq!(w.supply(weth), supply);
     assert_eq!(w.eth.balance(STRANGER), 0);
     assert_eq!(w.eth.balance(ALICE), alice - ETHER);
-    // The honest message's record stays: nothing refunded it.
+    // But the refused refund told the home gateway that the nonce is spent
+    // with nothing taking effect, so the honest message it recorded there
+    // never arrives: anyone has it refunded to Alice, once (spec 21 §5.5c).
+    // The forgeries of nonces no message took leave nothing to refund.
+    assert_eq!(w.spent(on_eth, taken.nonce), VOID);
+    assert_eq!(w.spent(on_eth, 1_002), VOID);
+    assert_eq!(w.spent(on_solo, 1_003), VOID);
     assert_eq!(w.sent(on_eth, taken.nonce), identity(1, ALICE, BOB, ETHER));
+    let paid = w.unstrand(0);
+    ok(&paid);
+    assert!(logged(&paid, "SpentRefunded(uint64)"));
+    assert_eq!(w.sent(on_eth, taken.nonce), [0; 32]);
+    w.check(on_eth, NATIVE, &[]);
+    w.execute_all();
+    assert_eq!(w.eth.balance(ALICE), alice);
+    w.check(on_eth, NATIVE, &[]);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn messages_that_never_arrive_are_refunded_or_sent_again() {
+    let mut w = World::new();
+    let (on_eth, on_solo, tkn) = (w.on_eth, w.on_solo, w.tkn);
+    for who in [ALICE, CAROL] {
+        w.eth.fund(who, 100 * ETHER);
+    }
+    mint_and_approve(&mut w.eth, tkn, ALICE, 1_000, on_eth);
+    ok(&w.eth.call(
+        OWNER,
+        on_solo,
+        &set_mint_limit_calldata(&NATIVE, ETHER, 1_000),
+    ));
+    ok(&w.eth.call(
+        OWNER,
+        on_eth,
+        &set_release_limit_calldata(&NATIVE, ETHER, 1_000),
+    ));
+    let weth = wrapped_of(on_solo, NATIVE);
+    let wsolo = wrapped_of(on_eth, NATIVE);
+    let forged_mint = |amount: u128| {
+        TokenMessage::Mint {
+            origin: NATIVE,
+            from: STRANGER,
+            to: STRANGER,
+            amount,
+            name: b"Ether".to_vec(),
+            symbol: b"ETH".to_vec(),
+            decimals: 18,
+        }
+        .encode()
+    };
+    let checks = |w: &mut World| {
+        w.check(on_eth, NATIVE, &[]);
+        w.check(on_solo, NATIVE, &[]);
+        w.check(on_eth, tkn, &[]);
+    };
+
+    // A forgery takes the nonce of Alice's deposit while it is in flight,
+    // over the mint limit so that it queues. Alice's message can never
+    // arrive now, but nothing says so yet: her record is not refundable.
+    let alice = w.eth.balance(ALICE);
+    ok(&w.deposit(ALICE, on_eth, NATIVE, BOB, ETHER));
+    let honest = w.strand(0);
+    let forged = Pending {
+        payload: forged_mint(40 * ETHER),
+        ..honest.clone()
+    };
+    ok(&w.forge(&forged));
+    checks(&mut w);
+    reverted_with(&w.unstrand(0), "NotSpent()");
+    let wrong = refund_spent_calldata(honest.nonce, 1, &NATIVE, &ALICE, &BOB, 2 * ETHER);
+    reverted_with(&w.eth.call(ALICE, on_eth, &wrong), "NotRecorded()");
+    // The owner on Solo refunds the forgery; its refund is refused at home,
+    // which learns from it that the nonce was spent with no effect: Alice's
+    // deposit is refunded to her by anyone, once, under the release limit.
+    ok(&w.refund(0));
+    let refused = w.deliver(0);
+    ok(&refused);
+    assert!(logged(&refused, "RefundRefused(uint64,uint64)"));
+    assert!(logged(&refused, "NonceSpent(uint64,bytes32)"));
+    assert_eq!(w.spent(on_eth, honest.nonce), VOID);
+    checks(&mut w);
+    let paid = w.unstrand(0);
+    ok(&paid);
+    assert!(logged(&paid, "SpentRefunded(uint64)"));
+    assert!(logged(
+        &paid,
+        "Released(uint64,address,address,address,uint256)"
+    ));
+    assert_eq!(w.eth.balance(ALICE), alice);
+    let again = w.eth.call(
+        STRANGER,
+        on_eth,
+        &refund_spent_calldata(honest.nonce, 1, &NATIVE, &ALICE, &BOB, ETHER),
+    );
+    reverted_with(&again, "NotRecorded()");
+    assert_eq!(w.balance_of(weth, STRANGER), 0);
+    checks(&mut w);
+
+    // From Solo: a forgery that pays out at once (a HELLO, which moves
+    // nothing) takes the nonce of Carol's deposit. Anyone reports to Solo
+    // what the inbox delivered with that nonce, and Carol is refunded there.
+    let carol = w.eth.balance(CAROL);
+    ok(&w.deposit(CAROL, on_solo, NATIVE, DAVE, ETHER));
+    let honest = w.strand(0);
+    let forged = Pending {
+        payload: hello(true),
+        ..honest.clone()
+    };
+    ok(&w.forge(&forged));
+    // Only what the inbox delivered is reported, and only once.
+    reverted_with(&w.report(honest.nonce, Some(&honest)), "NotDelivered()");
+    reverted_with(&w.report(honest.nonce, None), "NotVetoed()");
+    let reported = w.report(honest.nonce, Some(&forged));
+    ok(&reported);
+    assert!(logged(&reported, "Reported(uint64,bytes32,uint64)"));
+    reverted_with(&w.report(honest.nonce, Some(&forged)), "AlreadyReported()");
+    assert_eq!(
+        TokenMessage::decode(&w.pending[0].payload),
+        Some(TokenMessage::Spent {
+            nonce: honest.nonce,
+            effect: identity(&hello(true)),
+        })
+    );
+    w.deliver_all();
+    assert_eq!(w.spent(on_solo, honest.nonce), identity(&hello(true)));
+    ok(&w.unstrand(0));
+    assert_eq!(w.eth.balance(CAROL), carol);
+    checks(&mut w);
+
+    // A vetoed message is reported in the same way, with nothing delivered.
+    ok(&w.deposit(CAROL, on_solo, NATIVE, DAVE, ETHER));
+    let nonce = w.pending[0].nonce;
+    reverted_with(&w.report(nonce, None), "NotVetoed()");
+    w.veto(0);
+    checks(&mut w);
+    ok(&w.report(nonce, None));
+    reverted_with(&w.report(nonce, None), "AlreadyReported()");
+    w.deliver_all();
+    assert_eq!(w.spent(on_solo, nonce), VOID);
+    ok(&w.unstrand(0));
+    assert_eq!(w.eth.balance(CAROL), carol);
+    checks(&mut w);
+
+    // An honest message reported as delivered is not refunded: the nonce
+    // was spent by what its sender recorded.
+    ok(&w.deposit(CAROL, on_solo, NATIVE, DAVE, ETHER));
+    let delivered = w.pending[0].clone();
+    w.deliver_all();
+    ok(&w.report(delivered.nonce, Some(&delivered)));
+    w.deliver_all();
+    assert_eq!(
+        w.spent(on_solo, delivered.nonce),
+        identity(&delivered.payload)
+    );
+    w.stranded.push(delivered);
+    reverted_with(&w.unstrand(0), "NotSpent()");
+    w.stranded.clear();
+    assert_eq!(w.balance_of(wsolo, DAVE), ETHER);
+    checks(&mut w);
+    // What a nonce was spent by is kept from the first report, unless it is
+    // spent with no effect after all.
+    for (effect, kept) in [([7; 32], [7; 32]), ([8; 32], [7; 32]), (VOID, VOID)] {
+        let p = Pending {
+            nonce: 5_000,
+            sender: on_eth,
+            recipient: on_solo,
+            payload: TokenMessage::Spent {
+                nonce: 50_000,
+                effect,
+            }
+            .encode(),
+        };
+        ok(&w.forge(&p));
+        assert_eq!(w.spent(on_solo, 50_000), kept);
+    }
+
+    // A refund is stranded in turn: the owner on Solo refunds an honest
+    // queued deposit, and a forged release, queued on Ethereum, takes the
+    // nonce of the refund. Refunding the forgery tells Solo the nonce was
+    // spent, and anyone sends the refund again; a refund's record is the
+    // hash of its payload, so it is not refunded but sent again, once.
+    let alice = w.eth.balance(ALICE);
+    ok(&w.deposit(ALICE, on_eth, NATIVE, BOB, 2 * ETHER));
+    w.deliver_all();
+    let i = w.queued.iter().position(|q| q.0 == on_solo).unwrap();
+    ok(&w.refund(i));
+    let refund = w.strand(0);
+    assert_eq!(w.sent(on_solo, refund.nonce), keccak256(&refund.payload));
+    let forged = Pending {
+        nonce: refund.nonce,
+        sender: on_solo,
+        recipient: on_eth,
+        payload: TokenMessage::Release {
+            token: NATIVE,
+            from: STRANGER,
+            to: STRANGER,
+            amount: 3 * ETHER / 2,
+        }
+        .encode(),
+    };
+    ok(&w.forge(&forged));
+    checks(&mut w);
+    let (_, id, _) = *w.queued.last().unwrap();
+    ok(&w.eth.call(GUARDIAN, on_eth, &freeze_queued_calldata(id)));
+    ok(&w.refund(w.queued.len() - 1));
+    w.deliver_all();
+    assert_eq!(w.spent(on_solo, refund.nonce), VOID);
+    checks(&mut w);
+    let resent = w.unstrand(0);
+    ok(&resent);
+    assert!(logged(&resent, "Resent(uint64,uint64)"));
+    assert_eq!(w.sent(on_solo, refund.nonce), [0; 32]);
+    let again = w.eth.call(
+        STRANGER,
+        on_solo,
+        &resend_spent_calldata(refund.nonce, &refund.payload),
+    );
+    reverted_with(&again, "NotRecorded()");
+    let paid = w.deliver(0);
+    assert!(logged(&paid, "Refunded(uint64,uint64)"));
+    w.execute_all();
+    assert_eq!(w.eth.balance(ALICE), alice);
+    assert_eq!(w.eth.balance(STRANGER), 0);
+    checks(&mut w);
+    // A release is refunded, never sent again.
+    ok(&w.deposit(DAVE, on_eth, wsolo, CAROL, ETHER));
+    let release = w.pending[0].clone();
+    let release_again = resend_spent_calldata(release.nonce, &release.payload);
+    reverted_with(
+        &w.eth.call(STRANGER, on_eth, &release_again),
+        "NotResendable()",
+    );
+    w.deliver_all();
+
+    // A mint of a token the receiving gateway does not list goes back to be
+    // refunded at once instead of waiting in its channel; a forged one's
+    // refund is refused.
+    ok(&w.eth.call(OWNER, on_solo, &set_mint_cap_calldata(&tkn, 0)));
+    ok(&w.deposit(ALICE, on_eth, tkn, BOB, 600));
+    assert_eq!(w.balance_of(tkn, ALICE), 400);
+    let bounced = w.deliver(0);
+    ok(&bounced);
+    assert!(logged(&bounced, "Bounced(uint64,uint64)"));
+    assert!(
+        w.eth
+            .view(
+                RELAYER,
+                wrapped_of(on_solo, tkn),
+                &abi::call("totalSupply()", &[])
+            )
+            .output
+            .is_empty()
+    );
+    checks(&mut w);
+    let back = w.deliver(0);
+    assert!(logged(&back, "Refunded(uint64,uint64)"));
+    assert_eq!(w.balance_of(tkn, ALICE), 1_000);
+    checks(&mut w);
+    let forged = Pending {
+        nonce: 6_000,
+        sender: on_eth,
+        recipient: on_solo,
+        payload: TokenMessage::Mint {
+            origin: tkn,
+            from: STRANGER,
+            to: STRANGER,
+            amount: 600,
+            name: b"Test Token".to_vec(),
+            symbol: b"TKN".to_vec(),
+            decimals: 6,
+        }
+        .encode(),
+    };
+    ok(&w.forge(&forged));
+    let refused = w.deliver(0);
+    assert!(logged(&refused, "RefundRefused(uint64,uint64)"));
+    assert_eq!(w.balance_of(tkn, STRANGER), 0);
+    checks(&mut w);
+    assert!(w.pending.is_empty() && w.stranded.is_empty());
 }
 
 /// A deterministic generator for the randomized run.
@@ -1802,8 +2177,44 @@ fn locked_always_covers_what_is_minted() {
     let mut refunds_paid = 0;
     let mut refunds_refused = 0;
     let mut forged_nonce = 1_000_000;
-    for _ in 0..600 {
-        let op = rng.below(18);
+    let mut displaced = 0;
+    let mut reports = 0;
+    let mut made_whole = 0;
+    // Nonces spent in `SoloInbox` that nobody reported to Solo yet: vetoed,
+    // or delivered as a forgery.
+    let mut reportable: Vec<(u64, Option<Pending>)> = Vec::new();
+    let other = |gateway: [u8; 20]| if gateway == on_eth { on_solo } else { on_eth };
+    // A forged transfer of `origin`, native to `home`, to gateway `to`: a mint
+    // if `to` is away from home, else a release, and its sender.
+    let forged_transfer = |home: [u8; 20], origin: [u8; 20], to: [u8; 20], amount: u128| {
+        let message = if to == home {
+            TokenMessage::Release {
+                token: origin,
+                from: STRANGER,
+                to: STRANGER,
+                amount,
+            }
+        } else {
+            TokenMessage::Mint {
+                origin,
+                from: STRANGER,
+                to: STRANGER,
+                amount,
+                name: b"Forged".to_vec(),
+                symbol: b"F".to_vec(),
+                decimals: 18,
+            }
+        };
+        (other(to), message.encode())
+    };
+    for _ in 0..900 {
+        // Deliveries and executions weigh more, so that most transfers
+        // complete.
+        let op = match rng.below(26) {
+            22 | 23 => 5,
+            24.. => 13,
+            op => op,
+        };
         let amount =
             u128::from(rng.below(5_000) + 1) * if rng.below(2) == 0 { 1 } else { ETHER / 1_000 };
         match op {
@@ -1915,45 +2326,91 @@ fn locked_always_covers_what_is_minted() {
             // that it queues, and the guardian freezes it at once.
             17 => {
                 let (home, origin) = rng.pick(&homes);
-                let away = if home == on_eth { on_solo } else { on_eth };
-                let amount = ETHER / 2 + amount;
-                let (sender, recipient, payload) = if rng.below(2) == 0 {
-                    let mint = TokenMessage::Mint {
-                        origin,
-                        from: STRANGER,
-                        to: STRANGER,
-                        amount,
-                        name: b"Forged".to_vec(),
-                        symbol: b"F".to_vec(),
-                        decimals: 18,
-                    };
-                    (home, away, mint)
-                } else {
-                    let release = TokenMessage::Release {
-                        token: origin,
-                        from: STRANGER,
-                        to: STRANGER,
-                        amount,
-                    };
-                    (away, home, release)
-                };
+                let to = if rng.below(2) == 0 { other(home) } else { home };
+                let (sender, payload) = forged_transfer(home, origin, to, ETHER / 2 + amount);
                 forged_nonce += 1;
                 let forged = Pending {
                     nonce: forged_nonce,
                     sender,
-                    recipient,
-                    payload: payload.encode(),
+                    recipient: to,
+                    payload,
                 };
-                if w.forge(&forged).success {
-                    let (gateway, id, _) = *w.queued.last().unwrap();
-                    assert!(gateway == recipient && w.forged_entries.contains(&(gateway, id)));
+                // A mint of a token the gateway does not list goes back instead.
+                let before = w.queued.len();
+                if w.forge(&forged).success
+                    && let Some(&(gateway, id, _)) = w.queued.get(before)
+                {
+                    assert!(gateway == to && w.forged_entries.contains(&(gateway, id)));
                     ok(&w.eth.call(GUARDIAN, gateway, &freeze_queued_calldata(id)));
+                }
+            }
+            // A forgery takes the nonce of an honest message in flight, which
+            // never arrives: a mint or release over its limit (or of a token
+            // the receiving gateway does not list, which goes back at once),
+            // or, from Solo, a HELLO that moves nothing.
+            18..=19 if !w.pending.is_empty() => {
+                let i = usize::try_from(rng.below(w.pending.len() as u64)).unwrap();
+                let p = w.pending[i].clone();
+                let payload = if op == 19 && p.recipient == on_eth {
+                    hello(true)
+                } else {
+                    let (home, origin) = rng.pick(&homes);
+                    let home = if rng.below(2) == 0 { home } else { other(home) };
+                    let origin = if homes.contains(&(home, origin)) {
+                        origin
+                    } else {
+                        NATIVE
+                    };
+                    forged_transfer(home, origin, p.recipient, ETHER / 2 + amount).1
+                };
+                let forged = Pending { payload, ..p };
+                let before = w.queued.len();
+                if w.forge(&forged).success {
+                    w.strand(i);
+                    displaced += 1;
+                    if let Some(&(gateway, id, _)) = w.queued.get(before) {
+                        ok(&w.eth.call(GUARDIAN, gateway, &freeze_queued_calldata(id)));
+                    }
+                    if forged.recipient == on_eth {
+                        reportable.push((forged.nonce, Some(forged)));
+                    }
+                }
+            }
+            // `SoloInbox`'s guardian vetoes a message from Solo.
+            20 if w.pending.iter().any(|p| p.recipient == on_eth) => {
+                let i = w
+                    .pending
+                    .iter()
+                    .position(|p| p.recipient == on_eth)
+                    .unwrap();
+                let p = w.veto(i);
+                reportable.push((p.nonce, None));
+            }
+            // Anyone reports a nonce spent in `SoloInbox` to Solo, or has a
+            // stranded message refunded or sent again, which works once the
+            // nonce is known spent there by something else.
+            21 if !reportable.is_empty() || !w.stranded.is_empty() => {
+                if !reportable.is_empty() && rng.below(2) == 0 {
+                    let i = usize::try_from(rng.below(reportable.len() as u64)).unwrap();
+                    let (nonce, delivered) = reportable.remove(i);
+                    ok(&w.report(nonce, delivered.as_ref()));
+                    reports += 1;
+                } else if !w.stranded.is_empty() {
+                    let i = usize::try_from(rng.below(w.stranded.len() as u64)).unwrap();
+                    if w.unstrand(i).success {
+                        made_whole += 1;
+                    }
                 }
             }
             _ => {
                 let (gateway, token) = rng.pick(&homes);
                 let other = if gateway == on_eth { on_solo } else { on_eth };
-                let cap = if rng.below(4) == 0 { amount * 3 } else { BIG };
+                // A zero mint cap delists a token: its mints go back.
+                let cap = match rng.below(8) {
+                    0 => 0,
+                    1 | 2 => amount * 3,
+                    _ => BIG,
+                };
                 if rng.below(2) == 0 {
                     ok(&w
                         .eth
@@ -1975,12 +2432,15 @@ fn locked_always_covers_what_is_minted() {
         }
     }
     assert!(delivered > 50, "{delivered}");
-    assert!(executed >= 10, "{executed}");
+    assert!(executed >= 5, "{executed}");
     assert!(cancelled >= 3, "{cancelled}");
     assert!(refused_frozen >= 1, "{refused_frozen}");
     assert!(refunded >= 5, "{refunded}");
     assert!(refunds_paid >= 2, "{refunds_paid}");
     assert!(refunds_refused >= 2, "{refunds_refused}");
+    assert!(displaced >= 5, "{displaced}");
+    assert!(reports >= 3, "{reports}");
+    assert!(made_whole >= 3, "{made_whole}");
     // The owner refunds the forgeries still queued, and every other transfer
     // still queued runs once unfrozen.
     while let Some(i) = w
@@ -2014,6 +2474,30 @@ fn locked_always_covers_what_is_minted() {
     ));
     w.deliver_all();
     w.execute_all();
+    // Every nonce spent in `SoloInbox` is reported, and every stranded message
+    // is refunded or sent again, now that the forgeries' refunds told their
+    // senders: none is left but those whose sender was never told, as when
+    // the owner on Solo cancelled a forgery without a refund (and so a
+    // report it took the nonce of).
+    for (nonce, delivered) in std::mem::take(&mut reportable) {
+        ok(&w.report(nonce, delivered.as_ref()));
+    }
+    w.deliver_all();
+    for _ in 0..3 {
+        let mut i = 0;
+        while i < w.stranded.len() {
+            let o = w.unstrand(i);
+            if !o.success {
+                assert_eq!(o.output, abi::selector("NotSpent()"));
+                i += 1;
+            }
+        }
+        w.deliver_all();
+        w.execute_all();
+    }
+    for p in w.stranded.clone() {
+        assert_eq!(w.spent(p.sender, p.nonce), [0; 32]);
+    }
     for (home, origin) in homes {
         let away = if home == on_eth { on_solo } else { on_eth };
         let wrapped = wrapped_of(away, origin);
@@ -2048,8 +2532,8 @@ fn locked_always_covers_what_is_minted() {
         }
         w.check(home, origin, recipients);
     }
-    // What the test receiver holds of wrapped tokens it cannot bridge back, and what owners
-    // cancelled, is all that stays locked.
+    // What the test receiver holds of wrapped tokens it cannot bridge back, what owners
+    // cancelled, and what stays stranded, is all that stays locked.
     for (home, origin) in homes {
         let away = if home == on_eth { on_solo } else { on_eth };
         let wrapped = wrapped_of(away, origin);
@@ -2059,9 +2543,10 @@ fn locked_always_covers_what_is_minted() {
             0
         };
         let retired = w.retired.get(&(home, origin)).copied().unwrap_or(0);
+        let stranded = w.stranded_amount(home, origin);
         assert_eq!(
             w.gateway_view(home, "locked(address)", origin),
-            stuck + retired
+            stuck + retired + stranded
         );
         assert_eq!(w.supply(wrapped), stuck);
     }

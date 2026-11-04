@@ -352,7 +352,7 @@ pub fn message_hash(message: &Message) -> Hash {
 }
 
 /// The inbox's `Message` tuple of `message`.
-fn message_value(message: &Message) -> Value {
+pub(crate) fn message_value(message: &Message) -> Value {
     Value::Tuple(vec![
         Value::uint(u128::from(message.nonce)),
         Value::address(&message.sender),

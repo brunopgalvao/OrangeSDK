@@ -24,9 +24,17 @@ abstract contract TokenGateway {
     /// receiving gateway, which answers if it has not.
     uint8 public constant HELLO = 3;
     /// @notice Message kind: give back to its sender the value of a `MINT` or `RELEASE` this gateway
-    /// sent, which the receiving gateway queued and its owner cancelled; paid only if this gateway
-    /// recorded sending exactly that message and has not refunded it.
+    /// sent, which the receiving gateway took out of its channel with no effect (queued and cancelled
+    /// by its owner, or a `MINT` of a token it does not list); paid only if this gateway recorded
+    /// sending exactly that message and has not refunded it.
     uint8 public constant REFUND = 4;
+    /// @notice Message kind: nonce `nonce` of the receiving gateway's messages is spent in the
+    /// sending gateway's inbox, by a message whose identity is `effect`, or by nothing that took
+    /// effect here (`VOID`); whatever else the receiving gateway sent with that nonce never arrives.
+    uint8 public constant SPENT = 5;
+    /// @notice The effect of a nonce that was spent without anything taking effect: vetoed, delivered
+    /// to another recipient, or delivered and undone by a cancellation.
+    bytes32 public constant VOID = bytes32(uint256(1));
     /// @notice The token address that stands for the chain's native currency.
     address public constant NATIVE = address(0);
     /// @notice Gas a release gives the token's `transfer`, or the recipient of native currency.
@@ -111,10 +119,16 @@ abstract contract TokenGateway {
     /// @notice Amount of each wrapped token (by its origin) waiting in the queue to be minted, which
     /// its mint cap counts.
     mapping(address origin => uint256) public mintsQueued;
-    /// @notice What each `MINT` and `RELEASE` this gateway sent asked, by the channel's nonce:
-    /// `keccak256(abi.encode(kind, token, from, to, amount))`, `token` as the message names it.
-    /// Cleared when a refund of the message is paid, so that it is paid once.
+    /// @notice What each `MINT`, `RELEASE`, `REFUND` and `SPENT` this gateway sent asked, by the
+    /// channel's nonce, its *identity*: `keccak256(abi.encode(kind, token, from, to, amount))` for a
+    /// `MINT` or `RELEASE`, `token` as the message names it, and the hash of the payload for the
+    /// others. Cleared when the message is refunded or sent again, so that that happens once.
     mapping(uint64 nonce => bytes32) public sent;
+    /// @notice What the paired gateway reported spending each nonce of this gateway's messages in
+    /// its inbox with: the identity of the message that took effect there with it, or `VOID`. A
+    /// message whose record differs never arrives, and is refunded (`refundSpent`) or sent again
+    /// (`resendSpent`).
+    mapping(uint64 nonce => bytes32) public spent;
 
     uint256 private transient entered;
 
@@ -142,6 +156,10 @@ abstract contract TokenGateway {
     event RefundRequested(uint256 indexed id, uint64 indexed nonce, uint64 refundNonce);
     event Refunded(uint64 indexed nonce, uint64 indexed original);
     event RefundRefused(uint64 indexed nonce, uint64 indexed original);
+    event Bounced(uint64 indexed nonce, uint64 refundNonce);
+    event NonceSpent(uint64 indexed nonce, bytes32 effect);
+    event SpentRefunded(uint64 indexed nonce);
+    event Resent(uint64 indexed nonce, uint64 indexed resentNonce);
     event PeerConfirmed();
     event Paused(address indexed by);
     event Unpaused();
@@ -168,6 +186,9 @@ abstract contract TokenGateway {
     error NotReady(uint64 readyAt);
     error Frozen();
     error NotRefundable();
+    error NotRecorded();
+    error NotSpent();
+    error NotResendable();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -311,8 +332,43 @@ abstract contract TokenGateway {
         Transfer memory t = queued[id];
         if (t.refund) revert NotRefundable();
         _cancel(id, t);
-        refundNonce = _send(abi.encode(REFUND, t.nonce, t.kind, t.token, t.from, t.to, t.amount));
+        refundNonce = _sendRecorded(abi.encode(REFUND, t.nonce, t.kind, t.token, t.from, t.to, t.amount));
         emit RefundRequested(id, t.nonce, refundNonce);
+    }
+
+    /// @notice Refunds the `MINT` or `RELEASE` this gateway sent as message `nonce`, whose nonce the
+    /// paired gateway reported spent by something else (`spent[nonce]`), so that it never arrives:
+    /// a `MINT`'s locked token is released to its sender, a `RELEASE`'s burned token minted to its
+    /// sender again, under the limits and caps, once. Anyone may call it, naming what the message
+    /// asked, as its `Deposited` log shows.
+    function refundSpent(uint64 nonce, uint8 kind, address token, address from, address to, uint256 amount)
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        bytes32 identity = keccak256(abi.encode(kind, token, from, to, amount));
+        if (sent[nonce] != identity) revert NotRecorded();
+        bytes32 effect = spent[nonce];
+        if (effect == 0 || effect == identity) revert NotSpent();
+        delete sent[nonce];
+        emit SpentRefunded(nonce);
+        _giveBack(nonce, kind, token, from, amount);
+    }
+
+    /// @notice Sends again the `REFUND` or `SPENT` this gateway sent as message `nonce` with
+    /// `payload`, whose nonce the paired gateway reported spent by something else, so that it never
+    /// arrives. Both are safe to repeat: a refund pays once against its record, and a spent nonce
+    /// stays spent. Anyone may call it, once per record.
+    function resendSpent(uint64 nonce, bytes calldata payload) external returns (uint64 resent) {
+        bytes32 identity = keccak256(payload);
+        if (sent[nonce] != identity) revert NotRecorded();
+        uint256 kind = uint256(bytes32(payload[:32]));
+        if (kind != REFUND && kind != SPENT) revert NotResendable();
+        bytes32 effect = spent[nonce];
+        if (effect == 0 || effect == identity) revert NotSpent();
+        delete sent[nonce];
+        resent = _sendRecorded(payload);
+        emit Resent(nonce, resent);
     }
 
     /// @notice Sends the paired gateway a `HELLO` again, while none of its messages has arrived: for a
@@ -380,6 +436,28 @@ abstract contract TokenGateway {
     /// @dev Sends `payload` to the paired gateway and returns the channel's nonce.
     function _send(bytes memory payload) internal virtual returns (uint64);
 
+    /// @dev Sends `payload` and records its hash as what this gateway sent with its nonce.
+    function _sendRecorded(bytes memory payload) internal returns (uint64 nonce) {
+        nonce = _send(payload);
+        sent[nonce] = keccak256(payload);
+    }
+
+    /// @dev The identity of a message with `payload` that the paired gateway sent and the channel
+    /// delivered here, as the paired gateway records it in `sent`.
+    function _identity(bytes calldata payload) internal pure returns (bytes32) {
+        if (uint256(bytes32(payload[:32])) == MINT) return keccak256(payload[:160]);
+        return keccak256(payload);
+    }
+
+    /// @dev Records that the paired gateway's inbox spent nonce `nonce` of this gateway's messages
+    /// with `effect`. `VOID`, which a nonce gets when nothing took effect with it, replaces what was
+    /// reported before; any other effect is kept from the first report.
+    function _markSpent(uint64 nonce, bytes32 effect) internal {
+        if (effect != VOID && spent[nonce] != 0) return;
+        spent[nonce] = effect;
+        emit NonceSpent(nonce, effect);
+    }
+
     /// @dev Acts on a message the subcontract authenticated as the paired gateway's. Reverting
     /// leaves the message undelivered, to be delivered again.
     function _receive(uint64 nonce, bytes calldata payload) internal whenNotPaused nonReentrant {
@@ -392,7 +470,13 @@ abstract contract TokenGateway {
         if (kind == MINT) {
             (, address origin, address from, address to, uint256 amount, string memory name, string memory symbol, uint8 decimals)
             = abi.decode(payload, (uint8, address, address, address, uint256, string, string, uint8));
-            _mint(nonce, origin, from, to, amount, _wrapped(origin, name, symbol, decimals), false);
+            if (mintCap[origin] == 0) {
+                // Not listed here: sent back to be refunded, rather than left in the channel.
+                uint64 refundNonce = _sendRecorded(abi.encode(REFUND, nonce, MINT, origin, from, to, amount));
+                emit Bounced(nonce, refundNonce);
+            } else {
+                _mint(nonce, origin, from, to, amount, _wrapped(origin, name, symbol, decimals), false);
+            }
         } else if (kind == RELEASE) {
             (, address token, address from, address to, uint256 amount) =
                 abi.decode(payload, (uint8, address, address, address, uint256));
@@ -402,6 +486,9 @@ abstract contract TokenGateway {
             if (!heard) _send(abi.encode(HELLO, true));
         } else if (kind == REFUND) {
             _refund(nonce, payload);
+        } else if (kind == SPENT) {
+            (, uint64 original, bytes32 effect) = abi.decode(payload, (uint8, uint64, bytes32));
+            _markSpent(original, effect);
         } else {
             revert UnknownMessage();
         }
@@ -411,16 +498,25 @@ abstract contract TokenGateway {
     /// sending exactly what the refund names and has not refunded it: a `MINT` it sent locked the
     /// token here, which is released to its sender; a `RELEASE` it sent burned the wrapped token,
     /// which is minted to its sender again. Each under its limit and cap, as a release or mint is.
-    /// Anything else is refused, and the message counts as delivered.
+    /// Anything else is refused, and the message counts as delivered; but the paired gateway took
+    /// nonce `original` out of its channel with no effect, so whatever this gateway sent with it
+    /// never arrives: the nonce is spent, with `VOID`.
     function _refund(uint64 nonce, bytes calldata payload) private {
         (, uint64 original, uint8 kind, address token, address from, address to, uint256 amount) =
             abi.decode(payload, (uint8, uint64, uint8, address, address, address, uint256));
         if (sent[original] != keccak256(abi.encode(kind, token, from, to, amount))) {
             emit RefundRefused(nonce, original);
+            _markSpent(original, VOID);
             return;
         }
         delete sent[original];
         emit Refunded(nonce, original);
+        _giveBack(nonce, kind, token, from, amount);
+    }
+
+    /// @dev Gives `from` back the value of a `MINT` or `RELEASE` this gateway sent: the token a
+    /// `MINT` locked here is released, the wrapped token a `RELEASE` burned is minted again.
+    function _giveBack(uint64 nonce, uint8 kind, address token, address from, uint256 amount) private {
         if (kind == MINT) {
             _payOut(nonce, token, from, from, amount, true);
         } else {
