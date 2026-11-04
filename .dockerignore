@@ -7,3 +7,8 @@ design
 target
 guest/target
 lcov.info
+# The ecosystem suite's installs and build output (tools/ecosystem).
+**/node_modules
+tools/ecosystem/out
+tools/ecosystem/cache
+tools/ecosystem/broadcast

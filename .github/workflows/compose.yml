@@ -1,0 +1,51 @@
+# The compose stack of ops/ built and run as an operator runs it: four
+# validators, Prometheus and Grafana, checked by tools/compose-smoke.sh.
+# Runs only when something the image or the stack is made of changes.
+name: compose
+on:
+  push:
+    branches: [main]
+    paths:
+      - ops/**
+      - .dockerignore
+      - tools/compose-smoke.sh
+      - Cargo.lock
+      - Cargo.toml
+      - rust-toolchain.toml
+      - crates/solo-abi/**
+      - crates/solo-cli/**
+      - crates/solo-metrics/**
+      - crates/solo-node/**
+      - crates/solo-rpc/**
+      - crates/solo-store/**
+      - .github/workflows/compose.yml
+  pull_request:
+    paths:
+      - ops/**
+      - .dockerignore
+      - tools/compose-smoke.sh
+      - Cargo.lock
+      - Cargo.toml
+      - rust-toolchain.toml
+      - crates/solo-abi/**
+      - crates/solo-cli/**
+      - crates/solo-metrics/**
+      - crates/solo-node/**
+      - crates/solo-rpc/**
+      - crates/solo-store/**
+      - .github/workflows/compose.yml
+  workflow_dispatch:
+concurrency:
+  group: compose-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # The image build is the long part (a release build of the host);
+      # the checks themselves take two or three minutes.
+      - run: timeout 1500 tools/compose-smoke.sh
+        env:
+          SMOKE_TIMEOUT: "180"

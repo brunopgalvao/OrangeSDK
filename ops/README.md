@@ -20,6 +20,13 @@ docker compose -f ops/docker-compose.yml down -v
 
 The nodes' JSON-RPC is published on `127.0.0.1:8545` to `8548`, Prometheus on `127.0.0.1:9090` and Grafana on `127.0.0.1:3000`: loopback only, since the RPC carries the unauthenticated `solo_stop` and Grafana runs as an anonymous admin. The genesis has epochs of 20 blocks, DKG phases of 5 and a known governance key (`SOLO_GOVERNANCE_KEY`, default `0x60…60`; `SOLO_EPOCH_BLOCKS` and `SOLO_DKG_PHASE_BLOCKS` change the epochs). The `devnet` volume keeps the chain's identities and each node's driver state (`node-<i>/driver.state` and `persist.log`) across `up` and `down`; `down -v` starts over.
 
+`tools/compose-smoke.sh` is the stack's test, and CI runs it whenever the image or the stack changes (`.github/workflows/compose.yml`): it builds the image, brings the stack up from an empty volume, waits for every node to answer `eth_chainId`, make blocks and finalize them, checks that they agree on a finalized block's hash, that each serves `/health`, `/status` and `/metrics` with its three peers, that `solo doctor` passes, that Prometheus scrapes all four with the alert rules loaded and evaluating, and that Grafana has its data source, the dashboard and answers a query through Prometheus; then it stops one validator, checks the others go on, starts it and checks it catches up, and takes the stack down (`down -v`), printing the containers' logs if anything failed. `SMOKE_EXTERNAL=1` checks a stack that is already up and leaves it running; `RPCS`, `PROMETHEUS_URL` and `GRAFANA_URL` point it elsewhere (an empty URL skips that part), so the node checks also run against `solo devnet up`.
+
+```sh
+tools/compose-smoke.sh                                   # build, up, check, restart one, down
+SMOKE_EXTERNAL=1 tools/compose-smoke.sh                  # check a running stack
+```
+
 To rehearse a kernel upgrade on the stack, as `tools/rehearse-upgrade.sh` does on a local devnet:
 
 ```sh
