@@ -204,18 +204,18 @@ impl Scheduler {
                     let o = self.observers();
                     *self.rng.pick(&o)
                 };
-                // A validator that lost its data comes back from a snapshot
-                // newer than anything it signed: from nothing it would
-                // replay the chain and sign again in the views it signed in
-                // before (see the soak's report of 2026-11-04). An observer
-                // signs nothing and may start from either.
-                let validator = self.cluster.role(target) != Role::Observer;
+                // A node that lost its data comes back from nothing, replaying
+                // the chain from its peers' blocks, or from their snapshots. A
+                // validator does either under its signing guard, which keeps
+                // it from signing again in the views it signed in before
+                // (spec 08 §7b): the checker's no-equivocation invariant holds
+                // it to that.
                 // Peers keep the blocks of the last DRIVER_RETENTION heights
                 // (spec 22 §8.1): a node further behind joins from a
                 // snapshot, so catching up from nothing is for young chains.
                 let young = self.best() + 200 < solo_node::DRIVER_RETENTION;
-                let wipe = self.rng.chance(1, 4) && (syncable || !validator);
-                let sync = wipe && syncable && (validator || !young || self.rng.chance(1, 2));
+                let wipe = self.rng.chance(1, 4);
+                let sync = wipe && syncable && (!young || self.rng.chance(1, 2));
                 let down = self.secs(2, 20);
                 self.kill_restart(&[target], down, wipe, sync)
             }
@@ -296,9 +296,10 @@ impl Scheduler {
             .join(",")
     }
 
-    /// Kills `targets`, keeps them down `down` (and, for a wipe, until the
-    /// network has moved ten blocks on, so that a validator that lost its
-    /// driver state never comes back into a view it voted in), restarts.
+    /// Kills `targets`, keeps them down `down` (and, for a wipe that syncs
+    /// its state, until a snapshot taken after the kill is served), and
+    /// restarts them. A wipe that replays the chain comes back at once: a
+    /// validator then catches up into the views it signed in just before.
     fn kill_restart(&mut self, targets: &[usize], down: Duration, wipe: bool, sync: bool) -> bool {
         let set = self.set_members();
         let n_set = targets.iter().filter(|t| set.contains(t)).count();
@@ -323,9 +324,10 @@ impl Scheduler {
         }
         let at = self.best();
         let mut ok = self.pause(down);
-        if ok && wipe {
+        if ok && sync {
             // Until a snapshot of an epoch that ended after the kill is
-            // served (spec 22 §7.4: exported once a certificate covers it).
+            // served (spec 22 §7.4: exported once a certificate covers it),
+            // so that the node joins from one at least as new as its kill.
             let epoch = self.cluster.shape.epoch_blocks;
             let after = (at / epoch + 1) * epoch + epoch / 2;
             ok = self.wait_for(Duration::from_mins(3), |s| s.best() >= after.max(at + 10));
