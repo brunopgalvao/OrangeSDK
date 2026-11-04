@@ -568,9 +568,16 @@ impl Node {
     }
 
     /// The answer to a peer's state-sync request (spec 22 §7.4, the
-    /// payload of a `SyncRequest` frame, spec 09 §2).
+    /// payload of a `SyncRequest` frame, spec 09 §2): handoffs from its chain
+    /// state, whether it serves snapshots or not; the rest from the
+    /// snapshots it serves.
     #[must_use]
     pub fn answer_sync(&self, payload: &[u8]) -> Vec<u8> {
+        use crate::statesync::{SyncRequest, SyncResponse, handoffs_from};
+        if let Ok(SyncRequest::Handoffs { from, to }) = SyncRequest::from_bytes(payload) {
+            let handoffs = handoffs_from(|key| self.state_get(key), from, to);
+            return SyncResponse::Handoffs(handoffs).to_bytes();
+        }
         match &self.server {
             Some(server) => server.answer(payload),
             None => crate::statesync::answer_unserved(payload),
@@ -694,6 +701,14 @@ impl Node {
     /// comes back after the driver entered another view is lost.
     pub fn set_catch_up(&mut self, on: bool) {
         self.catch_up.set(on);
+    }
+
+    /// Why the node cannot catch up from its peers' blocks, while it cannot
+    /// (spec 09 §6a, step 6): it is further behind than they keep blocks
+    /// (spec 22 §8.1), and joins again from a snapshot.
+    #[must_use]
+    pub fn sync_alert(&self) -> Option<String> {
+        self.catch_up.alert()
     }
 
     /// How many sync requests the host lets be on the wire at once now

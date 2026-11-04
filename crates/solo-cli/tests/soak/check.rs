@@ -573,8 +573,8 @@ impl Checker {
                         .flatten()
                 });
                 let mut w = self.world.lock().unwrap();
-                if key.is_some() {
-                    w.trust_key = key;
+                if let Some(key) = key {
+                    w.key_sets.insert(id, key);
                 }
                 if let std::collections::btree_map::Entry::Vacant(e) = w.chain.key_ids.entry(id) {
                     e.insert(h);

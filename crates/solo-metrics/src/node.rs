@@ -461,6 +461,9 @@ pub struct Status {
     pub active_gates: u64,
     /// The pending kernel upgrade, while one is pending.
     pub pending_upgrade: Option<PendingUpgrade>,
+    /// Why the node cannot catch up from its peers' blocks, while it cannot
+    /// (spec 09 §6a, step 6).
+    pub sync_alert: Option<String>,
 }
 
 /// A kernel upgrade the chain has proposed and not yet switched to or
@@ -1057,6 +1060,7 @@ mod tests {
                 code_hash: [8; 32],
                 activation_height: 9,
             }),
+            sync_alert: None,
         };
         assert_eq!(s.clone(), s);
         assert!(format!("{s:?}").contains("chain_id"));

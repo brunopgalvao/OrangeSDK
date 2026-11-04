@@ -296,10 +296,9 @@ impl Scheduler {
             .join(",")
     }
 
-    /// Kills `targets`, keeps them down `down` (and, for a wipe that syncs
-    /// its state, until a snapshot taken after the kill is served), and
-    /// restarts them. A wipe that replays the chain comes back at once: a
-    /// validator then catches up into the views it signed in just before.
+    /// Kills `targets`, keeps them down `down` and restarts them. A wiped
+    /// validator then catches up into the views it signed in just before,
+    /// by replay or by a snapshot of any age its trust reaches.
     fn kill_restart(&mut self, targets: &[usize], down: Duration, wipe: bool, sync: bool) -> bool {
         let set = self.set_members();
         let n_set = targets.iter().filter(|t| set.contains(t)).count();
@@ -322,16 +321,10 @@ impl Scheduler {
         for &t in targets {
             self.cluster.kill(t);
         }
-        let at = self.best();
-        let mut ok = self.pause(down);
-        if ok && sync {
-            // Until a snapshot of an epoch that ended after the kill is
-            // served (spec 22 §7.4: exported once a certificate covers it),
-            // so that the node joins from one at least as new as its kill.
-            let epoch = self.cluster.shape.epoch_blocks;
-            let after = (at / epoch + 1) * epoch + epoch / 2;
-            ok = self.wait_for(Duration::from_mins(3), |s| s.best() >= after.max(at + 10));
-        }
+        // A wiped validator comes back at once, from whatever snapshot its
+        // peers serve or from genesis: the signing guard (spec 08 §7b) must
+        // keep it from signing again in a view it signed in before the kill.
+        let ok = self.pause(down);
         for &t in targets {
             if !self.cluster.running(t) {
                 self.cluster.start(t, wipe, sync);

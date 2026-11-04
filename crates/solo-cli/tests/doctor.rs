@@ -285,7 +285,20 @@ fn the_status_carries_upgrade_alerts() {
             "the chain locked in feature gates this release does not support: 0, 2, 63",
         ]
     );
+    // A node further behind than its peers keep blocks says why, and the
+    // doctor names the remedy (spec 22 §8.1).
+    assert_eq!(plain.sync_alert, None);
+    assert_eq!(with("\"syncAlert\":null").unwrap().sync_alert, None);
+    let behind = with("\"syncAlert\":\"block 1 is no longer kept by its peers (one has finalized 2000): this node is further behind than its peers keep blocks; restart it over an empty data directory with --sync-from-peers or --snapshot\"").unwrap();
+    let problems = solo_metrics::assess(&behind, &[], &solo_metrics::Limits::default());
+    assert_eq!(problems.len(), 1);
+    assert!(
+        problems[0].starts_with("the node cannot catch up from its peers' blocks: block 1")
+            && problems[0].ends_with("--sync-from-peers or --snapshot"),
+        "{problems:?}"
+    );
     for bad in [
+        "\"syncAlert\":5",
         "\"upgradeAlert\":5",
         "\"chainName\":5",
         "\"missingGates\":3",

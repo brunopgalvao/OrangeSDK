@@ -47,8 +47,6 @@ pub struct Proc {
     pub expected_exit: bool,
     /// Where its current process's output starts in its log.
     pub log_from: usize,
-    /// State syncs retried under a newer trusted key in a row.
-    pub sync_retries: u32,
 }
 
 pub struct Cluster {
@@ -178,7 +176,6 @@ impl Cluster {
                 peers: Vec::new(),
                 expected_exit: false,
                 log_from: 0,
-                sync_retries: 0,
             });
         }
         fs::write(
@@ -234,7 +231,6 @@ impl Cluster {
             peers,
             expected_exit: false,
             log_from: 0,
-            sync_retries: 0,
         });
         self.keys.push(None);
         self.world.lock().unwrap().members.push(member(
@@ -272,9 +268,6 @@ impl Cluster {
             });
         let log_path = p.dir.join("log");
         p.log_from = fs::metadata(&log_path).map_or(0, |m| usize::try_from(m.len()).unwrap_or(0));
-        if !sync {
-            p.sync_retries = 0;
-        }
         let log = File::options()
             .create(true)
             .append(true)
@@ -300,9 +293,10 @@ impl Cluster {
         command.arg("--no-discovery");
         if sync {
             command.arg("--sync-from-peers");
-            // A chain with staking trusts a group key, not its genesis set
-            // (spec 22 §7.2): the newest key set a live node reports.
-            if let Some(key) = self.world.lock().unwrap().trust_key.clone() {
+            // A chain with staking trusts a key set, not its genesis set
+            // (spec 22 §7.2), and follows the chain's handoffs from it to
+            // the snapshot it fetches (§7.5).
+            if let Some(key) = self.world.lock().unwrap().trust_key() {
                 command.args(["--trust-key", &key]);
             }
         }
@@ -466,31 +460,14 @@ impl Cluster {
             };
             if let Ok(Some(status)) = child.try_wait() {
                 p.child = None;
-                let log = fs::read_to_string(p.dir.join("log")).unwrap_or_default();
-                let this_run = log.get(p.log_from..).unwrap_or_default();
+                // A state sync that fails is a violation like any other
+                // exit: a joiner follows the chain's handoffs from the key
+                // set it trusts (spec 22 §7.5), so no retry under a newer
+                // key is needed.
                 let tail = tail(&p.dir.join("log"), 30);
                 let mut w = self.world.lock().unwrap();
                 w.members[id].pid = None;
                 let label = w.members[id].label.clone();
-                // A state sync under a key the chain rotated past fails, as
-                // spec 22 §7.2 says it must; the operator retries with a
-                // newer key, and so does the soak, a few times.
-                let stale = w.members[id].syncs
-                    && (this_run.contains("does not verify under the node's trust")
-                        || this_run.contains("the trusted key does not verify"))
-                    && this_run
-                        .trim_end()
-                        .ends_with("no peer to sync from in time");
-                if stale && p.sync_retries < 3 {
-                    p.sync_retries += 1;
-                    let n = p.sync_retries;
-                    w.log(format!(
-                        "{label}: state sync failed under a key set the chain rotated past; retry {n} with the newest key"
-                    ));
-                    drop(w);
-                    self.start(id, true, true);
-                    continue;
-                }
                 w.violate(format!(
                     "{label} exited on its own with {status}; its log ends:\n{tail}"
                 ));

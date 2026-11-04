@@ -904,7 +904,53 @@ fn snapshots_export_verify_import_and_start_a_node() {
         "0x12",
     ])
     .unwrap_err();
-    assert_eq!(err, "--trust-key must be 96 bytes of 0x hex");
+    assert_eq!(
+        err,
+        "--trust-key must be 96 bytes of 0x hex, or <key set id>:<them>"
+    );
+    // A key set is named by its id and group key (spec 22 §7.5), on a chain
+    // with a threshold key; its horizon is the chain's unbonding period, and
+    // a file carries no handoffs, so the key set must certify it itself.
+    let verify_under = |genesis: &str, trust: &str| {
+        snap(&[
+            "verify",
+            "--snapshot",
+            &file,
+            "--genesis",
+            genesis,
+            "--trust-key",
+            trust,
+        ])
+        .unwrap_err()
+    };
+    assert_eq!(
+        verify_under(&genesis, &format!("x:{key}")),
+        "--trust-key: x is not a key set id"
+    );
+    assert_eq!(
+        verify_under(&genesis, &format!("3:{key}")),
+        "--trust-key names a key set, and this chain has no threshold key"
+    );
+    assert_eq!(
+        verify_under(&staking, &format!("3:{key}")),
+        "--trust-key names a key set, and this chain has no threshold key"
+    );
+    let threshold = genesis_file(
+        "snap-threshold.json",
+        &EPOCHS.replace(
+            "\"epochBlocks\": 4",
+            "\"staking\": {\"epochBlocks\": 4, \"dkgPhaseBlocks\": 1, \"unbondingEpochs\": 4, \"maxKeyAge\": 2}",
+        ),
+    );
+    let err = verify_under(&threshold, &format!("3:{key}"));
+    assert!(
+        err.contains("a vote certificate needs the genesis validator set"),
+        "{err}"
+    );
+    assert_eq!(
+        verify_under(&threshold, "3:0x12"),
+        "--trust-key must be 96 bytes of 0x hex, or <key set id>:<them>"
+    );
     // Arguments and files that are missing or wrong.
     assert_eq!(snap(&[]).unwrap_err(), USAGE);
     assert_eq!(
@@ -1223,5 +1269,19 @@ fn a_node_fetches_its_state_from_a_peer_that_serves_snapshots() {
             epoch: 4
         })
         .starts_with("epoch 4 set aside: its certificate from peer 0x0101")
+    );
+    assert_eq!(
+        snapshot::describe_event(&SyncEvent::PastHorizon {
+            epoch: 9,
+            horizon: 6
+        }),
+        "epoch 9 offered, past the trusted key set's horizon (epoch 6): not fetched; trust a newer key set to fetch it"
+    );
+    assert_eq!(
+        snapshot::describe_event(&SyncEvent::Followed {
+            handoffs: 3,
+            key_set: 7
+        }),
+        "3 handoffs verified, reaching key set 7"
     );
 }

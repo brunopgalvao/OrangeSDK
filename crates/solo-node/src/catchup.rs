@@ -80,6 +80,9 @@ pub struct CatchUp {
     stride: u64,
     /// The peer last asked.
     tried: [u8; 32],
+    /// A block a peer that finalized past it no longer keeps, and that
+    /// peer's finalized height (spec 09 §6a, step 6).
+    out_of_reach: Option<(u64, u64)>,
 }
 
 impl Default for CatchUp {
@@ -95,6 +98,7 @@ impl Default for CatchUp {
             depth: 1,
             stride: 1,
             tried: [0; 32],
+            out_of_reach: None,
         }
     }
 }
@@ -130,6 +134,17 @@ impl CatchUp {
     #[must_use]
     pub fn parked(&self) -> usize {
         self.parked.len()
+    }
+
+    /// Why the node cannot catch up from its peers' blocks, while it cannot
+    /// (spec 09 §6a, step 6): a peer that finalized past the block it needs
+    /// no longer keeps it.
+    #[must_use]
+    pub fn alert(&self) -> Option<String> {
+        let (height, theirs) = self.out_of_reach?;
+        Some(format!(
+            "block {height} is no longer kept by its peers (one has finalized {theirs}): this node is further behind than its peers keep blocks; restart it over an empty data directory with --sync-from-peers or --snapshot"
+        ))
     }
 
     /// Notes that `peer` was heard from at `now_ms`.
@@ -207,10 +222,16 @@ impl CatchUp {
             });
         };
         self.heard(flight.peer, now_ms);
-        let Some(response) = SyncResponse::from_bytes(&payload)
-            .ok()
-            .filter(|r| r.certificate.is_some())
-        else {
+        let decoded = SyncResponse::from_bytes(&payload).ok();
+        // No blocks from a peer that finalized the first one asked for: it
+        // pruned them (spec 22 §8.1).
+        if let Some(r) = &decoded
+            && r.certificate.is_none()
+            && r.finalized_height >= flight.from
+        {
+            self.out_of_reach = Some((flight.from, r.finalized_height));
+        }
+        let Some(response) = decoded.filter(|r| r.certificate.is_some()) else {
             // Nothing to serve from: the next poll asks someone else.
             return None;
         };
@@ -220,6 +241,7 @@ impl CatchUp {
             .first()
             .zip(response.proposals.0.last())
             .map(|(a, b)| (a.height, b.height))?;
+        self.out_of_reach = None;
         // Quick answers widen the window; slow ones narrow it.
         if now_ms.saturating_sub(flight.sent_ms) <= flight.wait_ms / 4 {
             self.depth = (self.depth + 1).min(MAX_DEPTH);
@@ -266,6 +288,8 @@ impl CatchUp {
     /// next epoch never does.
     pub fn poll(&mut self, now_ms: u64, finalized: u64, out: &mut Vec<Outbound>) -> Option<Input> {
         self.forget_below(finalized + 1);
+        self.out_of_reach
+            .take_if(|(height, _)| *height <= finalized);
         let moot = self
             .wanted
             .take_if(|(_, from)| *from <= finalized)

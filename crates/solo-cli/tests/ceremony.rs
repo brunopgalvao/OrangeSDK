@@ -839,11 +839,17 @@ fn trust_key_needs_every_node_to_agree() {
     let none = fake_node(Value::Null);
     let trust =
         |list: &str| solo_cli::snapshot::run(&args(&["snapshot", "trust-key", "--rpc", list]));
+    // The key set, by id and group key, as --trust-key takes it.
     assert_eq!(
         trust(&format!("{a},{b}")),
-        Ok(format!("0x{}", "aa".repeat(96)))
+        Ok(format!("2:0x{}", "aa".repeat(96)))
     );
-    assert_eq!(trust(&a), Ok(format!("0x{}", "aa".repeat(96))));
+    assert_eq!(trust(&a), Ok(format!("2:0x{}", "aa".repeat(96))));
+    let no_id = fake_node(json!({"keyId": 2, "groupKey": format!("0x{}", "aa".repeat(96))}));
+    assert_eq!(
+        trust(&no_id),
+        Err(format!("{no_id}: expected a quantity, got 2"))
+    );
     let split = trust(&format!("{a}, {c}")).unwrap_err();
     assert!(
         split.starts_with("the nodes report different keys; ask again:"),

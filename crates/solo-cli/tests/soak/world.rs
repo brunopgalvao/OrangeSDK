@@ -105,8 +105,8 @@ pub struct World {
     /// When a fault last ended.
     pub last_heal: Instant,
     pub chain: Chain,
-    /// The group key of the newest key set seen, for `--trust-key`.
-    pub trust_key: Option<String>,
+    /// The group keys of the active key sets seen, by id.
+    pub key_sets: std::collections::BTreeMap<u64, String>,
     /// The counter contract, once deployed.
     pub counter: Option<String>,
     /// Stops the helper threads.
@@ -129,10 +129,21 @@ impl World {
             last_restart: None,
             last_heal: now,
             chain: Chain::default(),
-            trust_key: None,
+            key_sets: std::collections::BTreeMap::new(),
             counter: None,
             done: false,
         }
+    }
+
+    /// What a joiner trusts (`--trust-key <id>:<key>`, spec 22 §7.5): the
+    /// key set before the newest one seen, as an operator who looked it up
+    /// a while ago would hold, so that every state sync follows handoffs
+    /// from it; within the chain's unbonding period, it reaches every
+    /// snapshot served meanwhile.
+    pub fn trust_key(&self) -> Option<String> {
+        let mut newest = self.key_sets.iter().rev();
+        let (id, key) = newest.nth(1).or_else(|| self.key_sets.iter().next_back())?;
+        Some(format!("{id}:{key}"))
     }
 
     /// Seconds since the start, for the timeline.

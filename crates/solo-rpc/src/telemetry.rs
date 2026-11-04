@@ -31,6 +31,7 @@ pub fn status_json(s: &Status) -> Value {
             "codeHash": data(&p.code_hash),
             "activationHeight": p.activation_height,
         })),
+        "syncAlert": s.sync_alert,
     })
 }
 

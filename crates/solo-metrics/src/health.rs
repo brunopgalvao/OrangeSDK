@@ -101,6 +101,11 @@ pub fn assess(status: &Status, samples: &[Sample], limits: &Limits) -> Vec<Strin
             ));
         }
     }
+    if let Some(why) = &status.sync_alert {
+        problems.push(format!(
+            "the node cannot catch up from its peers' blocks: {why}"
+        ));
+    }
     if let Some(why) = &status.upgrade_alert {
         problems.push(format!(
             "the pending kernel upgrade cannot be enacted: {why}"
@@ -168,6 +173,7 @@ mod tests {
             kernel_hash: [0; 32],
             active_gates: 0,
             pending_upgrade: None,
+            sync_alert: None,
         }
     }
 
@@ -210,6 +216,7 @@ mod tests {
             mempool: 1001,
             upgrade_alert: Some("this host cannot load upgrade 0x01".to_owned()),
             missing_gates: 0b101,
+            sync_alert: Some("block 1 is no longer kept by its peers".to_owned()),
             ..status()
         };
         let metrics = parse(
@@ -233,6 +240,7 @@ mod tests {
                 "? faulted 1 times (?) since the node started",
                 "kernel_stf_execute_block takes 3.000s per call on average (limit 1s)",
                 "? takes 5.000s per call on average (limit 1s)",
+                "the node cannot catch up from its peers' blocks: block 1 is no longer kept by its peers",
                 "the pending kernel upgrade cannot be enacted: this host cannot load upgrade 0x01",
                 "the chain locked in feature gates this release does not support: 0, 2",
             ]

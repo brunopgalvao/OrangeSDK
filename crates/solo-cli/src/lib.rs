@@ -122,13 +122,13 @@ pub const DEFAULT_RPC: &str = "127.0.0.1:8545";
 /// Usage line printed on a command-line mistake.
 pub const USAGE: &str = "usage:
   solo dev  --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive] [--data-dir <dir>]
-  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--snapshot <file> | --sync-from-peers] [--trust-key <0x 96 bytes>] [--serve-snapshots] [--listen 127.0.0.1:30333] [--peer <addr>]... [--bootstrap <addr>]... [--max-peers 32] [--outbound-peers 8] [--advertise <addr>] [--no-discovery] [--node-key-file <path>] [--rpc 127.0.0.1:8545] [--no-rpc-stop] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
+  solo node --kernel <kernel.elf|kernel.solo> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--snapshot <file> | --sync-from-peers] [--trust-key <id>:<0x 96 bytes> | <0x 96 bytes>] [--serve-snapshots] [--listen 127.0.0.1:30333] [--peer <addr>]... [--bootstrap <addr>]... [--max-peers 32] [--outbound-peers 8] [--advertise <addr>] [--no-discovery] [--node-key-file <path>] [--rpc 127.0.0.1:8545] [--no-rpc-stop] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
   solo key  <64 hex> | --key-file <path> | generate --out <path>
   solo genesis operator --key-file <key> --name <name> --chain-id <id> [--p2p <ip:port>] --out <card.json>
   solo genesis assemble --template <template.json> --kernel <kernel> --operator <card.json>... [--bootnode <ip:port>]... [--genesis-time <unix seconds>] [--operator-funding <wei>] --out <genesis.json>
   solo genesis hash --genesis <genesis.json> --kernel <kernel>
   solo genesis verify --genesis <genesis.json> --kernel <kernel> --hash <0x genesis hash> [--key-file <key>] [--operator <card.json>]...
-  solo snapshot export --data-dir <dir> --out <file> [--epoch <n>] | verify --snapshot <file> --genesis <genesis.json> [--trust-key <0x 96 bytes>] | import --snapshot <file> --data-dir <dir> --kernel <kernel> --genesis <genesis.json> [--trust-key <0x 96 bytes>] | trust-key --rpc <addr,...>
+  solo snapshot export --data-dir <dir> --out <file> [--epoch <n>] | verify --snapshot <file> --genesis <genesis.json> [--trust-key <id>:<0x 96 bytes> | <0x 96 bytes>] | import --snapshot <file> --data-dir <dir> --kernel <kernel> --genesis <genesis.json> [--trust-key <id>:<0x 96 bytes> | <0x 96 bytes>] | trust-key --rpc <addr,...>
   solo gov  submit <target> <0x calldata> | vote <id> yes|no | execute <id> | veto <id> | pause <target> | set-guardian <address> | set-mode stake | set-params <voting> <timelock> <quorumBps> <deposit> | set-fee-params <denominator> <elasticity> <minBaseFee> <treasury|burn>
   solo doctor [--rpc 127.0.0.1:8545] [--max-head-age <s>] [--max-finality-lag <blocks>] [--min-peers <n>] [--max-mempool <txs>] [--max-call-ms <ms>]
   solo upgrade --kernel <kernel.elf|kernel.solo> (--key <64 hex> | --key-file <path>) [--rpc 127.0.0.1:8545] [--delay <blocks>] [--required-gates <g,g,...>] [--timeout <s>]
@@ -812,6 +812,26 @@ fn load_state(
     Ok(())
 }
 
+/// What to log when the node's sync alert goes from `seen` to `now` (spec
+/// 09 §6a, step 6): why it cannot catch up from its peers' blocks, once,
+/// when that starts, and once that it can again; nothing otherwise.
+#[must_use]
+pub fn sync_alert_change(seen: Option<&str>, now: Option<&str>) -> Option<String> {
+    match (seen, now) {
+        (None, Some(why)) => Some(format!("catch-up: {why}")),
+        (Some(_), None) => {
+            Some("catch-up: peers serve the blocks this node needs again".to_owned())
+        }
+        _ => None,
+    }
+}
+
+fn report_sync_alert(node: &solo_node::Node, seen: &mut Option<String>) {
+    let alert = node.sync_alert();
+    let _ = sync_alert_change(seen.as_deref(), alert.as_deref()).inspect(|l| eprintln!("{l}"));
+    *seen = alert;
+}
+
 /// Says where the driver's state lives, which view it started in and, on a
 /// resume, how many of its own finalized blocks it re-executed from its
 /// tables before anything else happened (spec 08 §7), and where the chain
@@ -1025,6 +1045,7 @@ pub(crate) fn run_inner(
     let listener = bind_rpc(rpc_addr, command, (chain_id, &chain_name), key.as_ref())?;
     let mut last_tick = Instant::now();
     let mut switches_seen = 0usize;
+    let mut alert_seen: Option<String> = None;
     let blocks_seen = Rc::new(Cell::new(0u64));
     let seen = Rc::clone(&blocks_seen);
     // The network and the clock, between connections and between the steps
@@ -1043,6 +1064,7 @@ pub(crate) fn run_inner(
         // same before it sends (spec 08 §7).
         report(node.sync_store());
         report_switches(node, &mut switches_seen);
+        report_sync_alert(node, &mut alert_seen);
         let executed = node.blocks_executed();
         if executed > seen.get()
             && let Some((height, hash)) = node.executed.last()
