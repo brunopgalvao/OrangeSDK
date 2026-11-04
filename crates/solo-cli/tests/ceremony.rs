@@ -891,3 +891,142 @@ fn the_network_registry_is_well_formed() {
         hashes.push(hash);
     }
 }
+
+const SOLO_OPS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../ops/testnet/solo-ops");
+const REHEARSAL: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/rehearse-testnet.sh"
+);
+
+/// `solo-ops` with `args`: its status, stdout and stderr.
+fn solo_ops(args: &[&str]) -> (bool, String, String) {
+    let out = std::process::Command::new(SOLO_OPS)
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The deploy tooling reads an inventory, renders each host's node.env
+/// and the Prometheus configuration, prints what it would run over ssh,
+/// and names a malformed inventory's line.
+#[test]
+fn solo_ops_renders_and_dry_runs_an_inventory() {
+    let dir = Scratch::dir("ceremony", "ops");
+    let inventory = path(&dir, "inventory");
+    std::fs::write(
+        &inventory,
+        "# hosts\n\
+         val-a validator solo@192.0.2.10 192.0.2.10:30333 10.0.0.10:8545 key=a.key\n\
+         boot-1 bootnode solo@192.0.2.20 192.0.2.20:30333 10.0.0.20:8545\n\
+         rpc-1 rpc local 127.0.0.1:30399 127.0.0.1:8599 join=sync trust=10.0.0.10:8545 public-rpc=1\n",
+    )
+    .unwrap();
+    let (ok, out, _) = solo_ops(&["--inventory", &inventory, "hosts"]);
+    assert!(ok && out.lines().count() == 3, "{out}");
+    let rendered = path(&dir, "rendered");
+    let (ok, _, err) = solo_ops(&["--inventory", &inventory, "render", &rendered]);
+    assert!(ok, "{err}");
+    let env = std::fs::read_to_string(format!("{rendered}/rpc-1.env")).unwrap();
+    for line in [
+        "SOLO_ROLE=rpc",
+        "SOLO_RPC=127.0.0.1:8599",
+        "SOLO_BOOTSTRAP=\"192.0.2.20:30333\"",
+        "SOLO_JOIN=sync",
+        "SOLO_TRUST_FROM=10.0.0.10:8545",
+        "SOLO_PUBLIC_RPC=1",
+    ] {
+        assert!(env.contains(line), "{line} not in {env}");
+    }
+    let prometheus = std::fs::read_to_string(format!("{rendered}/prometheus.yml")).unwrap();
+    assert!(
+        prometheus.contains("targets: [\"10.0.0.10:8545\"]"),
+        "{prometheus}"
+    );
+    assert!(prometheus.contains("alerts.yml"));
+    let (ok, out, _) = solo_ops(&[
+        "--inventory",
+        &inventory,
+        "--dry-run",
+        "--hosts",
+        "val-a",
+        "install",
+        "--binary",
+        "solo",
+    ]);
+    assert!(ok, "{out}");
+    assert!(out.contains("+ scp -q -o BatchMode=yes"), "{out}");
+    assert!(out.contains("solo-node.service"), "{out}");
+    assert!(out.contains("install-binary"), "{out}");
+    let (ok, out, _) = solo_ops(&[
+        "--inventory",
+        &inventory,
+        "--dry-run",
+        "--role",
+        "rpc",
+        "start",
+    ]);
+    assert!(
+        ok && out.contains("SOLO_SERVICE=process bash") && out.contains(" start"),
+        "{out}"
+    );
+    let (ok, out, _) = solo_ops(&["--inventory", &inventory, "ansible-inventory"]);
+    assert!(
+        ok && out.contains("[solo_validator]\nval-a ansible_host=192.0.2.10"),
+        "{out}"
+    );
+    for (text, message) in [
+        (
+            "a validator ssh p2p\n",
+            "expected <name> <role> <ssh> <p2p> <rpc>",
+        ),
+        (
+            "a miner ssh p2p rpc\n",
+            "role miner is not validator, rpc or bootnode",
+        ),
+        (
+            "a rpc ssh p2p rpc\na rpc ssh p2p rpc\n",
+            "host a listed twice",
+        ),
+        (
+            "a rpc ssh p2p rpc colour=red\n",
+            "unknown option colour=red",
+        ),
+        ("# nothing\n", "lists no host"),
+    ] {
+        std::fs::write(&inventory, text).unwrap();
+        let (ok, _, err) = solo_ops(&["--inventory", &inventory, "hosts"]);
+        assert!(!ok && err.contains(message), "{text}: {err}");
+    }
+}
+
+/// The whole rehearsal of ops/testnet/README.md on this machine: the
+/// ceremony, deploy, a late joiner, an upgrade, a rolling restart and a
+/// short steady state. It takes minutes, so it runs only when
+/// `SOLO_REHEARSE_TESTNET` is set.
+#[test]
+fn the_testnet_rehearsal_passes_when_asked_for() {
+    if std::env::var_os("SOLO_REHEARSE_TESTNET").is_none() {
+        eprintln!("skipped: set SOLO_REHEARSE_TESTNET=1 to run tools/rehearse-testnet.sh");
+        return;
+    }
+    let dir = Scratch::new("ceremony", "rehearsal");
+    let out = std::process::Command::new(REHEARSAL)
+        .arg(dir.str())
+        .env("SOLO_BIN", env!("CARGO_BIN_EXE_solo"))
+        .env("SOAK", "20")
+        .env("LOAD", "0")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout.matches("PASS ").count(), 8, "{stdout}");
+}

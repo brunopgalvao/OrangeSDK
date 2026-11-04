@@ -1,0 +1,40 @@
+# The container alternative to solo-node.service: one node per host from the
+# image ops/Dockerfile builds, with the same layout and node.env, run by
+# solo-host as systemd would run it. On the host:
+#
+#   docker build -f ops/Dockerfile -t solo:<release> .     # or load a published image
+#   SOLO_IMAGE=solo:<release> docker compose -f compose.node.yml up -d
+#
+# /etc/solo (node.env, genesis.json, kernel.elf, keys/) is mounted read-only
+# and /var/lib/solo is the data directory, owned by SOLO_UID. Host
+# networking: the node binds the addresses node.env names (p2p public, RPC
+# private) exactly as on bare metal, and the firewall notes of README.md
+# apply unchanged.
+name: solo-node
+
+services:
+  solo:
+    image: ${SOLO_IMAGE:-solo:devnet}
+    network_mode: host
+    restart: unless-stopped
+    user: "${SOLO_UID:-10001}:${SOLO_GID:-10001}"
+    entrypoint: ["/bin/bash", "/opt/solo/bin/solo-host", "run"]
+    environment:
+      SOLO_BIN: /usr/local/bin/solo
+      SOLO_SERVICE: process
+    volumes:
+      - /etc/solo:/etc/solo:ro
+      - /var/lib/solo:/var/lib/solo
+      - /opt/solo/bin/solo-host:/opt/solo/bin/solo-host:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"

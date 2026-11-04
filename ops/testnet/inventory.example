@@ -1,0 +1,16 @@
+# An inventory for solo-ops, one host per line:
+#   <name> <role> <ssh> <p2p> <rpc> [option=value ...]
+# p2p is the public address peers dial; rpc a private address (VPC or
+# WireGuard) that only the operator's machines, Prometheus and the other
+# hosts reach. 192.0.2.0/24 and 10.0.0.0/8 below are placeholders.
+#
+# An operator lists only their own hosts; key= is the key on the operator's
+# machine that `configure` pushes (mode 0600): a validator's consensus key,
+# or an observer's node key (`solo key generate --out ...`).
+val-a     validator  solo@192.0.2.10    192.0.2.10:30333    10.0.0.10:8545  key=keys/val-a.key
+val-b     validator  solo@192.0.2.11    192.0.2.11:30333    10.0.0.11:8545  key=keys/val-b.key
+boot-1    bootnode   solo@192.0.2.20    192.0.2.20:30333    10.0.0.20:8545  key=keys/boot-1.key
+rpc-1     rpc        solo@192.0.2.30    192.0.2.30:30333    10.0.0.30:8545  key=keys/rpc-1.key history=100000
+# A node added later joins from its peers' snapshots, trusting the group key
+# the operator's own nodes report:
+#rpc-2    rpc        solo@192.0.2.31    192.0.2.31:30333    10.0.0.31:8545  join=sync trust=10.0.0.10:8545,10.0.0.11:8545

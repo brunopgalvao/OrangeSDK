@@ -1,0 +1,18 @@
+{
+  "name": "tangerine",
+  "chainId": 0,
+  "timestamp": 0,
+  "slotMs": 1000,
+  "maxTxs": 256,
+  "alloc": {},
+  "governance": "0x0000000000000000000000000000000000000000",
+  "upgradeDelay": 600,
+  "epochBlocks": 3600,
+  "staking": {
+    "epochBlocks": 3600,
+    "dkgPhaseBlocks": 300,
+    "unbondingEpochs": 6,
+    "maxKeyAge": 3
+  },
+  "fees": {"denominator": 125, "elasticity": 2, "minBaseFee": "1000000000"}
+}

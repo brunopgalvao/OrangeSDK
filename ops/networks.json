@@ -1,0 +1,4 @@
+{
+  "about": "Every network launched from a published genesis: its name (the genesis `name`, spec 20 §3.4), kind (devnet, testnet or mainnet), chain id, genesis hash (`solo genesis hash`) and launch date (UTC, the day of the genesis `timestamp`). The testnets and the mainnet of one chain share its name; the kind, the chain id and the genesis hash tell them apart. Chain ids and genesis hashes are unique across the list, as wallets need chain ids to be. crates/solo-cli/tests/ceremony.rs checks this file.",
+  "networks": []
+}

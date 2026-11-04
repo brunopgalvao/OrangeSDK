@@ -1,0 +1,58 @@
+# systemd unit of a Solo node, one per host: `solo-ops install` puts it in
+# /etc/systemd/system/solo-node.service. The node reads /etc/solo/node.env
+# through solo-host, which builds the `solo node` command line from it and
+# execs it, so systemd supervises the node process itself.
+[Unit]
+Description=Solo node
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=solo
+Group=solo
+EnvironmentFile=/etc/solo/node.env
+ExecStartPre=/opt/solo/bin/solo-host check-config
+ExecStart=/opt/solo/bin/solo-host run
+# solo_stop over the private RPC first, so the node stops between steps
+# (its stores are crash-safe either way: spec 08 §7, spec 22 §4); SIGTERM
+# after that, and at once for a node with --no-rpc-stop.
+ExecStop=/opt/solo/bin/solo-host graceful-stop
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+# Logs go to journald; cap them with SystemMaxUse= in journald.conf (see
+# ops/testnet/README.md).
+SyslogIdentifier=solo-node
+
+# Hardening. The node writes only its data directory. The interpreter it
+# runs by default allocates no executable memory; if the native backend
+# (solo-jit) is ever turned on, MemoryDenyWriteExecute must go.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/solo
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

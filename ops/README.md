@@ -6,6 +6,8 @@ What a node exports is specified in [spec 11](../spec/11-telemetry.md); a test (
 - `prometheus.yml` — a scrape configuration for one node on this machine (`127.0.0.1:8545`).
 - `grafana-solo.json` — the Solo dashboard: chain progress, kernel calls, peers, mempool, emitted metrics, kernel upgrades and feature gates.
 - `Dockerfile`, `docker-compose.yml`, `prometheus-devnet.yml`, `grafana/` — the compose stack below.
+- `testnet/` — the genesis ceremony, per-host configuration (systemd unit, container, `node.env`), the `solo-ops` and `solo-host` deploy and operate scripts and the runbook for a network of several operators on several hosts: [`testnet/README.md`](testnet/README.md); `tools/rehearse-testnet.sh` rehearses all of it on this machine.
+- `networks.json` — the registry of launched networks: name, kind, chain id, genesis hash, launch date.
 
 ## The compose stack
 
