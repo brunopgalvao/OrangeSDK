@@ -42,7 +42,7 @@ pub const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// sync runs before the RPC is up.
 pub const START_GRACE: Duration = Duration::from_mins(2);
 pub const RSS_GROWTH: u64 = 3;
-pub const RSS_SLACK: u64 = 768 * 1024;
+pub const RSS_SLACK: u64 = 384 * 1024;
 pub const FD_SLACK: u64 = 256;
 /// How long a process runs before its memory and files count as warm.
 const WARM: Duration = Duration::from_secs(90);
@@ -556,11 +556,14 @@ impl Checker {
                 continue;
             };
             if let Some(id) = q64(&p["keyId"]) {
-                // Its group key, from the handoff into it.
-                let key = id.checked_sub(1).and_then(|from| {
-                    rpc::call(&m.rpc, "solo_getRotation", &json!([tag(from)]), RPC_TIMEOUT)
-                        .ok()
-                        .and_then(|r| r["key"].as_str().map(str::to_owned))
+                // Its group key, from the handoff into it: from the newest
+                // key set before it (an epoch's run may make none).
+                let key = (id.saturating_sub(16)..id).rev().find_map(|from| {
+                    let r = rpc::call(&m.rpc, "solo_getRotation", &json!([tag(from)]), RPC_TIMEOUT)
+                        .ok()?;
+                    (q64(&r["to"]) == Some(id))
+                        .then(|| r["key"].as_str().map(str::to_owned))
+                        .flatten()
                 });
                 let mut w = self.world.lock().unwrap();
                 if key.is_some() {

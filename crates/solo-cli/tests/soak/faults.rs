@@ -204,8 +204,14 @@ impl Scheduler {
                     let o = self.observers();
                     *self.rng.pick(&o)
                 };
-                let wipe = self.rng.chance(1, 4);
-                let sync = wipe && syncable && self.rng.chance(1, 2);
+                // A validator that lost its data comes back from a snapshot
+                // newer than anything it signed: from nothing it would
+                // replay the chain and sign again in the views it signed in
+                // before (see the soak's report of 2026-11-04). An observer
+                // signs nothing and may start from either.
+                let validator = self.cluster.role(target) != Role::Observer;
+                let wipe = self.rng.chance(1, 4) && (syncable || !validator);
+                let sync = wipe && syncable && (validator || self.rng.chance(1, 2));
                 let down = self.secs(2, 20);
                 self.kill_restart(&[target], down, wipe, sync)
             }
@@ -314,7 +320,11 @@ impl Scheduler {
         let at = self.best();
         let mut ok = self.pause(down);
         if ok && wipe {
-            ok = self.wait_for(Duration::from_mins(2), |s| s.best() >= at + 10);
+            // Until a snapshot of an epoch that ended after the kill is
+            // served (spec 22 §7.4: exported once a certificate covers it).
+            let epoch = self.cluster.shape.epoch_blocks;
+            let after = (at / epoch + 1) * epoch + epoch / 2;
+            ok = self.wait_for(Duration::from_mins(3), |s| s.best() >= after.max(at + 10));
         }
         for &t in targets {
             if !self.cluster.running(t) {
@@ -620,17 +630,22 @@ impl Scheduler {
     /// Whether every live node has finalized within `slack` blocks of the
     /// furthest, and the furthest is at least `at_least`.
     pub fn caught_up(&self, slack: u64, at_least: u64) -> bool {
-        let rpcs: Vec<String> = {
+        let rpcs: Vec<(String, bool)> = {
             let w = self.world.lock().unwrap();
             w.members
                 .iter()
                 .filter(|m| !m.retired && m.pid.is_some())
-                .map(|m| m.rpc.clone())
+                .map(|m| (m.rpc.clone(), m.syncs))
                 .collect()
         };
         let mut heights = Vec::new();
-        for r in rpcs {
+        for (r, syncs) in rpcs {
             let Ok(body) = rpc::get(&r, "/status", Duration::from_secs(10)) else {
+                // A node syncing its state serves no RPC until it has it;
+                // the checker bounds how long that takes.
+                if syncs {
+                    continue;
+                }
                 return false;
             };
             let Ok(doc) = serde_json::from_str::<serde_json::Value>(&body) else {

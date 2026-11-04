@@ -367,7 +367,20 @@ impl Cluster {
             return true;
         };
         p.expected_exit = true;
-        let _ = rpc::call(&rpc_addr, "solo_stop", &json!([]), Duration::from_secs(10));
+        if let Err(rpc::Fail::Transport(_)) =
+            rpc::call(&rpc_addr, "solo_stop", &json!([]), Duration::from_secs(10))
+        {
+            // No RPC yet (a state sync runs before it is up): nothing to
+            // ask, so it is killed.
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut w = self.world.lock().unwrap();
+            w.members[id].pid = None;
+            w.log(format!(
+                "killed {label}: it served no RPC to stop it through"
+            ));
+            return true;
+        }
         let deadline = Instant::now() + Duration::from_mins(1);
         let mut stopped = None;
         while Instant::now() < deadline {
@@ -459,7 +472,8 @@ impl Cluster {
                 // spec 22 §7.2 says it must; the operator retries with a
                 // newer key, and so does the soak, a few times.
                 let stale = w.members[id].syncs
-                    && this_run.contains("does not verify under the node's trust")
+                    && (this_run.contains("does not verify under the node's trust")
+                        || this_run.contains("the trusted key does not verify"))
                     && this_run
                         .trim_end()
                         .ends_with("no peer to sync from in time");

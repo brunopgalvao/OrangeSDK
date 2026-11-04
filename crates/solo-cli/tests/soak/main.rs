@@ -10,8 +10,10 @@
 //! be cut and slowed. A load generator (`load.rs`) sends value transfers
 //! and calls to a counter contract to random live nodes. The scheduler
 //! (`faults.rs`) draws from the seed: kill -9 and restart, with the data
-//! directory kept or wiped, and a wiped node either catching up from its
-//! peers' blocks or syncing state from their snapshots (`--sync-from-peers`);
+//! directory kept or wiped (a wiped observer catches up from its peers'
+//! blocks or syncs state from their snapshots, `--sync-from-peers`; a wiped
+//! validator always syncs, from a snapshot newer than its kill, since from
+//! nothing it would sign again in views it signed in);
 //! graceful restarts through `solo_stop`; one node isolated; partitions,
 //! with and without a quorum; slow links; SIGSTOP; more validators down
 //! than the network tolerates; flapping links; fresh observers joining
@@ -41,7 +43,8 @@
 //! (4 to 7; the long run's default comes from the seed),
 //! `SOLO_SOAK_STANDBYS`, `SOLO_SOAK_OBSERVERS`, `SOLO_SOAK_EPOCH` (blocks),
 //! `SOLO_SOAK_REPORT` (where a failure's report goes; default the system
-//! temp dir), `SOLO_SOAK_KEEP` (keep the nodes' directories) and `SOLO_BIN` (the `solo` binary; default the one Cargo
+//! temp dir), `SOLO_SOAK_KEEP` (keep the nodes' directories),
+//! `SOLO_SOAK_KEEP_FAILED` (keep them when the run fails) and `SOLO_BIN` (the `solo` binary; default the one Cargo
 //! built for this test).
 
 mod check;
@@ -276,15 +279,13 @@ fn soak(config: &Config) {
         sched.heal_all();
         final_checks(&mut sched, &run);
     }
-    world.lock().unwrap().log("stopping every node");
-    sched.cluster.shutdown();
-    {
-        let mut w = world.lock().unwrap();
-        w.done = true;
-    }
+    // The checker and the load stop first: nodes going down are no fault.
+    world.lock().unwrap().done = true;
     for t in run.threads.drain(..) {
         let _ = t.join();
     }
+    world.lock().unwrap().log("stopping every node");
+    sched.cluster.shutdown();
     for (label, path) in &logs {
         let log = fs::read_to_string(path).unwrap_or_default();
         if let Some(line) = log.lines().find(|l| l.contains("panicked")) {
@@ -297,7 +298,9 @@ fn soak(config: &Config) {
     let report = summary(config, &run, &sched, started.elapsed());
     eprintln!("{report}");
     let violations = world.lock().unwrap().violations.clone();
-    if std::env::var_os("SOLO_SOAK_KEEP").is_some() {
+    if std::env::var_os("SOLO_SOAK_KEEP").is_some()
+        || (!violations.is_empty() && std::env::var_os("SOLO_SOAK_KEEP_FAILED").is_some())
+    {
         eprintln!("soak: SOLO_SOAK_KEEP is set; {} stays", root.display());
         std::mem::forget(scratch);
     }
