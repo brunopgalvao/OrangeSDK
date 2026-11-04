@@ -982,15 +982,12 @@ impl Snapshot {
             };
             candidates.push((height, bytes, certificate, trie, proposal));
         }
-        let latest = candidates
-            .last()
-            .map(|(_, _, certificate, _, _)| trust_class(certificate))
-            .ok_or_else(|| {
-                SnapshotError::Export(format!(
-                    "no certified proposal anchors a kept height above block {}",
-                    record.height
-                ))
-            })?;
+        if candidates.is_empty() {
+            return Err(SnapshotError::Export(format!(
+                "no certified proposal anchors a kept height above block {}",
+                record.height
+            )));
+        }
         // The newest threshold certificate's key set; on a chain with a
         // threshold key a vote certificate vouches for nothing a verifier
         // accepts (spec 22 §7.2, check 3), and the newest blocks often have
@@ -1007,7 +1004,7 @@ impl Snapshot {
                     record.height
                 )));
             }
-            None => latest,
+            None => None,
         };
         let (height, bytes, certificate, trie, _) = candidates
             .into_iter()
