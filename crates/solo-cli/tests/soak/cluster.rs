@@ -368,6 +368,8 @@ impl Cluster {
             return true;
         };
         p.expected_exit = true;
+        // Going down from now on: the checker no longer expects answers.
+        self.world.lock().unwrap().members[id].pid = None;
         if let Err(rpc::Fail::Transport(_)) =
             rpc::call(&rpc_addr, "solo_stop", &json!([]), Duration::from_secs(10))
         {
