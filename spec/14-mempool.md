@@ -62,7 +62,7 @@ These checks are the account-dependent part of the kernel's validation, so the k
 
 ## 6. Gossip
 
-A transaction is sent to peers (09 §4) when it first becomes pending, at admission or when a block or a later transaction fills the gap before it. Queued transactions stay on the node that received them: a peer would hold them as queued too, and an attacker could otherwise fill every pool with transactions that never run. A transaction is sent once.
+A transaction is sent to peers (09 §4) when it first becomes pending, at admission or when a block or a later transaction fills the gap before it. Queued transactions stay on the node that received them: a peer would hold them as queued too, and an attacker could otherwise fill every pool with transactions that never run. A transaction is sent once to each peer connected at that moment, and to a peer that connects later with the rest of the pending transactions (09 §4).
 
 ## 7. RPC
 

@@ -128,8 +128,8 @@ fn a_node_resumes_from_its_store_with_the_same_state_history_and_proofs() {
     assert_eq!(again.state().base().history_keys(), history);
     // Its status reports the height it took up, before the driver starts
     // and before it finalizes anything new.
-    let status = again.status().unwrap();
-    assert_eq!((status.head, status.finalized), (head, head));
+    let reported = again.status().unwrap();
+    assert_eq!((reported.head, reported.finalized), (head, head));
     again.start(resumed).unwrap();
     assert!(again.executed.is_empty(), "{:?}", again.executed);
     assert_eq!(again.finalized_height().unwrap(), head);

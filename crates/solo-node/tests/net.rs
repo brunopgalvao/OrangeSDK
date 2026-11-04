@@ -1058,3 +1058,80 @@ fn a_hello_of_another_genesis_is_heard_though_its_peer_closes_at_once() {
     };
     assert_eq!(why, "a peer is on a chain with another genesis block");
 }
+
+/// A transaction a node accepted while it had no peer reaches the peers it
+/// connects to later (spec 09 §4): sent when it became pending, it went to
+/// nobody, and an observer, which never proposes, would hold it for ever.
+/// Found by the soak test (`crates/solo-cli/tests/soak`) isolating an
+/// observer that had accepted transactions.
+#[test]
+fn a_transaction_accepted_without_peers_reaches_the_peers_that_connect_later() {
+    let keys = keys(1);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys);
+    let start = Instant::now();
+    let epoch = 1_000_000;
+    let open = |key: Option<SigningKey>| {
+        let mut node = Node::open(
+            &kernel,
+            &genesis,
+            NodeConfig {
+                now_ms: epoch,
+                key,
+                ..NodeConfig::default()
+            },
+        )
+        .unwrap();
+        node.start(None).unwrap();
+        node
+    };
+    let validator = open(Some(keys[0].clone()));
+    let genesis_hash = validator.genesis_hash();
+    let listening = Transport::bind(
+        "127.0.0.1:0",
+        keys[0].clone(),
+        CHAIN_ID,
+        genesis_hash,
+        vec![],
+    )
+    .unwrap();
+    let dial = vec![listening.local_addr().unwrap()];
+    let mut observer = open(None);
+    let to = address(&keys[0]);
+    // Submitted before the observer's transport ever ran: no peer yet.
+    let tx_hash = observer.submit(&transfer(&keys[0], to, 5)).unwrap();
+    let alone = Transport::bind(
+        "127.0.0.1:0",
+        fresh_key().unwrap(),
+        CHAIN_ID,
+        genesis_hash,
+        dial,
+    )
+    .unwrap();
+    let mut nodes = vec![validator, observer];
+    let mut transports = vec![listening, alone];
+    let landed = pump(
+        &mut nodes,
+        &mut transports,
+        start,
+        epoch,
+        Duration::from_mins(2),
+        |nodes, _| nodes[0].receipt(&tx_hash).unwrap().is_some(),
+    );
+    assert!(
+        landed,
+        "the validator finalized {} blocks without the observer's transaction",
+        nodes[0].finalized.len()
+    );
+    // And a peer already holding it is not sent it again in a loop: both
+    // pools are empty once the block carried it.
+    let drained = pump(
+        &mut nodes,
+        &mut transports,
+        start,
+        epoch,
+        Duration::from_mins(1),
+        |nodes, _| nodes.iter().all(|n| n.mempool().is_empty()),
+    );
+    assert!(drained);
+}
