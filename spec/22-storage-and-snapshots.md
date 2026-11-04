@@ -137,7 +137,7 @@ struct Entry { key: bytes, value: bytes }
 
 ## 8. Bounds and telemetry
 
-The window of spec 20 §5.1 bounds the store: after each seal the host prunes the versions below the oldest the window keeps, deleting their history rows and giving their roots back (§3.2), so the file holds the current state, the nodes the kept roots reach and the history of the window; with `--archive` nothing is pruned. The file does not shrink when rows are deleted: the engine reuses freed pages, and when a file opens with more freed bytes than live ones plus 8 MiB the host compacts it, giving the space back.
+The window of spec 20 §5.1 bounds the store: after each seal the host prunes the versions below the oldest the window keeps, deleting their history rows and giving their roots back (§3.2), so the file holds the current state, the nodes the kept roots reach and the history of the window; with `--archive` nothing is pruned. The file does not shrink when rows are deleted: the engine reuses freed pages, and when a file opens with more freed bytes than live ones plus 8 MiB the host compacts it, giving the space back. The engine's page cache is bounded at `CACHE_BYTES` (64 MiB) per store: the engine caches the pages a commit writes as well as those it reads, and at its own default of 1 GiB a node's memory grows with every block it writes until it holds a gigabyte, most of it pages written once and never read again.
 
 ### 8.1 Retention of the driver's tables
 
