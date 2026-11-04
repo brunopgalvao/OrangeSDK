@@ -747,6 +747,68 @@ fn frames_after_the_hellos_are_sealed() {
 }
 
 /// Polls `t` until its handshaken peers are `want`: whether they got there.
+/// Two validators that both dial each other hold two connections and are
+/// one peer to each other: the peer count counts peers, not connections.
+#[test]
+fn a_peer_connected_twice_counts_once() {
+    let keys = keys(2);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys);
+    let mut nodes: Vec<Node> = keys
+        .iter()
+        .map(|key| {
+            let mut node = Node::open(
+                &kernel,
+                &genesis,
+                NodeConfig {
+                    key: Some(key.clone()),
+                    ..NodeConfig::default()
+                },
+            )
+            .unwrap();
+            node.start(None).unwrap();
+            node
+        })
+        .collect();
+    let listeners: Vec<std::net::TcpListener> = (0..2)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let addrs: Vec<String> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().to_string())
+        .collect();
+    drop(listeners);
+    let mut transports: Vec<Transport> = (0..2)
+        .map(|i| {
+            let other = addrs[1 - i].parse().unwrap();
+            let genesis = nodes[i].genesis_hash();
+            Transport::bind(&addrs[i], keys[i].clone(), CHAIN_ID, genesis, vec![other]).unwrap()
+        })
+        .collect();
+    let mut both = false;
+    for _ in 0..500 {
+        for (t, n) in transports.iter_mut().zip(nodes.iter_mut()) {
+            t.poll(n, 0).unwrap();
+        }
+        if transports.iter().all(|t| t.connected().len() == 2) {
+            both = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        both,
+        "{:?}",
+        transports
+            .iter()
+            .map(|t| t.connected().len())
+            .collect::<Vec<_>>()
+    );
+    for n in &mut nodes {
+        assert_eq!(n.status().unwrap().peers, 1);
+    }
+}
+
 fn connected_as(t: &mut Transport, n: &mut Node, want: &[[u8; 32]]) -> bool {
     for _ in 0..200 {
         if t.connected() == want {

@@ -1274,8 +1274,12 @@ impl Transport {
         self.reap(now_ms);
         self.persist(now_ms);
         self.refresh_validators(node, now_ms);
-        node.telemetry
-            .p2p(self.connected().len(), &mut self.traffic);
+        // Peers, not connections: two nodes that both dial each other hold
+        // two connections (spec 09 §5) and are one peer to each other.
+        let mut peers = self.connected();
+        peers.sort_unstable();
+        peers.dedup();
+        node.telemetry.p2p(peers.len(), &mut self.traffic);
         Ok(())
     }
 }

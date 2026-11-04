@@ -701,6 +701,20 @@ fn effects_injected_by_hand() {
         None
     );
     assert_eq!(node.metrics.last(), Some(&(b"m".to_vec(), 3)));
+    // Only the latest emissions are kept: a node that kept them all grew
+    // with every step for as long as it ran.
+    assert_eq!(node.metric_history, solo_node::METRIC_HISTORY);
+    node.metric_history = 2;
+    for value in 0..10 {
+        node.apply_effect(Effect::Metric {
+            name: b"n".to_vec(),
+            value,
+        })
+        .unwrap();
+        assert!(node.metrics.len() <= 4, "{}", node.metrics.len());
+    }
+    assert!(node.metrics.len() >= 2);
+    assert_eq!(node.metrics.last(), Some(&(b"n".to_vec(), 9)));
     assert_eq!(
         node.apply_effect(Effect::SetTimer {
             timer_id: propose_timer(1),

@@ -96,6 +96,13 @@ pub const BLOCK_KERNEL_GAS: i64 = 1 << 35;
 /// [`HISTORY_KEYS_PER_BLOCK`] keys each on average.
 pub const STATE_HISTORY: usize = 1024;
 
+/// How many of the driver's latest metric emissions [`Node::metrics`]
+/// keeps: between this many and twice as many. The telemetry holds every
+/// value the node exports (spec 11); the list is for tests and tools that
+/// look at recent emissions, and a node that kept every one grew by every
+/// step it ran, tens of kilobytes a block, for as long as it ran.
+pub const METRIC_HISTORY: usize = 16_384;
+
 /// A [`NodeConfig::state_history`] that keeps the state of every block,
 /// however many keys they write.
 pub const ARCHIVE: usize = usize::MAX;
@@ -216,8 +223,12 @@ pub struct Node {
     pub executed: Vec<(u64, [u8; 32])>,
     /// Heights finalized, in order.
     pub finalized: Vec<u64>,
-    /// Metrics the driver emitted.
+    /// Metrics the driver emitted, in order: the latest `metric_history`
+    /// at least, older ones dropped.
     pub metrics: Vec<(Vec<u8>, i64)>,
+    /// How many of the latest metric emissions `metrics` keeps, at least
+    /// (up to twice as many); [`METRIC_HISTORY`] unless changed.
+    pub metric_history: usize,
     /// The last state the driver asked to persist.
     pub persisted_driver_state: Option<Vec<u8>>,
     /// Gas budget for each kernel call; see [`KERNEL_GAS`].
@@ -325,6 +336,7 @@ impl Node {
             executed: Vec::new(),
             finalized: Vec::new(),
             metrics: Vec::new(),
+            metric_history: METRIC_HISTORY,
             persisted_driver_state: None,
             kernel_gas: KERNEL_GAS,
             query_gas: config.query_gas,
@@ -1027,6 +1039,9 @@ impl Node {
             }
             Effect::Metric { name, value } => {
                 self.telemetry.driver_metric(&name, value);
+                if self.metrics.len() >= 2 * self.metric_history.max(1) {
+                    self.metrics.drain(..self.metric_history.max(1));
+                }
                 self.metrics.push((name, value));
                 None
             }
