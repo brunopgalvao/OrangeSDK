@@ -551,6 +551,16 @@ fn every_ceremony_mistake_is_named() {
         ceremony::assemble(&json!([]), &[], "1", &[]),
         Err("template: not a JSON object".to_owned())
     );
+    // A template without an allocation gets one.
+    assert_eq!(
+        ceremony::assemble(&json!({"chainId": 1}), &[], "1", &[]).unwrap()["alloc"],
+        json!({})
+    );
+    assert!(
+        ceremony::genesis_hash(b"not a kernel", r#"{"chainId": 1}"#)
+            .unwrap_err()
+            .starts_with("the kernel refuses this genesis: "),
+    );
     assert_eq!(
         ceremony::bootnodes(&json!({"bootnodes": ["0.0.0.0:1"]})),
         Err("genesis: bootnodes must be a list of ip:port addresses peers can dial".to_owned())
