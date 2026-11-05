@@ -43,6 +43,12 @@ fn encodings() {
     assert_eq!(parse_hex("0xzz").unwrap_err().message, "bad hex digit");
     assert_eq!(parse_hex("0xé").unwrap_err().message, "bad hex digit");
     assert_eq!(parse_hex("0xaé0").unwrap_err().message, "bad hex digit");
+    // A sign is not a digit, though Rust's integer parsing takes a leading `+`.
+    assert_eq!(parse_hex("0x+f").unwrap_err().message, "bad hex digit");
+    assert_eq!(parse_hex("0x+f+f").unwrap_err().message, "bad hex digit");
+    assert_eq!(parse_quantity("0x+1").unwrap_err().message, "bad quantity");
+    assert_eq!(parse_big("0x+10").unwrap_err().message, "bad quantity");
+    assert_eq!(parse_word("0x+1").unwrap_err().message, "bad hex digit");
     assert_eq!(parse_quantity("0x10").unwrap(), 16);
     assert_eq!(parse_quantity("10").unwrap_err().code, -32602);
     assert_eq!(parse_quantity("0xg").unwrap_err().message, "bad quantity");

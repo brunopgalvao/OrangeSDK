@@ -37,7 +37,8 @@ pub fn data(bytes: &[u8]) -> String {
 /// Decodes `0x` hex into bytes.
 ///
 /// # Errors
-/// Invalid params if the prefix is missing, the length is odd or a digit is not hex.
+/// Invalid params if the prefix is missing, the length is odd or a digit is
+/// not hex (a sign included, which integer parsing would take).
 pub fn parse_hex(s: &str) -> Result<Vec<u8>, RpcError> {
     let hex = s
         .strip_prefix("0x")
@@ -47,15 +48,18 @@ pub fn parse_hex(s: &str) -> Result<Vec<u8>, RpcError> {
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
     for i in (0..hex.len()).step_by(2) {
-        let Some(digits) = hex.get(i..i + 2) else {
-            return Err(RpcError::invalid_params("bad hex digit"));
-        };
-        let Ok(byte) = u8::from_str_radix(digits, 16) else {
+        let byte = hex.get(i..i + 2).filter(|d| all_hex(d));
+        let Some(byte) = byte.and_then(|d| u8::from_str_radix(d, 16).ok()) else {
             return Err(RpcError::invalid_params("bad hex digit"));
         };
         out.push(byte);
     }
     Ok(out)
+}
+
+/// Whether every character of `digits` is a hex digit: no sign, no space.
+fn all_hex(digits: &str) -> bool {
+    digits.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Decodes exactly `n` bytes of `0x` hex.
@@ -105,12 +109,13 @@ pub fn parse_word(s: &str) -> Result<[u8; 32], RpcError> {
 /// Decodes a `0x` hex quantity of at most 128 bits.
 ///
 /// # Errors
-/// Invalid params if the prefix is missing or the number does not fit.
+/// Invalid params if the prefix is missing, a digit is not hex (a sign
+/// included) or the number does not fit.
 pub fn parse_big(s: &str) -> Result<u128, RpcError> {
     let hex = s
         .strip_prefix("0x")
         .ok_or_else(|| RpcError::invalid_params("expected 0x-prefixed quantity"))?;
-    let Ok(n) = u128::from_str_radix(hex, 16) else {
+    let Some(Ok(n)) = all_hex(hex).then(|| u128::from_str_radix(hex, 16)) else {
         return Err(RpcError::invalid_params("bad quantity"));
     };
     Ok(n)
