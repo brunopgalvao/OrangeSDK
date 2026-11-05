@@ -1018,6 +1018,56 @@ fn undecodable_transactions_show_as_blank() {
     assert_eq!(block["transactions"], json!([tx]));
 }
 
+/// A filter object names at most `MAX_FILTER_ADDRESSES` addresses and
+/// `MAX_SUB_TOPICS` alternatives per topic position (spec 20 §8.6), so that
+/// the filters a client installs hold little.
+#[test]
+fn a_filter_object_is_bounded() {
+    use orange_rpc::filter::{MAX_FILTER_ADDRESSES, MAX_SUB_TOPICS};
+    let alice = Wallet::new(1);
+    let mut rpc = Rpc::new(node_funding(&[&alice]));
+    let addresses = |n: usize| vec![data(&[7; 20]); n];
+    let topics = |n: usize| vec![data(&[7; 32]); n];
+    ok(
+        &mut rpc,
+        "eth_getLogs",
+        json!([{ "address": addresses(MAX_FILTER_ADDRESSES) }]),
+    );
+    ok(
+        &mut rpc,
+        "eth_getLogs",
+        json!([{ "topics": [null, topics(MAX_SUB_TOPICS)] }]),
+    );
+    for (method, params, why) in [
+        (
+            "eth_getLogs",
+            json!([{ "address": addresses(MAX_FILTER_ADDRESSES + 1) }]),
+            "exceed max addresses",
+        ),
+        (
+            "eth_newFilter",
+            json!([{ "address": addresses(MAX_FILTER_ADDRESSES + 1) }]),
+            "exceed max addresses",
+        ),
+        (
+            "eth_getLogs",
+            json!([{ "topics": [null, topics(MAX_SUB_TOPICS + 1)] }]),
+            "exceed max topics",
+        ),
+        (
+            "eth_newFilter",
+            json!([{ "topics": [topics(MAX_SUB_TOPICS + 1)] }]),
+            "exceed max topics",
+        ),
+    ] {
+        assert_eq!(
+            err(&mut rpc, method, params),
+            (-32602, why.into()),
+            "{method}"
+        );
+    }
+}
+
 #[test]
 fn log_filter_errors_and_range_limit() {
     let alice = Wallet::new(1);
