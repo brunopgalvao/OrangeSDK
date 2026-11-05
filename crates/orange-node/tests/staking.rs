@@ -12,8 +12,8 @@ use orange_abi::chain::consensus::{
     KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE, TOPIC, leader, signing_preimage,
 };
 use orange_abi::chain::{
-    Allocation, BlockHeader, Certificate, ConsensusMessage, GenesisParams, Proposal, Signature,
-    SyncResponse, Validator, ValidatorSet, reason,
+    Allocation, BlockHeader, Certificate, ConsensusMessage, Evidence, GenesisParams, Proposal,
+    Signature, SyncResponse, Validator, ValidatorSet, reason,
 };
 use orange_abi::codec::Seq;
 use orange_abi::rotation::{
@@ -781,11 +781,7 @@ fn an_equivocator_is_slashed_once_and_excluded() {
     assert_eq!(record_of(&mut sim.nodes[0], &keys[4]).delegated, delegated);
     let ahead = sim.nodes[0].simplex_state().unwrap().view + 40;
     // Three offences: two block votes in each of two views, and two finalize votes.
-    for (kind, view, hashes) in [
-        (KIND_VOTE, ahead, [[1; 32], [2; 32]]),
-        (KIND_VOTE, ahead + 1, [[1; 32], [2; 32]]),
-        (KIND_FINALIZE, ahead, [[3; 32], [4; 32]]),
-    ] {
+    let offend = |sim: &mut Sim, (kind, view, hashes): (u8, u64, [[u8; 32]; 2])| {
         for hash in hashes {
             let signature = signed(&keys[4], kind, view, hash);
             let m = if kind == KIND_VOTE {
@@ -805,16 +801,33 @@ fn an_equivocator_is_slashed_once_and_excluded() {
                 .deliver(byzantine, TOPIC, m.to_bytes())
                 .unwrap();
         }
+    };
+    let offences = [
+        (KIND_VOTE, ahead, [[1; 32], [2; 32]]),
+        (KIND_VOTE, ahead + 1, [[1; 32], [2; 32]]),
+        (KIND_FINALIZE, ahead, [[3; 32], [4; 32]]),
+    ];
+    // While the first is pending the others add nothing: node 0 keeps one
+    // record per offender (spec 08 §9).
+    for offence in offences {
+        offend(&mut sim, offence);
     }
+    let pending = |node: &Node| {
+        node.persisted()
+            .get(b"simplex/evidence".as_slice())
+            .map(|b| Seq::<Evidence>::from_bytes(b).unwrap().0)
+            .unwrap_or_default()
+    };
+    assert_eq!(pending(&sim.nodes[0]).len(), 1);
     let zero_before = balance(&mut sim.nodes[0], [0; 20]);
     let recorded = sim
         .run_until(40 * SLOT_MS, |s| {
-            (0..4).all(|i| s.nodes[i].evidence(0).unwrap().len() == 3)
+            (0..4).all(|i| s.nodes[i].evidence(0).unwrap().len() == 1)
         })
         .unwrap();
     assert!(recorded);
-    // One slash for all three offences: a tenth of the stake burned, the
-    // delegation's tenth with it, and the validator jailed.
+    // One slash: a tenth of the stake burned, the delegation's tenth with
+    // it, and the validator jailed.
     let r = record_of(&mut sim.nodes[1], &keys[4]);
     assert!(r.jailed);
     assert_eq!(r.stake, u128::from(STAKE) * GWEI * 9 / 10);
@@ -887,6 +900,26 @@ fn an_equivocator_is_slashed_once_and_excluded() {
     }
     assert_eq!(balance(&mut sim.nodes[1], address(&keys[4])), before[4]);
     assert_eq!(status(&mut sim.nodes[1]).pool, pool - 4 * share);
+    // Jailed, it can sign whatever it likes: nobody keeps a record that
+    // could punish it no more, and the chain records nothing else.
+    for (kind, view, _) in offences {
+        offend(&mut sim, (kind, view, [[7; 32], [8; 32]]));
+    }
+    assert!(pending(&sim.nodes[0]).is_empty());
+    let metrics = |node: &Node| {
+        node.metrics
+            .iter()
+            .filter(|(name, _)| name == b"equivocations")
+            .count()
+    };
+    assert_eq!(metrics(&sim.nodes[0]), 1);
+    let height = sim.nodes[0].finalized_height().unwrap();
+    assert!(
+        sim.run_until(20 * SLOT_MS, |s| s.nodes[0].finalized_height().unwrap()
+            >= height + 2)
+            .unwrap()
+    );
+    assert_eq!(sim.nodes[0].evidence(0).unwrap().len(), 1);
 }
 
 /// Waits until every live node in `nodes` has adopted a key set with id `id`.

@@ -35,7 +35,8 @@ const STATE_KEY: &[u8] = b"simplex/state";
 const ENTRY_KEY: &[u8] = b"simplex/entry";
 /// The certificate that made the current tip the tip.
 const TIP_KEY: &[u8] = b"simplex/tip";
-/// Evidence found here that chain state does not hold yet.
+/// Evidence found here that can still punish its offender, at most one
+/// record per offender (spec 08 §9).
 const PENDING_EVIDENCE_KEY: &[u8] = b"simplex/evidence";
 /// Messages for views of the epoch after this node's, each the delivering
 /// peer and the signer followed by the payload.
@@ -669,7 +670,7 @@ impl Ctx {
         // A suffix proposal carries nothing: it only finalizes the epoch's last block.
         if !self.is_suffix(&proposal) {
             proposal.txs = Seq(self.select(txs));
-            proposal.evidence = Self::pending_evidence();
+            proposal.evidence = self.pending_evidence();
             proposal.dkg = dkg::for_proposal();
             (proposal.anchor_height, proposal.anchor_root) = anchor();
         }
@@ -721,19 +722,33 @@ impl Ctx {
         selected
     }
 
-    /// Evidence this node found that chain state does not record yet, as
-    /// much as one proposal carries.
-    fn pending_evidence() -> Seq<Evidence> {
+    /// Evidence this node found that can still punish its offender, as much
+    /// as one proposal carries.
+    fn pending_evidence(&self) -> Seq<Evidence> {
         let mut pending: Seq<Evidence> = persist::get(PENDING_EVIDENCE_KEY).unwrap_or_default();
         let before = pending.0.len();
         pending
             .0
-            .retain(|e| state::get_raw(&key(keys::EVIDENCE_SEEN, &[&e.id()])).is_none());
+            .retain(|e| self.offender(e).is_some_and(|id| Self::punishes(e, &id)));
         if pending.0.len() != before {
             persist::set(PENDING_EVIDENCE_KEY, &pending);
         }
         pending.0.truncate(MAX_EVIDENCE);
         pending
+    }
+
+    /// The validator id `evidence` names, in the set of its view's epoch.
+    fn offender(&self, evidence: &Evidence) -> Option<Hash> {
+        self.set_for(evidence.view)?
+            .get(evidence.validator as usize)
+            .map(|v| v.0)
+    }
+
+    /// Whether recording `evidence` against `offender` would still punish
+    /// it: chain state holds neither its offence nor the offender jailed.
+    fn punishes(evidence: &Evidence, offender: &Hash) -> bool {
+        state::get_raw(&key(keys::EVIDENCE_SEEN, &[&evidence.id()])).is_none()
+            && !staking::record(offender).is_some_and(|r| r.jailed)
     }
 
     fn on_message(&mut self, m: ConsensusMessage) {
@@ -1209,13 +1224,20 @@ impl Ctx {
         if first.hash == signed.hash {
             return;
         }
+        // One pending record per offender, and only while it can punish: an
+        // offender is punished once, so a validator signing conflicting
+        // messages for many views would otherwise queue them all ahead of
+        // the evidence against others.
         let evidence = Evidence::new(kind, view, validator, first, signed);
-        let ek = key(b"evidence/", &[&evidence.id()]);
-        if persist::get_raw(&ek).is_some() {
+        let mut pending: Seq<Evidence> = persist::get(PENDING_EVIDENCE_KEY).unwrap_or_default();
+        let Some(offender) = self.offender(&evidence) else {
+            return;
+        };
+        if !Self::punishes(&evidence, &offender)
+            || pending.0.iter().any(|e| self.offender(e) == Some(offender))
+        {
             return;
         }
-        persist::set(&ek, &evidence);
-        let mut pending: Seq<Evidence> = persist::get(PENDING_EVIDENCE_KEY).unwrap_or_default();
         pending.0.push(evidence);
         persist::set(PENDING_EVIDENCE_KEY, &pending);
         self.effects.push(Effect::Metric {

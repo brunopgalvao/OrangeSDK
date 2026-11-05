@@ -118,7 +118,7 @@ Recording a new equivocation offence (08 §9) is the slashing hook. In the same 
 
 An offender whose record was pruned (§3.5) holds nothing to burn; its record is created again, jailed, empty and outside the registration order, with its address entry, so it can never register again.
 
-An offence is recorded once (08 §9), so one offence is never punished twice, and a validator is punished for at most one offence whatever else it signs. Slashing removes it from the next set, not from the current one. Unbonding stake is slashable until it is withdrawn, so unbonding does not escape an offence recorded before the withdrawal.
+An offence is recorded once (08 §9), so one offence is never punished twice, and a validator is punished for at most one offence whatever else it signs. Nodes therefore keep at most one pending equivocation record per offender, and none against a jailed one (08 §9). Slashing removes it from the next set, not from the current one. Unbonding stake is slashable until it is withdrawn, so unbonding does not escape an offence recorded before the withdrawal.
 
 ### 5.1 Threshold misbehaviour
 

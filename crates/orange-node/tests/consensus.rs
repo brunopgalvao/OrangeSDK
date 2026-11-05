@@ -952,8 +952,15 @@ fn equivocations_are_detected_and_recorded_on_chain() {
             .deliver(byzantine, TOPIC, vote(&keys[3], ahead, hash))
             .unwrap();
     }
-    // Two finalize votes for different hashes in one view.
+    // Two finalize votes for different hashes in one view, from validator 2.
     for hash in [[1; 32], [3; 32]] {
+        sim.nodes[0]
+            .deliver(byzantine, TOPIC, finalize(&keys[2], ahead, hash))
+            .unwrap();
+    }
+    // A second offence of validator 3 while one is pending adds nothing: one
+    // record is all its punishment needs (spec 08 §9).
+    for hash in [[4; 32], [5; 32]] {
         sim.nodes[0]
             .deliver(byzantine, TOPIC, finalize(&keys[3], ahead, hash))
             .unwrap();
@@ -991,14 +998,10 @@ fn equivocations_are_detected_and_recorded_on_chain() {
         );
         assert_eq!(penalties.len(), 2 - i);
     }
-    // Both signed messages are kept node-locally.
-    let stored: Vec<Evidence> = sim.nodes[0]
-        .persisted()
-        .iter()
-        .filter(|(k, _)| k.starts_with(b"evidence/"))
-        .map(|(_, v)| Evidence::from_bytes(v).unwrap())
-        .collect();
-    assert_eq!(stored.len(), 2);
+    // Both signed messages are kept node-locally, one record per offender.
+    let stored = pending_evidence(&sim.nodes[0]);
+    let offenders: Vec<(u8, u32)> = stored.iter().map(|e| (e.kind, e.validator)).collect();
+    assert_eq!(offenders, vec![(KIND_VOTE, 3), (KIND_FINALIZE, 2)]);
     assert!(stored.iter().all(Evidence::well_formed));
     // Leaders put the evidence in their proposals, and executing them records it in chain
     // state, where every node can query it.
@@ -1012,7 +1015,11 @@ fn equivocations_are_detected_and_recorded_on_chain() {
     let mut kinds: Vec<u8> = on_chain.iter().map(|e| e.kind).collect();
     kinds.sort_unstable();
     assert_eq!(kinds, vec![KIND_PROPOSE, KIND_VOTE, KIND_FINALIZE]);
-    assert!(on_chain.iter().all(|e| e.validator == 3));
+    assert!(
+        on_chain
+            .iter()
+            .all(|e| e.validator == if e.kind == KIND_FINALIZE { 2 } else { 3 })
+    );
     for e in &stored {
         assert!(on_chain.contains(e));
     }
@@ -1071,9 +1078,9 @@ fn equivocations_inside_certificates_are_detected() {
     node.deliver(byzantine, TOPIC, message.to_bytes()).unwrap();
     assert_eq!(equivocations(node), 1);
     assert_eq!(node.simplex_state().unwrap().view, 1);
-    // Validator 3 finalizes one hash in view 1, then signs the finalize certificate of
+    // Validator 2 finalizes one hash in view 1, then signs the finalize certificate of
     // the block a sync response delivers.
-    node.deliver(byzantine, TOPIC, finalize(&keys[3], 1, [9; 32]))
+    node.deliver(byzantine, TOPIC, finalize(&keys[2], 1, [9; 32]))
         .unwrap();
     let block = Proposal {
         view: 1,
@@ -1116,17 +1123,69 @@ fn equivocations_inside_certificates_are_detected() {
         .unwrap();
     assert_eq!(equivocations(node), 2);
     assert_eq!(node.simplex_state().unwrap().finalized_height, 1);
-    let mut kinds: Vec<(u8, u64)> = node
-        .persisted()
+    let mut kinds: Vec<(u8, u64, u32)> = pending_evidence(node)
         .iter()
-        .filter(|(k, _)| k.starts_with(b"evidence/"))
-        .map(|(_, v)| {
-            let e = Evidence::from_bytes(v).unwrap();
-            (e.kind, e.view)
-        })
+        .map(|e| (e.kind, e.view, e.validator))
         .collect();
     kinds.sort_unstable();
-    assert_eq!(kinds, vec![(KIND_FINALIZE, 1), (KIND_FINALIZE, 7)]);
+    assert_eq!(kinds, vec![(KIND_FINALIZE, 1, 2), (KIND_FINALIZE, 7, 3)]);
+}
+
+/// A validator that signs conflicting votes for many views, relayed by a
+/// peer that is not itself, so that no budget of spec 08 §5a applies, holds
+/// one place in the pending evidence: the evidence against another
+/// validator is not queued behind its flood, and the chain records both in
+/// the next blocks (spec 08 §9).
+#[test]
+fn an_equivocation_flood_holds_one_place_per_offender() {
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, address(&keys[0]));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    sim.crash(3);
+    assert!(
+        sim.run_until(20 * SLOT_MS, |s| s.nodes[0].finalized.len() >= 2)
+            .unwrap()
+    );
+    let relay = validator_id(&keys[1]);
+    let view = simplex(&sim, 0).view;
+    // Validator 3 equivocates in every view up to the current one and in a
+    // hundred views ahead.
+    for v in (1..view).chain(view + 40..view + 140) {
+        for hash in [[1; 32], [2; 32]] {
+            sim.nodes[0]
+                .deliver(relay, TOPIC, vote(&keys[3], v, hash))
+                .unwrap();
+        }
+    }
+    // Then validator 2 equivocates once.
+    for hash in [[1; 32], [2; 32]] {
+        sim.nodes[0]
+            .deliver(relay, TOPIC, vote(&keys[2], view + 200, hash))
+            .unwrap();
+    }
+    let pending = pending_evidence(&sim.nodes[0]);
+    let offenders: Vec<u32> = pending.iter().map(|e| e.validator).collect();
+    assert_eq!(offenders, vec![3, 2]);
+    assert_eq!(equivocations(&sim.nodes[0]), 2);
+    // Node 0's next proposal carries both, and the chain records them.
+    let recorded = sim
+        .run_until(40 * SLOT_MS, |s| s.nodes[0].evidence(0).unwrap().len() == 2)
+        .unwrap();
+    assert!(recorded, "{:?}", sim.nodes[0].evidence(0).unwrap());
+    let mut on_chain: Vec<u32> = sim.nodes[1]
+        .evidence(0)
+        .unwrap()
+        .iter()
+        .map(|e| e.validator)
+        .collect();
+    on_chain.sort_unstable();
+    assert_eq!(on_chain, vec![2, 3]);
+    assert!(
+        sim.run_until(20 * SLOT_MS, |s| pending_evidence(&s.nodes[0]).is_empty())
+            .unwrap()
+    );
+    assert_agreement(&sim, &[0, 1, 2]);
 }
 
 /// Block `height` of `node` carries no transactions, yet its header's root covers the
