@@ -1472,6 +1472,34 @@ fn threshold_keys_rotate_across_epochs() {
     // Honest rotation produced no evidence and slashed no one.
     assert_eq!(evidence_count(&mut sim.nodes[0]), 0);
     assert!(!record_of(&mut sim.nodes[0], &keys[1]).jailed);
+    // By now key 1 has handed off too. Partials of key 0, two key sets back, on a finalize
+    // vote for a block after its handoff are dropped before any pairing and never kept
+    // for a certificate (spec 08 §5, §6a).
+    assert!(status(&mut sim.nodes[0]).active.unwrap().id > 1);
+    let top = sim.nodes[0].finalized_height().unwrap();
+    let block = finalized_hash(&sim.nodes[0], top);
+    let tables = sim.nodes[0].persisted();
+    let p = Proposal::from_bytes(&tables[&[b"prop/".as_slice(), &block].concat()]).unwrap();
+    assert!(p.anchor_height >= h.height);
+    let stale = partials_of(&sim.nodes[0], &keys[2], 0, &[0x55; 8]);
+    assert!(!stale.is_empty());
+    let share = ConsensusMessage::FinalizeShare {
+        view: p.view,
+        hash: block,
+        signature: signed(&keys[2], KIND_FINALIZE, p.view, block),
+        partials: Seq(stale),
+    };
+    sim.nodes[0]
+        .deliver(validator_id(&keys[2]), TOPIC, share.to_bytes())
+        .unwrap();
+    let kept: Seq<PartialShare> = sim.nodes[0]
+        .persisted()
+        .get(&[b"part/".as_slice(), &p.view.to_le_bytes(), &block].concat())
+        .map(|b| Seq::from_bytes(b).unwrap())
+        .unwrap_or_default();
+    assert!(!kept.0.is_empty());
+    assert!(kept.0.iter().all(|k| k.key_set != 0), "{kept:?}");
+    assert_eq!(evidence_count(&mut sim.nodes[0]), 0);
     // A valid partial of key 0 over a proposal anchored below the handoff is honest, so
     // it is no evidence of a stale key: key 0 was still in force at that anchor.
     let early = Proposal {
@@ -2281,6 +2309,76 @@ fn threshold_misbehaviour_is_slashed_once() {
     assert_eq!(evidence_count(&mut sim.nodes[0]), 2);
     assert_eq!(record_of(&mut sim.nodes[0], &keys[3]).stake, after.stake);
     assert_agreement(&sim);
+}
+
+/// The gas node `node`'s driver steps have used so far.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn driver_gas(node: &Node) -> u64 {
+    let value = node.telemetry().registry().value(
+        &orange_metrics::node::KERNEL_GAS,
+        &[orange_abi::types::exports::DRIVER_STEP],
+    );
+    // A sum of gas, held exactly by an f64 below 2^53.
+    value.unwrap_or_default() as u64
+}
+
+#[test]
+fn a_repeated_invalid_partial_costs_its_pairing_once() {
+    // Four validators with key set 0 active. Validator 1 sends a finalize vote whose
+    // partials, one per share it holds, do not verify, over a proposal node 0 holds whose
+    // anchor root is false: each partial looks like evidence until its pairing says
+    // otherwise (spec 08 §6a).
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, &[0, 1, 2, 3], &[STAKE; 4], &staking(24, 4));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    let done = sim
+        .run_until(80 * SLOT_MS, |s| adopted(s, &[0, 1, 2, 3], 0))
+        .unwrap();
+    assert!(done, "{:?}", sim.finalized_heights().unwrap());
+    // A view far ahead, in the current epoch, that no validator reaches in this test.
+    let state = sim.nodes[0].simplex_state().unwrap();
+    let view = state.view + 1_000_000;
+    assert_eq!(view_epoch(view), view_epoch(state.view));
+    let proposal = Proposal {
+        view,
+        height: state.tip_height + 1,
+        parent: state.tip_hash,
+        timestamp_ms: 1,
+        anchor_height: 2,
+        anchor_root: [0x66; 32],
+        ..Proposal::default()
+    };
+    let hash = keccak256(&proposal.to_bytes());
+    let proposer = leader(view, 4);
+    let propose = ConsensusMessage::Propose {
+        signature: signed(&keys[proposer], KIND_PROPOSE, view, hash),
+        proposal: proposal.clone(),
+    };
+    let node = &mut sim.nodes[0];
+    node.deliver(validator_id(&keys[proposer]), TOPIC, propose.to_bytes())
+        .unwrap();
+    let elsewhere = certificate_message_v2(CHAIN_ID, 0, proposal.height, &[0x77; 32]);
+    let partials = partials_of(node, &keys[1], 0, &elsewhere);
+    assert_eq!(partials.len(), 4);
+    let vote = ConsensusMessage::FinalizeShare {
+        view,
+        hash,
+        signature: signed(&keys[1], KIND_FINALIZE, view, hash),
+        partials: Seq(partials),
+    };
+    let mut cost = || {
+        let before = driver_gas(node);
+        node.deliver(validator_id(&keys[1]), TOPIC, vote.to_bytes())
+            .unwrap();
+        driver_gas(node) - before
+    };
+    // The first copy pays a pairing per partial (100 000 gas each, spec 05
+    // §4.3); a copy after it pays none of them.
+    let (first, second, third) = (cost(), cost(), cost());
+    assert!(first >= second + 4 * 100_000, "{first} {second}");
+    assert_eq!(second, third);
+    assert_eq!(evidence_count(&mut sim.nodes[0]), 0);
 }
 
 #[test]

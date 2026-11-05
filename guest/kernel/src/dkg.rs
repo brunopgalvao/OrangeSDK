@@ -50,6 +50,13 @@ const HANDOFF_KEY: &[u8] = b"dkg/handoff/";
 const EVIDENCE_KEY: &[u8] = b"dkg/evidence";
 /// Most pieces of evidence this node keeps to report.
 const EVIDENCE_CAP: usize = 16;
+/// The finalize votes' partials this node verified, each a key set
+/// (big-endian u64), a share index (big-endian u32) and a proposal hash.
+const INSPECTED_KEY: &[u8] = b"dkg/inspected";
+/// Bytes of one entry of `INSPECTED_KEY`.
+const INSPECTED_ENTRY: usize = 8 + 4 + 32;
+/// Most partials remembered as verified.
+const INSPECTED_CAP: usize = 256;
 
 /// Sends `request` to the threshold keystore; its answer, if it has one.
 pub fn keystore(request: &KeystoreRequest) -> Option<Vec<u8>> {
@@ -503,12 +510,72 @@ fn rotation_fraud(share: &RotationShare, signer: &Hash) -> Option<ThresholdEvide
     })
 }
 
-/// Evidence of a finalize vote's partial `partial` over proposal `p` that no
-/// honest shareholder signs: its anchor root is not the state root this node
-/// executed at the anchored height, or the key set signing it had handed off
-/// by then (spec 15 §5.1). Checked only when one of the two holds, so honest
-/// partials cost nothing more.
-pub fn inspect(chain_id: u64, partial: &PartialShare, p: &Proposal) -> Vec<Vec<u8>> {
+/// The key sets whose partials a finalize vote may carry (spec 08 §6a), as
+/// this node's chain state has them.
+pub struct VoteKeys {
+    active: u64,
+    target: Option<u64>,
+    since: Option<u64>,
+}
+
+impl VoteKeys {
+    /// The key sets of now, once one is active.
+    pub fn now() -> Option<VoteKeys> {
+        let active: u64 = state::get(orange_abi::staking::keys::ACTIVE)?;
+        let target = rotation::pending().map(|t| t.id);
+        Some(VoteKeys {
+            active,
+            target,
+            since: rotation::activated(active),
+        })
+    }
+
+    /// Whether a partial of key set `id` is inspected at all: the active key
+    /// set, the target of the due handoff, or the key set the active one
+    /// replaced, which shareholders that have not executed the handoff yet
+    /// still sign with. Any other costs no pairing.
+    pub fn inspected(&self, id: u64) -> bool {
+        self.kept(id) || rotation::replaced(id).is_some_and(|r| Some(r) == self.since)
+    }
+
+    /// Whether a partial of key set `id` is kept for a certificate: the
+    /// active key set or the target, the only ones a certificate is still
+    /// combined from.
+    pub fn kept(&self, id: u64) -> bool {
+        id == self.active || Some(id) == self.target
+    }
+}
+
+/// Whether this node verifies `partial` over the proposal with `hash` for
+/// the first time, remembering it if so; it remembers the last
+/// `INSPECTED_CAP`, so one partial sent again costs no second pairing.
+fn first_inspection(partial: &PartialShare, hash: &Hash) -> bool {
+    let entry = [
+        &partial.key_set.to_be_bytes()[..],
+        &partial.index.to_be_bytes(),
+        hash,
+    ]
+    .concat();
+    let mut seen = persist::get_raw(INSPECTED_KEY).unwrap_or_default();
+    if seen.chunks(INSPECTED_ENTRY).any(|e| e == entry) {
+        return false;
+    }
+    if seen.len() >= INSPECTED_CAP * INSPECTED_ENTRY {
+        seen.drain(..INSPECTED_ENTRY);
+    }
+    seen.extend_from_slice(&entry);
+    persist::set_raw(INSPECTED_KEY, &seen);
+    true
+}
+
+/// Evidence of a finalize vote's partial `partial` over proposal `p`, with
+/// `hash`, that no honest shareholder signs: its anchor root is not the
+/// state root this node executed at the anchored height, or the key set
+/// signing it had handed off by then (spec 15 §5.1). Checked only when one
+/// of the two holds, so honest partials cost nothing more, and verified at
+/// most once per key set, share and proposal, and not at all when this node
+/// holds or chain state records the offence.
+pub fn inspect(chain_id: u64, partial: &PartialShare, p: &Proposal, hash: &Hash) -> Vec<Vec<u8>> {
     if p.anchor_height == 0 {
         return Vec::new();
     }
@@ -527,7 +594,11 @@ pub fn inspect(chain_id: u64, partial: &PartialShare, p: &Proposal) -> Vec<Vec<u
         signature: partial.signature.clone(),
         subject: p.to_bytes(),
     };
+    let held = persist::get::<Seq<ThresholdEvidence>>(EVIDENCE_KEY)
+        .is_some_and(|s| s.0.iter().any(|e| e.id() == evidence.id()));
     if rotation::on_record(&evidence)
+        || held
+        || !first_inspection(partial, hash)
         || rotation::offender(&evidence, state::height().unwrap_or(0) + 1).is_none()
     {
         return Vec::new();
@@ -740,8 +811,9 @@ pub fn belongs(partial: &PartialShare, signer: &Hash) -> bool {
 }
 
 /// A version-2 threshold certificate for the proposal at `height` with
-/// `hash`, when the partials of some key set that has been active reach its
-/// threshold and combine into a signature that verifies under its group key.
+/// `hash`, when the partials of some key set that has been made active and
+/// not since replaced reach its threshold and combine into a signature that
+/// verifies under its group key.
 pub fn certificate(
     chain_id: u64,
     height: u64,
@@ -752,7 +824,8 @@ pub fn certificate(
     ids.sort_unstable();
     ids.dedup();
     for id in ids {
-        let Some(record) = staking::key_set(id).filter(|r| rotation::activated(r.id).is_some())
+        let Some(record) = staking::key_set(id)
+            .filter(|r| rotation::activated(r.id).is_some() && rotation::replaced(r.id).is_none())
         else {
             continue;
         };

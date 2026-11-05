@@ -1399,6 +1399,51 @@ fn untimely_proposals_get_no_votes_and_the_chain_goes_on() {
     assert!(stamps.windows(2).all(|w| w[0] < w[1]), "{stamps:?}");
 }
 
+/// A finalize quorum for a proposal that does not extend the finalized
+/// head finalizes nothing (spec 08 §5): the node asks for blocks instead of
+/// executing it on the wrong parent. Only validators that sign conflicting
+/// chains make such a quorum, and here the test holds every key.
+#[test]
+fn a_finalize_quorum_off_the_finalized_head_finalizes_nothing() {
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, address(&keys[0]));
+    let config = orange_node::NodeConfig {
+        key: Some(keys[0].clone()),
+        ..at(10_000)
+    };
+    let mut node = Node::open(kernel, &genesis, config).unwrap();
+    node.start(None).unwrap();
+    let finalize_in = |node: &mut Node, view: u64, parent: [u8; 32]| {
+        let proposal = Proposal {
+            view,
+            height: 1,
+            parent,
+            timestamp_ms: 10_000 + SLOT_MS,
+            ..Proposal::default()
+        };
+        let hash = keccak256(&proposal.to_bytes());
+        let proposer = leader(view, 4);
+        node.deliver(
+            validator_id(&keys[proposer]),
+            TOPIC,
+            propose(&keys[proposer], proposal),
+        )
+        .unwrap();
+        for key in &keys[1..] {
+            node.deliver(validator_id(key), TOPIC, finalize(key, view, hash))
+                .unwrap();
+        }
+        node.finalized_height().unwrap()
+    };
+    // Height 1 on a parent that is not the genesis tip: not finalized.
+    assert_eq!(finalize_in(&mut node, 2, [9; 32]), 0);
+    assert!(node.executed.is_empty());
+    // On the genesis tip, the same quorum finalizes it.
+    assert_eq!(finalize_in(&mut node, 3, [0; 32]), 1);
+    assert_eq!(node.executed.len(), 1);
+}
+
 /// Validators vote only for proposals within the size bounds (spec 08 §5):
 /// at most `max_txs` transactions and `MAX_PROPOSAL_BYTES` encoded. Before
 /// the bounds a faulty leader could fill its turns with a frame's worth of

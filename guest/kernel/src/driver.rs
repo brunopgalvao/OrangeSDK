@@ -959,16 +959,28 @@ impl Ctx {
         }
         let mut reported = false;
         let voter = self.set[validator as usize].0;
-        for partial in partials.into_iter().filter(|p| dkg::belongs(p, &voter)) {
+        // Only partials of the key sets a vote can still name are looked at,
+        // before any pairing (spec 08 §6a).
+        let keys = if partials.is_empty() {
+            None
+        } else {
+            dkg::VoteKeys::now()
+        };
+        let proposal = keys.as_ref().and_then(|_| Self::proposal(&hash));
+        for partial in partials.into_iter().filter(|p| {
+            keys.as_ref().is_some_and(|k| k.inspected(p.key_set)) && dkg::belongs(p, &voter)
+        }) {
             // A partial no honest shareholder signs is evidence (spec 15
             // §5.1); one piece per vote is enough.
-            if !reported && let Some(p) = Self::proposal(&hash) {
-                for envelope in dkg::inspect(self.chain_id, &partial, &p) {
+            if !reported && let Some(p) = &proposal {
+                for envelope in dkg::inspect(self.chain_id, &partial, p, &hash) {
                     reported = true;
                     self.broadcast(&ConsensusMessage::Dkg { envelope });
                 }
             }
-            Self::add_partial(view, &hash, partial);
+            if keys.as_ref().is_some_and(|k| k.kept(partial.key_set)) {
+                Self::add_partial(view, &hash, partial);
+            }
         }
         Self::add_vote(
             b"fin/",
@@ -1427,7 +1439,8 @@ impl Ctx {
     }
 
     /// Finalizes the proposal notarized in `view` and every unexecuted
-    /// ancestor, oldest first, once a quorum of finalize votes is in. Such a
+    /// ancestor, oldest first, once a quorum of finalize votes is in and they
+    /// link to the finalized head. Such a
     /// quorum also implies the notarization, which moves a node that is
     /// behind past `view`. When the finalize votes carry enough partial
     /// signatures, the blocks also get a threshold certificate.
@@ -1465,7 +1478,11 @@ impl Ctx {
             };
             chain.push(p);
         }
-        if chain.last().map(|p| p.height) != Some(self.s.finalized_height + 1) {
+        // The lowest must extend the finalized head, or the chain would
+        // execute on a parent it never finalized.
+        if chain.last().map(|p| (p.height, p.parent))
+            != Some((self.s.finalized_height + 1, self.finalized_hash()))
+        {
             self.request_sync();
             return;
         }
