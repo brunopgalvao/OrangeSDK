@@ -63,6 +63,9 @@ pub enum Error {
     NotCommitted,
     /// The chain holds no key set of this id with a usable group key.
     UnknownKeySet(u64),
+    /// The node's handoff out of this key set is not from it, or not to a
+    /// newer key set.
+    BadHandoff(u64),
     /// The node failed.
     Node(NodeError),
 }
@@ -77,6 +80,10 @@ impl fmt::Display for Error {
             Error::NoAnchor => f.write_str("the proposal carries no anchor"),
             Error::NotCommitted => f.write_str("the message is not committed at that height"),
             Error::UnknownKeySet(id) => write!(f, "the chain holds no key set {id}"),
+            Error::BadHandoff(id) => write!(
+                f,
+                "the handoff recorded out of key set {id} does not move to a newer one"
+            ),
             Error::Node(e) => write!(f, "node: {e}"),
         }
     }
@@ -292,15 +299,36 @@ pub fn rotation(node: &mut Node, from: u64) -> Result<Option<Rotation>, Error> {
     Rotation::new(&handoff).map(Some)
 }
 
-/// Every handoff from key set `from` on, in order: what a light client
-/// holding `from` submits to reach the chain's active key set.
+/// The most handoffs [`rotations_from`] reads in one call.
+pub const MAX_ROTATIONS: usize = 256;
+
+/// The handoffs from key set `from` on, in order, at most [`MAX_ROTATIONS`]
+/// of them: what a light client holding `from` submits to reach the
+/// chain's active key set, or to come closer to it, after which a relayer
+/// asks again from where the last one ends.
 ///
 /// # Errors
-/// As [`rotation`].
+/// As [`rotation`], and [`Error::BadHandoff`] for a record out of a key
+/// set that is not from it or not to a newer one, which no chain records.
 pub fn rotations_from(node: &mut Node, from: u64) -> Result<Vec<Rotation>, Error> {
+    chain_of(from, &mut |at| rotation(node, at))
+}
+
+/// The chain of handoffs from `from` that `fetch` reads one at a time:
+/// each must leave the key set the previous one reached for a newer one,
+/// so the chain ends, and it stops after [`MAX_ROTATIONS`].
+fn chain_of(
+    from: u64,
+    fetch: &mut dyn FnMut(u64) -> Result<Option<Rotation>, Error>,
+) -> Result<Vec<Rotation>, Error> {
     let mut out = Vec::new();
     let mut at = from;
-    while let Some(r) = rotation(node, at)? {
+    while out.len() < MAX_ROTATIONS
+        && let Some(r) = fetch(at)?
+    {
+        if r.from != at || r.to <= at {
+            return Err(Error::BadHandoff(at));
+        }
         at = r.to;
         out.push(r);
     }
@@ -640,12 +668,60 @@ mod tests {
             ),
             (Error::UnknownKeySet(7), "the chain holds no key set 7"),
             (
+                Error::BadHandoff(3),
+                "the handoff recorded out of key set 3 does not move to a newer one",
+            ),
+            (
                 Error::Node(NodeError::Decode("x")),
                 "node: x returned an undecodable result",
             ),
         ] {
             assert_eq!(e.to_string(), text);
         }
+    }
+
+    /// A rotation from `from` to `to`, with placeholder key and signature.
+    fn hop(from: u64, to: u64) -> Rotation {
+        Rotation {
+            from,
+            to,
+            key: Vec::new(),
+            key_eip2537: [0; 256],
+            signature: [0; 128],
+            height: 0,
+        }
+    }
+
+    #[test]
+    fn a_chain_of_handoffs_only_moves_forward() {
+        // A faulty node that hands key set 2 back to 1 would keep a relayer
+        // reading the same two records for ever.
+        let mut cyclic = |at: u64| Ok(Some(hop(at, if at == 2 { 1 } else { at + 1 })));
+        assert!(matches!(
+            chain_of(1, &mut cyclic),
+            Err(Error::BadHandoff(2))
+        ));
+        // One that names another key set than the one asked for.
+        let mut elsewhere = |at: u64| Ok(Some(hop(at + 5, at + 6)));
+        assert!(matches!(
+            chain_of(1, &mut elsewhere),
+            Err(Error::BadHandoff(1))
+        ));
+        // One that never ends is read only so far.
+        let mut endless = |at: u64| Ok(Some(hop(at, at + 1)));
+        let chain = chain_of(3, &mut endless).unwrap();
+        assert_eq!(chain.len(), MAX_ROTATIONS);
+        assert_eq!(chain.last().unwrap().to, 3 + MAX_ROTATIONS as u64);
+        // An honest chain ends where the node records no more.
+        let mut short = |at: u64| Ok((at < 4).then(|| hop(at, at + 2)));
+        let tos: Vec<u64> = chain_of(0, &mut short)
+            .unwrap()
+            .iter()
+            .map(|r| r.to)
+            .collect();
+        assert_eq!(tos, [2, 4]);
+        let mut failing = |_| Err(Error::NoAnchor);
+        assert!(matches!(chain_of(0, &mut failing), Err(Error::NoAnchor)));
     }
 
     #[test]
