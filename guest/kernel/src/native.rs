@@ -1,5 +1,5 @@
 //! Native contracts from the EVM (spec 16 §5): an account whose code is
-//! `0xEF02 ‖ code hash` runs that Orange module instead of EVM bytecode.
+//! `0xEF02 ‖ code hash` runs that OrangeSDK module instead of EVM bytecode.
 //!
 //! revm consults its precompile provider for every message call, after the
 //! value transfer and inside the call's journal checkpoint, and hands it the

@@ -1,4 +1,4 @@
-// viem against an Orange node: public and wallet clients over HTTP, the way
+// viem against an OrangeSDK node: public and wallet clients over HTTP, the way
 // wagmi apps and scripts use them.
 import assert from 'node:assert/strict';
 import { before, describe, it } from 'node:test';
@@ -17,7 +17,7 @@ import { CHAIN_ID, FUNDED, FUNDED_KEY, RPC, SUPPLY, token, until } from './commo
 
 const chain = defineChain({
   id: CHAIN_ID,
-  name: 'Orange devnet',
+  name: 'OrangeSDK devnet',
   nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
   rpcUrls: { default: { http: [RPC] } },
 });

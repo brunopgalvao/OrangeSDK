@@ -1,6 +1,6 @@
 [package]
 name = "orange-node"
-description = "Hosts an Orange kernel: privileged host functions, the driver loop, mempool and queries"
+description = "Hosts an OrangeSDK kernel: privileged host functions, the driver loop, mempool and queries"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

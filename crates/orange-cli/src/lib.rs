@@ -47,7 +47,7 @@
 //! under the key track unless `"governanceMode"` says `"stake"`; see [`gov`],
 //! which also has `orange gov`, the encoder of governance calls. Kernel modules
 //! installed at genesis (spec 16) are listed under `"modules"`; see [`modules`].
-//! The Ethereum-to-Orange bridge (spec 18) is configured under `"bridgeIn"`;
+//! The Ethereum-to-OrangeSDK bridge (spec 18) is configured under `"bridgeIn"`;
 //! see [`bridge`]. Staking, epochs and the threshold key (spec 15) under
 //! `"staking"`; see [`staking`]. The fee market (spec 23) under `"fees"`;
 //! see [`fees`]: without it the base fee is zero, as a development chain

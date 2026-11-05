@@ -1,6 +1,6 @@
 # Running a public testnet
 
-This is the runbook for an Orange network whose validators are run by several operators on their own hosts, one node per host. Everything here was rehearsed on one machine (`tools/rehearse-testnet.sh`, below); no server, cloud account or DNS name is assumed to exist yet.
+This is the runbook for an OrangeSDK network whose validators are run by several operators on their own hosts, one node per host. Everything here was rehearsed on one machine (`tools/rehearse-testnet.sh`, below); no server, cloud account or DNS name is assumed to exist yet.
 
 The pieces:
 

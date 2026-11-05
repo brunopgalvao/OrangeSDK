@@ -150,7 +150,7 @@ struct World {
     on_orange: [u8; 20],
     /// A token of the Ethereum side.
     tkn: [u8; 20],
-    /// A token of the Orange side.
+    /// A token of the OrangeSDK side.
     stk: [u8; 20],
     pending: Vec<Pending>,
     /// Transfers queued and not executed yet: `(gateway, id, ready at)`.
@@ -391,7 +391,7 @@ impl World {
         p
     }
 
-    /// `OrangeInbox`'s guardian vetoes pending message `i`, sent from Orange.
+    /// `OrangeInbox`'s guardian vetoes pending message `i`, sent from the OrangeSDK chain.
     fn veto(&mut self, i: usize) -> Pending {
         let p = self.strand(i);
         assert_eq!(p.recipient, self.on_eth);
@@ -400,7 +400,7 @@ impl World {
         p
     }
 
-    /// Anyone reports to the gateway on Orange that its message `nonce` was
+    /// Anyone reports to the gateway on the OrangeSDK chain that its message `nonce` was
     /// vetoed, or, with `delivered`, what the inbox delivered with it.
     fn report(&mut self, nonce: u64, delivered: Option<&Pending>) -> Outcome {
         let data = match delivered {
@@ -712,7 +712,7 @@ fn tokens_of_both_sides_cross_and_come_back() {
     w.eth.fund(ALICE, 100 * ETHER);
     mint_and_approve(&mut w.eth, tkn, ALICE, 1_000_000, on_eth);
 
-    // Alice locks ETH and an ERC-20 on Ethereum for Bob on Orange.
+    // Alice locks ETH and an ERC-20 on Ethereum for Bob on the OrangeSDK chain.
     let first = w.deposit(ALICE, on_eth, NATIVE, BOB, 5 * ETHER);
     ok(&first);
     let second = w.deposit(ALICE, on_eth, tkn, BOB, 700_000);
@@ -736,7 +736,7 @@ fn tokens_of_both_sides_cross_and_come_back() {
     );
     assert_eq!(w.eth.balance(on_eth), 5 * ETHER);
     assert_eq!(w.gateway_view(on_eth, "locked(address)", tkn), 700_000);
-    // Delivered on Orange, each creates its wrapped token at the address anyone computes.
+    // Delivered on the OrangeSDK chain, each creates its wrapped token at the address anyone computes.
     w.deliver_all();
     let (weth, wtkn) = (wrapped_of(on_orange, NATIVE), wrapped_of(on_orange, tkn));
     let wrapped = w.eth.view(
@@ -771,7 +771,7 @@ fn tokens_of_both_sides_cross_and_come_back() {
     assert_eq!(w.gateway_view(on_eth, "locked(address)", tkn), 300_000);
     assert_eq!(w.eth.balance(on_eth), 3 * ETHER);
 
-    // The other way: Carol locks Orange's currency and an Orange token for Dave on Ethereum.
+    // The other way: Carol locks the OrangeSDK chain's currency and an OrangeSDK-chain token for Dave on Ethereum.
     w.eth.fund(CAROL, 10 * ETHER);
     mint_and_approve(&mut w.eth, stk, CAROL, 50, on_orange);
     ok(&w.deposit(CAROL, on_orange, NATIVE, DAVE, 4 * ETHER));
@@ -985,7 +985,7 @@ fn deliveries_count_only_from_the_paired_gateway_and_failed_releases_are_owed() 
     ok(&w.deliver(0));
     let weth = wrapped_of(on_orange, NATIVE);
 
-    // On Ethereum: the inbox, the Orange chain and the paired sender are checked, and no value.
+    // On Ethereum: the inbox, the OrangeSDK chain and the paired sender are checked, and no value.
     let on_eth_call = |chain: u64, sender: [u8; 20], value: u128, payload: &[u8]| {
         abi::call(
             "onOrangeMessage(uint64,uint64,address,uint256,bytes)",
@@ -1271,7 +1271,7 @@ fn no_gateway_takes_deposits_before_its_peer_is_heard_from() {
         &w.deposit(ALICE, on_orange, NATIVE, BOB, ETHER),
         "PeerUnconfirmed()",
     );
-    // The Orange gateway's HELLO was executed on Ethereum before the gateway
+    // The OrangeSDK-chain gateway's HELLO was executed on Ethereum before the gateway
     // there existed, and is gone; the owner may send another until the peer
     // answers, nobody else.
     reverted_with(
@@ -1284,7 +1284,7 @@ fn no_gateway_takes_deposits_before_its_peer_is_heard_from() {
     assert_eq!(w.pending.len(), 1);
     assert_eq!(w.pending[0].payload, hello(false));
     w.pending.clear();
-    // The Ethereum gateway's HELLO reaches the Orange gateway, which now
+    // The Ethereum gateway's HELLO reaches the OrangeSDK-chain gateway, which now
     // takes deposits and answers; the answer, which says it has heard,
     // gets no answer of its own.
     w.pending.push(Pending {
@@ -1355,7 +1355,7 @@ fn transfers_over_the_rate_limit_wait_in_the_queue() {
     let (on_eth, on_orange) = (w.on_eth, w.on_orange);
     w.eth.fund(ALICE, 100 * ETHER);
     let weth = wrapped_of(on_orange, NATIVE);
-    // Wrapped ETH mints on Orange at 10 ETH at once, refilling 10 ETH per 1 000 s.
+    // Wrapped ETH mints on the OrangeSDK chain at 10 ETH at once, refilling 10 ETH per 1 000 s.
     reverted_with(
         &w.eth.call(
             STRANGER,
@@ -1670,7 +1670,7 @@ fn one_queued_transfer_is_frozen_or_cancelled_alone() {
     // Refunded instead, an honest transfer goes back to its sender, because
     // its home gateway recorded sending it: a cancelled mint's ETH is
     // released to Alice on Ethereum, a cancelled release's burned ETH is
-    // minted to Bob on Orange again. Releases now queue above 0.1 ETH.
+    // minted to Bob on the OrangeSDK chain again. Releases now queue above 0.1 ETH.
     ok(&w.eth.call(
         OWNER,
         on_eth,
@@ -1911,7 +1911,7 @@ fn messages_that_never_arrive_are_refunded_or_sent_again() {
     reverted_with(&w.unstrand(0), "NotSpent()");
     let wrong = refund_spent_calldata(honest.nonce, 1, &NATIVE, &ALICE, &BOB, 2 * ETHER);
     reverted_with(&w.eth.call(ALICE, on_eth, &wrong), "NotRecorded()");
-    // The owner on Orange refunds the forgery; its refund is refused at home,
+    // The owner on the OrangeSDK chain refunds the forgery; its refund is refused at home,
     // which learns from it that the nonce was spent with no effect: Alice's
     // deposit is refunded to her by anyone, once, under the release limit.
     ok(&w.refund(0));
@@ -1938,8 +1938,8 @@ fn messages_that_never_arrive_are_refunded_or_sent_again() {
     assert_eq!(w.balance_of(weth, STRANGER), 0);
     checks(&mut w);
 
-    // From Orange: a forgery that pays out at once (a HELLO, which moves
-    // nothing) takes the nonce of Carol's deposit. Anyone reports to Orange
+    // From the OrangeSDK chain: a forgery that pays out at once (a HELLO, which moves
+    // nothing) takes the nonce of Carol's deposit. Anyone reports to the OrangeSDK chain
     // what the inbox delivered with that nonce, and Carol is refunded there.
     let carol = w.eth.balance(CAROL);
     ok(&w.deposit(CAROL, on_orange, NATIVE, DAVE, ETHER));
@@ -2016,9 +2016,9 @@ fn messages_that_never_arrive_are_refunded_or_sent_again() {
         assert_eq!(w.spent(on_orange, 50_000), kept);
     }
 
-    // A refund is stranded in turn: the owner on Orange refunds an honest
+    // A refund is stranded in turn: the owner on the OrangeSDK chain refunds an honest
     // queued deposit, and a forged release, queued on Ethereum, takes the
-    // nonce of the refund. Refunding the forgery tells Orange the nonce was
+    // nonce of the refund. Refunding the forgery tells the OrangeSDK chain the nonce was
     // spent, and anyone sends the refund again; a refund's record is the
     // hash of its payload, so it is not refunded but sent again, once.
     let alice = w.eth.balance(ALICE);
@@ -2192,7 +2192,7 @@ fn locked_always_covers_what_is_minted() {
     let mut displaced = 0;
     let mut reports = 0;
     let mut made_whole = 0;
-    // Nonces spent in `OrangeInbox` that nobody reported to Orange yet: vetoed,
+    // Nonces spent in `OrangeInbox` that nobody reported to the OrangeSDK chain yet: vetoed,
     // or delivered as a forgery.
     let mut reportable: Vec<(u64, Option<Pending>)> = Vec::new();
     let other = |gateway: [u8; 20]| if gateway == on_eth { on_orange } else { on_eth };
@@ -2359,7 +2359,7 @@ fn locked_always_covers_what_is_minted() {
             // A forgery takes the nonce of an honest message in flight, which
             // never arrives: a mint or release over its limit (or of a token
             // the receiving gateway does not list, which goes back at once),
-            // or, from Orange, a HELLO that moves nothing.
+            // or, from the OrangeSDK chain, a HELLO that moves nothing.
             18..=19 if !w.pending.is_empty() => {
                 let i = usize::try_from(rng.below(w.pending.len() as u64)).unwrap();
                 let p = w.pending[i].clone();
@@ -2388,7 +2388,7 @@ fn locked_always_covers_what_is_minted() {
                     }
                 }
             }
-            // `OrangeInbox`'s guardian vetoes a message from Orange.
+            // `OrangeInbox`'s guardian vetoes a message from the OrangeSDK chain.
             20 if w.pending.iter().any(|p| p.recipient == on_eth) => {
                 let i = w
                     .pending
@@ -2398,7 +2398,7 @@ fn locked_always_covers_what_is_minted() {
                 let p = w.veto(i);
                 reportable.push((p.nonce, None));
             }
-            // Anyone reports a nonce spent in `OrangeInbox` to Orange, or has a
+            // Anyone reports a nonce spent in `OrangeInbox` to the OrangeSDK chain, or has a
             // stranded message refunded or sent again, which works once the
             // nonce is known spent there by something else.
             21 if !reportable.is_empty() || !w.stranded.is_empty() => {
@@ -2489,7 +2489,7 @@ fn locked_always_covers_what_is_minted() {
     // Every nonce spent in `OrangeInbox` is reported, and every stranded message
     // is refunded or sent again, now that the forgeries' refunds told their
     // senders: none is left but those whose sender was never told, as when
-    // the owner on Orange cancelled a forgery without a refund (and so a
+    // the owner on the OrangeSDK chain cancelled a forgery without a refund (and so a
     // report it took the nonce of).
     for (nonce, delivered) in std::mem::take(&mut reportable) {
         ok(&w.report(nonce, delivered.as_ref()));

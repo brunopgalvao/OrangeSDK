@@ -4,7 +4,7 @@ What a node exports is specified in [spec 11](../spec/11-telemetry.md); a test (
 
 - `alerts.yml` — Prometheus alert rules: the conditions of spec 11 §7, with the thresholds `orange doctor` judges by.
 - `prometheus.yml` — a scrape configuration for one node on this machine (`127.0.0.1:8545`).
-- `grafana-orange.json` — the Orange dashboard: chain progress, kernel calls, peers, mempool, emitted metrics, kernel upgrades and feature gates.
+- `grafana-orange.json` — the OrangeSDK dashboard: chain progress, kernel calls, peers, mempool, emitted metrics, kernel upgrades and feature gates.
 - `Dockerfile`, `docker-compose.yml`, `prometheus-devnet.yml`, `grafana/` — the compose stack below.
 - `testnet/` — the genesis ceremony, per-host configuration (systemd unit, container, `node.env`), the `orange-ops` and `orange-host` deploy and operate scripts and the runbook for a network of several operators on several hosts: [`testnet/README.md`](testnet/README.md); `tools/rehearse-testnet.sh` rehearses all of it on this machine.
 - `networks.json` — the registry of launched networks: name, kind, chain id, genesis hash, launch date.

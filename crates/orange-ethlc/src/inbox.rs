@@ -20,7 +20,7 @@ pub struct Message {
     pub nonce: u64,
     /// The account that called `send` on Ethereum.
     pub sender: Address,
-    /// The contract on Orange it is for.
+    /// The contract on the OrangeSDK chain it is for.
     pub recipient: Address,
     /// The gas the recipient gets to handle it, which the sender chose.
     pub gas_limit: u64,
@@ -95,7 +95,7 @@ pub fn storage_root(
 }
 
 /// Whether the proofs show `message` stored by the outbox at `outbox` in
-/// the state under `state_root`, for the Orange chain `chain_id`.
+/// the state under `state_root`, for the OrangeSDK chain `chain_id`.
 ///
 /// # Errors
 /// [`BadProof`] when they do not.

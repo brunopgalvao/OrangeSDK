@@ -1,6 +1,6 @@
-//! Orange to Ethereum end to end (spec 17): four validators run the DKG of
+//! OrangeSDK to Ethereum end to end (spec 17): four validators run the DKG of
 //! spec 15 §6 until finalized blocks carry threshold certificates; a
-//! contract on Orange sends two messages through the outbox; the relayer
+//! contract on the OrangeSDK chain sends two messages through the outbox; the relayer
 //! library turns a stored certificate into a light-client submission and
 //! the outbox slots into inbox proofs; on revm the light client accepts the
 //! submission, the inbox the proofs, and the recipient contract observes the
@@ -138,7 +138,7 @@ fn messages_cross_from_orange_to_ethereum() {
     // verifier, light client, inbox, recipient, in that order from the deployer.
     let recipient = create_address(&DEPLOYER, 3);
 
-    // On Orange: deploy the caller contract and send two messages through it.
+    // On the OrangeSDK chain: deploy the caller contract and send two messages through it.
     let deployed = included(
         &mut sim,
         &tx(&alice, 0, None, 0, &init_code("OutboxCaller"), 1_000_000),

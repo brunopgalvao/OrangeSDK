@@ -1,9 +1,9 @@
-# systemd unit of an Orange node, one per host: `orange-ops install` puts it in
+# systemd unit of an OrangeSDK node, one per host: `orange-ops install` puts it in
 # /etc/systemd/system/orange-node.service. The node reads /etc/orange/node.env
 # through orange-host, which builds the `orange node` command line from it and
 # execs it, so systemd supervises the node process itself.
 [Unit]
-Description=Orange node
+Description=OrangeSDK node
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=600

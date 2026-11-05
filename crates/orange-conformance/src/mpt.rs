@@ -2,7 +2,7 @@
 //! Merkle-Patricia trie over the accounts (Yellow Paper, appendix D) and the
 //! hash of the RLP-encoded logs.
 //!
-//! Orange commits to its state with its own binary trie (spec 10); this module
+//! OrangeSDK commits to its state with its own binary trie (spec 10); this module
 //! exists only to compare a post-state with Ethereum's expected root.
 
 use std::collections::BTreeMap;

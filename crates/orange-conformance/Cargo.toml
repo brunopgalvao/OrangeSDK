@@ -1,6 +1,6 @@
 [package]
 name = "orange-conformance"
-description = "Runs Ethereum execution-spec state tests through the Orange pipeline: the kernel's EVM recompiled to an Orange module, on the interpreter and the native backend (spec 07 §4.2)"
+description = "Runs Ethereum execution-spec state tests through the OrangeSDK pipeline: the kernel's EVM recompiled to an OrangeSDK module, on the interpreter and the native backend (spec 07 §4.2)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

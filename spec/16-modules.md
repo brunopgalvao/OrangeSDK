@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-A *kernel module* is an Orange module (03) that the kernel installs at an address, records with a capability set, initializes, and calls at block boundaries (codex ADR 0009). A *native contract* is an account whose code designates an Orange module: an EVM message call to it runs the module instead of the EVM interpreter (codex ADR 0004, ADR 0026). Every installed kernel module is also a native contract at its address; a native contract need not be an installed module.
+A *kernel module* is an OrangeSDK module (03) that the kernel installs at an address, records with a capability set, initializes, and calls at block boundaries (codex ADR 0009). A *native contract* is an account whose code designates an OrangeSDK module: an EVM message call to it runs the module instead of the EVM interpreter (codex ADR 0004, ADR 0026). Every installed kernel module is also a native contract at its address; a native contract need not be an installed module.
 
 The kernel reaches a module only through the host's `invoke` (05 §4.4), and always *static*: a module never writes storage through the host. It returns its writes in its output, and the kernel applies them. That is what lets a native contract's writes follow the EVM's revert rules exactly without any host function beyond those of 05.
 
@@ -159,7 +159,7 @@ Every write a native call makes is thus kept exactly when the EVM would have kep
 
 ### 5.6 Nesting
 
-EVM code calls native contracts at any depth, and a native call may be made from any frame, including one inside a static call (then with an empty write set). A module cannot call back into the EVM: the host functions it may use reach only Orange modules, and `invoke` from a static module is static (05 §4.4), so a native contract may invoke other modules for computation but never causes an EVM frame or a write outside its write set. A nested EVM → native → EVM call is therefore not expressible in this kernel version.
+EVM code calls native contracts at any depth, and a native call may be made from any frame, including one inside a static call (then with an empty write set). A module cannot call back into the EVM: the host functions it may use reach only OrangeSDK modules, and `invoke` from a static module is static (05 §4.4), so a native contract may invoke other modules for computation but never causes an EVM frame or a write outside its write set. A nested EVM → native → EVM call is therefore not expressible in this kernel version.
 
 ### 5.7 Deployment
 

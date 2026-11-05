@@ -4,7 +4,7 @@
 //! client applies at once: finalized, signed by a supermajority of the
 //! sync committee (spec 18 §3).
 //!
-//! The protocol's `current_slot` checks are left out: Orange has no clock it
+//! The protocol's `current_slot` checks are left out: the OrangeSDK chain has no clock it
 //! could trust to say what slot Ethereum is at, and an update is ordered by
 //! its signature slot and authenticated by the committee's signature alone.
 //! The best-valid-update bookkeeping and the forced update after a timeout

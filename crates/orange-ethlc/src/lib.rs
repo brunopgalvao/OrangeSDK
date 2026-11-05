@@ -1,4 +1,4 @@
-//! The Ethereum-to-Orange half of the Tier-2 bridge (spec 18; codex ADR 0013).
+//! The Ethereum-to-OrangeSDK half of the Tier-2 bridge (spec 18; codex ADR 0013).
 //!
 //! - [`ssz`]: SSZ merkleization and Merkle branches, over SHA-256.
 //! - [`beacon`]: the light-client containers at the Electra format (also

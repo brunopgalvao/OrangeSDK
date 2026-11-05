@@ -1,4 +1,4 @@
-//! The Ethereum-to-Orange bridge (spec 18): at genesis, the light-client and
+//! The Ethereum-to-OrangeSDK bridge (spec 18): at genesis, the light-client and
 //! message-verifier modules behind their addresses, the checked checkpoint,
 //! and the inbox contract at the inbox address; afterwards, the admission
 //! checks of transactions to the three, and the governed calls governance

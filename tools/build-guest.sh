@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds every guest program for the Orange target (hello, the kernel, the
+# Builds every guest program for the OrangeSDK target (hello, the kernel, the
 # example module, the two bridge modules, the precompile module and the
 # conformance guest), refreshes the test fixtures and prints the ELF paths.
 # The precompile module (spec 19) is built first and recompiled with the

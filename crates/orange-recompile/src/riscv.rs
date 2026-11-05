@@ -81,7 +81,7 @@ pub enum Rv {
     },
     /// `fence` or `fence.i`; deleted by the recompiler.
     Fence,
-    /// `ecall`; not used by Orange guests (host calls are symbol calls).
+    /// `ecall`; not used by OrangeSDK guests (host calls are symbol calls).
     Ecall,
     /// `ebreak`; becomes `trap`.
     Ebreak,

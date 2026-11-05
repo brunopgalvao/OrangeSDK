@@ -1,6 +1,6 @@
 [package]
 name = "orange-trie"
-description = "The binary Merkle trie of the Orange state commitment, with inclusion and exclusion proofs, no_std"
+description = "The binary Merkle trie of the OrangeSDK state commitment, with inclusion and exclusion proofs, no_std"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

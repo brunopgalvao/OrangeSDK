@@ -1,9 +1,9 @@
-//! The `bridgeIn` object of a genesis file: the Ethereum-to-Orange bridge of
+//! The `bridgeIn` object of a genesis file: the Ethereum-to-OrangeSDK bridge of
 //! spec 18.
 //!
 //! ```json
 //! "bridgeIn": {
-//!   "lightClient": "0x<Orange module>", "verifier": "0x<Orange module>",
+//!   "lightClient": "0x<OrangeSDK module>", "verifier": "0x<OrangeSDK module>",
 //!   "genesisValidatorsRoot": "0x<32 bytes>",
 //!   "forks": [{"epoch": 364032, "version": "0x05000000"}, {"epoch": 411392, "version": "0x06000000"}],
 //!   "syncCommitteeSize": 512, "slotsPerEpoch": 32, "epochsPerPeriod": 256,

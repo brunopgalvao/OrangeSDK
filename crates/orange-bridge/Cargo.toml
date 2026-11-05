@@ -1,6 +1,6 @@
 [package]
 name = "orange-bridge"
-description = "Relayer library of the Orange-to-Ethereum bridge (spec 17): light-client submissions from threshold certificates, outbox proofs and inbox calldata; and the token bridge's messages and calldata (spec 21)"
+description = "Relayer library of the OrangeSDK-to-Ethereum bridge (spec 17): light-client submissions from threshold certificates, outbox proofs and inbox calldata; and the token bridge's messages and calldata (spec 21)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -5,7 +5,7 @@
 //!
 //! A relayer moves token messages as it moves any other: a gateway's
 //! messages are ordinary messages of the channel it sends through (spec 17
-//! from Orange, spec 18 from Ethereum). [`TokenMessage::decode`] reads what a
+//! from the OrangeSDK chain, spec 18 from Ethereum). [`TokenMessage::decode`] reads what a
 //! message's payload asks the receiving gateway to do, so that tooling can
 //! show it or check it before relaying.
 
@@ -429,14 +429,14 @@ pub fn resend_spent_calldata(nonce: u64, payload: &[u8]) -> Vec<u8> {
 }
 
 /// `reportVetoed(nonce)` on `TokenGatewayOnEthereum`: tells the gateway on
-/// Orange that `OrangeInbox` vetoed its message `nonce`; anyone may send it.
+/// the OrangeSDK chain that `OrangeInbox` vetoed its message `nonce`; anyone may send it.
 #[must_use]
 pub fn report_vetoed_calldata(nonce: u64) -> Vec<u8> {
     abi::call("reportVetoed(uint64)", &[Value::uint(u128::from(nonce))])
 }
 
 /// `reportDelivered(message)` on `TokenGatewayOnEthereum`: tells the gateway
-/// on Orange what `OrangeInbox` delivered as its message `message.nonce`;
+/// on the OrangeSDK chain what `OrangeInbox` delivered as its message `message.nonce`;
 /// anyone may send it.
 #[must_use]
 pub fn report_delivered_calldata(message: &Message) -> Vec<u8> {
@@ -457,19 +457,19 @@ pub fn address_view(signature: &str, account: &Address) -> Vec<u8> {
 /// The configuration `TokenGatewayOnEthereum` is deployed with (spec 21 §5.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EthereumGatewayConfig {
-    /// The Orange chain's `EthereumOutbox`.
+    /// The OrangeSDK chain's `EthereumOutbox`.
     pub outbox: Address,
     /// The `OrangeInbox` whose deliveries count.
     pub inbox: Address,
-    /// The Orange chain's id.
+    /// The OrangeSDK chain's id.
     pub orange_chain_id: u64,
-    /// The paired gateway on Orange.
+    /// The paired gateway on the OrangeSDK chain.
     pub orange_gateway: Address,
     /// The owner.
     pub owner: Address,
     /// The guardian.
     pub guardian: Address,
-    /// The gas each message gives the gateway on Orange.
+    /// The gas each message gives the gateway on the OrangeSDK chain.
     pub message_gas: u64,
 }
 
@@ -492,9 +492,9 @@ impl EthereumGatewayConfig {
 /// The configuration `TokenGatewayOnOrange` is deployed with (spec 21 §5.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrangeGatewayConfig {
-    /// The outbox: [`OUTBOX_ADDRESS`] on an Orange chain.
+    /// The outbox: [`OUTBOX_ADDRESS`] on an OrangeSDK chain.
     pub outbox: Address,
-    /// The inbox: [`INBOX_ADDRESS`] on an Orange chain.
+    /// The inbox: [`INBOX_ADDRESS`] on an OrangeSDK chain.
     pub inbox: Address,
     /// The chain the paired gateway is on.
     pub ethereum_chain_id: u64,
@@ -511,7 +511,7 @@ pub struct OrangeGatewayConfig {
 }
 
 impl OrangeGatewayConfig {
-    /// A configuration with the Orange chain's outbox and inbox.
+    /// A configuration with the OrangeSDK chain's outbox and inbox.
     #[must_use]
     pub fn new(
         ethereum_chain_id: u64,

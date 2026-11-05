@@ -1,6 +1,6 @@
 [package]
 name = "orange-host"
-description = "The host side of the Orange VM boundary: module cache, storage overlays, the host ABI, nested invoke"
+description = "The host side of the OrangeSDK VM boundary: module cache, storage overlays, the host ABI, nested invoke"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

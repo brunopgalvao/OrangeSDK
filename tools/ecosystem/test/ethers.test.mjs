@@ -1,4 +1,4 @@
-// ethers v6 against an Orange node: what a dapp or a backend does with it.
+// ethers v6 against an OrangeSDK node: what a dapp or a backend does with it.
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import {

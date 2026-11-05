@@ -1,6 +1,6 @@
 [package]
 name = "orange-guest"
-description = "Runtime for programs that run on the Orange VM: host-call stubs, entry wrapper, panic handler"
+description = "Runtime for programs that run on the OrangeSDK VM: host-call stubs, entry wrapper, panic handler"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

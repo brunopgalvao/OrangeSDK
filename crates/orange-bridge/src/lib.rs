@@ -1,6 +1,6 @@
-//! The relayer side of the Orange-to-Ethereum bridge (spec 17).
+//! The relayer side of the OrangeSDK-to-Ethereum bridge (spec 17).
 //!
-//! A relayer moves two things from an Orange node to Ethereum:
+//! A relayer moves two things from an OrangeSDK node to Ethereum:
 //!
 //! - **State roots.** [`Submission::new`] turns a stored threshold
 //!   certificate and the proposal it certifies ([`finality_proof`]) into the
@@ -12,7 +12,7 @@
 //!   the state root of a recent height, and [`SlotProof::prove_calldata`] and
 //!   [`execute_calldata`] build the inbox's `prove` and `execute` calls.
 //!
-//! - **Key rotations.** Orange's group key rotates (spec 15 §6.6): [`rotation`]
+//! - **Key rotations.** The OrangeSDK chain's group key rotates (spec 15 §6.6): [`rotation`]
 //!   and [`rotations_from`] read the handoffs the chain recorded, and
 //!   [`Rotation::calldata`] builds `OrangeLightClientV2.rotate`, which moves a
 //!   light client from one key set to the next. A version-2 certificate
@@ -237,7 +237,7 @@ pub struct Rotation {
     pub key_eip2537: [u8; 256],
     /// The group signature of `from` in EIP-2537 encoding.
     pub signature: [u8; 128],
-    /// The Orange height that recorded the handoff.
+    /// The OrangeSDK height that recorded the handoff.
     pub height: u64,
 }
 

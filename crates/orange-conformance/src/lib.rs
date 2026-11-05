@@ -1,7 +1,7 @@
-//! Ethereum execution-spec conformance of the Orange pipeline (spec 07 §4.2).
+//! Ethereum execution-spec conformance of the OrangeSDK pipeline (spec 07 §4.2).
 //!
-//! The EVM as Orange runs it is revm compiled for `riscv64imac`, recompiled
-//! into an Orange module, interpreted by `orange-vm` (or compiled by `orange-jit`),
+//! The EVM as OrangeSDK runs it is revm compiled for `riscv64imac`, recompiled
+//! into an OrangeSDK module, interpreted by `orange-vm` (or compiled by `orange-jit`),
 //! with the precompiles the host accelerates routed to host functions, and
 //! with state read and written through the kernel's storage layout. The
 //! conformance guest (`guest/evm-conformance`) compiles the kernel's own

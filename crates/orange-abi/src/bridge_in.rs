@@ -1,4 +1,4 @@
-//! The Ethereum-to-Orange bridge of the reference kernel (spec 18): its two
+//! The Ethereum-to-OrangeSDK bridge of the reference kernel (spec 18): its two
 //! system addresses and its genesis parameters. The light client's records
 //! and its logic are in `orange-ethlc`.
 
@@ -44,7 +44,7 @@ pub const VERIFIER_ADDRESS: Address = [
 
 /// The inbox address, `0x0000000000000000000000000000000000004549` ("EI"):
 /// the EVM contract that delivers proven Ethereum messages to their
-/// recipients on Orange (spec 18 §6).
+/// recipients on the OrangeSDK chain (spec 18 §6).
 pub const INBOX_ADDRESS: Address = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x45, 0x49,
 ];
@@ -94,7 +94,7 @@ record! {
     /// Genesis parameters of the bridge, carried in
     /// `GenesisParams::bridge_in`. An empty `light_client` disables it.
     BridgeInParams {
-        /// The light-client module (an Orange module, spec 03).
+        /// The light-client module (an OrangeSDK module, spec 03).
         light_client: Vec<u8>,
         /// The message-verifier module.
         verifier: Vec<u8>,

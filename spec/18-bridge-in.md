@@ -1,23 +1,23 @@
-# 18 — Ethereum to Orange: the sync-committee light client and the inbox
+# 18 — Ethereum to the OrangeSDK chain: the sync-committee light client and the inbox
 
 ## 1. Overview
 
-This document specifies the Ethereum-to-Orange half of the Tier-2 bridge of codex ADR 0013 for the reference kernel:
+This document specifies the Ethereum-to-OrangeSDK half of the Tier-2 bridge of codex ADR 0013 for the reference kernel:
 
 - an **Ethereum light client** that follows the beacon chain's finalized headers through its sync committees (the Altair light-client sync protocol), and keeps the execution state root of every finalized block it learns (§3);
-- an **outbox** contract on Ethereum that stores the hash of every message sent to an Orange chain (§6.1);
+- an **outbox** contract on Ethereum that stores the hash of every message sent to an OrangeSDK chain (§6.1);
 - a **message verifier** that proves a message against a finalized execution state root with an account and storage proof, records it delivered, and paces and pauses deliveries (§6.2–§6.4);
-- an **inbox** contract on Orange that calls the message's recipient with its payload, once (§6.5).
+- an **inbox** contract on the OrangeSDK chain that calls the message's recipient with its payload, once (§6.5).
 
-The light client and the verifier are Orange modules that run as native contracts (spec 16 §5) at two reserved system addresses; the inbox is EVM bytecode at a third. The kernel places all three at genesis (§4). Everything is driven by ordinary Ethereum transactions: anyone may submit light-client updates and relay messages.
+The light client and the verifier are OrangeSDK modules that run as native contracts (spec 16 §5) at two reserved system addresses; the inbox is EVM bytecode at a third. The kernel places all three at genesis (§4). Everything is driven by ordinary Ethereum transactions: anyone may submit light-client updates and relay messages.
 
-The Orange-to-Ethereum direction (threshold certificates verified on Ethereum, spec 12 §8) is separate.
+The OrangeSDK-to-Ethereum direction (threshold certificates verified on Ethereum, spec 12 §8) is separate.
 
 The code is `orange-ethlc` (the protocol, the proofs and both modules' logic over a key-value store, `no_std`), `guest/modules/eth-light-client` and `guest/modules/eth-message-verifier` (the two modules), `guest/kernel/src/bridge.rs` (genesis and admission), `orange_abi::bridge_in` (the addresses and the genesis record) and `contracts/` (the three contracts).
 
 ## 2. Trust and limits
 
-- **Sync committees.** The light client accepts what a supermajority of the current (or, across a period boundary, next) sync committee signs. A dishonest supermajority of 512 randomly sampled validators can make it accept any header, as it can every Ethereum light client. Value that enters Orange through this bridge inherits that trust, which is why deliveries are delayed and rate limited (§6.3, §6.4) and can be paused (§6.4).
+- **Sync committees.** The light client accepts what a supermajority of the current (or, across a period boundary, next) sync committee signs. A dishonest supermajority of 512 randomly sampled validators can make it accept any header, as it can every Ethereum light client. Value that enters the OrangeSDK chain through this bridge inherits that trust, which is why deliveries are delayed and rate limited (§6.3, §6.4) and can be paused (§6.4).
 - **Recovery.** A root accepted from a dishonest committee stays stored, at whatever execution block number the forged header named. Governance recovers in two steps: `pause` the verifier, then `setCheckpoint` with an honest checkpoint, which starts a new checkpoint epoch and so revokes every root stored before it, honest or not (§5.1); then `unpause`. Under the stake track of spec 13 §9 the guardian pauses at once, or a majority of stake does on the fast track, and proposals install the checkpoint and unpause. Messages not yet delivered are proven again against roots of the new epoch, which hold the same outbox storage. Nonces a forged root already marked delivered stay delivered: the delay exists so that governance pauses before any is.
 - **Finality only.** Only finalized headers are stored, and an update is applied at once or refused: there is no optimistic header and no pending best update (§3.6).
 - **Liveness.** Each sync-committee period (256 epochs, about 27 hours on mainnet) the client must learn the next committee, from an update attested in the period. A client that misses a whole period can no longer verify any signature and stalls; governance then installs a new checkpoint (§5.1, `setCheckpoint`). Relayers keep the client live; anyone can relay.
@@ -100,7 +100,7 @@ Checks 1 to 6 need no hashing beyond the update's own decoding; admission runs t
 
 ### 3.6 Departures from Altair
 
-- No `current_slot` check: Orange has no clock it could trust for Ethereum's slot, and the signature authenticates the update whatever the time.
+- No `current_slot` check: the OrangeSDK chain has no clock it could trust for Ethereum's slot, and the signature authenticates the update whatever the time.
 - No `best_valid_update`, optimistic header, or forced update after `UPDATE_TIMEOUT`: an update is applied when it can be and refused otherwise, so state changes only on finalized, supermajority-signed data. A client a whole period behind needs a governance checkpoint (§2).
 - Supermajority is Altair's `3 · participants ≥ 2 · N`, required to apply; updates with less participation are refused rather than kept.
 
@@ -210,13 +210,13 @@ A governance function called by any other account, or with no governance account
 
 ### 6.1 The outbox
 
-`contracts/EthereumOutbox.sol` is deployed on Ethereum once per Orange chain with that chain's id. `send(address recipient, uint64 gasLimit, bytes payload)` (`0xdd624a88`) gives the message the next nonce (from 0), stores
+`contracts/EthereumOutbox.sol` is deployed on Ethereum once per OrangeSDK chain with that chain's id. `send(address recipient, uint64 gasLimit, bytes payload)` (`0xdd624a88`) gives the message the next nonce (from 0), stores
 
 ```
 messages[nonce] = keccak256(abi.encode(uint64 orangeChainId, uint64 nonce, address sender, address recipient, uint64 gasLimit, bytes payload))
 ```
 
-with `sender = msg.sender`, and emits `MessageSent(nonce, sender, recipient, gasLimit, payload, messageHash)`. `gasLimit` is the gas the recipient gets to handle the message (§6.5); the sender chooses it, and a message whose `gasLimit` no Orange block can provide is never delivered. `messages` is a `mapping(uint64 => bytes32)` at storage slot 0, so message `n` is at slot `keccak256(uint256(n) ‖ uint256(0))`; `nextNonce` is slot 1. The chain id in the hash keeps a message for one Orange chain from being delivered on another.
+with `sender = msg.sender`, and emits `MessageSent(nonce, sender, recipient, gasLimit, payload, messageHash)`. `gasLimit` is the gas the recipient gets to handle the message (§6.5); the sender chooses it, and a message whose `gasLimit` no OrangeSDK block can provide is never delivered. `messages` is a `mapping(uint64 => bytes32)` at storage slot 0, so message `n` is at slot `keccak256(uint256(n) ‖ uint256(0))`; `nextNonce` is slot 1. The chain id in the hash keeps a message for one OrangeSDK chain from being delivered on another.
 
 ### 6.2 Proofs
 
@@ -282,7 +282,7 @@ A mainnet `deliver` carries proofs of about 9 account-trie nodes and 7 storage-t
 
 ## 9. Contracts and fixtures
 
-`contracts/` holds this document's contracts beside spec 17's: `EthereumOutbox.sol` (deployed on Ethereum), `EthereumInbox.sol` (the inbox contract on Orange), the interfaces `IEthereumLightClient.sol` and `IMessageVerifier.sol`, and the test recipient on Orange `test/EthereumMessageRecipient.sol`. Contracts deployed on Ethereum keep the names spec 17 gives its own (`OrangeFinalityVerifierV1`, `OrangeLightClient`, `OrangeInbox`) and `EthereumOutbox`; the contract deployed on Orange that delivers Ethereum's messages is `EthereumInbox`. `tools/build-contracts.sh` compiles every source under `contracts/` with solc 0.8.28 (`--optimize --optimize-runs 200 --evm-version cancun --metadata-hash none`) into `contracts/build/` (`<Name>.bin`, `<Name>.bin-runtime`, `<Name>.abi`) and records the SHA-256 of every source in `contracts/build/SOURCES`; a test fails when a source no longer matches its recorded hash, so stale fixtures cannot pass. The kernel embeds `EthereumInbox.bin-runtime`, so the guest is rebuilt (`tools/build-guest.sh`) after the contracts. The guest build does not depend on where the repository is checked out (the script builds a copy at one fixed path), so the gas of §8 is the same from every checkout.
+`contracts/` holds this document's contracts beside spec 17's: `EthereumOutbox.sol` (deployed on Ethereum), `EthereumInbox.sol` (the inbox contract on the OrangeSDK chain), the interfaces `IEthereumLightClient.sol` and `IMessageVerifier.sol`, and the test recipient on the OrangeSDK chain `test/EthereumMessageRecipient.sol`. Contracts deployed on Ethereum keep the names spec 17 gives its own (`OrangeFinalityVerifierV1`, `OrangeLightClient`, `OrangeInbox`) and `EthereumOutbox`; the contract deployed on the OrangeSDK chain that delivers Ethereum's messages is `EthereumInbox`. `tools/build-contracts.sh` compiles every source under `contracts/` with solc 0.8.28 (`--optimize --optimize-runs 200 --evm-version cancun --metadata-hash none`) into `contracts/build/` (`<Name>.bin`, `<Name>.bin-runtime`, `<Name>.abi`) and records the SHA-256 of every source in `contracts/build/SOURCES`; a test fails when a source no longer matches its recorded hash, so stale fixtures cannot pass. The kernel embeds `EthereumInbox.bin-runtime`, so the guest is rebuilt (`tools/build-guest.sh`) after the contracts. The guest build does not depend on where the repository is checked out (the script builds a copy at one fixed path), so the gas of §8 is the same from every checkout.
 
 ## 10. Test vectors
 

@@ -209,8 +209,8 @@ if [ -n "$GRAFANA_URL" ]; then
     wait_for healthy
     graf /api/datasources/uid/prometheus | jq -e '.type == "prometheus"' >/dev/null \
         || fail "Grafana has no Prometheus data source"
-    dashboard() { graf '/api/search?type=dash-db' | jq -e 'any(.[]; .title == "Orange node")'; }
-    WHAT="the Orange dashboard provisioned in Grafana"
+    dashboard() { graf '/api/search?type=dash-db' | jq -e 'any(.[]; .title == "OrangeSDK node")'; }
+    WHAT="the OrangeSDK dashboard provisioned in Grafana"
     wait_for dashboard
     through() {
         graf '/api/datasources/proxy/uid/prometheus/api/v1/query?query=up%7Bjob%3D%22orange%22%7D' \
@@ -218,7 +218,7 @@ if [ -n "$GRAFANA_URL" ]; then
     }
     WHAT="Grafana querying Prometheus"
     wait_for through
-    log "Grafana has its data source and the Orange dashboard, and queries Prometheus"
+    log "Grafana has its data source and the OrangeSDK dashboard, and queries Prometheus"
 fi
 
 # --- a validator restart -----------------------------------------------

@@ -1,4 +1,4 @@
-//! Threshold BLS signatures over BLS12-381 for Orange finality certificates
+//! Threshold BLS signatures over BLS12-381 for OrangeSDK finality certificates
 //! (spec 12).
 //!
 //! - [`sig`]: the signature scheme. Signatures and message hashes live in G1

@@ -1,4 +1,4 @@
-//! Runtime for Orange guest programs.
+//! Runtime for OrangeSDK guest programs.
 //!
 //! A guest is an ordinary `no_std` Rust crate for `riscv64imac-unknown-none-elf`.
 //! Host calls are ordinary `extern "C"` functions named `__orange_import_<name>`;

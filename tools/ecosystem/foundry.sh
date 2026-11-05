@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The Foundry half of the ecosystem suite: cast and forge against a running
-# Orange node, as a developer drives them by hand or from a deploy pipeline.
+# OrangeSDK node, as a developer drives them by hand or from a deploy pipeline.
 #
 # usage: ORANGE_RPC=http://127.0.0.1:8545 tools/ecosystem/foundry.sh
 #

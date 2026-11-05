@@ -88,7 +88,7 @@ record! {
         block_hash: Hash,
         /// The beacon slot that finalized it.
         slot: u64,
-        /// The Orange timestamp, in seconds, from which it may prove messages.
+        /// The OrangeSDK timestamp, in seconds, from which it may prove messages.
         usable_at: u64,
         /// The checkpoint epoch it was stored in; a root of an older epoch
         /// is treated as absent (spec 18 §5.1).

@@ -6,7 +6,7 @@
 //! the sync-committee light client of spec 18 verifies through the gated
 //! host function `bls12381_fast_aggregate_verify` (spec 05 §4.3).
 //!
-//! Orange's own certificates use the other variant (spec 12, [`crate::sig`]).
+//! OrangeSDK's own certificates use the other variant (spec 12, [`crate::sig`]).
 
 use bls12_381::{G1Affine, G1Projective, G2Prepared, Gt};
 

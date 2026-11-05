@@ -1,6 +1,6 @@
 [package]
 name = "orange-ethlc"
-description = "The Ethereum-to-Orange bridge of spec 18: SSZ, the Altair sync-committee light client at the Electra header format, Merkle-Patricia proofs and the message inbox, no_std"
+description = "The Ethereum-to-OrangeSDK bridge of spec 18: SSZ, the Altair sync-committee light client at the Electra header format, Merkle-Patricia proofs and the message inbox, no_std"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,4 +1,4 @@
-//! ELF to Orange module recompiler (spec 03 §8).
+//! ELF to OrangeSDK module recompiler (spec 03 §8).
 //!
 //! Pipeline: [`elf::Input::load`] reads the sections, symbols and relocations
 //! of a linked RV64 ELF; [`translate::recompile`] decodes the code, discovers

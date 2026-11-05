@@ -2,15 +2,15 @@
 
 ## 1. Overview
 
-Codex ADR 0003 makes Orange a Type 2 Ethereum chain: standard EVM bytecode at exact gas, every transaction type a wallet sends, the full RPC, and Orange's own state tree, consensus and block format underneath. This document specifies where the reference kernel and host meet Ethereum tooling beyond the EVM itself (codex ADR 0033):
+Codex ADR 0003 makes every OrangeSDK chain a Type 2 Ethereum chain: standard EVM bytecode at exact gas, every transaction type a wallet sends, the full RPC, and OrangeSDK's own state tree, consensus and block format underneath. This document specifies where the reference kernel and host meet Ethereum tooling beyond the EVM itself (codex ADR 0033):
 
 - the transaction types the kernel accepts, including EIP-7702 set-code transactions, and the one it refuses, EIP-4844 blob transactions (§2);
-- the block header: every block, the genesis block included, has an Ethereum header whose `keccak256` of the RLP is the block hash, with Merkle-Patricia transactions and receipts roots and a logs bloom, while the state root stays Orange's binary trie (§3); the genesis block's hash and the chain id identify the chain (§3.4);
+- the block header: every block, the genesis block included, has an Ethereum header whose `keccak256` of the RLP is the block hash, with Merkle-Patricia transactions and receipts roots and a logs bloom, while the state root stays OrangeSDK's binary trie (§3); the genesis block's hash and the chain id identify the chain (§3.4);
 - `eth_getProof`, which answers with spec 10 proofs in EIP-1186's response shape (§4);
 - historical state: the state methods answer at any block within a retention window, or at every block on an archive node (§5);
 - the polled filters and the smaller methods standard clients call, the differences from geth that remain, and the suite of standard clients that checks them (§8).
 
-It extends codex ADR 0020, which specified the RPC with state at the head only and Orange's own block commitments; §3 and §5 replace its points 2 and 5. What this document does not change: proposals, anchors and threshold certificates (spec 08, 12, 17) keep their formats, since none of them carries the block hash or the receipts root; the state commitment is spec 10's.
+It extends codex ADR 0020, which specified the RPC with state at the head only and OrangeSDK's own block commitments; §3 and §5 replace its points 2 and 5. What this document does not change: proposals, anchors and threshold certificates (spec 08, 12, 17) keep their formats, since none of them carries the block hash or the receipts root; the state commitment is spec 10's.
 
 ## 2. Transactions
 
@@ -89,7 +89,7 @@ The block's **Ethereum header** is the Prague/Osaka header with these values, in
 | `parentHash` | `parent_hash` |
 | `ommersHash` | `keccak256(rlp([]))` = `1dcc4de8…d49347` |
 | `beneficiary` | `beneficiary` |
-| `stateRoot` | `state_root`: Orange's binary-trie root, not a Merkle-Patricia root (§3.3) |
+| `stateRoot` | `state_root`: OrangeSDK's binary-trie root, not a Merkle-Patricia root (§3.3) |
 | `transactionsRoot` | `transactions_root` |
 | `receiptsRoot` | `receipts_root` |
 | `logsBloom` | `logs_bloom` |
@@ -123,7 +123,7 @@ The block's `logs_bloom` is the OR of its receipts' blooms. A transaction the bl
 
 ### 3.3 State root
 
-`stateRoot` is Orange's state commitment (spec 10), a binary Merkle trie over the store's entries. It is not, and cannot be checked as, an Ethereum state root: a tool that verifies Ethereum state proofs against it fails, and Orange's state proofs follow spec 10 (§4). What an Ethereum state root would commit to (accounts, storage) is in Orange's store under the keys of §4.1, alongside the kernel's other state.
+`stateRoot` is OrangeSDK's state commitment (spec 10), a binary Merkle trie over the store's entries. It is not, and cannot be checked as, an Ethereum state root: a tool that verifies Ethereum state proofs against it fails, and OrangeSDK's state proofs follow spec 10 (§4). What an Ethereum state root would commit to (accounts, storage) is in OrangeSDK's store under the keys of §4.1, alongside the kernel's other state.
 
 ### 3.4 The genesis block
 
@@ -193,7 +193,7 @@ Choosing a receipt outside the header over a system transaction inside it: a pse
 | `address` | the address |
 | `balance`, `nonce` | the account's, at that block |
 | `codeHash` | `keccak256` of the account's code; `keccak256("")` for an account without code |
-| `storageHash` | the block's state root (Orange has no per-account storage trie) |
+| `storageHash` | the block's state root (OrangeSDK has no per-account storage trie) |
 | `stateRoot` | the block's state root, the header's `stateRoot` |
 | `proofFormat` | `orange-binary-trie-v0`: the proofs are spec 10's |
 | `accountKey` | the account's state key, `acct/ ‖ address` (`61 63 63 74 2f` then 20 bytes) |
@@ -247,7 +247,7 @@ The execution-spec state tests run set-code transactions through the kernel's ow
 
 - A genesis without a genesis time (§3.4) keeps a genesis header timestamp of 0, as every chain made before the field existed does.
 - A system receipt (§3.5) is outside the header: the logs bloom does not cover its logs, so a tool that skips blocks by their bloom misses them, and it is not in `eth_getBlockReceipts`; `eth_getLogs` and `eth_getTransactionReceipt` are the way to it.
-- `stateRoot` is not an Ethereum state root (§3.3), and `eth_getProof` answers in Orange's proof format, which Ethereum's verifiers do not read.
+- `stateRoot` is not an Ethereum state root (§3.3), and `eth_getProof` answers in OrangeSDK's proof format, which Ethereum's verifiers do not read.
 - A node without a data directory keeps its history in memory and has none from before it started; while blocks write heavily a window is shorter than `state_history` (§5.1). A node started from a snapshot has no state from before the snapshot (22 §7).
 - The pool's rules for delegation are geth's, plus the take's rule for authorities ahead (§2.4); a pool of another host may differ without affecting consensus (14 §1).
 - Proposals are not run before they are made: a delegated account's code can spend the account's balance, or move its nonce by creating a contract, during another sender's transaction, and a later transaction of that account in the same block is then recorded as failed (06 §5.1) where a geth builder would have left it out; so is a transaction priced below the base fee of the block it lands in (23 §10).
@@ -279,7 +279,7 @@ Deliberate differences from geth, each found by the suite of §8.4:
 - **No subscriptions.** The server answers one request per connection (`Connection: close`), so it has no WebSocket and no `eth_subscribe`: it answers `eth_subscribe` and `eth_unsubscribe` with geth's answer over HTTP, -32601 `notifications not supported`. Clients poll: ethers' `JsonRpcProvider` and viem's `http` transport do so by default, through the filters of §8.1 or `eth_getLogs` and `eth_blockNumber`.
 - **No tracing, no access-list generation, no simulation.** `debug_*`, `trace_*`, `eth_createAccessList` and `eth_simulateV1` would need an inspector in the kernel's EVM; they get -32601. `cast run` works without them: it replays a transaction in Foundry's own EVM over historical state (§5), and the suite checks it charges the gas the kernel charged. `cast access-list` does not work.
 - **Methods geth removed** (`eth_coinbase`, `eth_mining`, `eth_hashrate`, `eth_protocolVersion`) and the node-held-key methods (`eth_sign`, `eth_sendTransaction`, `eth_signTransaction`; `eth_accounts` is empty) are not served.
-- **Client caches and short slots.** A block every 400 ms is shorter than some client caches: ethers 6 answers a request identical to one made in the last 250 ms from its cache (`cacheTimeout`), so a script that sends, waits for the receipt and sends again within that can sign with a stale pending nonce, which the node refuses as `nonce too low`, as it does against anvil or hardhat with automine. A client on an Orange chain sets `cacheTimeout: -1` (or manages nonces, as ethers' `NonceManager` does); viem has no such cache for nonces.
+- **Client caches and short slots.** A block every 400 ms is shorter than some client caches: ethers 6 answers a request identical to one made in the last 250 ms from its cache (`cacheTimeout`), so a script that sends, waits for the receipt and sends again within that can sign with a stale pending nonce, which the node refuses as `nonce too low`, as it does against anvil or hardhat with automine. A client on an OrangeSDK chain sets `cacheTimeout: -1` (or manages nonces, as ethers' `NonceManager` does); viem has no such cache for nonces.
 
 ### 8.4 The ecosystem suite
 

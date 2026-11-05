@@ -33,7 +33,7 @@ const GOVERNANCE: [u8; 20] = [0x60; 20];
 /// Committee size: two thirds is 22 members.
 const SIZE: usize = 32;
 const QUORUM: usize = 22;
-/// The Orange chain id the outbox names.
+/// The OrangeSDK chain id the outbox names.
 const ORANGE_CHAIN_ID: u64 = 7;
 const NOW: u64 = 500;
 

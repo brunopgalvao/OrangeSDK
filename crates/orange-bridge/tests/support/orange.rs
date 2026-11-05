@@ -1,4 +1,4 @@
-//! Orange chains for the bridge tests: the reference kernel, signed legacy
+//! OrangeSDK chains for the bridge tests: the reference kernel, signed legacy
 //! transactions, and genesis files with and without the threshold key.
 
 #![allow(dead_code)]

@@ -1,4 +1,4 @@
-//! Reference implementation of the Orange VM.
+//! Reference implementation of the OrangeSDK VM.
 //!
 //! This crate is the normative companion to `spec/`. Where the two disagree,
 //! the spec wins and this crate has a bug. The reference interpreter is

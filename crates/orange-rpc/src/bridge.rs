@@ -1,4 +1,4 @@
-//! The bridge's methods (spec 17 §7): what a relayer of the Orange-to-Ethereum
+//! The bridge's methods (spec 17 §7): what a relayer of the OrangeSDK-to-Ethereum
 //! bridge needs from a node beside the Ethereum methods, a stored threshold
 //! certificate with the proposal it certifies, and the proof of an outbox
 //! slot against the state root of a recent height.

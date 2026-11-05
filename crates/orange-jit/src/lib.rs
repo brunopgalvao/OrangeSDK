@@ -1,4 +1,4 @@
-//! Native code backend for the Orange VM.
+//! Native code backend for the OrangeSDK VM.
 //!
 //! [`Compiled::new`] translates a validated [`Program`] ahead of time into
 //! machine code for the host (`AArch64` on Apple silicon, x86-64 on Unix);

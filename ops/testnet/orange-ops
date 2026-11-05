@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# orange-ops: deploys and operates the Orange nodes an inventory lists, one node
+# orange-ops: deploys and operates the OrangeSDK nodes an inventory lists, one node
 # per host, over plain ssh. Each host runs `orange-host` (beside this script),
 # which does the work there; this script only copies files and calls it, so
 # a configuration tool can take its place (`orange-ops ansible-inventory`

@@ -1,4 +1,4 @@
-//! A token gateway on Orange owned by the chain's governance (spec 21 §5.6,
+//! A token gateway on the OrangeSDK chain owned by the chain's governance (spec 21 §5.6,
 //! spec 13 §9.2): `TokenGatewayOnOrange` names the governance address as its
 //! owner, nobody else can set its rate limits, and a governed call that the
 //! validators pass sets one (spec 21 §6.5); under the key track the key's

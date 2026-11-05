@@ -80,7 +80,7 @@ pub struct GenesisParams {
     pub upgrades: UpgradeParams,
     /// Staking, epochs, slashing and threshold keys (spec 15).
     pub staking: crate::staking::StakingParams,
-    /// The Ethereum-to-Orange bridge (spec 18); disabled by default.
+    /// The Ethereum-to-OrangeSDK bridge (spec 18); disabled by default.
     pub bridge_in: crate::bridge_in::BridgeInParams,
     /// Two-track governance (spec 13 §9): the mode and the proposal rules.
     pub governance: crate::governance::GovernanceParams,

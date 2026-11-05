@@ -1,6 +1,6 @@
 [package]
 name = "orange-rpc"
-description = "Ethereum JSON-RPC over an Orange node, with a minimal HTTP server"
+description = "Ethereum JSON-RPC over an OrangeSDK node, with a minimal HTTP server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

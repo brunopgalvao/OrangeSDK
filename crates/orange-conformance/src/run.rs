@@ -1,4 +1,4 @@
-//! Running a case: the conformance guest on the Orange VM, with the post-state
+//! Running a case: the conformance guest on the OrangeSDK VM, with the post-state
 //! read back from the storage the kernel's state code wrote.
 
 use orange_abi::chain::{Account as Stored, keys};
@@ -23,7 +23,7 @@ pub struct Executed {
     pub post: State,
     /// Addresses with storage slots but no account, in order. Ethereum has
     /// no such thing, and the state root cannot show it (an account's slots
-    /// are reached only through the account), but Orange's own commitment
+    /// are reached only through the account), but OrangeSDK's own commitment
     /// (spec 10) covers them and they would reappear under a new account at
     /// the address, so any is a failure of its own.
     pub orphans: Vec<[u8; 20]>,

@@ -72,7 +72,7 @@ pub struct Header {
 }
 
 impl Header {
-    /// The header of an Orange block (spec 20 §3.1): the record's fields where it
+    /// The header of an OrangeSDK block (spec 20 §3.1): the record's fields where it
     /// has them, the constants of a chain with no ommers, withdrawals, blobs,
     /// beacon chain or requests elsewhere, and the timestamp in seconds.
     #[must_use]
@@ -138,7 +138,7 @@ impl Header {
     }
 }
 
-/// The hash of an Orange block: that of its Ethereum header (spec 20 §3.1).
+/// The hash of an OrangeSDK block: that of its Ethereum header (spec 20 §3.1).
 #[must_use]
 pub fn block_hash(block: &BlockHeader, keccak: fn(&[u8]) -> [u8; 32]) -> [u8; 32] {
     Header::of(block).hash(keccak)

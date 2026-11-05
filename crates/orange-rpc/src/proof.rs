@@ -1,4 +1,4 @@
-//! `eth_getProof` with Orange's state proofs (spec 20 §4): the account and its
+//! `eth_getProof` with OrangeSDK's state proofs (spec 20 §4): the account and its
 //! storage slots, each with the spec 10 proof of its entry against the
 //! block's state root, in the response shape of EIP-1186 with a field naming
 //! the proof format.

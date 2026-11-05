@@ -1,4 +1,4 @@
-# Prometheus alert rules for Orange nodes (spec 11 section 7).
+# Prometheus alert rules for OrangeSDK nodes (spec 11 section 7).
 #
 # Load with `rule_files: [alerts.yml]` (see prometheus.yml). The thresholds
 # are the defaults `orange doctor` judges by (orange_metrics::DEFAULT_LIMITS).

@@ -1,0 +1,2 @@
+# OrangeSDK is the framework's name in prose, not an identifier.
+doc-valid-idents = ["OrangeSDK", ".."]

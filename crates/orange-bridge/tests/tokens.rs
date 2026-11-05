@@ -1,9 +1,9 @@
 //! The canonical token bridge end to end (spec 21) over both real message
-//! channels. The gateways first hear from each other: the Orange gateway's
+//! channels. The gateways first hear from each other: the OrangeSDK-chain gateway's
 //! `HELLO` crosses to Ethereum, and until it arrives the Ethereum gateway
 //! takes no deposits. On "Ethereum" (revm at Osaka) Alice locks ETH and an ERC-20 in
 //! `TokenGatewayOnEthereum`, which sends through `EthereumOutbox`; a
-//! synthetic beacon chain finalizes that state; on an Orange chain of four
+//! synthetic beacon chain finalizes that state; on an OrangeSDK chain of four
 //! staking validators (simulated with `Sim`) the sync-committee light client
 //! takes the update, the inbox delivers the messages with `eth_getProof`
 //! proofs, and `TokenGatewayOnOrange` mints the wrapped tokens to Bob, who
@@ -11,20 +11,20 @@
 //! through the outbox; the relayer library turns a threshold certificate
 //! into a light-client submission and the outbox slots into inbox proofs,
 //! and on Ethereum the gateway releases the locked tokens. Carol also locks
-//! Orange's own currency, which arrives on Ethereum as a wrapped token and
+//! the OrangeSDK chain's own currency, which arrives on Ethereum as a wrapped token and
 //! comes back. Along the way: a paused gateway and a mint over its cap make
 //! deliveries fail and wait, a message from another Ethereum account than
 //! the gateway is never honoured, replays are refused on both sides, a
 //! fee-on-transfer token and a deposit over the lock cap are refused, and a
 //! release to a recipient that refuses ETH is owed and claimed later. A
-//! deposit queued on Orange by its mint limit is cancelled and refunded by
+//! deposit queued on the OrangeSDK chain by its mint limit is cancelled and refunded by
 //! governance, and the refund crosses back to release Alice's ETH. Then a
 //! dishonest sync committee finalizes a state in which a forged mint takes
 //! the nonce of Alice's next deposit: governance refunds the queued forgery,
 //! the refusal tells the Ethereum gateway the nonce is spent, and Alice's
 //! deposit, which can never arrive, is refunded to her; a mint of a token
-//! Orange does not list goes back; `OrangeInbox`'s guardian vetoes Carol's
-//! deposit, anyone reports the veto to Orange and Carol is refunded there.
+//! the OrangeSDK chain does not list goes back; `OrangeInbox`'s guardian vetoes Carol's
+//! deposit, anyone reports the veto to the OrangeSDK chain and Carol is refunded there.
 //! Every balance at the end is exact, and minted never exceeds locked.
 
 mod support;
@@ -79,7 +79,7 @@ const MALLORY: [u8; 20] = [0x66; 20];
 
 const DELAY: u64 = 600;
 const MAX_KEY_AGE: u64 = 2;
-/// The gas each message from Ethereum gives the gateway on Orange.
+/// The gas each message from Ethereum gives the gateway on the OrangeSDK chain.
 const MESSAGE_GAS: u64 = 1_500_000;
 const UPDATE_GAS: u64 = 3_000_000;
 const DELIVER_GAS: u64 = 3_000_000;
@@ -90,32 +90,32 @@ const BIG: u128 = 1 << 100;
 const DEPOSIT_ETH_GAS: u64 = 123_972;
 /// Of the first `deposit` of an ERC-20 there.
 const DEPOSIT_TOKEN_GAS: u64 = 181_961;
-/// Of the delivery on Orange whose mint creates wrapped ETH (the inbox's proofs included).
+/// Of the delivery on the OrangeSDK chain whose mint creates wrapped ETH (the inbox's proofs included).
 const FIRST_MINT_GAS: u64 = 833_067;
-/// Of a delivery on Orange whose wrapped token exists.
+/// Of a delivery on the OrangeSDK chain whose wrapped token exists.
 const MINT_GAS: u64 = 109_989;
-/// Of a withdrawal on Orange: the burn and the send through the outbox.
+/// Of a withdrawal on the OrangeSDK chain: the burn and the send through the outbox.
 const BURN_GAS: u64 = 120_033;
-/// Of a deposit of Orange's currency on Orange.
+/// Of a deposit of the OrangeSDK chain's currency on the OrangeSDK chain.
 const LOCK_NATIVE_GAS: u64 = 140_161;
 /// Of `OrangeInbox.execute` releasing ETH through the gateway on Ethereum.
 const RELEASE_GAS: u64 = 80_516;
 /// Of a withdrawal on Ethereum: the burn and the send through `EthereumOutbox`.
 const ETH_BURN_GAS: u64 = 108_860;
-/// Of the delivery on Orange that releases Orange's currency.
+/// Of the delivery on the OrangeSDK chain that releases the OrangeSDK chain's currency.
 const NATIVE_RELEASE_GAS: u64 = 100_212;
 /// Of `OrangeInbox.execute` of a `REFUND` that releases ETH back to its depositor.
 const REFUND_GAS: u64 = 83_502;
-/// Of the delivery on Orange of a `MINT` of a token the gateway does not list, which sends it back.
+/// Of the delivery on the OrangeSDK chain of a `MINT` of a token the gateway does not list, which sends it back.
 const BOUNCE_GAS: u64 = 165_059;
 /// Of `refundSpent` on Ethereum releasing ETH whose message never arrives.
 const REFUND_SPENT_GAS: u64 = 47_282;
 /// Of `reportVetoed` on Ethereum, through `EthereumOutbox`.
 const REPORT_GAS: u64 = 114_619;
-/// Of the delivery on Orange of the `SPENT` it sends.
+/// Of the delivery on the OrangeSDK chain of the `SPENT` it sends.
 const SPENT_GAS: u64 = 106_449;
 
-/// The Orange side: the simulated chain and its wallets' nonces.
+/// The OrangeSDK side: the simulated chain and its wallets' nonces.
 struct Orange {
     sim: Sim,
     nonces: std::collections::BTreeMap<[u8; 20], u64>,
@@ -312,7 +312,7 @@ fn genesis(
     }
 }
 
-/// Proves `messages`, sent on Orange at or before height `sent_at`, to
+/// Proves `messages`, sent on the OrangeSDK chain at or before height `sent_at`, to
 /// `OrangeInbox` on Ethereum: a light-client submission from a threshold
 /// certificate anchoring a height at or after the sends, then each
 /// message's outbox slot. Their delay runs from here.
@@ -362,7 +362,7 @@ fn module(elf: &[u8]) -> Vec<u8> {
 fn tokens_cross_both_ways_over_the_verified_channels() {
     // (name, measured, pinned) of every gas figure spec 21 §8 states, checked together at the end.
     let mut gas: Vec<(&str, u64, u64)> = Vec::new();
-    // Orange wallets: the relayer, the gateway's deployer, owner (the governance account) and
+    // OrangeSDK-chain wallets: the relayer, the gateway's deployer, owner (the governance account) and
     // guardian, and the users Bob and Carol.
     let relayer = key(0x11);
     let deployer = key(0x12);
@@ -373,7 +373,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
     let validators: Vec<SigningKey> = (1..=4).map(|i| key(0x30 + i)).collect();
 
     // Addresses known before anything is deployed: the outbox is the Ethereum deployer's
-    // first contract and the gateway its fifth; the Orange gateway is its deployer's first.
+    // first contract and the gateway its fifth; the OrangeSDK-chain gateway is its deployer's first.
     let eth_outbox = create_address(&ETH_DEPLOYER, 0);
     let eth_gateway = create_address(&ETH_DEPLOYER, 4);
     let orange_gateway = create_address(&address(&deployer), 0);
@@ -533,7 +533,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
         &set_mint_cap_calldata(&NATIVE, 10 * ETHER),
     ));
 
-    // Orange: the gateway, deployed by an ordinary transaction, governed by the governance account.
+    // OrangeSDK: the gateway, deployed by an ordinary transaction, governed by the governance account.
     let created = orange.send(
         &deployer,
         None,
@@ -582,7 +582,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
             &deposit_calldata(&token, &to, amount),
         )
     };
-    // But not before the Ethereum gateway has heard from its peer (spec 21 §5.7): the Orange
+    // But not before the Ethereum gateway has heard from its peer (spec 21 §5.7): the OrangeSDK-chain
     // gateway's constructor sent a HELLO, which crosses through the outbox, a certificate and
     // `OrangeInbox`; the Ethereum gateway answers it.
     reverted_with(
@@ -643,7 +643,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
     ok(&eth.call(GUARDIAN, eth_gateway, &abi::call("pause()", &[])));
     reverted_with(&deposit(&mut eth, NATIVE, address(&bob), 1), "IsPaused()");
     ok(&eth.call(OWNER, eth_gateway, &abi::call("unpause()", &[])));
-    // Mallory sends the Orange gateway a mint of her own through the outbox.
+    // Mallory sends the OrangeSDK-chain gateway a mint of her own through the outbox.
     let forged = TokenMessage::Mint {
         origin: NATIVE,
         from: MALLORY,
@@ -684,7 +684,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
         })
     );
 
-    // The beacon chain finalizes that state at execution block 16; the light client on Orange
+    // The beacon chain finalizes that state at execution block 16; the light client on the OrangeSDK chain
     // takes the update, and its root is usable after the delay.
     let state = eth.state();
     // The state spec 21 §8's deliveries prove against.
@@ -724,7 +724,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
         ) == word(1)
     };
 
-    // The guardian paused the Orange gateway: the delivery fails and stays undelivered.
+    // The guardian paused the OrangeSDK-chain gateway: the delivery fails and stays undelivered.
     let pause = abi::call("pause()", &[]);
     assert_eq!(
         orange
@@ -840,7 +840,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
         5 * ETHER
     );
 
-    // On Orange: Bob pays Carol 200 000 TKN; Carol sends them to Alice on Ethereum; Bob sends 2 ETH
+    // On the OrangeSDK chain: Bob pays Carol 200 000 TKN; Carol sends them to Alice on Ethereum; Bob sends 2 ETH
     // to a contract that refuses ETH and 1 ETH to Alice; Carol locks 3 ORANGE for Dave.
     let transfer = abi::call(
         "transfer(address,uint256)",
@@ -899,7 +899,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
     ]);
     assert_eq!(orange.native(address(&carol)), carol_before - 3 * ETHER);
     assert_eq!(orange.native(orange_gateway), 3 * ETHER);
-    // Minted on Orange never exceeds locked on Ethereum.
+    // Minted on the OrangeSDK chain never exceeds locked on Ethereum.
     assert_eq!(
         orange.u128_view(weth, &abi::call("totalSupply()", &[])),
         2 * ETHER
@@ -983,7 +983,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
     );
 
     // Dave sends 1 ORANGE back to Carol: burned on Ethereum, proven against the next finalized
-    // state, released on Orange from what the gateway there locked.
+    // state, released on the OrangeSDK chain from what the gateway there locked.
     let back = eth.call(
         DAVE,
         eth_gateway,
@@ -1040,7 +1040,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
     ]);
 
     // A refund (spec 21 §5.5b): with a mint limit on wrapped ETH, Alice's next deposit queues on
-    // Orange; governance, the owner there, cancels it and refunds it, and the refund crosses back
+    // the OrangeSDK chain; governance, the owner there, cancels it and refunds it, and the refund crosses back
     // through the outbox, a certificate and `OrangeInbox` to the Ethereum gateway, which recorded
     // sending that very message and releases Alice's ETH to her.
     assert_eq!(
@@ -1137,11 +1137,11 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
     let sent = abi::call("sent(uint64)", &[Value::uint(u128::from(refundable.nonce))]);
     assert_eq!(eth.view(RELAYER, eth_gateway, &sent).output, [0; 32]);
 
-    // Messages that never arrive (spec 21 §5.5c). Governance delists TKN on Orange. On Ethereum
+    // Messages that never arrive (spec 21 §5.5c). Governance delists TKN on the OrangeSDK chain. On Ethereum
     // Alice deposits 1 ETH and 100 000 TKN for Bob; then the sync committee turns dishonest and
     // finalizes a state in which the outbox slot of her ETH deposit holds a forged mint of 1 ETH
-    // to Mallory instead. On Orange the forgery is delivered under Alice's nonce and queued by the
-    // mint limit, and the TKN deposit, of a token Orange does not list, goes back at once.
+    // to Mallory instead. On the OrangeSDK chain the forgery is delivered under Alice's nonce and queued by the
+    // mint limit, and the TKN deposit, of a token the OrangeSDK chain does not list, goes back at once.
     assert_eq!(
         orange
             .send(
@@ -1311,7 +1311,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
     ok(&made_whole);
     gas.push(("REFUND_SPENT_GAS", made_whole.gas, REFUND_SPENT_GAS));
     assert_eq!(eth.balance(ALICE), alice_eth + ETHER);
-    // Anyone reports Carol's vetoed deposit to Orange, through `EthereumOutbox` and the honest
+    // Anyone reports Carol's vetoed deposit to the OrangeSDK chain, through `EthereumOutbox` and the honest
     // committee's next update; her ORANGE is refunded to her there. Alice's real message is proven
     // against that state, but its nonce is spent: it is never delivered.
     let report = eth.call(

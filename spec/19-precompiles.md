@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-The reference kernel runs the EVM (revm, Osaka) inside the Orange VM, metered in VM gas (04), and charges transactions Ethereum's gas. That is sound only while the kernel gas an operation takes stays roughly proportional to the EVM gas it is charged. Ethereum prices its precompiles for native code; computed in the interpreted guest, the bn254, KZG and BLS12-381 precompiles cost the kernel up to 1 700 VM gas per EVM gas, against 40 to 130 for ordinary opcodes, so a cheap transaction could take a block's whole kernel-gas allowance: a denial of service on block production, or a block a node with a smaller allowance cannot execute (§2).
+The reference kernel runs the EVM (revm, Osaka) inside the OrangeSDK VM, metered in VM gas (04), and charges transactions Ethereum's gas. That is sound only while the kernel gas an operation takes stays roughly proportional to the EVM gas it is charged. Ethereum prices its precompiles for native code; computed in the interpreted guest, the bn254, KZG and BLS12-381 precompiles cost the kernel up to 1 700 VM gas per EVM gas, against 40 to 130 for ordinary opcodes, so a cheap transaction could take a block's whole kernel-gas allowance: a denial of service on block production, or a block a node with a smaller allowance cannot execute (§2).
 
 This document specifies how the reference kernel keeps kernel gas per EVM gas bounded without changing Ethereum's gas (codex ADR 0032):
 
@@ -141,7 +141,7 @@ Whether gate 2 is active is read from the gate book at the start of each `kernel
 
 ### 3.4 Equivalence
 
-Both paths run revm 43's own backends (arkworks for bn254, BLS12-381 and KZG, `aurora-engine-modexp`, revm's BLAKE2F): in the guest compiled for the Orange VM, on the host natively. They return the same output for every input, and halt for the same inputs; which `PrecompileHalt` a halt names may differ, which nothing observes, every halt failing the call and consuming its gas. `host_and_guest_paths_agree_on_every_precompile` runs every row of table 2.1 and 27 refused or degenerate inputs (invalid and off-curve points, non-canonical field elements, bad lengths and padding, a wrong proof or versioned hash, empty inputs, zero scalars, pairings that do not hold) through both paths, the host path on both backends, and requires identical outcomes and post-states; the host functions' own tests compare each result with revm's precompile on the same operands.
+Both paths run revm 43's own backends (arkworks for bn254, BLS12-381 and KZG, `aurora-engine-modexp`, revm's BLAKE2F): in the guest compiled for the OrangeSDK VM, on the host natively. They return the same output for every input, and halt for the same inputs; which `PrecompileHalt` a halt names may differ, which nothing observes, every halt failing the call and consuming its gas. `host_and_guest_paths_agree_on_every_precompile` runs every row of table 2.1 and 27 refused or degenerate inputs (invalid and off-curve points, non-canonical field elements, bad lengths and padding, a wrong proof or versioned hash, empty inputs, zero scalars, pairings that do not hold) through both paths, the host path on both backends, and requires identical outcomes and post-states; the host functions' own tests compare each result with revm's precompile on the same operands.
 
 ## 4. Ordinary operations
 
@@ -207,7 +207,7 @@ A budget of 2^31, tried first, failed two cases with the gate inactive, single t
 
 ## 7. Rationale (non-normative)
 
-- **Acceleration, not repricing.** Charging the guest's cost as EVM gas would make Orange's gas schedule differ from Ethereum's for every contract using these precompiles, breaking the Type 2 equivalence that lets Ethereum tooling estimate gas. Moving the work to the host keeps Ethereum's gas exact; the budget before the gate is the least deviation that still bounds a block.
+- **Acceleration, not repricing.** Charging the guest's cost as EVM gas would make OrangeSDK's gas schedule differ from Ethereum's for every contract using these precompiles, breaking the Type 2 equivalence that lets Ethereum tooling estimate gas. Moving the work to the host keeps Ethereum's gas exact; the budget before the gate is the least deviation that still bounds a block.
 - **Through `Crypto`, not a precompile of the kernel's own.** revm 43's `Crypto` trait exposes exactly the arithmetic, after revm's input parsing and gas; routing it keeps every Ethereum rule (lengths, padding, gas formulas, the versioned-hash check) in revm, where conformance tests it, and leaves the host only mathematics, priced by a rule that follows Ethereum's own calibration.
 - **A module, not a kernel upgrade.** A kernel importing the gated functions would need a kernel upgrade with `requiredGates` set (13 §3) once the gate is active, and two kernels to maintain. The module lets one kernel run before and after the gate, switching at the activation height on every node with no governance action, at a cost of about 5 000 VM gas per call, as the light client of spec 18 waits for gate 1.
 - **Per-block budget, not per transaction.** A transaction's EVM gas cannot bound the guest's work for these operations, which is the problem; the budget bounds the block, which is what a node must execute in time. A per-transaction cap would let many transactions add up to the same unbounded block.

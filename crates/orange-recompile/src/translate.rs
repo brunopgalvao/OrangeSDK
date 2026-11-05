@@ -1,4 +1,4 @@
-//! The translation pipeline from a loaded ELF to an Orange module (spec 03 §8).
+//! The translation pipeline from a loaded ELF to an OrangeSDK module (spec 03 §8).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;

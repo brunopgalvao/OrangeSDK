@@ -1,4 +1,4 @@
-//! The host side of the Orange VM boundary (spec 05).
+//! The host side of the OrangeSDK VM boundary (spec 05).
 //!
 //! `orange-vm` executes one instance and knows nothing about storage, code, or
 //! nested calls. This crate supplies those: a [`cache::ModuleCache`] keyed by

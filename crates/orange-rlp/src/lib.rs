@@ -33,7 +33,7 @@ pub enum Error {
     TooDeep,
 }
 
-/// The deepest nesting of lists [`decode`] accepts. Every structure Orange
+/// The deepest nesting of lists [`decode`] accepts. Every structure OrangeSDK
 /// reads from RLP is at most four lists deep (a transaction's access list
 /// entry's storage keys, a receipt's log's topics); a limit keeps the
 /// recursive decoder's stack bounded, where a 30 KB string of nested lists

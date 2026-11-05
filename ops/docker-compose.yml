@@ -1,4 +1,4 @@
-# A four-validator Orange devnet with Prometheus and Grafana: the topology of
+# A four-validator OrangeSDK devnet with Prometheus and Grafana: the topology of
 # `orange devnet init --validators 4` as containers, one image built once from
 # ops/Dockerfile. See ops/README.md.
 #
@@ -9,7 +9,7 @@
 # unauthenticated (no `--rpc-stop`, so no `orange_stop`) and Grafana runs
 # as an anonymous admin:
 # JSON-RPC 127.0.0.1:8545 to 8548 (node 0 to 3), Prometheus 127.0.0.1:9090,
-# Grafana 127.0.0.1:3000 with the Orange dashboard provisioned.
+# Grafana 127.0.0.1:3000 with the OrangeSDK dashboard provisioned.
 #
 # `init` runs once and writes the genesis, the kernel module and the keys to
 # the `devnet` volume; it leaves them alone on later runs, so a restart keeps

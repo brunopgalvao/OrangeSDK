@@ -1,7 +1,7 @@
 {
   "name": "orange-ecosystem",
   "private": true,
-  "description": "Standard Ethereum clients (ethers, viem) against an Orange devnet",
+  "description": "Standard Ethereum clients (ethers, viem) against an OrangeSDK devnet",
   "type": "module",
   "engines": {
     "node": ">=20"

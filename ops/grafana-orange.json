@@ -1,7 +1,7 @@
 {
-  "title": "Orange node",
+  "title": "OrangeSDK node",
   "uid": "orange-node",
-  "description": "Chain progress, kernel calls, peers and the mempool of Orange nodes (spec 11).",
+  "description": "Chain progress, kernel calls, peers and the mempool of OrangeSDK nodes (spec 11).",
   "tags": [
     "orange"
   ],

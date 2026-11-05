@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-This document specifies the Orange-to-Ethereum half of the tier-2 bridge of codex ADR 0013: a message that any account or contract on an Orange chain hands to the *outbox* is recorded in chain state, a relayer proves it on Ethereum against a state root that a *light client* there accepted from a threshold certificate (spec 12), and an *inbox* delivers it to its recipient once, after a delay, within rate limits, unless a guardian stops it. The Ethereum-to-Orange half, a sync-committee light client of Ethereum as a kernel module, is specified separately. The decisions behind this document are recorded in codex ADRs 0029 and 0031; the second replaced the constant group key with one that rotates every epoch, and the version-1 contracts with version-2 ones that follow it.
+This document specifies the OrangeSDK-to-Ethereum half of the tier-2 bridge of codex ADR 0013: a message that any account or contract on an OrangeSDK chain hands to the *outbox* is recorded in chain state, a relayer proves it on Ethereum against a state root that a *light client* there accepted from a threshold certificate (spec 12), and an *inbox* delivers it to its recipient once, after a delay, within rate limits, unless a guardian stops it. The Ethereum-to-OrangeSDK half, a sync-committee light client of Ethereum as a kernel module, is specified separately. The decisions behind this document are recorded in codex ADRs 0029 and 0031; the second replaced the constant group key with one that rotates every epoch, and the version-1 contracts with version-2 ones that follow it.
 
 The pieces, and where they live:
 
@@ -15,7 +15,7 @@ The pieces, and where they live:
 | `OrangeInbox` | `contracts/` | §6 |
 | Relayer library, node queries, RPC methods | `crates/orange-bridge`, the kernel's `finality_proof` and `handoff` queries, `crates/orange-rpc` | §7 |
 
-Integers inside a message, a certificate message or an Ethereum ABI word are big-endian. Integers inside an Orange canonical encoding (06 §2), such as a proposal, are little-endian.
+Integers inside a message, a certificate message or an Ethereum ABI word are big-endian. Integers inside an OrangeSDK canonical encoding (06 §2), such as a proposal, are little-endian.
 
 ## 2. The outbox
 
@@ -70,7 +70,7 @@ message = version (1 byte, 1) ‖ source_chain_id (u64) ‖ nonce (u64) ‖ send
         ‖ recipient (20) ‖ value (32 bytes) ‖ payload
 ```
 
-integers big-endian, 97 bytes plus the payload: the layout of Solidity's `abi.encodePacked(uint8(1), uint64 sourceChainId, uint64 nonce, address sender, uint64 destChainId, address recipient, uint256 value, bytes payload)`. `source_chain_id` is the Orange chain's id, `sender` the caller of `send`, `value` its value. The *message hash* is `keccak256(message)`.
+integers big-endian, 97 bytes plus the payload: the layout of Solidity's `abi.encodePacked(uint8(1), uint64 sourceChainId, uint64 nonce, address sender, uint64 destChainId, address recipient, uint256 value, bytes payload)`. `source_chain_id` is the OrangeSDK chain's id, `sender` the caller of `send`, `value` its value. The *message hash* is `keccak256(message)`.
 
 Message `nonce` is committed (10 §2) as the EVM storage slot `nonce` of the outbox, under the chain-state key
 
@@ -96,7 +96,7 @@ The anchor of a certified proposal is typically one or two heights below the pro
 
 ### 5.2 `OrangeLightClient`
 
-`contracts/OrangeLightClient.sol` holds the state roots of one Orange chain. Its constructor takes the verifier and reads its chain id; both are immutable, and it has no owner.
+`contracts/OrangeLightClient.sol` holds the state roots of one OrangeSDK chain. Its constructor takes the verifier and reads its chain id; both are immutable, and it has no owner.
 
 `submit(bytes proposal, bytes signature)` takes an encoded proposal and the certificate's signature in EIP-2537 encoding. With `height` the little-endian `u64` at bytes 8 to 15 of `proposal`, `anchor` the one at bytes 56 to 63 and `root` bytes 64 to 95, it reverts with
 
@@ -116,7 +116,7 @@ and otherwise stores `stateRoots[anchor] = root`, sets `latestHeight = anchor` a
 
 `contracts/OrangeFinalityVerifierV2.sol` holds the chain id and no key. `isValidKey(key)` says whether a 256-byte EIP-2537 G2 point is a usable group key (not the identity, unchanged by `BLS12_G2MSM` with scalar 1); `compress(key)` returns its compressed encoding (12 §8, rotations); `verify(key, keyId, height, blockHash, signature)` returns whether the signature verifies under `key` over `message_v2`, and `verifyRotation(key, newKeyId, newKey, signature)` whether it verifies under `key` over the rotation message to `newKeyId` and the compressed `newKey`. A signature or key of the wrong length reverts with `InvalidLength()`. It has no owner and no storage.
 
-`contracts/OrangeLightClientV2.sol` holds the state roots of one Orange chain and its *current key set*: an id and a group key in EIP-2537 encoding, in storage. Its constructor takes `(verifier, keyId, key, epochBlocks, maxKeyAge)`: the trusted key set to start from (the chain's first key set, or any later one the deployer trusts), the chain's epoch length `L` and its `max_key_age` `K` (15 §2); it reverts with `InvalidParameters()` if `L` or `K` is zero and `InvalidKey()` if the key is not valid. The verifier, the chain id, `L` and `K` never change; it has no owner. `epochOf(h)` is `(h − 1) / L`, 0 for `h = 0`.
+`contracts/OrangeLightClientV2.sol` holds the state roots of one OrangeSDK chain and its *current key set*: an id and a group key in EIP-2537 encoding, in storage. Its constructor takes `(verifier, keyId, key, epochBlocks, maxKeyAge)`: the trusted key set to start from (the chain's first key set, or any later one the deployer trusts), the chain's epoch length `L` and its `max_key_age` `K` (15 §2); it reverts with `InvalidParameters()` if `L` or `K` is zero and `InvalidKey()` if the key is not valid. The verifier, the chain id, `L` and `K` never change; it has no owner. `epochOf(h)` is `(h − 1) / L`, 0 for `h = 0`.
 
 `rotate(newKeyId, newKey, signature)` moves the current key set along one handoff (15 §6.6). It reverts with
 
@@ -145,7 +145,7 @@ and otherwise makes `(newKeyId, newKey)` the current key set and logs `KeyRotate
 
 `execute(Message m)` reverts with `IsPaused()` while paused, `NotPending()` unless the nonce is pending, `MessageMismatch()` if `m` does not hash to the proven hash, `TooEarly()` before `executableAt`, and `RateLimited()` if the message does not fit the current window (§6.2). Otherwise it marks the nonce delivered, calls `recipient.onOrangeMessage(sourceChainId, nonce, sender, value, payload)` (`IOrangeMessageRecipient`, `contracts/IOrangeBridge.sol`) with all but one 64th of the gas it has left (EIP-150), and logs `MessageDelivered(nonce, messageHash, recipient)`. If the recipient reverts, `execute` reverts with the recipient's revert data and the message stays pending, so it can be executed again; anyone may call `execute`, and the caller chooses the gas. A recipient without code accepts every message. A nonce is delivered at most once.
 
-`value` is the Orange value the outbox kept (§2.3), passed to the recipient as a number; the inbox holds and pays no ether. A recipient checks that `msg.sender` is the inbox and decides what `sender`, `sourceChainId` and `value` entitle the message to.
+`value` is the OrangeSDK value the outbox kept (§2.3), passed to the recipient as a number; the inbox holds and pays no ether. A recipient checks that `msg.sender` is the inbox and decides what `sender`, `sourceChainId` and `value` entitle the message to.
 
 ### 6.2 Delay and rate limits
 
@@ -161,7 +161,7 @@ and otherwise makes `(newKeyId, newKey)` the current key set and logs `KeyRotate
 
 Pausing stops `prove` and `execute`. The delay exists so that the guardian can pause and veto a message proven from a certificate that faulty shareholders forged before it executes; the owner (a timelock or multisig) sets how long that window is and how much can move per window, which bounds what a forged certificate can deliver. The value limit counts only the value messages carry: a recipient that holds value itself and moves it on a message's word, as a token gateway does (spec 21 §6.2), is bounded by the message limit and its own caps, not by `maxValuePerWindow`. Neither role is needed for an honest message to arrive: while the inbox is not paused and the message fits a window, anyone can prove and execute it.
 
-`entries(nonce)` returns `(messageHash, executableAt, status)` for every proven nonce, with `status` `Pending` (1), `Delivered` (2) or `Vetoed` (3), and never changes once `Delivered` or `Vetoed`; with `hashMessage(m)` a contract on Ethereum can therefore tell exactly what the inbox delivered with a nonce, or that it will never deliver it. The token gateway reads it to report such nonces back to Orange (spec 21 §5.1, §5.5c). The record is of the inbox, not of the light client: a nonce a forged certificate proved stays proven, and its honest message, whose hash differs, is refused `AlreadyProven()` for good.
+`entries(nonce)` returns `(messageHash, executableAt, status)` for every proven nonce, with `status` `Pending` (1), `Delivered` (2) or `Vetoed` (3), and never changes once `Delivered` or `Vetoed`; with `hashMessage(m)` a contract on Ethereum can therefore tell exactly what the inbox delivered with a nonce, or that it will never deliver it. The token gateway reads it to report such nonces back to the OrangeSDK chain (spec 21 §5.1, §5.5c). The record is of the inbox, not of the light client: a nonce a forged certificate proved stays proven, and its honest message, whose hash differs, is refused `AlreadyProven()` for good.
 
 ### 6.4 Deployment and succession
 
@@ -169,7 +169,7 @@ The constructor takes `(lightClient, firstNonce, owner, guardian, delay, window,
 
 ## 7. Relaying
 
-A relayer needs, from an Orange node: messages (the outbox's `MessageSent` logs, through `eth_getLogs` or receipts); a certificate whose proposal anchors a height at or after the message's block, with that proposal; and the proof of the message's slot against that height's state root. Then on Ethereum it calls `submit` on the light client (unless a root at or after the message is already stored and its node can still prove against it), `prove` on the inbox, and, after the delay, `execute`.
+A relayer needs, from an OrangeSDK node: messages (the outbox's `MessageSent` logs, through `eth_getLogs` or receipts); a certificate whose proposal anchors a height at or after the message's block, with that proposal; and the proof of the message's slot against that height's state root. Then on Ethereum it calls `submit` on the light client (unless a root at or after the message is already stored and its node can still prove against it), `prove` on the inbox, and, after the delay, `execute`.
 
 **Keeping a version-2 client current.** The client accepts certificates of its current key set only. A relayer reads the client's `keyId`, submits with a certificate of that key set while the chain still produces them (checking it first, as below), and moves the client along every handoff the chain recorded, in order, by `rotate` with the handoff record (15 §6.6), from the `handoff` query or `orange_getRotation`. It does so promptly: the client's protection rests on it holding a key whose shareholders are still bonded (§10).
 
@@ -213,15 +213,15 @@ Of `verify`, 115 791 is precompiles: 114 275 of BLS (12 §2), 516 of SHA-256 and
 
 ## 9. Contracts and their fixtures
 
-The Solidity sources are in `contracts/` (test contracts in `contracts/test/`); the version-2 interface is `IOrangeBridgeV2.sol`. The directory also holds spec 18's contracts (`EthereumOutbox`, deployed on Ethereum, and `EthereumInbox`, deployed on Orange), built and checked the same way. `tools/build-contracts.sh` compiles them with solc 0.8.28 and writes `contracts/build/`: each contract's init code (`.bin`), runtime code (`.bin-runtime`) and ABI (`.abi`), and `SOURCES`, the sha256 of every source. The tests run the committed fixtures and fail when a source's hash differs from `SOURCES` or a source is missing from it, so a contract change without rebuilt fixtures cannot pass. CI does not need solc.
+The Solidity sources are in `contracts/` (test contracts in `contracts/test/`); the version-2 interface is `IOrangeBridgeV2.sol`. The directory also holds spec 18's contracts (`EthereumOutbox`, deployed on Ethereum, and `EthereumInbox`, deployed on the OrangeSDK chain), built and checked the same way. `tools/build-contracts.sh` compiles them with solc 0.8.28 and writes `contracts/build/`: each contract's init code (`.bin`), runtime code (`.bin-runtime`) and ABI (`.abi`), and `SOURCES`, the sha256 of every source. The tests run the committed fixtures and fail when a source's hash differs from `SOURCES` or a source is missing from it, so a contract change without rebuilt fixtures cannot pass. CI does not need solc.
 
 ## 10. Limits of this version
 
 - **Former shareholders no longer keep the power to forge, with a version-2 client kept current.** Earlier versions reshared one constant group key, which former shareholders could use for ever with no stake at risk, and recorded that as a departure from codex ADR 0013. Codex ADR 0031 resolves it: every epoch makes a fresh key that the old one hands off to (15 §6.6), a version-2 light client trusts a key for `K` epochs past its own (§5.3), unbonding outlasts that and the handoff latency (15 §6.7), and partials over false anchors, false rotations or after a key's handoff are slashable evidence (15 §5.1). ADR 0013's "unbonding longer than any trusting period" holds; a per-epoch cap on validator-set change is still not implemented and is not needed for this argument.
-- **The trusting period is measured in Orange heights as the client sees them.** The client has no clock of the Orange chain but the anchors it stores and the key ids it is shown; a forged certificate or rotation carries no time and can be signed after its signers withdrew. So the guarantee needs the client kept current: a relayer moves it past key set `k` before the chain reaches epoch `k + 1 + unbonding_epochs`, when the first shareholders of `k` can withdraw. A client left holding an old key for longer, for instance because nobody relayed for weeks, is exposed to that key's withdrawn shareholders as a version-1 client is: they can sign it a rotation to a key of their own, within `K` ids. Only the delay, the guardian's veto and the rate limits (§6) bound what such a client delivers. A bound in Ethereum time (refusing anything after a long idle period) is left for later.
+- **The trusting period is measured in OrangeSDK heights as the client sees them.** The client has no clock of the OrangeSDK chain but the anchors it stores and the key ids it is shown; a forged certificate or rotation carries no time and can be signed after its signers withdrew. So the guarantee needs the client kept current: a relayer moves it past key set `k` before the chain reaches epoch `k + 1 + unbonding_epochs`, when the first shareholders of `k` can withdraw. A client left holding an old key for longer, for instance because nobody relayed for weeks, is exposed to that key's withdrawn shareholders as a version-1 client is: they can sign it a rotation to a key of their own, within `K` ids. Only the delay, the guardian's veto and the rate limits (§6) bound what such a client delivers. A bound in Ethereum time (refusing anything after a long idle period) is left for later.
 - **A chain that cannot hand off for `K` epochs strands its clients.** When `K` runs in a row fail, the active key's next handoff goes to an id more than `K` past it, which clients refuse, and they must be redeployed from a key their deployers trust again, as any light client past its trusting period. A rotation certificate to an adopted key set that the chain superseded before recording its handoff (15 §6.6) can strand a client the same way if someone relays it. The chain never records that handoff, so relayers follow the chain's handoff records. A chain whose active key loses, for good, shareholders holding more than `M − t` of its `M` shares can never hand off again, whatever newer keys it adopts (15 §6.6). Its clients strand after `K` epochs, and the chain needs a governance kernel upgrade to move to a new key.
 - The guardian should still compare stored roots with the chain: slashing makes a forgery cost its signers a tenth of their stake each, which bounds the value worth forging but does not prevent it.
-- The value of a send stays with the outbox. The canonical token bridge (spec 21) does not use it: its gateway on Orange holds the currency it locks and sends messages without value. Messages from Ethereum to Orange are the other half of the bridge.
+- The value of a send stays with the outbox. The canonical token bridge (spec 21) does not use it: its gateway on the OrangeSDK chain holds the currency it locks and sends messages without value. Messages from Ethereum to the OrangeSDK chain are the other half of the bridge.
 - `submit` takes a whole proposal, transactions included; a block with large transactions or DKG dealings is costly to submit. A transaction or receipt root in the proposal, or certificates over executed headers, would shorten it, and need a new certificate version or a new proposal field.
 - A recipient that always reverts keeps its messages pending forever; nothing retires them.
 - Proofs are of single messages; proving several messages against one root shares no work.

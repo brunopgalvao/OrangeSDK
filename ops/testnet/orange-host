@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# orange-host: everything that happens on one host of an Orange network, one
+# orange-host: everything that happens on one host of an OrangeSDK network, one
 # node per host. `orange-ops` runs it over ssh; systemd and the container run
 # `orange-host run`. Every command is idempotent and prints what it did, so a
 # configuration tool (Ansible, a shell loop) can call it as is.

@@ -1,4 +1,4 @@
-//! The Orange-to-Ethereum half of the bridge (spec 17): the outbox system
+//! The OrangeSDK-to-Ethereum half of the bridge (spec 17): the outbox system
 //! address, the call it accepts, the message it records and where in chain
 //! state it records it, the proposal anchor a light client reads, and the
 //! finality-proof query a relayer makes.
@@ -181,7 +181,7 @@ impl SendCall {
 /// A message the outbox recorded (spec 17 §3).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Message {
-    /// The Orange chain that sent it.
+    /// The OrangeSDK chain that sent it.
     pub source_chain_id: u64,
     /// Its nonce, from 1, in the order the outbox recorded messages.
     pub nonce: u64,

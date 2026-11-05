@@ -1,7 +1,7 @@
 //! Roots of Ethereum's hexary Merkle-Patricia trie (Yellow Paper,
 //! appendices C and D): the transactions and receipts roots of a block
 //! header (spec 20 §3) and, for the conformance runner, the state root of a
-//! post-state. Only roots are built here; Orange proves its own state with the
+//! post-state. Only roots are built here; OrangeSDK proves its own state with the
 //! binary trie of spec 10.
 
 use alloc::collections::BTreeMap;

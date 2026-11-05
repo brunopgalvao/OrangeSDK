@@ -2,7 +2,7 @@
 //! installed at genesis.
 //!
 //! ```json
-//! "modules": [{"address": "0x<20 bytes>", "code": "0x<Orange module>", "capabilities": 1, "init": "0x<bytes>"}]
+//! "modules": [{"address": "0x<20 bytes>", "code": "0x<OrangeSDK module>", "capabilities": 1, "init": "0x<bytes>"}]
 //! ```
 //!
 //! `code` is the module itself (the output of `orange-recompile`); it travels

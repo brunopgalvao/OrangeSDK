@@ -1,6 +1,6 @@
-//! The Ethereum-to-Orange bridge end to end (spec 18): an `EthereumOutbox`
+//! The Ethereum-to-OrangeSDK bridge end to end (spec 18): an `EthereumOutbox`
 //! run on revm sends messages on "Ethereum"; a synthetic beacon chain whose
-//! sync committee signs finalizes the state that holds them; on an Orange chain
+//! sync committee signs finalizes the state that holds them; on an OrangeSDK chain
 //! simulated with `Sim`, the light client is inert until feature gate 1
 //! activates, then follows the updates, and the inbox delivers each proven
 //! message to its recipient contract exactly once, after the delay, within
@@ -31,7 +31,7 @@ const LIGHT_CLIENT_ELF: &[u8] = include_bytes!("fixtures/eth-light-client.elf");
 const VERIFIER_ELF: &[u8] = include_bytes!("fixtures/eth-message-verifier.elf");
 const CONTRACTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contracts/build/");
 
-/// The recipient contract's address on Orange.
+/// The recipient contract's address on the OrangeSDK chain.
 const RECIPIENT: [u8; 20] = [0x7E; 20];
 const UPDATE_GAS: u64 = 3_000_000;
 const DELIVER_GAS: u64 = 1_000_000;
@@ -118,7 +118,7 @@ fn ethereum() -> Ethereum {
     }
 }
 
-/// A user on Orange that tracks its nonce.
+/// A user on the OrangeSDK chain that tracks its nonce.
 struct Sender {
     wallet: Wallet,
     nonce: u64,

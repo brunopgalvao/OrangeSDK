@@ -8,7 +8,7 @@ This document fixes the entrypoint names, the encoding of inputs and effects, th
 
 ## 2. Encoding
 
-All structured data crossing the boundary uses the *Orange canonical encoding*:
+All structured data crossing the boundary uses the *OrangeSDK canonical encoding*:
 
 - Fixed-width integers little-endian: `u8`, `u16`, `u32`, `u64`, `u128`, `i64`.
 - `bytes`: `u:n` length (canonical ULEB128) followed by the bytes.

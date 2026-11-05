@@ -16,7 +16,7 @@ use crate::methods::{RpcError, param_str};
 pub const MAX_FEE_HISTORY: u64 = 1024;
 
 /// Blocks the tip oracle samples below the head: geth samples 20, which at
-/// twelve-second blocks span four minutes; Orange's blocks are many times
+/// twelve-second blocks span four minutes; OrangeSDK's blocks are many times
 /// shorter, so the oracle looks at 100 (spec 23 §7.1). It looks at up to
 /// twice as many when the blocks it finds are empty.
 pub const ORACLE_BLOCKS: u64 = 100;

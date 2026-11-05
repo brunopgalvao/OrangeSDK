@@ -1,6 +1,6 @@
 [package]
 name = "orange-vm"
-description = "Reference implementation of the Orange VM: a metered, sandboxed RISC-V derived virtual machine"
+description = "Reference implementation of the OrangeSDK VM: a metered, sandboxed RISC-V derived virtual machine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
