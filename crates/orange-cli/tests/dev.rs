@@ -519,7 +519,7 @@ fn live_node_serves_rpc_and_stops_after_blocks() {
 #[test]
 fn live_node_applies_geth_style_accounts() {
     // No block limit: the node runs until asked to stop, so no request races its exit.
-    let mut live = start(&[]);
+    let mut live = start(&["--rpc-stop"]);
     let reply = post(
         &live.addr,
         r#"{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionCount","params":["0x3333333333333333333333333333333333333333","latest"]}"#,
@@ -538,9 +538,46 @@ fn live_node_applies_geth_style_accounts() {
     assert!(live.child.wait().unwrap().success());
 }
 
+/// Without `--rpc-stop` the node serves no `orange_stop`, and it answers a
+/// browser page only from an origin `--rpc-cors` names (spec 20 §8.5):
+/// before, any page its operator opened could stop it.
+#[test]
+fn a_dev_node_serves_browsers_and_orange_stop_only_when_told_to() {
+    let mut live = start(&["--rpc-cors", "http://wallet.example"]);
+    let stop = r#"{"jsonrpc":"2.0","id":1,"method":"orange_stop"}"#;
+    let refused = post(&live.addr, stop);
+    assert!(
+        refused.contains("-32601") && refused.contains("--rpc-stop"),
+        "{refused}"
+    );
+    let from = |origin: &str| {
+        let mut stream = TcpStream::connect(&live.addr).unwrap();
+        let body = r#"{"jsonrpc":"2.0","id":2,"method":"eth_chainId","params":[]}"#;
+        write!(
+            stream,
+            "POST / HTTP/1.1\r\nOrigin: {origin}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut out = String::new();
+        stream.read_to_string(&mut out).unwrap();
+        out
+    };
+    let page = from("http://evil.example");
+    assert!(page.starts_with("HTTP/1.1 403"), "{page}");
+    let wallet = from("http://wallet.example");
+    assert!(
+        wallet.contains("Access-Control-Allow-Origin: http://wallet.example\r\n")
+            && wallet.ends_with(r#""result":"0x539"}"#),
+        "{wallet}"
+    );
+    live.child.kill().unwrap();
+    live.child.wait().unwrap();
+}
+
 #[test]
 fn starved_kernel_reports_node_errors_and_stops_on_request() {
-    let mut dev = start(&["--blocks", "1", "--kernel-gas", STARVED_GAS]);
+    let mut dev = start(&["--blocks", "1", "--kernel-gas", STARVED_GAS, "--rpc-stop"]);
     // The first slot runs out of gas; the node reports it and keeps serving queries.
     let mut first = String::new();
     dev.stderr.read_line(&mut first).unwrap();

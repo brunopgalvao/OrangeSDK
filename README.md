@@ -19,6 +19,8 @@ cast chain-id --rpc-url http://127.0.0.1:8545
 cast balance 0x1a642f0e3c3af545e7acbd38b07251b3990914f1 --rpc-url http://127.0.0.1:8545
 ```
 
+Clients outside a browser (`cast`, ethers and viem under Node, scripts) need nothing more. A browser wallet or dapp page sends an `Origin` header, and the node answers it only from the origins `--rpc-cors <origin>` names (`*` for any); `--rpc-stop` lets `orange_stop` end the node over JSON-RPC, which it otherwise refuses (spec 20 §8.5).
+
 The genesis address above is the account of the private key `0x01…01` (32 bytes of `0x01`), funded with one million ether. The kernel is a Rust guest compiled to RISC-V and recompiled to an Orange module on start; it executes the EVM (revm) inside the Orange VM, so contracts deploy and run as on Ethereum:
 
 ```sh

@@ -142,11 +142,11 @@ fn static_and_info_methods() {
     );
     assert_eq!(ok(&mut rpc, "eth_syncing", json!([])), json!(false));
     assert!(!rpc.stopped);
-    // A node whose RPC faces the public serves `orange_stop` to nobody.
-    rpc.stop_allowed = false;
+    // `orange_stop` is served only when the node's operator asked for it
+    // (`--rpc-stop`): anything that reaches the address could call it.
     let (code, message) = err(&mut rpc, "orange_stop", json!([]));
     assert_eq!(code, -32601);
-    assert!(message.contains("orange_stop"), "{message}");
+    assert!(message.contains("--rpc-stop"), "{message}");
     assert!(!rpc.stopped);
     rpc.stop_allowed = true;
     assert_eq!(ok(&mut rpc, "orange_stop", json!([])), json!(true));

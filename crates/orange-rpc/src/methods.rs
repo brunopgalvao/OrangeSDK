@@ -178,10 +178,15 @@ pub struct Rpc {
     pub max_filters: usize,
     /// Set by `orange_stop`; the server loop exits when it sees it.
     pub stopped: bool,
-    /// Whether `orange_stop` is served; a node whose JSON-RPC faces the
-    /// public turns it off (`orange node --no-rpc-stop`) and is stopped by a
-    /// signal instead. On unless changed.
+    /// Whether `orange_stop` is served: off unless changed, since anything
+    /// that reaches the address could stop the node; a node whose operator
+    /// stops it through its JSON-RPC turns it on (`--rpc-stop`).
     pub stop_allowed: bool,
+    /// The origins whose browser pages the HTTP server answers (spec 20
+    /// §8.5), `*` for any; none unless changed. A request without an
+    /// `Origin` header, which is what clients outside browsers send, is
+    /// answered whatever this holds.
+    pub cors: Vec<String>,
 }
 
 impl Rpc {
@@ -199,7 +204,8 @@ impl Rpc {
             filter_timeout: crate::filters::FILTER_TIMEOUT,
             max_filters: crate::filters::MAX_FILTERS,
             stopped: false,
-            stop_allowed: true,
+            stop_allowed: false,
+            cors: Vec::new(),
         }
     }
 
@@ -381,7 +387,7 @@ impl Rpc {
             "orange_stop" if !self.stop_allowed => {
                 return Err(RpcError::with_code(
                     -32601,
-                    "method not found: orange_stop (this node serves it to nobody)".into(),
+                    "method not found: orange_stop (this node serves it only when started with --rpc-stop)".into(),
                 ));
             }
             "orange_stop" => {

@@ -283,7 +283,8 @@ impl Cluster {
                 .args(["--genesis", path(&self.devnet.join("genesis.json"))])
                 .args(["--data-dir", path(&p.dir)])
                 .args(["--listen", &p.listen.to_string()])
-                .args(["--rpc", &rpc]);
+                .args(["--rpc", &rpc])
+                .arg("--rpc-stop");
         } else {
             command
                 .args(["devnet", "node", "--dir", path(&self.devnet)])

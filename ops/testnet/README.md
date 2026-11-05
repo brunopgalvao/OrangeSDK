@@ -70,7 +70,7 @@ One node per host. Roles:
 | Role | Runs | Ports open to the internet | Notes |
 |---|---|---|---|
 | `validator` | consensus key, `--serve-snapshots` | p2p (30333/tcp) | RPC on the private interface only |
-| `rpc` | observer with a node key, larger `--state-history` or `--archive` | p2p, and the RPC through a reverse proxy | `public-rpc=1` adds `--no-rpc-stop` |
+| `rpc` | observer with a node key, larger `--state-history` or `--archive` | p2p, and the RPC through a reverse proxy | `public-rpc=1` leaves out `--rpc-stop` |
 | `bootnode` | observer with a node key | p2p | small; any operator can run one |
 
 Measured on the rehearsal (section 8): a node at the rehearsal's load uses under a tenth of a core, 130 to 240 MiB of memory, about 9 KB/s of p2p traffic at one block a second, and its data grows by 10 to 30 KB a block. A testnet host that leaves room for load spikes, snapshot exports and months of growth:
@@ -114,7 +114,7 @@ ORANGE_JOIN=sync                        # only on a node that joins late, see se
 ORANGE_TRUST_FROM=10.0.0.10:8545,10.0.0.11:8545
 ```
 
-**Ports and firewall.** Open p2p (tcp) to the world. Bind the RPC to a private interface (a provider VPC, or WireGuard between the operator's hosts and their monitoring) and firewall it to those addresses: it serves `orange_stop`, `/metrics` and the mempool, and every request runs on the node's consensus thread under a gas budget. A public RPC endpoint goes through a reverse proxy (TLS, rate limits, request size limits) to an `rpc`-role node started with `public-rpc=1`, which refuses `orange_stop`; never expose a validator's RPC. Prometheus scrapes the RPC address, so it sits on the same private network.
+**Ports and firewall.** Open p2p (tcp) to the world. Bind the RPC to a private interface (a provider VPC, or WireGuard between the operator's hosts and their monitoring) and firewall it to those addresses: it serves `orange_stop` (`orange-host` starts every node whose RPC does not face the public with `--rpc-stop`, for its graceful stop), `/metrics` and the mempool, and every request runs on the node's consensus thread under a gas budget. A public RPC endpoint goes through a reverse proxy (TLS, rate limits, request size limits) to an `rpc`-role node started with `public-rpc=1`, which refuses `orange_stop`; never expose a validator's RPC. The RPC refuses requests from browser pages (an `Origin` header) unless `--rpc-cors` names their origin (spec 20 §8.5). Prometheus scrapes the RPC address, so it sits on the same private network.
 
 **Bootnodes and the peer table.** A node dials its `--peer`s, its `--bootstrap` addresses and the genesis `bootnodes`, learns the rest by peer exchange (spec 09 §5a), and keeps the peers that answered in `peers.records`, which it takes up again at start (entries seen in the last 7 days). So a restarted node finds the network even if every bootnode is down; a brand-new node needs at least one reachable bootnode or peer. Keep two or more bootnodes run by different operators, listed in the genesis.
 
@@ -220,7 +220,7 @@ What it means for a testnet at the template's 1 s slots, four validators:
 - *Memory grew with every step.* `Node::metrics` kept every metric the driver ever emitted, a few hundred entries per block, and nothing in a running node reads it (the telemetry holds the values). An `orange dev` node at 50 ms slots grew from 58 MiB to 132 MiB over 5 600 blocks; it now keeps the latest 4 096 to 8 192 emissions (`KEPT_RECORDS`), and the same probe stays between 44 and 61 MiB (`crates/orange-node/tests/chain.rs`).
 - *The peer count counted connections.* Two nodes that both dial each other hold two connections (spec 09 §5), and `ethereum_peer_count`, `/status` `peers` and `orange doctor --min-peers` counted both: a node of a six-node network reported 10 peers, and a node with fewer distinct peers than the count passed `orange devnet wait --peers` and the compose smoke test's peer check. It now counts each peer once (`crates/orange-node/tests/net.rs`, `a_peer_connected_twice_counts_once`; spec 11 §4).
 - *A joining node had no way to learn what to trust.* `--sync-from-peers` on a staking chain needs the current group key, which no RPC method served: `orange_getGroupKey` (spec 17 §7) and `orange snapshot trust-key` now do.
-- *A public RPC node could be stopped by anyone*, through the unauthenticated `orange_stop`: `--no-rpc-stop` refuses it.
+- *A public RPC node could be stopped by anyone*, through the unauthenticated `orange_stop`: a node serves it only with `--rpc-stop`, which `public-rpc=1` leaves out.
 
 ## 9. Incidents
 

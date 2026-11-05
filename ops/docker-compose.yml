@@ -5,8 +5,9 @@
 #   docker compose -f ops/docker-compose.yml up --build -d
 #   docker compose -f ops/docker-compose.yml down -v
 #
-# Published on this machine's loopback only, since the RPC carries the
-# unauthenticated `orange_stop` and Grafana runs as an anonymous admin:
+# Published on this machine's loopback only, since the RPC is
+# unauthenticated (no `--rpc-stop`, so no `orange_stop`) and Grafana runs
+# as an anonymous admin:
 # JSON-RPC 127.0.0.1:8545 to 8548 (node 0 to 3), Prometheus 127.0.0.1:9090,
 # Grafana 127.0.0.1:3000 with the Orange dashboard provisioned.
 #

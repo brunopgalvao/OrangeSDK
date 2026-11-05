@@ -24,9 +24,13 @@
 //! record signed with its key: a validator's consensus key, or an
 //! observer's `--node-key-file` (an observer without one dials with a key
 //! fresh at every start and advertises nothing). It also dials the genesis
-//! file's `bootnodes` (see [`ceremony`]). `--no-rpc-stop` refuses
-//! `orange_stop`, for a node whose JSON-RPC faces the public; it is stopped
-//! by a signal instead.
+//! file's `bootnodes` (see [`ceremony`]). Both commands serve `orange_stop`
+//! only with `--rpc-stop` (spec 20 §8.5), for an operator or a test harness
+//! that stops the node through its JSON-RPC; without it the node is stopped
+//! by a signal. `--no-rpc-stop`, once needed to refuse it, still refuses it,
+//! even beside `--rpc-stop`. The JSON-RPC answers browser pages, requests
+//! with an `Origin` header, only from the origins `--rpc-cors <origin>`
+//! names (repeatable; `*` for any), and refuses every other with `403`.
 //! The genesis file is
 //! JSON: `{"chainId": 1337, "slotMs": 400, "maxTxs": 64,
 //! "alloc": {"0x<address>": "<wei>"}, "validators": ["0x<32-byte id>"]}`.
@@ -122,8 +126,8 @@ pub const DEFAULT_RPC: &str = "127.0.0.1:8545";
 
 /// Usage line printed on a command-line mistake.
 pub const USAGE: &str = "usage:
-  orange dev  --kernel <kernel.elf|kernel.orange> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive] [--data-dir <dir>]
-  orange node --kernel <kernel.elf|kernel.orange> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--snapshot <file> | --sync-from-peers] [--trust-key <id>:<0x 96 bytes> | <0x 96 bytes>] [--serve-snapshots] [--listen 127.0.0.1:30333] [--peer <addr>]... [--bootstrap <addr>]... [--max-peers 32] [--outbound-peers 8] [--advertise <addr>] [--no-discovery] [--node-key-file <path>] [--rpc 127.0.0.1:8545] [--no-rpc-stop] [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
+  orange dev  --kernel <kernel.elf|kernel.orange> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--rpc-stop] [--rpc-cors <origin>]... [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive] [--data-dir <dir>]
+  orange node --kernel <kernel.elf|kernel.orange> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--snapshot <file> | --sync-from-peers] [--trust-key <id>:<0x 96 bytes> | <0x 96 bytes>] [--serve-snapshots] [--listen 127.0.0.1:30333] [--peer <addr>]... [--bootstrap <addr>]... [--max-peers 32] [--outbound-peers 8] [--advertise <addr>] [--no-discovery] [--node-key-file <path>] [--rpc 127.0.0.1:8545] [--rpc-stop] [--rpc-cors <origin>]... [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
   orange key  <64 hex> | --key-file <path> | generate --out <path>
   orange genesis operator --key-file <key> --name <name> --chain-id <id> [--p2p <ip:port>] --out <card.json>
   orange genesis assemble --template <template.json> --kernel <kernel> --operator <card.json>... [--bootnode <ip:port>]... [--genesis-time <unix seconds>] [--operator-funding <wei>] --out <genesis.json>
@@ -1047,7 +1051,9 @@ pub(crate) fn run_inner(
     report_driver_state(&node, resumed.as_deref(), opened_at);
     let chain_name = node.chain_name();
     let mut rpc = orange_rpc::Rpc::new(node);
-    rpc.stop_allowed = !args.iter().any(|a| a == "--no-rpc-stop");
+    rpc.stop_allowed =
+        args.iter().any(|a| a == "--rpc-stop") && !args.iter().any(|a| a == "--no-rpc-stop");
+    rpc.cors = args_all(args, "--rpc-cors");
     let listener = bind_rpc(rpc_addr, command, (chain_id, &chain_name), key.as_ref())?;
     let mut last_tick = Instant::now();
     let mut switches_seen = 0usize;

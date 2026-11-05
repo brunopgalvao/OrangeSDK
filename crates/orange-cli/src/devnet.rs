@@ -1053,6 +1053,9 @@ fn node(
             &spec.listen,
             "--rpc",
             &spec.rpc,
+            // `orange devnet stop` and `down` stop it through its JSON-RPC,
+            // which listens on loopback.
+            "--rpc-stop",
         ]
         .iter()
         .map(ToString::to_string),

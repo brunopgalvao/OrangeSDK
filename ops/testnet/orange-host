@@ -14,7 +14,7 @@
 #   start | stop | restart  through systemd, or as a background process
 #   status                  running or not, and the node's /status
 #   graceful-stop           orange_stop over the local JSON-RPC, then wait; a
-#                           node that refuses it (--no-rpc-stop) gets SIGTERM
+#                           node that refuses it (no --rpc-stop) gets SIGTERM
 #   health [doctor flags]   `orange doctor` against the local JSON-RPC
 #   finalized               "<height> <hash>" of the latest finalized block
 #   block-hash <height>     the hash of a block
@@ -46,6 +46,7 @@
 #   ORANGE_BOOTSTRAP="<ip:port> ..."    beyond the genesis bootnodes
 #   ORANGE_GENESIS_HASH=0x...           the published hash check-config checks
 #   ORANGE_PUBLIC_RPC=1                 the RPC faces the public: no orange_stop
+#                                       (without it the node gets --rpc-stop)
 #   ORANGE_JOIN=sync                    an empty data directory joins from the
 #                                     peers' snapshots (spec 22 §7.4) ...
 #   ORANGE_TRUST_FROM=<rpc,...>         ... trusting the group key these nodes
@@ -136,7 +137,7 @@ node_args() {
     [ -z "${ORANGE_MAX_PEERS:-}" ] || printf '%s\n' --max-peers "$ORANGE_MAX_PEERS"
     [ -z "${ORANGE_OUTBOUND_PEERS:-}" ] || printf '%s\n' --outbound-peers "$ORANGE_OUTBOUND_PEERS"
     [ "${ORANGE_SERVE_SNAPSHOTS:-1}" != 1 ] || printf '%s\n' --serve-snapshots
-    [ "${ORANGE_PUBLIC_RPC:-0}" != 1 ] || printf '%s\n' --no-rpc-stop
+    [ "${ORANGE_PUBLIC_RPC:-0}" = 1 ] || printf '%s\n' --rpc-stop
     if [ "${ORANGE_ARCHIVE:-0}" = 1 ]; then
         printf '%s\n' --archive
     elif [ -n "${ORANGE_STATE_HISTORY:-}" ]; then

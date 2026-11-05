@@ -154,6 +154,7 @@ fn a_kernel_that_cannot_answer_is_unavailable() {
 fn the_server_routes_metrics_and_status() {
     let alice = Wallet::new(1);
     let mut rpc = Rpc::new(node(&alice));
+    rpc.stop_allowed = true;
     let listener = bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let results = Arc::new(Mutex::new(Vec::new()));

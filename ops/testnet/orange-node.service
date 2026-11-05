@@ -18,7 +18,7 @@ ExecStartPre=/opt/orange/bin/orange-host check-config
 ExecStart=/opt/orange/bin/orange-host run
 # orange_stop over the private RPC first, so the node stops between steps
 # (its stores are crash-safe either way: spec 08 §7, spec 22 §4); SIGTERM
-# after that, and at once for a node with --no-rpc-stop.
+# after that, and at once for a node without --rpc-stop (ORANGE_PUBLIC_RPC=1).
 ExecStop=/opt/orange/bin/orange-host graceful-stop
 TimeoutStopSec=90
 Restart=on-failure

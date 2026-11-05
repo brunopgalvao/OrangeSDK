@@ -20,8 +20,18 @@ fn request_parsing() {
         Request {
             method: "POST".to_owned(),
             path: "/".to_owned(),
-            body: b"hello".to_vec()
+            body: b"hello".to_vec(),
+            origin: None,
         }
+    );
+    // The origin of a browser page, whatever the header's case; a line
+    // without a colon is skipped.
+    let mut input = Cursor::new(
+        b"POST / HTTP/1.1\r\norigin:  http://a.example \r\nnot a header\r\n\r\n".to_vec(),
+    );
+    assert_eq!(
+        read_request(&mut input).unwrap().origin.as_deref(),
+        Some("http://a.example")
     );
     let mut input = Cursor::new(b"GET /health HTTP/1.1\n\n".to_vec());
     let req = read_request(&mut input).unwrap();
@@ -75,6 +85,7 @@ fn request_parsing() {
         method: "A".into(),
         path: "/".into(),
         body: vec![],
+        origin: None,
     }
     .clone();
     assert!(format!("{clone:?}").contains('A'));
@@ -117,8 +128,79 @@ fn response_format() {
     let text = String::from_utf8(bytes).unwrap();
     assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
     assert!(text.contains("Content-Length: 2\r\n"));
-    assert!(text.contains("Access-Control-Allow-Origin: *\r\n"));
+    // No CORS headers: a browser page reads nothing it was not allowed to.
+    assert!(!text.contains("Access-Control"), "{text}");
     assert!(text.ends_with("\r\n\r\n{}"));
+}
+
+/// Browser pages (requests with an `Origin` header) are answered only from
+/// the origins the node was told to serve, and only those get CORS headers
+/// (spec 20 §8.5). Before, every answer carried
+/// `Access-Control-Allow-Origin: *`, and any page an operator opened could
+/// `POST` `orange_stop` to `127.0.0.1:8545` and stop the node.
+#[test]
+fn browser_pages_are_answered_only_from_allowed_origins() {
+    let alice = Wallet::new(1);
+    let mut rpc = Rpc::new(node(&alice));
+    rpc.stop_allowed = true;
+    let listener = bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(false).unwrap();
+    let stop = r#"{"jsonrpc":"2.0","id":1,"method":"orange_stop"}"#;
+    let post = |origin: &str| {
+        format!(
+            "POST / HTTP/1.1\r\n{origin}Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n{stop}",
+            stop.len()
+        )
+    };
+    let ask = |rpc: &mut Rpc, request: String| {
+        let client = std::thread::spawn(move || talk(addr, request.as_bytes()));
+        let (mut stream, _) = listener.accept().unwrap();
+        serve_connection(rpc, &mut stream);
+        drop(stream);
+        client.join().unwrap()
+    };
+    // By default no page is answered, its preflight included, and the stop
+    // a page sends reaches nothing.
+    let refused = ask(&mut rpc, post("Origin: http://evil.example\r\n"));
+    assert!(refused.starts_with("HTTP/1.1 403 Forbidden"), "{refused}");
+    assert!(!refused.contains("Access-Control"), "{refused}");
+    assert!(!rpc.stopped);
+    let preflight = "OPTIONS / HTTP/1.1\r\nOrigin: http://evil.example\r\n\r\n";
+    assert!(ask(&mut rpc, preflight.to_owned()).starts_with("HTTP/1.1 403"));
+    let telemetry = "GET /status HTTP/1.1\r\nOrigin: null\r\n\r\n";
+    assert!(ask(&mut rpc, telemetry.to_owned()).starts_with("HTTP/1.1 403"));
+    // An allowed origin is answered, with headers naming the origin as
+    // configured.
+    rpc.cors = vec!["http://localhost:5173".to_owned()];
+    let preflight = "OPTIONS / HTTP/1.1\r\nOrigin: HTTP://LOCALHOST:5173\r\n\r\n";
+    let allowed = ask(&mut rpc, preflight.to_owned());
+    assert!(
+        allowed.starts_with("HTTP/1.1 204 No Content\r\n"),
+        "{allowed}"
+    );
+    for header in [
+        "Access-Control-Allow-Origin: http://localhost:5173\r\n",
+        "Vary: Origin\r\n",
+        "Access-Control-Allow-Headers: content-type\r\n",
+        "Access-Control-Allow-Methods: POST, OPTIONS\r\n",
+    ] {
+        assert!(allowed.contains(header), "{allowed}");
+    }
+    assert!(ask(&mut rpc, post("Origin: http://evil.example\r\n")).starts_with("HTTP/1.1 403"));
+    // `*` allows every page.
+    rpc.cors = vec!["*".to_owned()];
+    let any = ask(&mut rpc, post("Origin: http://evil.example\r\n"));
+    assert!(any.contains("Access-Control-Allow-Origin: *\r\n"), "{any}");
+    assert!(any.ends_with(r#""result":true}"#), "{any}");
+    assert!(rpc.stopped);
+    // Clients outside browsers send no origin, and are answered whatever
+    // the list says.
+    rpc.cors.clear();
+    rpc.stopped = false;
+    let plain = ask(&mut rpc, post(""));
+    assert!(plain.ends_with(r#""result":true}"#), "{plain}");
+    assert!(!plain.contains("Access-Control"), "{plain}");
 }
 
 fn talk(addr: std::net::SocketAddr, request: &[u8]) -> String {
@@ -138,12 +220,7 @@ fn connections_and_accept_loop() {
     let addr = listener.local_addr().unwrap();
     // Direct per-connection serving on a blocking accept.
     listener.set_nonblocking(false).unwrap();
-    let client = std::thread::spawn(move || {
-        talk(
-            addr,
-            b"OPTIONS / HTTP/1.1\r\nOrigin: http://localhost\r\n\r\n",
-        )
-    });
+    let client = std::thread::spawn(move || talk(addr, b"OPTIONS / HTTP/1.1\r\n\r\n"));
     let (mut stream, _) = listener.accept().unwrap();
     serve_connection(&mut rpc, &mut stream);
     drop(stream);
@@ -168,6 +245,7 @@ fn connections_and_accept_loop() {
         "POST / HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
+    rpc.stop_allowed = true;
     let body = r#"{"jsonrpc":"2.0","id":9,"method":"orange_stop"}"#;
     let stop = format!(
         "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",

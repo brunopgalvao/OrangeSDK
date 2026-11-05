@@ -696,7 +696,8 @@ fn free_ports(n: usize) -> Vec<String> {
 
 /// A validator finds an observer through the genesis file's bootnodes
 /// alone; the observer keeps the node key of its file, serves no
-/// `orange_stop`, and the node options around them name their mistakes.
+/// `orange_stop` (`--no-rpc-stop` wins over `--rpc-stop`), and the node
+/// options around them name their mistakes.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn nodes_dial_the_genesis_bootnodes() {
@@ -735,6 +736,7 @@ fn nodes_dial_the_genesis_bootnodes() {
         [
             "--node-key-file",
             &node_key,
+            "--rpc-stop",
             "--no-rpc-stop",
             "--data-dir",
             &path(&dir, "obs"),
@@ -747,7 +749,16 @@ fn nodes_dial_the_genesis_bootnodes() {
         run_until(&observer, |_| !stop.load(Ordering::SeqCst)).unwrap();
     });
     let mut validator_args = base(&v_p2p, &v_rpc);
-    validator_args.extend(["--key", &seed, "--data-dir", &path(&dir, "val")].map(str::to_owned));
+    validator_args.extend(
+        [
+            "--key",
+            &seed,
+            "--data-dir",
+            &path(&dir, "val"),
+            "--rpc-stop",
+        ]
+        .map(str::to_owned),
+    );
     let validator_thread = std::thread::spawn(move || run_until(&validator_args, |_| true));
     let deadline = Instant::now() + Duration::from_mins(3);
     let connected = loop {
@@ -764,7 +775,10 @@ fn nodes_dial_the_genesis_bootnodes() {
     };
     // The observer refuses `orange_stop`; the validator takes it.
     let refused = client::call(&o_rpc, "orange_stop", &json!([])).unwrap_err();
-    assert!(refused.contains("serves it to nobody"), "{refused}");
+    assert!(
+        refused.contains("only when started with --rpc-stop"),
+        "{refused}"
+    );
     client::call(&v_rpc, "orange_stop", &json!([])).unwrap();
     done.store(true, Ordering::SeqCst);
     validator_thread.join().unwrap().unwrap();

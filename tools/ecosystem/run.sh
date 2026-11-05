@@ -33,7 +33,7 @@ if rpc eth_chainId >/dev/null 2>&1; then
 fi
 
 "$ORANGE" dev --kernel "$ROOT/crates/orange-node/tests/fixtures/kernel.elf" \
-    --genesis "$HERE/genesis.json" --rpc "127.0.0.1:$PORT" >"$LOG" 2>&1 &
+    --genesis "$HERE/genesis.json" --rpc "127.0.0.1:$PORT" --rpc-stop >"$LOG" 2>&1 &
 PID=$!
 stop() {
     rpc orange_stop >/dev/null 2>&1 || true
