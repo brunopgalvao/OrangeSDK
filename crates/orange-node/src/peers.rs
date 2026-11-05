@@ -212,10 +212,16 @@ pub fn dialable(addr: &SocketAddr) -> bool {
 
 /// The prefix whose entries and connections are limited together: the
 /// first 24 bits of an IPv4 address, the first 48 of an IPv6 one, none for
-/// a loopback address.
+/// a loopback address. An IPv4-mapped IPv6 address, as a dual-stack
+/// listener reports every IPv4 peer, counts as the IPv4 address it maps:
+/// otherwise they would all share the prefix `::ffff:0`.
 #[must_use]
 pub fn prefix(addr: &SocketAddr) -> Option<Vec<u8>> {
-    match addr.ip() {
+    let ip = match addr.ip() {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 @ IpAddr::V4(_) => v4,
+    };
+    match ip {
         ip if ip.is_loopback() => None,
         IpAddr::V4(v4) => Some(v4.octets()[..3].to_vec()),
         IpAddr::V6(v6) => Some(v6.octets()[..6].to_vec()),
@@ -590,6 +596,10 @@ mod tests {
             p("[2001:db8:1:2::5]:1"),
             Some(vec![0x20, 0x01, 0x0d, 0xb8, 0, 1])
         );
+        // A dual-stack listener's IPv4 peers, mapped, keep their own prefixes.
+        assert_eq!(p("[::ffff:10.1.2.3]:1"), Some(vec![10, 1, 2]));
+        assert_eq!(p("[::ffff:10.9.2.3]:1"), Some(vec![10, 9, 2]));
+        assert_eq!(p("[::ffff:127.0.0.1]:1"), None);
         assert_eq!(backoff_ms(0), 500);
         assert_eq!(backoff_ms(1), 500);
         assert_eq!(backoff_ms(2), 1_000);
