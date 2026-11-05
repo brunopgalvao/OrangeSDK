@@ -15,8 +15,8 @@ use alloc::vec::Vec;
 use orange_abi::bridge::FinalityProof;
 use orange_abi::chain::consensus::{
     EQUIVOCATION_PENALTY, KEY_ROLE, KIND_FETCH, KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE,
-    MAX_BACKOFF, MAX_EVIDENCE, TOPIC, identity_preimage, leader, propose_timer, signing_preimage,
-    timeout_timer, timer_view, view_timeout_ms,
+    MAX_BACKOFF, MAX_DRIFT_MS, MAX_EVIDENCE, TOPIC, identity_preimage, leader, propose_timer,
+    signing_preimage, timeout_timer, timer_view, view_timeout_ms,
 };
 use orange_abi::chain::{
     BLOCK_GAS_LIMIT, BlockHeader, Certificate, ConsensusMessage, Evidence, GenesisParams,
@@ -946,11 +946,22 @@ impl Ctx {
     }
 
     /// Votes for `proposal` if it is a valid proposal of the current view
-    /// that extends the tip and this node has neither voted nor timed out in
-    /// the view (spec 08 §5).
+    /// that extends the tip, with a timestamp above the tip's and at most
+    /// `MAX_DRIFT_MS` past this node's clock, and this node has neither voted
+    /// nor timed out in the view (spec 08 §5).
     fn try_vote(&mut self, proposal: &Proposal, hash: Hash) {
         let extends_tip =
             proposal.parent == self.s.tip_hash && proposal.height == self.s.tip_height + 1;
+        // The tip at height 0 stands for the genesis block, whose timestamp
+        // is the genesis time (spec 20 §3.4); a node's own initial tip time,
+        // its start, only paces its first proposal.
+        let parent_ms = if self.s.tip_height == 0 {
+            self.params.genesis_time_ms()
+        } else {
+            self.s.tip_timestamp_ms
+        };
+        let timely = proposal.timestamp_ms > parent_ms
+            && proposal.timestamp_ms <= self.s.now_ms.saturating_add(MAX_DRIFT_MS);
         let bounded = proposal.evidence.0.len() <= MAX_EVIDENCE && proposal.dkg.0.len() <= MAX_DKG;
         let empty = proposal.txs.0.is_empty()
             && proposal.evidence.0.is_empty()
@@ -958,6 +969,7 @@ impl Ctx {
         let fits = !self.is_suffix(proposal) || empty;
         if proposal.view == self.s.view
             && extends_tip
+            && timely
             && bounded
             && fits
             && !self.s.voted

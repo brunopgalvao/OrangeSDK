@@ -6,8 +6,8 @@
 
 use k256::ecdsa::SigningKey;
 use orange_abi::chain::consensus::{
-    KIND_FETCH, KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE, MAX_EVIDENCE, TOPIC, leader, quorum,
-    signing_preimage,
+    KIND_FETCH, KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE, MAX_DRIFT_MS, MAX_EVIDENCE, TOPIC, leader,
+    quorum, signing_preimage,
 };
 use orange_abi::chain::{
     Allocation, Certificate, ConsensusMessage, Evidence, GenesisParams, Proposal, Signature,
@@ -1256,6 +1256,87 @@ fn the_chain_keeps_only_evidence_that_verifies() {
         assert!(!simplex(&sim, i).voted);
     }
     assert_agreement(&sim, &[0, 1, 2]);
+}
+
+/// Validators vote only for timely proposals (spec 08 §5): a leader that
+/// proposes a timestamp far past their clocks, or one not above its
+/// parent's, gets no votes, and the chain goes on. Before the rule, honest
+/// validators finalized a block `10^12` ms ahead, and every later leader
+/// waited a slot past it and timed out: the chain halted.
+#[test]
+fn untimely_proposals_get_no_votes_and_the_chain_goes_on() {
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, address(&keys[0]));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    // Validator 3 is the one the test speaks for: it leads every fourth view.
+    sim.crash(3);
+    let byzantine = validator_id(&keys[3]);
+    let in_led_view = |s: &mut Sim| {
+        let first = simplex(s, 0);
+        first.view > 4
+            && leader(first.view, 4) == 3
+            && (1..3).all(|i| {
+                let other = simplex(s, i);
+                other.view == first.view && other.tip_hash == first.tip_hash
+            })
+    };
+    // Each proposal in a view led by validator 3, extending the tip, with the
+    // timestamp `at` makes of the tip's timestamp and node 0's clock.
+    let propose_at = |sim: &mut Sim, at: &dyn Fn(u64, u64) -> u64| {
+        assert!(sim.run_until(40 * SLOT_MS, in_led_view).unwrap());
+        let state = simplex(sim, 0);
+        let proposal = Proposal {
+            view: state.view,
+            height: state.tip_height + 1,
+            parent: state.tip_hash,
+            timestamp_ms: at(state.tip_timestamp_ms, sim.nodes[0].now_ms()),
+            ..Proposal::default()
+        };
+        for i in 0..3 {
+            sim.nodes[i]
+                .deliver(byzantine, TOPIC, propose(&keys[3], proposal.clone()))
+                .unwrap();
+        }
+        (0..3).map(|i| simplex(sim, i).voted).collect::<Vec<bool>>()
+    };
+    // Far ahead, at the tip's timestamp, and below it: no votes.
+    assert_eq!(
+        propose_at(&mut sim, &|_, now| now + 1_000_000_000_000),
+        [false; 3]
+    );
+    assert_eq!(propose_at(&mut sim, &|tip, _| tip), [false; 3]);
+    assert_eq!(propose_at(&mut sim, &|tip, _| tip - 1), [false; 3]);
+    // One millisecond past the drift: no votes; exactly at it, a leader
+    // whose clock runs ahead of the voters', the proposal gets them.
+    assert_eq!(
+        propose_at(&mut sim, &|_, now| now + MAX_DRIFT_MS + 1),
+        [false; 3]
+    );
+    let height = simplex(&sim, 0).tip_height;
+    assert_eq!(
+        propose_at(&mut sim, &|_, now| now + MAX_DRIFT_MS),
+        [true; 3]
+    );
+    // The chain goes on, the early block among its blocks, with every
+    // finalized timestamp above its parent's.
+    let target = height + 4;
+    assert!(
+        sim.run_until(80 * SLOT_MS, |s| (0..3)
+            .all(|i| s.nodes[i].finalized_height().unwrap() >= target))
+            .unwrap()
+    );
+    assert_agreement(&sim, &[0, 1, 2]);
+    let stamps: Vec<u64> = (0..=target)
+        .map(|h| {
+            sim.nodes[0]
+                .block_by_number(h)
+                .unwrap()
+                .unwrap()
+                .timestamp_ms
+        })
+        .collect();
+    assert!(stamps.windows(2).all(|w| w[0] < w[1]), "{stamps:?}");
 }
 
 /// A proposal a validator holds before it can vote for it gets its vote as

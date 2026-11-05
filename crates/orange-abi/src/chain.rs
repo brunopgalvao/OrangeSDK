@@ -986,6 +986,10 @@ pub mod consensus {
     pub const MAX_BACKOFF: u8 = 4;
     /// Most evidence records one proposal carries; a proposal with more gets no votes.
     pub const MAX_EVIDENCE: usize = 8;
+    /// How far past its own clock a voter accepts a proposal's timestamp
+    /// (spec 08 §5): room for honest clocks that disagree, and the most one
+    /// faulty leader can move the chain's time ahead of the network's.
+    pub const MAX_DRIFT_MS: u64 = 1_000;
     /// Most evidence records one `query::EVIDENCE` answer holds.
     pub const EVIDENCE_PAGE: u64 = 64;
     /// Peer score change for the peer that delivered an equivocation.
