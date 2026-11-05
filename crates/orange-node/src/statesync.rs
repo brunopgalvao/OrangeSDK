@@ -1015,11 +1015,16 @@ impl StateSync {
         out
     }
 
-    /// Hands the sync `payload`, the answer `peer` gave to request `id`.
+    /// Hands the sync `payload`, the answer `peer` gave to request `id`. A
+    /// sync that has stopped, done or failed, takes no answer: one still on
+    /// the wire when a local fault ended it is dropped.
     ///
     /// # Panics
     /// Never: a pending request's peer is known.
     pub fn on_response(&mut self, peer: [u8; 32], id: u64, payload: &[u8], now_ms: u64) {
+        if matches!(self.phase, Phase::Done(_) | Phase::Failed(_)) {
+            return;
+        }
         // An answer to a request abandoned, or another peer's, is dropped.
         if self.pending.get(&id).is_none_or(|p| p.peer != peer) {
             return;
@@ -1455,8 +1460,8 @@ impl StateSync {
 
     fn on_slice(&mut self, peer: [u8; 32], slice: u32, entries: &[Entry], more: bool) {
         let parts = self.config.dir.join("parts");
-        // Slices are asked for in the fetch phase, and leaving it drops
-        // their requests.
+        // Slices are asked for in the fetch phase, leaving it for another
+        // phase drops their requests, and a stopped sync takes no answer.
         let f = self
             .fetch_mut()
             .expect("slices are answered while fetching");
@@ -1873,8 +1878,30 @@ mod tests {
             key: b"k".to_vec(),
             value: b"v".to_vec(),
         };
+        // Another slice is still asked of the same peer when the disk fails.
+        let peer = Peer {
+            busy: 1,
+            ..Peer::default()
+        };
+        s.peers.insert([1; 32], peer);
+        s.pending.insert(
+            9,
+            Pending {
+                peer: [1; 32],
+                sent_ms: 0,
+                asked: Asked::Slice(1),
+            },
+        );
         s.on_slice([1; 32], 0, &[entry], true);
         assert_eq!(s.failed(), Some("the disk is full"));
         assert!(Full.flush().is_ok());
+        // Its answer, arriving after the sync stopped, is dropped: the sync
+        // stays stopped for the reason it stopped for.
+        let late = SyncResponse::Slice {
+            entries: Vec::new(),
+            more: false,
+        };
+        s.on_response([1; 32], 9, &late.to_bytes(), 1);
+        assert_eq!(s.failed(), Some("the disk is full"));
     }
 }
