@@ -60,9 +60,13 @@ describe('ethers: accounts and transfers', () => {
     const fees = await provider.getFeeData();
     assert.ok(fees.gasPrice > 0n);
     assert.ok(fees.maxFeePerGas > fees.maxPriorityFeePerGas);
+    // A young dev chain may hold fewer than four blocks: the answer then
+    // starts at genesis. It always adds the next block's base fee.
     const history = await provider.send('eth_feeHistory', ['0x4', 'latest', [25, 75]]);
-    assert.equal(history.baseFeePerGas.length, 5);
-    assert.equal(history.reward.length, 4);
+    const count = history.reward.length;
+    assert.ok(count >= 1 && count <= 4);
+    if (count < 4) assert.equal(history.oldestBlock, '0x0');
+    assert.equal(history.baseFeePerGas.length, count + 1);
   });
 
   it('sends a signed EIP-1559 transfer and waits for its receipt', async () => {
