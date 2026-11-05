@@ -518,7 +518,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     run_until(args, |_| true)
 }
 
-/// [`run`] with an extra stop condition, checked between connections.
+/// [`run`] with an extra stop condition, checked between the server's turns.
 ///
 /// # Errors
 /// As [`run`].
@@ -1062,7 +1062,7 @@ pub(crate) fn run_inner(
     let mut alert_seen: Option<String> = None;
     let blocks_seen = Rc::new(Cell::new(0u64));
     let seen = Rc::clone(&blocks_seen);
-    // The network and the clock, between connections and between the steps
+    // The network and the clock, between requests and between the steps
     // of long requests.
     rpc.set_background(Box::new(move |node: &mut orange_node::Node| {
         let now = epoch + u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1087,7 +1087,7 @@ pub(crate) fn run_inner(
             eprintln!("block {height} {}", orange_rpc::methods::data(hash));
         }
     }));
-    orange_rpc::http::serve(&listener, &mut rpc, |rpc| {
+    orange_rpc::http::serve(listener, &mut rpc, |rpc| {
         !rpc.stopped && max_blocks.is_none_or(|n| blocks_seen.get() < n) && keep_going(rpc)
     });
     Ok(())

@@ -72,7 +72,7 @@ fn serve(kernel_gas: i64) -> Served {
         }));
         let listener = orange_rpc::http::bind("127.0.0.1:0").unwrap();
         tx.send(listener.local_addr().unwrap().to_string()).unwrap();
-        orange_rpc::http::serve(&listener, &mut rpc, |_| !stopping.load(Ordering::SeqCst));
+        orange_rpc::http::serve(listener, &mut rpc, |_| !stopping.load(Ordering::SeqCst));
     });
     Served {
         addr: rx.recv().unwrap(),

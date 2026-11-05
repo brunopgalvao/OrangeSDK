@@ -29,8 +29,8 @@ pub const MAX_BATCH: usize = 1000;
 
 /// Work the node must keep doing while requests are served: polling the
 /// network and ticking the clock. Requests run on the thread that drives
-/// consensus, so the server runs this between connections, and long requests
-/// run it between their steps (see [`Rpc::run_background`]).
+/// consensus, so the server runs this after each request it answers, and
+/// long requests run it between their steps (see [`Rpc::run_background`]).
 pub type Background = Box<dyn FnMut(&mut Node)>;
 
 /// Most storage keys one `eth_getProof` request may ask for (spec 20 §4.1):
@@ -215,8 +215,8 @@ impl Rpc {
     }
 
     /// Runs the background work once, if any is set. The HTTP server calls
-    /// this between connections; requests call it between batch entries,
-    /// between gas-estimation runs, between the blocks of a log or
+    /// this after each request it answers; requests call it between batch
+    /// entries, between gas-estimation runs, between the blocks of a log or
     /// fee-history scan and between the storage keys of `eth_getProof`, so
     /// the node keeps voting while they are served.
     /// The head can move during such a request.

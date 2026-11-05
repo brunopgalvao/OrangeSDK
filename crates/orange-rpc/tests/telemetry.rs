@@ -173,7 +173,7 @@ fn the_server_routes_metrics_and_status() {
             r.push(talk(addr, post.as_bytes()));
         })
     };
-    serve(&listener, &mut rpc, |rpc| !rpc.stopped);
+    serve(listener, &mut rpc, |rpc| !rpc.stopped);
     client.join().unwrap();
     let results = results.lock().unwrap();
     assert!(
