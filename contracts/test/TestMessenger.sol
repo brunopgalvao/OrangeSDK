@@ -22,6 +22,7 @@ contract TestMessenger {
     struct Entry {
         bytes32 messageHash;
         uint64 executableAt;
+        uint64 height;
         uint8 status;
     }
 
@@ -38,7 +39,7 @@ contract TestMessenger {
 
     /// @notice Vetoes message `nonce` as `OrangeInbox.veto` does.
     function veto(uint64 nonce) external {
-        entries[nonce] = Entry(bytes32(0), 0, 3);
+        entries[nonce] = Entry(bytes32(0), 0, 0, 3);
     }
 
     /// @notice `EthereumOutbox.send`.
@@ -58,7 +59,7 @@ contract TestMessenger {
         external
     {
         IOrangeMessageRecipient(gateway).onOrangeMessage(sourceChainId, nonce, sender, 0, payload);
-        entries[nonce] = Entry(hashMessage(Message(nonce, sender, gateway, 0, payload)), 0, 2);
+        entries[nonce] = Entry(hashMessage(Message(nonce, sender, gateway, 0, payload)), 0, 0, 2);
     }
 
     /// @notice Delivers as the Orange inbox does.

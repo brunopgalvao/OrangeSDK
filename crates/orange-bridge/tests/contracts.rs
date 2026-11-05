@@ -36,11 +36,11 @@ const VERIFY_GAS: u64 = 126_708;
 /// Gas of a light client `submit` transaction with a 103-byte proposal.
 const SUBMIT_TX_GAS: u64 = 206_756;
 /// Gas of an inbox `prove` transaction with a 3-sibling proof and a 4-byte payload.
-const PROVE_TX_GAS: u64 = 83_746;
+const PROVE_TX_GAS: u64 = 86_179;
 /// Gas of a `prove` transaction in a state of 4 099 entries, whose proof has 14 siblings.
-const PROVE_DEEP_TX_GAS: u64 = 95_906;
+const PROVE_DEEP_TX_GAS: u64 = 98_339;
 /// Gas of the `execute` transaction that delivers it to `MessageRecipient`.
-const EXECUTE_TX_GAS: u64 = 204_362;
+const EXECUTE_TX_GAS: u64 = 206_725;
 
 /// Intrinsic gas of a call with `data` (EIP-2028), below the EIP-7623 floor
 /// only for calldata-heavy transactions, which these are not.
@@ -443,16 +443,24 @@ impl Bridge {
             .output
     }
 
-    fn status(&mut self, nonce: u64) -> u64 {
-        let out = self
-            .eth
+    /// `entries(nonce)`: the hash, the time it may execute, the height whose
+    /// root proved it and its status.
+    fn entry(&mut self, nonce: u64) -> Vec<u8> {
+        self.eth
             .view(
                 RELAYER,
                 self.inbox,
                 &abi::call("entries(uint64)", &[Value::uint(u128::from(nonce))]),
             )
-            .output;
-        word_u64(&out[64..96])
+            .output
+    }
+
+    fn status(&mut self, nonce: u64) -> u64 {
+        word_u64(&self.entry(nonce)[96..128])
+    }
+
+    fn height_of(&mut self, nonce: u64) -> u64 {
+        word_u64(&self.entry(nonce)[64..96])
     }
 }
 
@@ -804,6 +812,84 @@ fn the_guardian_pauses_and_vetoes_and_the_owner_governs() {
             .success
     );
     assert_eq!(word_u64(&b.get(b.inbox, "delay()")), 1);
+}
+
+#[test]
+fn nonces_a_forged_root_proved_are_freed_when_the_guardian_revokes_it() {
+    let mut b = Bridge::new(3, 1, 10, 1_000);
+    let messages = b.messages.clone();
+    // A forged certificate stores, at height 12, a root of junk under nonce 2,
+    // under nonce 3 and far ahead of the outbox, at nonce 1 000 000.
+    let junk = |nonce: u64| Message {
+        nonce,
+        payload: b"junk".to_vec(),
+        ..messages[0].clone()
+    };
+    let honest = std::mem::replace(&mut b.trie, Trie::new());
+    for nonce in [2, 3, 1_000_000] {
+        b.trie
+            .insert(&message_key(nonce), &message_hash(&junk(nonce)));
+    }
+    b.anchor(12);
+    let forged = std::mem::replace(&mut b.trie, honest);
+    let prove_under = |b: &mut Bridge, trie: &Trie, m: &Message, height: u64| {
+        let proof = SlotProof::new(
+            m.nonce,
+            height,
+            message_hash(m),
+            &trie.prove(&message_key(m.nonce)),
+        )
+        .unwrap();
+        b.eth.call(RELAYER, b.inbox, &proof.prove_calldata(m))
+    };
+    for nonce in [2, 3, 1_000_000] {
+        let proven = prove_under(&mut b, &forged, &junk(nonce), 12);
+        assert!(proven.success, "{proven:?}");
+    }
+    assert_eq!(b.height_of(2), 12);
+    // The honest message 2 cannot take its nonce back, nor can anyone but the
+    // guardian or the owner revoke the root.
+    reverted_with(&b.prove(&messages[1]), "AlreadyProven()");
+    let revoke = |height: u64| abi::call("revokeRoot(uint64)", &[Value::uint(height.into())]);
+    reverted_with(&b.eth.call(RELAYER, b.inbox, &revoke(12)), "NotGuardian()");
+    // The guardian vetoes the junk at nonce 3, which stays vetoed for good, and
+    // revokes the root, during a pause, which a revocation does not need lifted.
+    let veto = abi::call("veto(uint64)", &[Value::uint(3)]);
+    assert!(b.eth.call(GUARDIAN, b.inbox, &veto).success);
+    assert!(
+        b.eth
+            .call(GUARDIAN, b.inbox, &abi::call("pause()", &[]))
+            .success
+    );
+    let revoked = b.eth.call(GUARDIAN, b.inbox, &revoke(12));
+    assert!(revoked.success, "{revoked:?}");
+    assert!(b.owner("revokeRoot(uint64)", &[Value::uint(12)]).success);
+    assert!(b.owner("unpause()", &[]).success);
+    let is_revoked = |b: &mut Bridge, height: u64| {
+        let data = abi::call("revoked(uint64)", &[Value::uint(height.into())]);
+        word_u64(&b.eth.view(RELAYER, b.inbox, &data).output)
+    };
+    assert_eq!((is_revoked(&mut b, 12), is_revoked(&mut b, 10)), (1, 0));
+    // Nothing more is proven under it, and what it proved never executes.
+    let more = prove_under(&mut b, &forged, &junk(1_000_000), 12);
+    reverted_with(&more, "RevokedRoot()");
+    b.eth.advance(DELAY);
+    reverted_with(&b.execute(&junk(2)), "RevokedRoot()");
+    reverted_with(&b.execute(&junk(1_000_000)), "RevokedRoot()");
+    // The honest message takes its nonce back under a good root, waits its own
+    // delay and is delivered.
+    let reproven = b.prove(&messages[1]);
+    assert!(reproven.success, "{reproven:?}");
+    assert_eq!((b.status(2), b.height_of(2)), (1, 10));
+    reverted_with(&b.prove(&messages[1]), "AlreadyProven()");
+    reverted_with(&b.execute(&messages[1]), "TooEarly()");
+    b.eth.advance(DELAY);
+    assert!(b.execute(&messages[1]).success);
+    assert_eq!(b.status(2), 2);
+    // A vetoed nonce is not proven again: the token gateway refunds it (spec 21
+    // §5.1), so delivering it as well would pay twice.
+    assert_eq!(b.status(3), 3);
+    reverted_with(&b.prove(&messages[2]), "AlreadyProven()");
 }
 
 #[test]

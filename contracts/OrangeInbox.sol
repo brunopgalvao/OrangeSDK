@@ -7,8 +7,9 @@ import {IOrangeLightClient, IOrangeMessageRecipient} from "./IOrangeBridge.sol";
 /// @notice Follows spec 17 §6. Anyone proves a message of the Orange outbox against a state root the
 /// light client holds; after the delay anyone executes it, which delivers it to its recipient once.
 /// Deliveries are rate-limited per window in messages and in value. The guardian can pause the
-/// inbox and veto a proven message before it is executed; the owner sets the delay, the rate limits
-/// and the guardian, unpauses, and hands over ownership. Neither can deliver, alter or replay a
+/// inbox, veto a proven message before it is executed and revoke a light-client root, after which
+/// nothing proven under it executes and its nonces can be proven again under another root; the
+/// owner sets the delay, the rate limits and the guardian, unpauses, and hands over ownership. Neither can deliver, alter or replay a
 /// message, or change the light client.
 contract OrangeInbox {
     /// @notice A message as the Orange outbox recorded it; its source chain is the light client's,
@@ -29,10 +30,12 @@ contract OrangeInbox {
         Vetoed
     }
 
-    /// @notice A proven message: its hash, when it may be executed, and its status.
+    /// @notice A proven message: its hash, when it may be executed, the height whose root proved
+    /// it, and its status.
     struct Entry {
         bytes32 messageHash;
         uint64 executableAt;
+        uint64 height;
         Status status;
     }
 
@@ -74,10 +77,13 @@ contract OrangeInbox {
 
     /// @notice Every proven nonce.
     mapping(uint64 nonce => Entry) public entries;
+    /// @notice The heights whose light-client roots the guardian revoked.
+    mapping(uint64 height => bool) public revoked;
 
     event MessageProven(uint64 indexed nonce, bytes32 messageHash, uint64 height, uint64 executableAt);
     event MessageDelivered(uint64 indexed nonce, bytes32 messageHash, address indexed recipient);
     event MessageVetoed(uint64 indexed nonce, bytes32 messageHash);
+    event RootRevoked(uint64 indexed height, address indexed by);
     event Paused(address indexed by);
     event Unpaused();
     event OwnerChanged(address indexed owner);
@@ -89,6 +95,7 @@ contract OrangeInbox {
     error NotGuardian();
     error IsPaused();
     error UnknownStateRoot();
+    error RevokedRoot();
     error InvalidProof();
     error ProofTooDeep();
     error NonceBelowFirst();
@@ -145,11 +152,14 @@ contract OrangeInbox {
     }
 
     /// @notice Proves `m` against the state root of Orange block `height` with the sibling hashes of
-    /// its binary-trie proof (spec 10 §5), deepest last as `storage_proof` returns them.
+    /// its binary-trie proof (spec 10 §5), deepest last as `storage_proof` returns them. A nonce
+    /// pending under a revoked root is proven anew.
     function prove(uint64 height, Message calldata m, bytes32[] calldata siblings) external whenNotPaused {
         if (m.nonce < firstNonce) revert NonceBelowFirst();
         Entry storage e = entries[m.nonce];
-        if (e.status != Status.None) revert AlreadyProven();
+        Status status = e.status;
+        if (status != Status.None && (status != Status.Pending || !revoked[e.height])) revert AlreadyProven();
+        if (revoked[height]) revert RevokedRoot();
         bytes32 root = lightClient.stateRoots(height);
         if (root == bytes32(0)) revert UnknownStateRoot();
         bytes32 messageHash = hashMessage(m);
@@ -157,6 +167,7 @@ contract OrangeInbox {
         uint64 executableAt = uint64(block.timestamp) + delay;
         e.messageHash = messageHash;
         e.executableAt = executableAt;
+        e.height = height;
         e.status = Status.Pending;
         emit MessageProven(m.nonce, messageHash, height, executableAt);
     }
@@ -166,6 +177,7 @@ contract OrangeInbox {
     function execute(Message calldata m) external whenNotPaused {
         Entry storage e = entries[m.nonce];
         if (e.status != Status.Pending) revert NotPending();
+        if (revoked[e.height]) revert RevokedRoot();
         bytes32 messageHash = hashMessage(m);
         if (messageHash != e.messageHash) revert MessageMismatch();
         if (block.timestamp < e.executableAt) revert TooEarly();
@@ -202,6 +214,15 @@ contract OrangeInbox {
         if (e.status != Status.Pending) revert NotPending();
         e.status = Status.Vetoed;
         emit MessageVetoed(nonce, e.messageHash);
+    }
+
+    /// @notice Refuses the light client's root of `height` from now on, for good: nothing is proven
+    /// under it, nothing proven under it executes, and a nonce pending under it can be proven again
+    /// under another root. The guardian or the owner, paused or not.
+    function revokeRoot(uint64 height) external {
+        if (msg.sender != guardian && msg.sender != owner) revert NotGuardian();
+        revoked[height] = true;
+        emit RootRevoked(height, msg.sender);
     }
 
     function setGuardian(address guardian_) external onlyOwner {

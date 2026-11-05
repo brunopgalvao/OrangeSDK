@@ -73,7 +73,7 @@ contract TokenGatewayOnEthereum is TokenGateway, IOrangeMessageRecipient {
     /// nothing is ever delivered with that nonce: a `SPENT(nonce, VOID)`, after which the gateway on
     /// Orange refunds or sends again what it sent with it. Anyone may call it, once per nonce.
     function reportVetoed(uint64 nonce) external returns (uint64) {
-        (,, OrangeInbox.Status status) = OrangeInbox(inbox).entries(nonce);
+        (,,, OrangeInbox.Status status) = OrangeInbox(inbox).entries(nonce);
         if (status != OrangeInbox.Status.Vetoed) revert NotVetoed();
         return _report(nonce, VOID);
     }
@@ -84,7 +84,7 @@ contract TokenGatewayOnEthereum is TokenGateway, IOrangeMessageRecipient {
     /// sends it again. Anyone may call it, once per nonce.
     function reportDelivered(OrangeInbox.Message calldata m) external returns (uint64) {
         OrangeInbox source = OrangeInbox(inbox);
-        (bytes32 messageHash,, OrangeInbox.Status status) = source.entries(m.nonce);
+        (bytes32 messageHash,,, OrangeInbox.Status status) = source.entries(m.nonce);
         if (status != OrangeInbox.Status.Delivered || messageHash != source.hashMessage(m)) revert NotDelivered();
         return _report(m.nonce, m.recipient == address(this) ? _identity(m.payload) : VOID);
     }
