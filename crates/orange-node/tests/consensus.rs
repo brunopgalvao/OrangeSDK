@@ -6,8 +6,8 @@
 
 use k256::ecdsa::SigningKey;
 use orange_abi::chain::consensus::{
-    KIND_FETCH, KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE, MAX_DRIFT_MS, MAX_EVIDENCE, TOPIC, leader,
-    quorum, signing_preimage,
+    KIND_FETCH, KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE, MAX_DRIFT_MS, MAX_EVIDENCE,
+    MAX_PROPOSAL_BYTES, TOPIC, leader, quorum, signing_preimage,
 };
 use orange_abi::chain::{
     Allocation, Certificate, ConsensusMessage, Evidence, GenesisParams, Proposal, Signature,
@@ -1397,6 +1397,75 @@ fn untimely_proposals_get_no_votes_and_the_chain_goes_on() {
         })
         .collect();
     assert!(stamps.windows(2).all(|w| w[0] < w[1]), "{stamps:?}");
+}
+
+/// Validators vote only for proposals within the size bounds (spec 08 §5):
+/// at most `max_txs` transactions and `MAX_PROPOSAL_BYTES` encoded. Before
+/// the bounds a faulty leader could fill its turns with a frame's worth of
+/// junk, and every transaction's receipt and bytes stayed in chain state.
+#[test]
+fn oversized_proposals_get_no_votes() {
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let genesis = genesis(&keys, address(&keys[0]));
+    let mut sim = Sim::new(kernel, &genesis, &keys, 0, &at(10_000), 20).unwrap();
+    sim.crash(3);
+    let byzantine = validator_id(&keys[3]);
+    let in_led_view = |s: &mut Sim| {
+        let first = simplex(s, 0);
+        first.view > 4
+            && leader(first.view, 4) == 3
+            && (1..3).all(|i| {
+                let other = simplex(s, i);
+                other.view == first.view && other.tip_hash == first.tip_hash
+            })
+    };
+    let propose_with = |sim: &mut Sim, txs: Vec<Vec<u8>>| {
+        assert!(sim.run_until(40 * SLOT_MS, in_led_view).unwrap());
+        let state = simplex(sim, 0);
+        let proposal = Proposal {
+            view: state.view,
+            height: state.tip_height + 1,
+            parent: state.tip_hash,
+            timestamp_ms: sim.now_ms.max(state.tip_timestamp_ms + 1),
+            txs: Seq(txs),
+            ..Proposal::default()
+        };
+        for i in 0..3 {
+            sim.nodes[i]
+                .deliver(byzantine, TOPIC, propose(&keys[3], proposal.clone()))
+                .unwrap();
+        }
+        (0..3).map(|i| simplex(sim, i).voted).collect::<Vec<bool>>()
+    };
+    // One transaction more than `max_txs` (8): no votes.
+    assert_eq!(propose_with(&mut sim, vec![vec![0xAA; 100]; 9]), [false; 3]);
+    // Eight, one of them taking the proposal one byte past the cap: no votes.
+    let fixed = Proposal::default().to_bytes().len();
+    let big = MAX_PROPOSAL_BYTES - fixed - 7 * 101 - 2;
+    let mut txs = vec![vec![0xAA; 100]; 7];
+    txs.push(vec![0xBB; big]);
+    let at_cap = |txs: &[Vec<u8>]| {
+        Proposal {
+            txs: Seq(txs.to_vec()),
+            ..Proposal::default()
+        }
+        .to_bytes()
+        .len()
+    };
+    assert_eq!(at_cap(&txs), MAX_PROPOSAL_BYTES + 1);
+    assert_eq!(propose_with(&mut sim, txs.clone()), [false; 3]);
+    // Exactly at the cap: the votes, and the chain goes on.
+    txs[7].pop();
+    assert_eq!(at_cap(&txs), MAX_PROPOSAL_BYTES);
+    let height = simplex(&sim, 0).tip_height;
+    assert_eq!(propose_with(&mut sim, txs), [true; 3]);
+    assert!(
+        sim.run_until(80 * SLOT_MS, |s| (0..3)
+            .all(|i| s.nodes[i].finalized_height().unwrap() >= height + 3))
+            .unwrap()
+    );
+    assert_agreement(&sim, &[0, 1, 2]);
 }
 
 /// A proposal a validator holds before it can vote for it gets its vote as

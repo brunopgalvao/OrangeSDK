@@ -698,11 +698,18 @@ pub fn pool_prune(executed: u64) {
     }
 }
 
-/// The envelopes a proposal carries: the first `MAX_DKG` of the pool.
-pub fn for_proposal() -> Seq<Vec<u8>> {
-    let mut pool = pool();
-    pool.truncate(MAX_DKG);
-    Seq(pool)
+/// The envelopes a proposal with `room` bytes left carries: the first
+/// `MAX_DKG` of the pool, leaving out each that no longer fits (spec 08 §5).
+pub fn for_proposal(mut room: usize) -> Seq<Vec<u8>> {
+    let mut chosen = Vec::new();
+    for envelope in pool() {
+        let len = crate::driver::bytes_len(envelope.len());
+        if chosen.len() < MAX_DKG && len <= room {
+            room -= len;
+            chosen.push(envelope);
+        }
+    }
+    Seq(chosen)
 }
 
 /// This node's partial signatures over the version-2 certificate message

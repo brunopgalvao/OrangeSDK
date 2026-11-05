@@ -986,6 +986,10 @@ pub mod consensus {
     pub const MAX_BACKOFF: u8 = 4;
     /// Most evidence records one proposal carries; a proposal with more gets no votes.
     pub const MAX_EVIDENCE: usize = 8;
+    /// Most bytes of one encoded proposal (spec 08 §5): twice what a leader
+    /// takes from the mempool, so an honest proposal always fits; a longer
+    /// one gets no votes.
+    pub const MAX_PROPOSAL_BYTES: usize = 2 << 20;
     /// How far past its own clock a voter accepts a proposal's timestamp
     /// (spec 08 §5): room for honest clocks that disagree, and the most one
     /// faulty leader can move the chain's time ahead of the network's.

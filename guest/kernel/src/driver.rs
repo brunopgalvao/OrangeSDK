@@ -15,8 +15,8 @@ use alloc::vec::Vec;
 use orange_abi::bridge::FinalityProof;
 use orange_abi::chain::consensus::{
     EQUIVOCATION_PENALTY, KEY_ROLE, KIND_FETCH, KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE,
-    MAX_BACKOFF, MAX_DRIFT_MS, MAX_EVIDENCE, TOPIC, identity_preimage, leader, propose_timer,
-    signing_preimage, timeout_timer, timer_view, view_timeout_ms,
+    MAX_BACKOFF, MAX_DRIFT_MS, MAX_EVIDENCE, MAX_PROPOSAL_BYTES, TOPIC, identity_preimage, leader,
+    propose_timer, signing_preimage, timeout_timer, timer_view, view_timeout_ms,
 };
 use orange_abi::chain::{
     BLOCK_GAS_LIMIT, BlockHeader, Certificate, ConsensusMessage, Evidence, GenesisParams,
@@ -159,6 +159,32 @@ fn weighs_quorum(set: &Set, indices: impl Iterator<Item = u32>) -> bool {
         }
     }
     weight * 3 > total * 2
+}
+
+/// The length of `n` in ULEB128, as the canonical encoding writes lengths.
+fn uleb_len(n: usize) -> usize {
+    let mut len = 1;
+    let mut rest = n >> 7;
+    while rest != 0 {
+        len += 1;
+        rest >>= 7;
+    }
+    len
+}
+
+/// The length of a `bytes` value of `len` bytes in the canonical encoding.
+pub fn bytes_len(len: usize) -> usize {
+    uleb_len(len) + len
+}
+
+/// The length of `p` encoded, without encoding it: its fixed fields, then
+/// each list as its count followed by its items.
+fn encoded_len(p: &Proposal) -> usize {
+    let bytes = |items: &[Vec<u8>]| {
+        uleb_len(items.len()) + items.iter().map(|b| bytes_len(b.len())).sum::<usize>()
+    };
+    let evidence: usize = p.evidence.0.iter().map(|e| e.to_bytes().len()).sum();
+    96 + bytes(&p.txs.0) + uleb_len(p.evidence.0.len()) + evidence + bytes(&p.dkg.0)
 }
 
 /// One driver step's working set.
@@ -671,8 +697,14 @@ impl Ctx {
         if !self.is_suffix(&proposal) {
             proposal.txs = Seq(self.select(txs));
             proposal.evidence = self.pending_evidence();
-            proposal.dkg = dkg::for_proposal();
             (proposal.anchor_height, proposal.anchor_root) = anchor();
+            // Within what voters accept (spec 08 §5): transactions the host
+            // handed out past what was asked for go, and envelopes fill what
+            // room is left.
+            while encoded_len(&proposal) > MAX_PROPOSAL_BYTES {
+                proposal.txs.0.pop();
+            }
+            proposal.dkg = dkg::for_proposal(MAX_PROPOSAL_BYTES - encoded_len(&proposal));
         }
         let hash = state::keccak256(&proposal.to_bytes());
         let Some(signature) = self.sign(KIND_PROPOSE, view, &hash) else {
@@ -962,8 +994,8 @@ impl Ctx {
 
     /// Votes for `proposal` if it is a valid proposal of the current view
     /// that extends the tip, with a timestamp above the tip's and at most
-    /// `MAX_DRIFT_MS` past this node's clock, and this node has neither voted
-    /// nor timed out in the view (spec 08 §5).
+    /// `MAX_DRIFT_MS` past this node's clock, within the size bounds, and
+    /// this node has neither voted nor timed out in the view (spec 08 §5).
     fn try_vote(&mut self, proposal: &Proposal, hash: Hash) {
         let extends_tip =
             proposal.parent == self.s.tip_hash && proposal.height == self.s.tip_height + 1;
@@ -977,7 +1009,10 @@ impl Ctx {
         };
         let timely = proposal.timestamp_ms > parent_ms
             && proposal.timestamp_ms <= self.s.now_ms.saturating_add(MAX_DRIFT_MS);
-        let bounded = proposal.evidence.0.len() <= MAX_EVIDENCE && proposal.dkg.0.len() <= MAX_DKG;
+        let bounded = proposal.txs.0.len() <= self.params.max_txs as usize
+            && proposal.evidence.0.len() <= MAX_EVIDENCE
+            && proposal.dkg.0.len() <= MAX_DKG
+            && encoded_len(proposal) <= MAX_PROPOSAL_BYTES;
         let empty = proposal.txs.0.is_empty()
             && proposal.evidence.0.is_empty()
             && proposal.dkg.0.is_empty();
