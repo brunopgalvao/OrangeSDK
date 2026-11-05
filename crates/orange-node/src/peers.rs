@@ -8,9 +8,11 @@
 //! signed with that key, so no peer can point others at its own address
 //! under somebody else's id. The table holds at most [`TABLE_CAP`]
 //! entries, limits what one source and one address prefix can put in it
-//! before any of it has answered, and lets a new entry displace only an
-//! entry whose dials failed, so a flood of junk never pushes out peers that
-//! work.
+//! before any of it has answered, and how much of it they can ever hold,
+//! and lets a new entry displace only an entry whose dials failed, so a
+//! flood of junk never pushes out peers that work. Where all else is equal
+//! it ranks entries under a secret key ([`PeerTable::rank`]), never by id,
+//! which anybody can grind.
 //!
 //! A node with a data directory keeps the entries that answered in
 //! [`PEER_FILE`] and takes them up again at start ([`PeerTable::saved`],
@@ -32,6 +34,12 @@ pub const TABLE_CAP: usize = 256;
 pub const PER_SOURCE: usize = 16;
 /// Most unverified entries, and accepted connections, per address prefix.
 pub const PER_PREFIX: usize = 8;
+/// Most entries one source may account for, verified or not: an eighth of
+/// the table, however many of them answer.
+pub const SOURCE_CAP: usize = TABLE_CAP / 8;
+/// Most entries that share an address prefix, verified or not: a
+/// sixteenth of the table.
+pub const PREFIX_CAP: usize = TABLE_CAP / 16;
 /// Failures running after which an entry outside the validator set is forgotten.
 pub const MAX_FAILURES: u32 = 8;
 /// How often a node asks each peer for its records.
@@ -65,6 +73,8 @@ const DIAL_PENALTY: i32 = 5;
 const MISMATCH_PENALTY: i32 = 50;
 /// Domain of a record's signature.
 const DOMAIN: &[u8] = b"ORANGE-PEER";
+/// Domain of an entry's rank.
+const RANK_DOMAIN: &[u8] = b"ORANGE-RANK";
 
 /// A node's signed advertisement of where it listens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,20 +280,35 @@ pub enum Refused {
 pub struct PeerTable {
     chain_id: u64,
     own: [u8; 32],
+    /// The secret entries are ranked under where all else is equal.
+    key: [u8; 32],
     entries: BTreeMap<[u8; 32], Entry>,
     validators: Vec<[u8; 32]>,
 }
 
 impl PeerTable {
-    /// An empty table for a node with id `own` on `chain_id`.
+    /// An empty table for a node with id `own` on `chain_id`, whose ties
+    /// are broken by rank under `key` ([`PeerTable::rank`]), a secret the
+    /// node draws at start.
     #[must_use]
-    pub fn new(chain_id: u64, own: [u8; 32]) -> PeerTable {
+    pub fn new(chain_id: u64, own: [u8; 32], key: [u8; 32]) -> PeerTable {
         PeerTable {
             chain_id,
             own,
+            key,
             entries: BTreeMap::new(),
             validators: Vec::new(),
         }
+    }
+
+    /// Where `id` stands among entries that are otherwise equal:
+    /// `keccak256("ORANGE-RANK" ‖ key ‖ id)`, lowest first. Ids cost
+    /// nothing to make, so an order by id would let anybody grind ids that
+    /// are dialled, answered and kept before every other; under a key
+    /// nobody else knows, no id can be made to stand first.
+    #[must_use]
+    pub fn rank(&self, id: &[u8; 32]) -> [u8; 32] {
+        orange_host::hash::keccak256(&[RANK_DOMAIN, &self.key, id].concat())
     }
 
     /// The entries, by id.
@@ -344,8 +369,27 @@ impl PeerTable {
         if record.id == self.own {
             return false;
         }
+        let p = prefix(&addr);
+        let sourced = record.id != source;
+        // Of the other entries, those that share the record's prefix and
+        // those its source accounts for: all of them, and the unverified.
+        let count = |of: &dyn Fn(&Entry) -> bool| {
+            self.entries
+                .iter()
+                .filter(|(id, e)| **id != record.id && of(e))
+                .fold((0, 0), |(all, unverified), (_, e)| {
+                    (all + 1, unverified + usize::from(!e.verified))
+                })
+        };
+        let (in_prefix, unverified_in_prefix) = count(&|e| p.is_some() && prefix(&e.addr) == p);
+        let (from_source, unverified_from_source) = count(&|e| sourced && e.source == Some(source));
+        // A current validator's entry is never kept out of a full bucket:
+        // nobody else can sign its records.
+        let bucketed = !self.is_validator(&record.id);
+        let prefix_full = bucketed && in_prefix >= PREFIX_CAP;
         if let Some(entry) = self.entries.get_mut(&record.id) {
-            if record.seq <= entry.record.seq {
+            // An entry that moves into a full prefix keeps the record it had.
+            if record.seq <= entry.record.seq || (entry.addr != addr && prefix_full) {
                 return false;
             }
             if entry.addr != addr {
@@ -357,21 +401,11 @@ impl PeerTable {
             entry.record = record.clone();
             return true;
         }
-        let unverified = |e: &&Entry| !e.verified;
-        let from_source = self
-            .entries
-            .values()
-            .filter(unverified)
-            .filter(|e| e.source == Some(source))
-            .count();
-        let in_prefix = prefix(&addr).map_or(0, |p| {
-            self.entries
-                .values()
-                .filter(unverified)
-                .filter(|e| prefix(&e.addr).as_ref() == Some(&p))
-                .count()
-        });
-        if (record.id != source && from_source >= PER_SOURCE) || in_prefix >= PER_PREFIX {
+        if unverified_from_source >= PER_SOURCE
+            || unverified_in_prefix >= PER_PREFIX
+            || (bucketed && from_source >= SOURCE_CAP)
+            || prefix_full
+        {
             return false;
         }
         if self.entries.len() >= TABLE_CAP {
@@ -379,7 +413,7 @@ impl PeerTable {
                 .entries
                 .iter()
                 .filter(|(id, e)| e.score < 0 && !self.is_validator(id) && !connected.contains(id))
-                .min_by_key(|(id, e)| (e.score, **id))
+                .min_by_key(|(id, e)| (e.score, self.rank(id)))
                 .map(|(id, _)| *id);
             let Some(worst) = worst else {
                 return false;
@@ -403,12 +437,12 @@ impl PeerTable {
     }
 
     /// The entries to keep across a restart (spec 09 §5a.7): those seen,
-    /// current validators first, then by score, then by id; at most `limit`.
+    /// current validators first, then by score, then by rank; at most `limit`.
     #[must_use]
     pub fn saved(&self, limit: usize) -> Vec<SavedPeer> {
         let mut seen: Vec<(&[u8; 32], &Entry)> =
             self.entries.iter().filter(|(_, e)| e.seen_ms > 0).collect();
-        seen.sort_by_key(|(id, e)| (!self.is_validator(id), -e.score, **id));
+        seen.sort_by_cached_key(|(id, e)| (!self.is_validator(id), -e.score, self.rank(id)));
         seen.into_iter()
             .take(limit)
             .map(|(_, e)| SavedPeer {
@@ -488,7 +522,7 @@ impl PeerTable {
     }
 
     /// Up to `n` entries to dial now: not connected, not being dialled, due;
-    /// current validators first, then by score, fewest failures and id.
+    /// current validators first, then by score, fewest failures and rank.
     #[must_use]
     pub fn candidates(
         &self,
@@ -501,7 +535,9 @@ impl PeerTable {
             .iter()
             .filter(|(id, e)| e.next_dial_ms <= now_ms && !busy.contains(id))
             .collect();
-        due.sort_by_key(|(id, e)| (!self.is_validator(id), -e.score, e.failures, **id));
+        due.sort_by_cached_key(|(id, e)| {
+            (!self.is_validator(id), -e.score, e.failures, self.rank(id))
+        });
         due.into_iter()
             .take(n)
             .map(|(id, e)| (*id, e.addr))
@@ -509,7 +545,7 @@ impl PeerTable {
     }
 
     /// The records to answer `asker`'s `GetPeers` with: `own` first, then
-    /// the validators', then by score, never the asker's own or one with a
+    /// the validators', then by score and rank, never the asker's own or one with a
     /// negative score; at most [`MAX_RECORDS`].
     #[must_use]
     pub fn answer(&self, asker: &[u8; 32], own: Option<&PeerRecord>) -> Vec<PeerRecord> {
@@ -518,7 +554,7 @@ impl PeerTable {
             .iter()
             .filter(|(id, e)| *id != asker && e.score >= 0)
             .collect();
-        known.sort_by_key(|(id, e)| (!self.is_validator(id), -e.score, **id));
+        known.sort_by_cached_key(|(id, e)| (!self.is_validator(id), -e.score, self.rank(id)));
         own.into_iter()
             .chain(known.into_iter().map(|(_, e)| &e.record))
             .take(MAX_RECORDS)
@@ -531,8 +567,10 @@ impl PeerTable {
 mod tests {
     use super::*;
     use k256::ecdsa::SigningKey;
+    use orange_host::hash::keccak256;
 
     const CHAIN: u64 = 7;
+    const KEY: [u8; 32] = [0x5a; 32];
 
     fn key(i: u32) -> SigningKey {
         let mut bytes = [0x11; 32];
@@ -609,7 +647,7 @@ mod tests {
 
     #[test]
     fn learning_replaces_only_newer_records_and_never_itself() {
-        let mut t = PeerTable::new(CHAIN, id(0));
+        let mut t = PeerTable::new(CHAIN, id(0), KEY);
         let src = id(9);
         let own = record(0, "10.0.0.9:1", 1);
         let r1 = record(1, "10.0.0.1:1", 1);
@@ -637,7 +675,7 @@ mod tests {
 
     #[test]
     fn frames_that_break_the_rules_are_refused_whole() {
-        let mut t = PeerTable::new(CHAIN, id(0));
+        let mut t = PeerTable::new(CHAIN, id(0), KEY);
         let many: Vec<PeerRecord> = (1..=33).map(|i| record(i, "127.0.0.1:1", 1)).collect();
         assert_eq!(t.learn(id(9), &many, &[]), Err(Refused::TooMany));
         let mut forged = record(2, "127.0.0.1:2", 1);
@@ -651,7 +689,7 @@ mod tests {
 
     #[test]
     fn sources_and_prefixes_are_limited_until_entries_answer() {
-        let mut t = PeerTable::new(CHAIN, id(0));
+        let mut t = PeerTable::new(CHAIN, id(0), KEY);
         let src = id(1000);
         // One source puts at most PER_SOURCE unverified entries in, across prefixes.
         for i in 0..20u32 {
@@ -666,7 +704,7 @@ mod tests {
         t.learn(src, &[record(50, "10.50.0.1:1", 1)], &[]).unwrap();
         assert!(t.entries().contains_key(&id(50)));
         // One prefix holds at most PER_PREFIX unverified entries, whatever the source.
-        let mut t = PeerTable::new(CHAIN, id(0));
+        let mut t = PeerTable::new(CHAIN, id(0), KEY);
         for i in 0..12u32 {
             t.learn(
                 id(2000 + i),
@@ -688,9 +726,107 @@ mod tests {
         assert_eq!(t.entries().len(), PER_PREFIX + 12);
     }
 
+    /// Verifies every entry the table holds, as dials that answer do.
+    fn answer_all(t: &mut PeerTable) {
+        let ids: Vec<[u8; 32]> = t.entries().keys().copied().collect();
+        for id in ids {
+            assert!(t.handshake(&id, &id, 1));
+        }
+    }
+
+    /// Entries that answer lift the limits on unverified ones, but never
+    /// the buckets: one source, or one prefix, whose nodes all answer, as an
+    /// attacker's do, still holds only its share of the table.
+    #[test]
+    fn one_source_or_prefix_never_fills_the_table_however_its_entries_answer() {
+        let mut t = PeerTable::new(CHAIN, id(0), KEY);
+        let src = id(1000);
+        for i in 0..100u32 {
+            let addr = format!("10.{i}.0.1:1");
+            t.learn(src, &[record(i + 1, &addr, 1)], &[]).unwrap();
+            answer_all(&mut t);
+        }
+        assert_eq!(t.entries().len(), SOURCE_CAP);
+        // Others still get in from it, and so does a current validator from the source.
+        t.learn(id(1001), &[record(200, "10.200.0.1:1", 1)], &[])
+            .unwrap();
+        t.set_validators(vec![id(201)]);
+        t.learn(src, &[record(201, "10.201.0.1:1", 1)], &[])
+            .unwrap();
+        assert_eq!(t.entries().len(), SOURCE_CAP + 2);
+        // One prefix, its nodes each naming themselves.
+        let mut t = PeerTable::new(CHAIN, id(0), KEY);
+        for i in 0..100u32 {
+            let r = record(i + 1, &format!("10.9.9.{i}:1"), 1);
+            t.learn(r.id, &[r], &[]).unwrap();
+            answer_all(&mut t);
+        }
+        assert_eq!(t.entries().len(), PREFIX_CAP);
+        // An entry elsewhere that moves into the full prefix keeps its record.
+        t.learn(id(300), &[record(300, "10.8.0.1:1", 1)], &[])
+            .unwrap();
+        assert_eq!(
+            t.learn(id(300), &[record(300, "10.9.9.200:1", 2)], &[]),
+            Ok(0)
+        );
+        assert_eq!(t.entries()[&id(300)].addr, "10.8.0.1:1".parse().unwrap());
+        // One already inside moves within it, and a current validator moves in.
+        assert_eq!(t.learn(id(1), &[record(1, "10.9.9.201:1", 2)], &[]), Ok(1));
+        t.set_validators(vec![id(300)]);
+        assert_eq!(
+            t.learn(id(300), &[record(300, "10.9.9.200:1", 3)], &[]),
+            Ok(1)
+        );
+        assert_eq!(t.entries().len(), PREFIX_CAP + 1);
+    }
+
+    /// Where all else is equal, entries are ranked under the table's secret
+    /// key, never by id: ids cost nothing, so anybody could grind ones that
+    /// are dialled, answered with, saved and kept before all others.
+    #[test]
+    fn ties_are_broken_by_a_secret_rank_not_by_id() {
+        let mut t = PeerTable::new(CHAIN, id(0), KEY);
+        let records: Vec<PeerRecord> = (1..=8)
+            .map(|i| record(i, &format!("127.0.0.1:{i}"), 1))
+            .collect();
+        t.learn(id(9), &records, &[]).unwrap();
+        let mut by_rank: Vec<[u8; 32]> = t.entries().keys().copied().collect();
+        by_rank.sort_by_key(|id| keccak256(&[b"ORANGE-RANK".as_slice(), &KEY, id].concat()));
+        let by_id: Vec<[u8; 32]> = t.entries().keys().copied().collect();
+        assert_ne!(by_rank, by_id, "the key ranks these ids otherwise");
+        let first = |v: Vec<([u8; 32], SocketAddr)>| v.into_iter().map(|c| c.0).collect::<Vec<_>>();
+        assert_eq!(first(t.candidates(0, &[], 8)), by_rank);
+        let answered: Vec<[u8; 32]> = t.answer(&id(0), None).iter().map(|r| r.id).collect();
+        assert_eq!(answered, by_rank);
+        answer_all(&mut t);
+        let saved: Vec<[u8; 32]> = t.saved(8).iter().map(|s| s.record.id).collect();
+        assert_eq!(saved, by_rank);
+        // Another key ranks them otherwise.
+        let mut other = PeerTable::new(CHAIN, id(0), [0xa5; 32]);
+        other.learn(id(9), &records, &[]).unwrap();
+        assert_ne!(first(other.candidates(0, &[], 8)), by_rank);
+        // Of the failed entries of a full table, the lowest score goes first, and of
+        // equal scores the lowest rank.
+        let mut full = PeerTable::new(CHAIN, id(0), KEY);
+        for i in 0..u32::try_from(TABLE_CAP).unwrap() {
+            let r = record(i + 1, &format!("127.0.0.1:{}", i + 1), 1);
+            full.learn(r.id, &[r], &[]).unwrap();
+        }
+        let failed: Vec<[u8; 32]> = (1..=8).map(id).collect();
+        for id in &failed {
+            full.dial_failed(id, 0);
+        }
+        let mut ranked = failed.clone();
+        ranked.sort_by_key(|id| full.rank(id));
+        let r = record(5_000, "127.0.0.2:9", 1);
+        assert_eq!(full.learn(r.id, &[r], &[]), Ok(1));
+        assert!(!full.entries().contains_key(&ranked[0]));
+        assert!(ranked[1..].iter().all(|id| full.entries().contains_key(id)));
+    }
+
     #[test]
     fn a_full_table_gives_way_only_to_failed_entries() {
-        let mut t = PeerTable::new(CHAIN, id(0));
+        let mut t = PeerTable::new(CHAIN, id(0), KEY);
         // Fill the table from many sources over loopback.
         for i in 0..u32::try_from(TABLE_CAP).unwrap() {
             let r = record(i + 1, &format!("127.0.0.1:{}", i + 1), 1);
@@ -725,7 +861,7 @@ mod tests {
 
     #[test]
     fn scores_backoff_and_forgetting() {
-        let mut t = PeerTable::new(CHAIN, id(0));
+        let mut t = PeerTable::new(CHAIN, id(0), KEY);
         t.learn(
             id(9),
             &[record(1, "127.0.0.1:1", 1), record(2, "127.0.0.1:2", 1)],
@@ -765,7 +901,7 @@ mod tests {
 
     #[test]
     fn candidates_and_answers_are_ordered() {
-        let mut t = PeerTable::new(CHAIN, id(0));
+        let mut t = PeerTable::new(CHAIN, id(0), KEY);
         let records: Vec<PeerRecord> = (1..=5)
             .map(|i| record(i, &format!("127.0.0.1:{i}"), 1))
             .collect();
@@ -788,7 +924,7 @@ mod tests {
         assert_eq!(got, vec![id(0), id(5), id(3), id(2)]);
         assert_eq!(t.answer(&id(1), None).len(), 3);
         // At most MAX_RECORDS.
-        let mut big = PeerTable::new(CHAIN, id(0));
+        let mut big = PeerTable::new(CHAIN, id(0), KEY);
         for i in 1..=40u32 {
             big.learn(id(100 + i), &[record(i, &format!("127.0.0.1:{i}"), 1)], &[])
                 .unwrap();
@@ -800,7 +936,7 @@ mod tests {
 
     #[test]
     fn only_seen_entries_are_saved_best_first() {
-        let mut t = PeerTable::new(CHAIN, id(0));
+        let mut t = PeerTable::new(CHAIN, id(0), KEY);
         let records: Vec<PeerRecord> = (1..=4)
             .map(|i| record(i, &format!("127.0.0.1:{i}"), 1))
             .collect();
@@ -847,7 +983,7 @@ mod tests {
             saved(6, now),
             saved(7, now),
         ];
-        let mut t = PeerTable::new(CHAIN, id(0));
+        let mut t = PeerTable::new(CHAIN, id(0), KEY);
         assert_eq!(t.restore(&file, now, 6), 3);
         let ids: Vec<[u8; 32]> = t.entries().keys().copied().collect();
         let mut want = vec![id(1), id(4), id(6)];
@@ -861,7 +997,7 @@ mod tests {
         // Taken up again, nothing changes: the records are no newer.
         assert_eq!(t.restore(&file, now, 6), 0);
         // A record from another chain does not verify.
-        let mut other = PeerTable::new(CHAIN + 1, id(0));
+        let mut other = PeerTable::new(CHAIN + 1, id(0), KEY);
         assert_eq!(other.restore(&file, now, 10), 0);
     }
 

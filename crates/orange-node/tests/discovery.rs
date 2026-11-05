@@ -720,3 +720,69 @@ fn a_restarted_node_keeps_the_peers_that_answered() {
     assert_eq!(table.entries().len(), 1);
     assert_eq!(table.entries()[&peer].record, saved[0].record);
 }
+
+/// A restarted node whose saved peers take every dial, as an attacker's
+/// that filled its table before the restart would, still dials its
+/// bootstrap addresses (spec 09 §5a.5): one outbound slot is theirs alone.
+#[test]
+fn a_table_that_takes_every_dial_leaves_one_slot_to_the_bootstrap_addresses() {
+    use orange_node::peers::{PEER_FILE, SavedPeer, write_saved};
+    let keys = keys(1);
+    let net = Net::new(&keys);
+    let dir = orange_scratch::Scratch::dir("discovery", "reserved");
+    let file = dir.join(PEER_FILE);
+    // Two saved peers whose listeners take every dial and never say Hello.
+    let held: Vec<TcpListener> = (0..2)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let saved: Vec<SavedPeer> = (10..)
+        .zip(&held)
+        .map(|(i, l)| SavedPeer {
+            record: PeerRecord::sign(&stranger(i), CHAIN_ID, l.local_addr().unwrap(), 1).unwrap(),
+            seen_ms: 1,
+        })
+        .collect();
+    write_saved(&file, &Seq(saved).to_bytes()).unwrap();
+    let boot = TcpListener::bind("127.0.0.1:0").unwrap();
+    boot.set_nonblocking(true).unwrap();
+    let me = stranger(3);
+    let mut node = Node::open(kernel_module(), &net.genesis, NodeConfig::default()).unwrap();
+    node.start(None).unwrap();
+    let genesis = node.genesis_hash();
+    let mut t = Transport::bind("127.0.0.1:0", me.clone(), CHAIN_ID, genesis, vec![]).unwrap();
+    t.enable_discovery(Discovery {
+        key: Some(me.clone()),
+        bootstrap: vec![boot.local_addr().unwrap()],
+        outbound: 2,
+        peer_file: Some(file),
+        ..Discovery::default()
+    });
+    // The clock stands still, so the saved peers' handshakes never time out. A
+    // connection whose Hello names another node is a dial of another test's, at a port
+    // this one reused, and is let go.
+    let me_id = validator_id(&me);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        t.poll(&mut node, 1_000).unwrap();
+        if let Ok((c, from)) = boot.accept() {
+            let mut w = Wire::over(c, net.chain, keccak256(from.to_string().as_bytes()));
+            let (frames, _) = w.read_until(&mut || t.poll(&mut node, 1_000).unwrap(), |f| {
+                raw_peer::nonce_of(f).is_some()
+            });
+            if frames
+                .iter()
+                .any(|f| matches!(f, Frame::Hello { id, .. } if *id == me_id))
+            {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the bootstrap address was never dialled"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // One slot went to the table, the other to the bootstrap address.
+    assert_eq!(t.peer_table().unwrap().entries().len(), 2);
+    assert_eq!(t.outbound(), 2);
+}

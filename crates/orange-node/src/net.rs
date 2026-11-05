@@ -189,6 +189,11 @@ pub fn fresh_key() -> std::io::Result<k256::ecdsa::SigningKey> {
         .expect("a hash is a scalar, bar a negligible chance"))
 }
 
+/// A secret drawn from `seed` under `label`: `keccak256(label ‖ seed)`.
+fn draw(label: &[u8], seed: &[u8; 32]) -> [u8; 32] {
+    orange_host::hash::keccak256(&[label, seed.as_slice()].concat())
+}
+
 /// One unit on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(missing_docs)]
@@ -823,11 +828,14 @@ impl Transport {
         let advertise = discovery
             .advertise
             .or_else(|| self.local_addr().ok().filter(peers::dialable));
+        // The table's ranking key, drawn as a connection's secrets are.
+        self.seed = draw(b"ORANGE-SEED", &self.seed);
+        let rank_key = draw(b"ORANGE-TABLE", &self.seed);
         self.exchange = Some(Exchange {
             key: discovery.key,
             advertise,
             own: None,
-            table: PeerTable::new(self.chain_id, self.id),
+            table: PeerTable::new(self.chain_id, self.id, rank_key),
             boot: discovery
                 .bootstrap
                 .into_iter()
@@ -861,9 +869,6 @@ impl Transport {
     /// is replaced by its hash first, so that what the node holds later
     /// tells nothing of the keys of the connections it opened before.
     fn open(&mut self, stream: TcpStream, now_ms: u64) -> Conn {
-        let draw = |label: &[u8], seed: &[u8; 32]| {
-            orange_host::hash::keccak256(&[label, seed.as_slice()].concat())
-        };
         self.seed = draw(b"ORANGE-SEED", &self.seed);
         let ephemeral = Ephemeral::from_seed(&draw(b"ORANGE-EPHEMERAL", &self.seed));
         let side = Side {
@@ -1018,9 +1023,26 @@ impl Transport {
                 .filter_map(|c| c.target.as_ref().and_then(entry)),
         );
         busy.extend(x.dialing.iter().filter_map(entry));
+        // While it has bootstrap addresses, one outbound slot is theirs
+        // alone (spec 09 §5a.5): a table that answers on every slot, as one
+        // an attacker filled before a restart does, would otherwise keep
+        // them from ever being dialled again.
+        let reserved = usize::from(!x.boot.is_empty());
+        let boot = |t: &Target| matches!(t, Target::Boot(_));
+        let others = self
+            .conns
+            .iter()
+            .filter(|c| c.dialled.is_some() || c.target.is_some_and(|t| !boot(&t)))
+            .count()
+            + x.dialing.iter().filter(|t| !boot(t)).count();
+        let for_table = x
+            .outbound
+            .saturating_sub(reserved)
+            .saturating_sub(others)
+            .min(room);
         let mut targets: Vec<(Target, SocketAddr)> = x
             .table
-            .candidates(now_ms, &busy, room)
+            .candidates(now_ms, &busy, for_table)
             .into_iter()
             .map(|(id, addr)| (Target::Entry(id), addr))
             .collect();
