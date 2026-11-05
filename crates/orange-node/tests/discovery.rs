@@ -430,20 +430,32 @@ fn dials_are_judged_by_their_handshakes() {
     let table = net.transports[me].peer_table().unwrap();
     assert!(!table.entries().contains_key(&validator_id(&stranger(3))));
     // The node dials X: the first time X's listener answers as X and hangs up, the
-    // second time as somebody else, the third time not at all.
+    // second time as somebody else, the third time not at all. A connection whose
+    // Hello names another node is a dial of another test's, at a port this one
+    // reused, and is let go.
     let chain = net.chain;
-    let accept = |net: &mut Net| -> Wire {
+    let me_id = validator_id(&keys[0]);
+    let accept = |net: &mut Net| -> (Wire, Vec<Frame>) {
         let deadline = Instant::now() + Duration::from_mins(1);
         loop {
             assert!(Instant::now() < deadline, "no dial");
             net.poll();
             if let Ok((c, from)) = fake.accept() {
-                return Wire::over(c, chain, keccak256(from.to_string().as_bytes()));
+                let mut w = Wire::over(c, chain, keccak256(from.to_string().as_bytes()));
+                let (frames, _) = w.read_until(&mut || net.poll(), |f| {
+                    f.iter().any(|f| matches!(f, Frame::Hello { .. }))
+                });
+                if frames
+                    .iter()
+                    .any(|f| matches!(f, Frame::Hello { id, .. } if *id == me_id))
+                {
+                    return (w, frames);
+                }
             }
             std::thread::sleep(Duration::from_millis(2));
         }
     };
-    let mut c = accept(&mut net);
+    let (mut c, _) = accept(&mut net);
     raw_peer::complete(&mut c, &x, &mut || net.poll());
     let verified = net.pump(Duration::from_secs(10), |net| {
         net.transports[me].peer_table().unwrap().entries()[&x_id].verified
@@ -451,10 +463,10 @@ fn dials_are_judged_by_their_handshakes() {
     assert!(verified);
     assert_eq!(net.transports[me].outbound(), 1);
     drop(c);
-    let mut c = accept(&mut net);
+    let (mut c, _) = accept(&mut net);
     raw_peer::complete(&mut c, &stranger(9), &mut || net.poll());
     assert!(read_while(&mut net, &mut c, Duration::from_secs(10)).1);
-    let c = accept(&mut net);
+    let (c, _) = accept(&mut net);
     drop(c);
     let judged = net.pump(Duration::from_secs(10), |net| {
         net.transports[me].peer_table().unwrap().entries()[&x_id].failures == 2
@@ -464,7 +476,7 @@ fn dials_are_judged_by_their_handshakes() {
     assert_eq!(entry.score, 10 - 50 - 5);
     // The fourth time it answers nothing and keeps the connection open: the node gives
     // up waiting for its Hello.
-    let mut c = accept(&mut net);
+    let (mut c, _) = accept(&mut net);
     assert!(read_while(&mut net, &mut c, Duration::from_secs(20)).1);
     let entry = net.transports[me].peer_table().unwrap().entries()[&x_id].clone();
     assert_eq!(
@@ -475,8 +487,7 @@ fn dials_are_judged_by_their_handshakes() {
     // The fifth time an impostor answers at X's address, naming X's id with a proof it
     // signed itself: the connection closes before its handshake completes, which counts
     // as a failed dial, and the node never counts the impostor as X.
-    let mut c = accept(&mut net);
-    let (frames, _) = c.read_until(&mut || net.poll(), |f| raw_peer::nonce_of(f).is_some());
+    let (mut c, frames) = accept(&mut net);
     assert!(raw_peer::nonce_of(&frames).is_some());
     c.send_clear(&c.hello(x_id));
     c.send(&chain.auth(&stranger(9), &c.side, &c.theirs.unwrap()));

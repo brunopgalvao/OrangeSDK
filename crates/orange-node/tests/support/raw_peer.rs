@@ -231,12 +231,13 @@ pub fn nonce_of(frames: &[Frame]) -> Option<[u8; 32]> {
 
 /// Completes the handshake on `w`, a connection either end opened, as the
 /// holder of `key`: says `Hello`, waits for the other end's while calling
-/// `poll`, and sends `Auth`, sealed. The frames read on the way, the other
-/// end's `Hello` among them.
+/// `poll`, unless it was read already, and sends `Auth`, sealed. The frames
+/// read on the way, the other end's `Hello` among them.
 pub fn complete(w: &mut Wire, key: &SigningKey, poll: &mut dyn FnMut()) -> Vec<Frame> {
     w.send_clear(&w.hello(validator_id(key)));
-    let (frames, _) = w.read_until(poll, |f| nonce_of(f).is_some());
-    assert!(nonce_of(&frames).is_some(), "the other end said no Hello");
+    let read = w.theirs.is_some();
+    let (frames, _) = w.read_until(poll, |f| read || nonce_of(f).is_some());
+    assert!(w.theirs.is_some(), "the other end said no Hello");
     w.send(&w.auth(key));
     frames
 }
