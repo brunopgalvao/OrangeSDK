@@ -383,13 +383,18 @@ fn write_entry(out: &mut BufWriter<Box<dyn Write>>, key: &[u8], value: &[u8]) ->
     Ok(())
 }
 
-/// A snapshot a node serves: the file, its manifest, and where each slice
-/// starts in the file with how many entries it holds.
+/// A snapshot a node serves: the file, its manifest, where each slice
+/// starts in the file with how many entries it holds, and the marks of its
+/// pages.
 #[derive(Debug)]
 struct Served {
     snapshot: Snapshot,
     manifest: Manifest,
     starts: Vec<(u64, u64)>,
+    /// Per slice, where each page after its first starts, as a page from the
+    /// slice's start cuts them: the path of the entry before, the offset in
+    /// the file and how many of the slice's entries come before it.
+    marks: Vec<Vec<(Hash, u64, u64)>>,
     chunk_bytes: usize,
 }
 
@@ -398,6 +403,9 @@ impl Served {
     fn index(snapshot: Snapshot, limits: ServeLimits) -> Result<Served, SnapshotError> {
         let depth = depth_for(snapshot.header.entries, limits.slice_entries);
         let mut starts = vec![(0, 0); 1 << depth];
+        let mut marks = vec![Vec::new(); 1 << depth];
+        // Bytes of keys and values since the open slice's last mark.
+        let mut page_bytes = 0;
         let mut slices = vec![Summary::Empty; 1 << depth];
         let mut offset = snapshot.body_offset();
         let mut last: Option<Hash> = None;
@@ -425,6 +433,7 @@ impl Served {
             if open.as_ref().is_none_or(|(s, _, _)| *s != slice) {
                 close(open.take(), &starts);
                 starts[slice as usize].0 = offset;
+                page_bytes = 0;
                 let first = Summary::Leaf { path, value_hash };
                 open = Some((slice, first, SortedRoot::new(keccak256)));
             }
@@ -433,6 +442,11 @@ impl Served {
                 .expect("paths ascend, checked above");
             starts[slice as usize].1 += 1;
             offset += 8 + key.len() as u64 + value.len() as u64;
+            page_bytes += key.len() + value.len();
+            if page_bytes >= limits.chunk_bytes {
+                page_bytes = 0;
+                marks[slice as usize].push((path, offset, starts[slice as usize].1));
+            }
         }
         close(open, &starts);
         Ok(Served {
@@ -443,6 +457,7 @@ impl Served {
             },
             snapshot,
             starts,
+            marks,
             chunk_bytes: limits.chunk_bytes,
         })
     }
@@ -458,17 +473,24 @@ impl Served {
     }
 
     /// A page of `slice`: its entries above `after`, as many as fit in
-    /// the limits' bytes, at least one.
+    /// the limits' bytes, at least one. It reads from the last mark at or
+    /// below `after`, every entry before which is at or below it, so that a
+    /// request costs at most a page more than its answer, whatever `after`.
     fn page(&self, slice: u32, after: Option<Hash>) -> io::Result<SyncResponse> {
         let (start, count) = *self
             .starts
             .get(slice as usize)
             .ok_or_else(|| io::Error::other("no such slice"))?;
+        let marks = &self.marks[slice as usize];
+        let below = after.map_or(0, |a| marks.partition_point(|(path, _, _)| *path <= a));
+        let (start, skipped) = below
+            .checked_sub(1)
+            .map_or((start, 0), |i| (marks[i].1, marks[i].2));
         let mut file = BufReader::new(File::open(self.snapshot.path())?);
         file.seek(SeekFrom::Start(start))?;
         let mut entries = Vec::new();
         let mut bytes = 0;
-        for left in (0..count).rev() {
+        for left in (0..count - skipped).rev() {
             let (key, value) = read_entry(&mut file)?;
             if after.is_some_and(|a| keccak256(&key) <= a) {
                 continue;
@@ -1903,5 +1925,58 @@ mod tests {
         };
         s.on_response([1; 32], 9, &late.to_bytes(), 1);
         assert_eq!(s.failed(), Some("the disk is full"));
+    }
+
+    /// A page after a mark is read from the mark (spec 22 §7.4): before, every
+    /// page re-read its slice from the start, so a peer that asked for the
+    /// end of a large slice over and over made the server read all of it each
+    /// time. Bytes before the mark are not read: here they are corrupted, and
+    /// the page is still what it was.
+    #[test]
+    fn a_page_is_read_from_the_last_mark_below_it() {
+        let dir = orange_scratch::Scratch::dir("statesync-unit", "paging-marks");
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = (0u32..40)
+            .map(|i| (i.to_be_bytes().to_vec(), vec![7; 20]))
+            .collect();
+        entries.sort_by_key(|(key, _)| keccak256(key));
+        let header = SnapshotHeader {
+            entries: entries.len() as u64,
+            ..SnapshotHeader::default()
+        };
+        let path = dir.join("snapshot");
+        let snapshot = Snapshot::write(&path, &header, entries.clone()).unwrap();
+        let body = snapshot.body_offset();
+        let limits = ServeLimits {
+            slice_entries: SLICE_ENTRIES,
+            chunk_bytes: 100,
+        };
+        let served = Served::index(snapshot, limits).unwrap();
+        // Pages of five entries of 24 bytes.
+        let after = keccak256(&entries[20].0);
+        let page = served.page(0, Some(after)).unwrap();
+        assert!(
+            matches!(&page, SyncResponse::Slice { entries: got, more: true }
+                if got.len() == 5 && got[0].key == entries[21].0),
+            "{page:?}"
+        );
+        let last = keccak256(&entries[39].0);
+        assert_eq!(
+            served.page(0, Some(last)).unwrap(),
+            SyncResponse::Slice {
+                entries: Vec::new(),
+                more: false
+            }
+        );
+        // The first entry's key, corrupted so that its path is above `after`:
+        // a read from the slice's start would now answer it.
+        let mut bytes = fs::read(&path).unwrap();
+        let key = usize::try_from(body).unwrap() + 4;
+        let mut flip = 0u8;
+        while keccak256(&bytes[key..key + 4]) <= after {
+            flip += 1;
+            bytes[key] = entries[0].0[0] ^ flip;
+        }
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(served.page(0, Some(after)).unwrap(), page);
     }
 }
