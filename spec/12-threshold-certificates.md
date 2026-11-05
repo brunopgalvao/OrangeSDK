@@ -43,8 +43,8 @@ The larger key costs little: a verifier of a key that never changes holds it as 
 
 | Tag | Value | Use |
 |---|---|---|
-| `DST_SIG` | `ORANGE-V01-CS01-with-BLS12381G1_XMD:SHA-256_SSWU_RO_` (50 bytes) | every signature and partial signature over a message |
-| `DST_POP` | `ORANGE-V01-CS02-with-BLS12381G1_XMD:SHA-256_SSWU_RO_` (50 bytes) | proofs of possession |
+| `DST_SIG` | `ORANGE-V01-CS01-with-BLS12381G1_XMD:SHA-256_SSWU_RO_` (52 bytes) | every signature and partial signature over a message |
+| `DST_POP` | `ORANGE-V01-CS02-with-BLS12381G1_XMD:SHA-256_SSWU_RO_` (52 bytes) | proofs of possession |
 | `DST_COEFFICIENT` | `ORANGE-V01-COEFFICIENT_XMD:SHA-256` | polynomial coefficients derived from a seed (§4, §5) |
 | `DST_EPHEMERAL` | `ORANGE-V01-DKG-EPHEMERAL_XMD:SHA-256` | a dealer's ephemeral scalar (§5) |
 | `DST_PAD` | `ORANGE-V01-DKG-PAD_XMD:SHA-256` | share encryption pads (§5) |
@@ -192,7 +192,7 @@ A decoder MUST reject a first byte other than 1 or 2 (an unknown version), a len
 rotation_message = "ORANGE-ROTATE" (13 ASCII bytes) ‖ 1 ‖ chain_id (u64) ‖ key_id (u64) ‖ key (96 bytes)
 ```
 
-Its group signature over it is a *rotation certificate*. The version byte 1 lets a later rotation format coexist; the tag differs from the certificate tag in its sixth byte, so no rotation message is a certificate message and no certificate message a rotation message, and both are signed under one `DST_SIG` without ambiguity. A rotation message names the new key, not the old: the old key is whoever signs it, and a verifier checks it against the key it holds.
+Its group signature over it is a *rotation certificate*. The version byte 1 lets a later rotation format coexist; the tag differs from the certificate tag in its eighth byte, so no rotation message is a certificate message and no certificate message a rotation message, and both are signed under one `DST_SIG` without ambiguity. A rotation message names the new key, not the old: the old key is whoever signs it, and a verifier checks it against the key it holds.
 
 **Relationship to 08.** A driver that adopts these certificates carries them in `FinalizeBlock.certificate`. A spec 08 finalize certificate opens with its kind byte 2 too, but its encoding is `42 + 69·n` bytes for `n` votes (one byte more from 128 votes on), never 97, and never 89, so a decoder tells the three formats apart by the first byte and the length. A certificate does not say which validators signed; participation is recorded separately (ADR 0008). What a certificate proves about stake follows from how the shares were dealt, never from the certificate: under the reference kernel's dealing, the shares behind any certificate belong to validators holding more than two thirds of the stake of the key set's epoch (15 §6.8), so a verifier, an Ethereum contract included, needs no list of validators or stakes.
 
