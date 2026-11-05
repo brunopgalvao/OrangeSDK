@@ -7,7 +7,9 @@ use orange_abi::chain::{Certificate, GenesisParams, Proposal, SyncRequest, SyncR
 use orange_abi::codec::Seq;
 use orange_abi::types::{Genesis, Input};
 use orange_abi::{Decode, Encode};
-use orange_node::catchup::{CatchUp, FIRST_WAIT_MS, HOST_IDS, MAX_WAIT_MS, PEER_TTL_MS};
+use orange_node::catchup::{
+    CatchUp, FIRST_WAIT_MS, HOST_IDS, MAX_PASSED, MAX_WAIT_MS, PEER_TTL_MS,
+};
 use orange_node::{NodeConfig, Outbound, Sim};
 
 const KERNEL: &[u8] = include_bytes!("fixtures/kernel.elf");
@@ -171,11 +173,11 @@ fn off_or_not_a_sync_request_passes_untouched() {
     assert!(c.on_request(A, 8, ask(1), 0, &mut out).is_none());
     assert_eq!(sent(&mut out), vec![(A, 8, 1)]);
     assert!(matches!(
-        c.on_response(8, answer(1, 2, 2), 0, &mut out),
+        c.on_response(A, 8, answer(1, 2, 2), 0, &mut out),
         Some(Input::Response { request_id: 8, .. })
     ));
     // An id of the host's that is no longer on the wire is dropped.
-    assert_eq!(c.on_response(HOST_IDS + 5, vec![], 0, &mut out), None);
+    assert_eq!(c.on_response(A, HOST_IDS + 5, vec![], 0, &mut out), None);
 }
 
 #[test]
@@ -189,7 +191,7 @@ fn an_answer_after_the_driver_asked_again_serves_the_new_request() {
     assert!(out.is_empty());
     // The answer comes back quickly, hands blocks 1 to 16 to request 2,
     // widens the window and asks ahead for the rest.
-    let input = c.on_response(HOST_IDS, answer(1, 16, 40), 100, &mut out);
+    let input = c.on_response(A, HOST_IDS, answer(1, 16, 40), 100, &mut out);
     assert_eq!(handed(input), (2, (1..=16).collect()));
     assert_eq!(c.depth(), 2);
     assert_eq!(
@@ -198,7 +200,7 @@ fn an_answer_after_the_driver_asked_again_serves_the_new_request() {
     );
     // The driver finalized 1 to 16 and some of the next batch on its own:
     // the parked answer from 17 is trimmed to what it lacks.
-    let input = c.on_response(HOST_IDS + 1, answer(17, 32, 40), 150, &mut out);
+    let input = c.on_response(A, HOST_IDS + 1, answer(17, 32, 40), 150, &mut out);
     assert_eq!(input, None);
     let next = c.on_request(A, 3, ask(20), 160, &mut out);
     assert_eq!(handed(next), (3, (20..=32).collect()));
@@ -209,7 +211,7 @@ fn an_answer_after_the_driver_asked_again_serves_the_new_request() {
     // An answer the driver has not asked for yet waits; it was slow, so
     // the window narrows.
     assert_eq!(
-        c.on_response(HOST_IDS + 2, answer(33, 40, 40), 2_000, &mut out),
+        c.on_response(A, HOST_IDS + 2, answer(33, 40, 40), 2_000, &mut out),
         None
     );
     assert_eq!((c.depth(), c.parked(), c.in_flight()), (1, 1, 0));
@@ -228,7 +230,7 @@ fn a_refused_answer_is_dropped_and_asked_for_again() {
     sent(&mut out);
     // The answer goes to request 1, which the driver abandoned and drops;
     // the answer stays parked.
-    let input = c.on_response(HOST_IDS, answer(5, 6, 6), 10, &mut out);
+    let input = c.on_response(A, HOST_IDS, answer(5, 6, 6), 10, &mut out);
     assert_eq!(handed(input).0, 1);
     assert_eq!(handed(c.on_request(A, 2, ask(5), 20, &mut out)).0, 2);
     // The driver did not take it: it is dropped, and the next request goes
@@ -254,7 +256,7 @@ fn an_answer_refused_within_a_step_is_not_handed_again() {
     sent(&mut out);
     // The answer goes to request 1, which the driver may have abandoned;
     // in the step it starts, the driver asks again and is handed it.
-    let input = c.on_response(HOST_IDS, answer(5, 9, 9), 10, &mut out);
+    let input = c.on_response(A, HOST_IDS, answer(5, 9, 9), 10, &mut out);
     assert_eq!(handed(input).0, 1);
     assert_eq!(handed(c.on_request(A, 2, ask(5), 20, &mut out)).0, 2);
     // Still in the step, the driver asks again for block 5: the answer is
@@ -279,7 +281,7 @@ fn an_answer_the_driver_took_is_spent() {
     c.on_request(A, 1, ask(34), 0, &mut out);
     sent(&mut out);
     // Blocks 34 to 48, the epoch's last, and a suffix proposal at 49.
-    let input = c.on_response(HOST_IDS, answer(34, 49, 48), 10, &mut out);
+    let input = c.on_response(A, HOST_IDS, answer(34, 49, 48), 10, &mut out);
     assert_eq!(handed(input).0, 1);
     // The step after finalized up to 48 without the driver asking.
     c.settle(48);
@@ -306,7 +308,10 @@ fn useless_answers_leave_the_request_to_another_peer() {
     // No certificate, then no blocks: nothing is handed over, and the next
     // poll asks the next peer.
     let no_certificate = SyncResponse::default().to_bytes();
-    assert_eq!(c.on_response(HOST_IDS, no_certificate, 5, &mut out), None);
+    assert_eq!(
+        c.on_response(A, HOST_IDS, no_certificate, 5, &mut out),
+        None
+    );
     c.poll(10, 2, &mut out);
     assert_eq!(sent(&mut out), vec![(B, HOST_IDS + 1, 3)]);
     let empty = SyncResponse {
@@ -314,7 +319,7 @@ fn useless_answers_leave_the_request_to_another_peer() {
         ..SyncResponse::default()
     };
     assert_eq!(
-        c.on_response(HOST_IDS + 1, empty.to_bytes(), 15, &mut out),
+        c.on_response(B, HOST_IDS + 1, empty.to_bytes(), 15, &mut out),
         None
     );
     c.poll(20, 2, &mut out);
@@ -388,7 +393,7 @@ fn a_peer_that_pruned_the_blocks_asked_for_raises_the_alert() {
         }
         .to_bytes()
     };
-    assert_eq!(c.on_response(HOST_IDS, pruned(2_000), 5, &mut out), None);
+    assert_eq!(c.on_response(A, HOST_IDS, pruned(2_000), 5, &mut out), None);
     assert_eq!(
         c.alert().as_deref(),
         Some(
@@ -402,12 +407,12 @@ fn a_peer_that_pruned_the_blocks_asked_for_raises_the_alert() {
         certificate: Some(Certificate::default()),
         ..SyncResponse::default()
     };
-    c.on_response(HOST_IDS + 1, empty.to_bytes(), 15, &mut out);
+    c.on_response(A, HOST_IDS + 1, empty.to_bytes(), 15, &mut out);
     assert!(c.alert().is_some());
     // One with blocks clears it.
     c.poll(20, 0, &mut out);
     assert_eq!(sent(&mut out), vec![(A, HOST_IDS + 2, 1)]);
-    let (_, heights) = handed(c.on_response(HOST_IDS + 2, answer(1, 4, 2_000), 25, &mut out));
+    let (_, heights) = handed(c.on_response(A, HOST_IDS + 2, answer(1, 4, 2_000), 25, &mut out));
     assert_eq!(heights, vec![1, 2, 3, 4]);
     assert_eq!(c.alert(), None);
     // Raised again further on, it clears once the node finalizes past it.
@@ -417,7 +422,7 @@ fn a_peer_that_pruned_the_blocks_asked_for_raises_the_alert() {
     c.on_request(A, 2, ask(5), 30, &mut out);
     assert!(out.is_empty());
     let (_, id, _) = *ahead.iter().find(|(_, _, from)| *from == 5).unwrap();
-    c.on_response(id, pruned(2_000), 35, &mut out);
+    c.on_response(A, id, pruned(2_000), 35, &mut out);
     assert!(c.alert().unwrap().starts_with("block 5 "));
     c.poll(40, 4, &mut out);
     assert!(c.alert().is_some());
@@ -426,6 +431,121 @@ fn a_peer_that_pruned_the_blocks_asked_for_raises_the_alert() {
     // A peer that has not finalized the height asked for is only behind.
     c.on_request(A, 3, ask(6), 50, &mut out);
     let (_, id, _) = sent(&mut out).pop().unwrap();
-    c.on_response(id, pruned(5), 55, &mut out);
+    c.on_response(A, id, pruned(5), 55, &mut out);
     assert_eq!(c.alert(), None);
+}
+
+/// An answer counts only from the peer that was asked (spec 09 §6a, step
+/// 2). Request ids are sequential, so any peer can guess them; before, a
+/// peer that answered someone else's request first had its answer taken
+/// and the honest one dropped, and an empty answer of its own, claiming a
+/// finalized height past the one asked for, raised the sync alert.
+#[test]
+fn an_answer_from_a_peer_not_asked_is_ignored() {
+    let mut c = CatchUp::default();
+    let mut out = Vec::new();
+    c.on_request(A, 1, ask(1), 0, &mut out);
+    assert_eq!(sent(&mut out), vec![(A, HOST_IDS, 1)]);
+    let pruned = SyncResponse {
+        finalized_height: 2_000,
+        ..SyncResponse::default()
+    };
+    // B answers A's request, with blocks or with a claim that they are
+    // gone: neither is taken, and the request stays on the wire.
+    assert_eq!(
+        c.on_response(B, HOST_IDS, answer(1, 4, 4), 5, &mut out),
+        None
+    );
+    assert_eq!(
+        c.on_response(B, HOST_IDS, pruned.to_bytes(), 5, &mut out),
+        None
+    );
+    assert_eq!((c.in_flight(), c.parked(), c.alert()), (1, 0, None));
+    assert!(out.is_empty());
+    // A's own answer still lands.
+    let (id, heights) = handed(c.on_response(A, HOST_IDS, answer(1, 4, 4), 10, &mut out));
+    assert_eq!((id, heights), (1, vec![1, 2, 3, 4]));
+    // With catch-up off, the driver's own requests are bound to their peers
+    // too, and each is answered once.
+    c.set(false);
+    c.on_request(A, 8, ask(5), 20, &mut out);
+    assert_eq!(sent(&mut out), vec![(A, 8, 5)]);
+    assert_eq!(c.on_response(B, 8, answer(5, 6, 6), 25, &mut out), None);
+    assert!(matches!(
+        c.on_response(A, 8, answer(5, 6, 6), 30, &mut out),
+        Some(Input::Response { request_id: 8, .. })
+    ));
+    assert_eq!(c.on_response(A, 8, answer(5, 6, 6), 35, &mut out), None);
+    // An answer to an id the driver never sent is nobody's.
+    assert_eq!(c.on_response(A, 9, answer(5, 6, 6), 40, &mut out), None);
+    // The host remembers the last MAX_PASSED of them; an older one's answer
+    // is dropped.
+    for id in 10..11 + MAX_PASSED as u64 {
+        c.on_request(A, id, ask(5), 50, &mut out);
+    }
+    out.clear();
+    assert_eq!(c.on_response(A, 10, answer(5, 6, 6), 60, &mut out), None);
+    assert!(
+        c.on_response(A, 11, answer(5, 6, 6), 60, &mut out)
+            .is_some()
+    );
+}
+
+/// An answer's heights must run one by one from the height asked for
+/// (spec 09 §6a, step 2); any other serves nothing and is not parked. The
+/// heights are the sender's to choose: before, reversed heights underflowed
+/// the stride (a panic in a debug build, a stride near 2^64 and a catch-up
+/// that stalled for good in a release one), and heights near 2^64
+/// overflowed the next batch's start.
+#[test]
+fn answers_whose_heights_do_not_run_from_the_height_asked_are_refused() {
+    let with = |heights: &[u64]| {
+        SyncResponse {
+            finalized_height: 100,
+            proposals: Seq(heights
+                .iter()
+                .map(|&height| Proposal {
+                    height,
+                    ..Proposal::default()
+                })
+                .collect()),
+            certificate: Some(Certificate::default()),
+            threshold: Vec::new(),
+        }
+        .to_bytes()
+    };
+    let mut c = CatchUp::default();
+    let mut out = Vec::new();
+    // Reversed, starting below, starting above, and with a gap.
+    for (i, heights) in [&[6, 5][..], &[4, 5, 6], &[6, 7], &[5, 7]]
+        .into_iter()
+        .enumerate()
+    {
+        c.poll(10 * i as u64, 4, &mut out);
+        c.on_request(A, 1, ask(5), 10 * i as u64, &mut out);
+        let (_, id, from) = sent(&mut out).pop().unwrap();
+        assert_eq!((id, from), (HOST_IDS + i as u64, 5));
+        assert_eq!(
+            c.on_response(A, id, with(heights), 10 * i as u64 + 1, &mut out),
+            None
+        );
+        assert_eq!((c.parked(), c.in_flight()), (0, 0));
+        assert!(out.is_empty());
+    }
+    // In order they are taken.
+    c.poll(50, 4, &mut out);
+    let (_, id, _) = sent(&mut out).pop().unwrap();
+    let (_, heights) = handed(c.on_response(A, id, with(&[5, 6]), 51, &mut out));
+    assert_eq!(heights, vec![5, 6]);
+    // At the top of the heights, nothing is asked past the last.
+    let mut c = CatchUp::default();
+    c.on_request(A, 1, ask(u64::MAX - 1), 0, &mut out);
+    sent(&mut out);
+    let top = SyncResponse {
+        finalized_height: u64::MAX,
+        ..SyncResponse::from_bytes(&with(&[u64::MAX - 1, u64::MAX])).unwrap()
+    };
+    let (_, heights) = handed(c.on_response(A, HOST_IDS, top.to_bytes(), 1, &mut out));
+    assert_eq!(heights, vec![u64::MAX - 1, u64::MAX]);
+    assert!(out.is_empty());
 }

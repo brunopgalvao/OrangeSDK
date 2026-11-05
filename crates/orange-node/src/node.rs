@@ -722,19 +722,24 @@ impl Node {
         self.catch_up.depth()
     }
 
-    /// Hands an answer from the wire to the request it answers (spec 06
-    /// §4.1): one to a request of the host's catch-up (spec 09 §6a) waits
-    /// for the driver's request for those blocks, any other goes to the
-    /// driver as `Response`.
+    /// Hands an answer from `peer` on the wire to the request it answers
+    /// (spec 06 §4.1), if that request went to `peer`: one to a request of
+    /// the host's catch-up (spec 09 §6a) waits for the driver's request for
+    /// those blocks, any other goes to the driver as `Response`.
     ///
     /// # Errors
     /// See [`NodeError`].
-    pub fn response(&mut self, request_id: u64, payload: Vec<u8>) -> Result<(), NodeError> {
+    pub fn response(
+        &mut self,
+        peer: [u8; 32],
+        request_id: u64,
+        payload: Vec<u8>,
+    ) -> Result<(), NodeError> {
         let now = self.now_ms();
         let mut out = Vec::new();
         let routed = self
             .catch_up
-            .on_response(request_id, payload, now, &mut out);
+            .on_response(peer, request_id, payload, now, &mut out);
         self.services.borrow_mut().outbound.extend(out);
         match routed {
             Some(input) => self.step(input),

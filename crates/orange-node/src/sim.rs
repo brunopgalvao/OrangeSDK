@@ -29,6 +29,7 @@ enum Wire {
         payload: Vec<u8>,
     },
     Response {
+        from: usize,
         request_id: u64,
         payload: Vec<u8>,
     },
@@ -492,6 +493,7 @@ impl Sim {
                                 i,
                                 to,
                                 Wire::Response {
+                                    from: i,
                                     request_id: their_id,
                                     payload,
                                 },
@@ -576,9 +578,10 @@ impl Sim {
                 }
             }
             Wire::Response {
+                from,
                 request_id,
                 payload,
-            } => return self.nodes[to].response(request_id, payload),
+            } => return self.nodes[to].response(self.ids[from], request_id, payload),
         };
         self.nodes[to].step(input)
     }

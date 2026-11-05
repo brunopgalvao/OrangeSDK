@@ -1093,7 +1093,7 @@ impl Transport {
             Frame::Response {
                 request_id,
                 payload,
-            } => node.response(request_id, payload)?,
+            } => node.response(peer, request_id, payload)?,
             Frame::SyncRequest {
                 request_id,
                 payload,

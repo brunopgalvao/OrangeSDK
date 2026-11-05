@@ -1112,7 +1112,8 @@ fn equivocations_inside_certificates_are_detected() {
         }),
         threshold: vec![],
     };
-    node.response(request_id, response.to_bytes()).unwrap();
+    node.response(leader_id, request_id, response.to_bytes())
+        .unwrap();
     assert_eq!(equivocations(node), 2);
     assert_eq!(node.simplex_state().unwrap().finalized_height, 1);
     let mut kinds: Vec<(u8, u64)> = node

@@ -13,7 +13,9 @@
 //! The answers are the driver's to verify: the host only reads heights to
 //! know which request an answer serves, trims the blocks the driver has
 //! already finalized off the front of one, and drops one the driver
-//! refused.
+//! refused. It takes an answer only from the peer it asked, so that no
+//! other peer can answer in its place, and only with heights that run one
+//! by one from the height asked for.
 
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Unbounded};
@@ -40,6 +42,11 @@ pub const MAX_DEPTH: usize = 8;
 
 /// A peer counts as reachable this long after the host last heard from it.
 pub const PEER_TTL_MS: u64 = 30_000;
+
+/// The most requests of the driver's own, passed to the wire untouched,
+/// whose peers the host remembers to match their answers to; past it the
+/// oldest is forgotten, and its answer dropped.
+pub const MAX_PASSED: usize = 64;
 
 /// A request on the wire.
 #[derive(Debug, Clone)]
@@ -80,6 +87,9 @@ pub struct CatchUp {
     stride: u64,
     /// The peer last asked.
     tried: [u8; 32],
+    /// The driver's requests passed to the wire as they are, by id, with
+    /// the peer each went to: only that peer's answer reaches the driver.
+    passed: BTreeMap<u64, [u8; 32]>,
     /// A block a peer that finalized past it no longer keeps, and that
     /// peer's finalized height (spec 09 §6a, step 6).
     out_of_reach: Option<(u64, u64)>,
@@ -98,6 +108,7 @@ impl Default for CatchUp {
             depth: 1,
             stride: 1,
             tried: [0; 32],
+            passed: BTreeMap::new(),
             out_of_reach: None,
         }
     }
@@ -167,6 +178,10 @@ impl CatchUp {
         let from = match SyncRequest::from_bytes(&payload) {
             Ok(request) if self.on => request.from_height,
             _ => {
+                self.passed.insert(request_id, peer);
+                if self.passed.len() > MAX_PASSED {
+                    self.passed.pop_first();
+                }
                 out.push(Outbound::Request {
                     peer,
                     request_id,
@@ -202,25 +217,39 @@ impl CatchUp {
         None
     }
 
-    /// Takes an answer from the wire: the input to step the driver with,
-    /// if any. An answer to the driver's own request (catch-up off) goes to
-    /// it as it is; one to the host's is parked, and handed to the driver's
-    /// outstanding request if it serves that one.
+    /// Takes an answer from the wire, sent by `peer`: the input to step the
+    /// driver with, if any. An answer to the driver's own request (catch-up
+    /// off) goes to it as it is; one to the host's is parked, and handed to
+    /// the driver's outstanding request if it serves that one. Either counts
+    /// only from the peer the request went to: ids are no secret, and a
+    /// peer that answered another's request in its place would have its
+    /// answer taken and the honest one dropped.
     pub fn on_response(
         &mut self,
+        peer: [u8; 32],
         request_id: u64,
         payload: Vec<u8>,
         now_ms: u64,
         out: &mut Vec<Outbound>,
     ) -> Option<Input> {
-        let Some(flight) = self.flights.remove(&request_id) else {
-            // A second answer to a request already answered or retried is
-            // nobody's.
-            return (request_id < HOST_IDS).then_some(Input::Response {
+        if request_id < HOST_IDS {
+            if self.passed.get(&request_id) != Some(&peer) {
+                return None;
+            }
+            self.passed.remove(&request_id);
+            return Some(Input::Response {
                 request_id,
                 payload,
             });
-        };
+        }
+        // A second answer to a request already answered or retried is
+        // nobody's, and an answer from a peer not asked is ignored: the
+        // request stays on the wire for the peer that was.
+        let flight = self.flights.remove(&request_id)?;
+        if flight.peer != peer {
+            self.flights.insert(request_id, flight);
+            return None;
+        }
         self.heard(flight.peer, now_ms);
         let decoded = SyncResponse::from_bytes(&payload).ok();
         // No blocks from a peer that finalized the first one asked for: it
@@ -231,16 +260,20 @@ impl CatchUp {
         {
             self.out_of_reach = Some((flight.from, r.finalized_height));
         }
-        let Some(response) = decoded.filter(|r| r.certificate.is_some()) else {
+        // Blocks that do not run one by one from the height asked for serve
+        // nothing either, and could not be filed by their heights.
+        let Some(response) = decoded.filter(|r| {
+            r.certificate.is_some()
+                && !r.proposals.0.is_empty()
+                && (0u64..)
+                    .zip(&r.proposals.0)
+                    .all(|(i, p)| flight.from.checked_add(i) == Some(p.height))
+        }) else {
             // Nothing to serve from: the next poll asks someone else.
             return None;
         };
-        let (first, top) = response
-            .proposals
-            .0
-            .first()
-            .zip(response.proposals.0.last())
-            .map(|(a, b)| (a.height, b.height))?;
+        let length = response.proposals.0.len() as u64;
+        let (first, top) = (flight.from, flight.from + (length - 1));
         self.out_of_reach = None;
         // Quick answers widen the window; slow ones narrow it.
         if now_ms.saturating_sub(flight.sent_ms) <= flight.wait_ms / 4 {
@@ -248,7 +281,7 @@ impl CatchUp {
         } else {
             self.depth = (self.depth / 2).max(1);
         }
-        self.stride = top - first + 1;
+        self.stride = length;
         let limit = response.finalized_height;
         self.parked.insert(first, Parked { response, top });
         self.ask_ahead(flight.peer, limit, now_ms, out);
@@ -322,7 +355,8 @@ impl CatchUp {
     fn forget_below(&mut self, from: u64) {
         let stride = self.stride;
         self.parked.retain(|_, p| p.top >= from);
-        self.flights.retain(|_, f| f.from + stride > from);
+        self.flights
+            .retain(|_, f| f.from.saturating_add(stride) > from);
     }
 
     /// Asks `peer` for the batches after the highest parked one, up to
@@ -333,16 +367,22 @@ impl CatchUp {
     /// request fills.
     fn ask_ahead(&mut self, peer: [u8; 32], limit: u64, now_ms: u64, out: &mut Vec<Outbound>) {
         while self.flights.len() < self.depth {
-            let next = self
+            // No guess past the last height a chain can have: nothing is
+            // asked beyond it.
+            let Some(next) = self
                 .parked
                 .values()
-                .map(|p| p.top + 1)
-                .chain(self.flights.values().map(|f| f.from + self.stride))
-                .max()
-                .expect("an answer was just parked");
-            if next > limit {
+                .map(|p| p.top.checked_add(1))
+                .chain(
+                    self.flights
+                        .values()
+                        .map(|f| f.from.checked_add(self.stride)),
+                )
+                .try_fold(0, |next: u64, guess| guess.map(|g| next.max(g)))
+                .filter(|next| *next <= limit)
+            else {
                 return;
-            }
+            };
             self.send(peer, next, FIRST_WAIT_MS, now_ms, out);
         }
     }
