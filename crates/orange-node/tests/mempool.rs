@@ -242,8 +242,12 @@ fn later_nonces_validate_against_what_the_earlier_ones_leave() {
 
 #[test]
 fn limits_evict_queued_transactions() {
-    let (alice, carol) = (Wallet::new(1), Wallet::new(3));
-    let mut node = node(&[(&alice, 100 * ETHER), (&carol, 100 * ETHER)]);
+    let (alice, carol, dave) = (Wallet::new(1), Wallet::new(3), Wallet::new(4));
+    let mut node = node(&[
+        (&alice, 100 * ETHER),
+        (&carol, 100 * ETHER),
+        (&dave, 100 * ETHER),
+    ]);
     node.set_mempool_limits(PoolLimits {
         max_txs: 2,
         ..PoolLimits::default()
@@ -260,6 +264,12 @@ fn limits_evict_queued_transactions() {
         node.submit(&carol.transfer(1, ETHER, GWEI)),
         Err(SubmitError::Pool(PoolError::Full))
     );
+    // A newcomer that outbids a pending transaction evicts it (spec 14 §4):
+    // of two at the same price, the latest to arrive.
+    let carols = keccak256(&carol.transfer(0, ETHER, GWEI));
+    node.submit(&dave.transfer(0, ETHER, 2 * GWEI)).unwrap();
+    assert!(node.mempool().get(&carols).is_none());
+    assert_eq!(node.mempool().status(), (2, 0));
 }
 
 #[test]

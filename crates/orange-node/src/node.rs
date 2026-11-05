@@ -1345,7 +1345,9 @@ impl Node {
             ValidateResult::Valid { priority, .. } => tx.priority = priority,
             ValidateResult::Invalid { reason } => return Err(SubmitError::Rejected(reason)),
         }
-        self.pool.insert(tx, account).map_err(SubmitError::Pool)?;
+        self.pool
+            .insert(tx, account, u128::from(self.fees.base_fee))
+            .map_err(SubmitError::Pool)?;
         let announced = self.pool.announce(&sender);
         self.tx_gossip.extend(announced);
         Ok(())

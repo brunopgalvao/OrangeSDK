@@ -1,7 +1,7 @@
 //! The mempool (spec 14): per-sender queues ordered by nonce, the pending
 //! (executable) and queued (gapped) split, replacement by price bump, limits
-//! with eviction, the block-ordered take, and geth's rules for delegated
-//! accounts and EIP-7702 authorities.
+//! with eviction by the current tip, the block-ordered take, and geth's
+//! rules for delegated accounts and EIP-7702 authorities.
 //!
 //! The pool is policy, not validity: the node admits a transaction only once
 //! the kernel's `kernel_stf_validate_tx` accepts it against the sender's
@@ -28,6 +28,10 @@ pub const MAX_TXS: usize = 8192;
 pub const MAX_QUEUED: usize = 1024;
 /// Most transactions of one sender ([`PoolLimits::per_sender`]).
 pub const PER_SENDER: usize = 256;
+/// Most gas the transactions of one sender declare in all
+/// ([`PoolLimits::per_sender_gas`]): four blocks of the reference kernel's
+/// 30 000 000, since blocks are budgeted by gas limit (spec 14 §4).
+pub const PER_SENDER_GAS: u64 = 120_000_000;
 /// Most bytes of raw transactions the pool holds ([`PoolLimits::max_bytes`]).
 pub const MAX_BYTES: usize = 64 << 20;
 /// Most bytes of one raw transaction ([`PoolLimits::max_tx_bytes`]): geth's
@@ -52,6 +56,8 @@ pub struct PoolLimits {
     pub max_queued: usize,
     /// Most transactions of one sender.
     pub per_sender: usize,
+    /// Most gas the transactions of one sender declare in all.
+    pub per_sender_gas: u64,
     /// Most bytes of raw transactions in all.
     pub max_bytes: usize,
     /// Most bytes of one raw transaction.
@@ -64,6 +70,7 @@ impl Default for PoolLimits {
             max_txs: MAX_TXS,
             max_queued: MAX_QUEUED,
             per_sender: PER_SENDER,
+            per_sender_gas: PER_SENDER_GAS,
             max_bytes: MAX_BYTES,
             max_tx_bytes: MAX_TX_BYTES,
         }
@@ -77,7 +84,8 @@ pub enum PoolError {
     /// The pool holds a transaction with the same sender and nonce, and this
     /// one does not raise both fee fields by [`PRICE_BUMP`] percent.
     Underpriced,
-    /// The pool is at a limit and nothing cheaper can make room.
+    /// The pool is at a limit and no transaction the newcomer may evict
+    /// can make room, or its sender is at a per-sender limit.
     Full,
     /// The raw transaction is longer than [`PoolLimits::max_tx_bytes`].
     Oversized,
@@ -185,11 +193,23 @@ impl PoolTx {
     /// [`PRICE_BUMP`] percent higher, rounding the threshold down as geth does.
     #[must_use]
     pub fn bumps(&self, old: &PoolTx) -> bool {
-        // fee × (100 + bump) / 100, without the overflow of the product.
-        let bump = |fee: u128| fee / 100 * PRICE_BUMP + fee % 100 * PRICE_BUMP / 100;
-        let threshold = |fee: u128| fee.saturating_add(bump(fee));
-        self.fee_cap >= threshold(old.fee_cap) && self.tip_cap >= threshold(old.tip_cap)
+        self.fee_cap >= bumped(old.fee_cap) && self.tip_cap >= bumped(old.tip_cap)
     }
+
+    /// Whether `self` may evict `old` from a full pool (spec 14 §4): its
+    /// tip under `base_fee` above `old`'s and at least [`PRICE_BUMP`]
+    /// percent higher.
+    #[must_use]
+    pub fn outbids(&self, old: &PoolTx, base_fee: u128) -> bool {
+        let (tip, theirs) = (self.tip_at(base_fee), old.tip_at(base_fee));
+        tip > theirs && tip >= bumped(theirs)
+    }
+}
+
+/// `fee` raised by [`PRICE_BUMP`] percent, rounding the raise down as geth
+/// does: fee × (100 + bump) / 100, without the overflow of the product.
+fn bumped(fee: u128) -> u128 {
+    fee.saturating_add(fee / 100 * PRICE_BUMP + fee % 100 * PRICE_BUMP / 100)
 }
 
 /// The authority an EIP-7702 authorization names: the signer of its
@@ -224,7 +244,8 @@ pub fn rejection(result: &ValidateResult) -> u32 {
 pub struct Inserted {
     /// The transaction it replaced, with the same sender and nonce.
     pub replaced: Option<[u8; 32]>,
-    /// Queued transactions evicted to make room.
+    /// Transactions evicted to make room, each with its sender's later
+    /// ones.
     pub evicted: Vec<[u8; 32]>,
     /// The sender's transaction dropped because the newcomer, filling a gap,
     /// made it pending without the balance to cover it.
@@ -455,24 +476,38 @@ impl Mempool {
 
     /// Adds a transaction the kernel accepted. `account` is its sender's
     /// account as the node read it, used when the pool holds nothing of that
-    /// sender yet. A transaction already held changes nothing.
+    /// sender yet; `base_fee` is the next block's, which prices transactions
+    /// for eviction. A transaction already held changes nothing.
     ///
     /// A newcomer that fills a gap makes the transactions behind it pending;
     /// the first of them its sender's balance cannot cover, with those
     /// before it, is dropped, and the rest are queued behind the new gap.
     ///
     /// # Errors
-    /// See [`Mempool::check`]; [`PoolError::Full`] when a limit holds and no
-    /// cheaper queued transaction can be evicted to make room.
-    pub fn insert(&mut self, mut tx: PoolTx, account: Account) -> Result<Inserted, PoolError> {
+    /// See [`Mempool::check`]; [`PoolError::Full`] when the sender is at a
+    /// per-sender limit, or the pool at another and evicting what the
+    /// newcomer may evict cannot make room (spec 14 §4).
+    pub fn insert(
+        &mut self,
+        mut tx: PoolTx,
+        account: Account,
+        base_fee: u128,
+    ) -> Result<Inserted, PoolError> {
         if self.index.contains_key(&tx.hash) {
             return Ok(Inserted::default());
         }
         self.check(&tx)?;
-        let (sender, nonce, priority) = (tx.sender, tx.nonce, tx.priority);
+        let (sender, nonce) = (tx.sender, tx.nonce);
         let held = self.queues.get(&sender).map(|q| &q.txs);
         let replacing = held.is_some_and(|txs| txs.contains_key(&nonce));
         if !replacing && held.map_or(0, BTreeMap::len) >= self.limits.per_sender {
+            return Err(PoolError::Full);
+        }
+        let gas = held.into_iter().flat_map(BTreeMap::values);
+        let gas = gas
+            .filter(|t| t.nonce != nonce)
+            .fold(tx.gas, |sum, t| sum.saturating_add(t.gas));
+        if gas > self.limits.per_sender_gas {
             return Err(PoolError::Full);
         }
         tx.arrival = self.arrivals;
@@ -482,7 +517,7 @@ impl Mempool {
             txs: BTreeMap::new(),
         });
         let replaced = self.put(tx);
-        if let Some(victims) = self.plan_eviction(&sender, nonce, priority) {
+        if let Some(victims) = self.plan_eviction(&sender, nonce, base_fee) {
             for victim in &victims {
                 self.remove(victim);
             }
@@ -546,12 +581,14 @@ impl Mempool {
         Some(tx)
     }
 
-    /// The queued transactions to evict so that the pool, holding the
-    /// transaction of `sender` with `nonce` just put in, is within its
-    /// limits: the cheapest first, the latest among equals. A pending
-    /// newcomer may evict any queued transaction, a queued one only cheaper
-    /// ones. `None` if no such set exists.
-    fn plan_eviction(&self, sender: &Address, nonce: u64, priority: u64) -> Option<Vec<[u8; 32]>> {
+    /// The transactions to evict so that the pool, holding the transaction
+    /// of `sender` with `nonce` just put in, is within its limits (spec 14
+    /// §4): of other senders, queued ones before pending ones, each the
+    /// cheapest first by its tip under `base_fee`, the latest among equals,
+    /// each with its sender's later transactions. A pending newcomer may
+    /// evict any queued transaction and a pending one it outbids, a queued
+    /// one only queued ones it outbids. `None` if no such set exists.
+    fn plan_eviction(&self, sender: &Address, nonce: u64, base_fee: u128) -> Option<Vec<[u8; 32]>> {
         let limits = self.limits;
         let (_, mut queued) = self.status();
         let (mut count, mut bytes) = (self.len(), self.bytes);
@@ -561,24 +598,51 @@ impl Mempool {
         if !over(count, bytes, queued) {
             return Some(Vec::new());
         }
-        let newcomer_pending = self.queues.get(sender)?.is_pending(nonce);
-        let mut candidates: Vec<&PoolTx> = self
+        let queue = self.queues.get(sender)?;
+        let (newcomer, newcomer_pending) = (queue.txs.get(&nonce)?, queue.is_pending(nonce));
+        // Each queue's pending run, read once.
+        let ends: HashMap<&Address, u64> = self
             .queues
-            .values()
-            .flat_map(|q| q.txs.values().filter(|tx| !q.is_pending(tx.nonce)))
-            .filter(|tx| (tx.sender, tx.nonce) != (*sender, nonce))
-            .filter(|tx| newcomer_pending || tx.priority < priority)
+            .iter()
+            .map(|(address, q)| (address, q.pending_end()))
             .collect();
-        candidates.sort_by_key(|tx| (tx.priority, Reverse(tx.arrival)));
+        let pending = |tx: &PoolTx| tx.nonce < ends[&tx.sender];
+        let mut candidates: Vec<(bool, &PoolTx)> = self
+            .queues
+            .iter()
+            .filter(|(address, _)| *address != sender)
+            .flat_map(|(_, q)| q.txs.values().map(|tx| (pending(tx), tx)))
+            .filter(|(pending, tx)| {
+                let outbid = newcomer.outbids(tx, base_fee);
+                if *pending {
+                    newcomer_pending && outbid
+                } else {
+                    newcomer_pending || outbid
+                }
+            })
+            .collect();
+        candidates
+            .sort_by_key(|(pending, tx)| (*pending, tx.tip_at(base_fee), Reverse(tx.arrival)));
+        // The lowest nonce evicted so far of each sender: it and everything
+        // above it are gone.
+        let mut cut: HashMap<Address, u64> = HashMap::new();
         let mut victims = Vec::new();
-        for tx in candidates {
+        for (_, tx) in candidates {
             if !over(count, bytes, queued) {
                 break;
             }
-            count -= 1;
-            bytes -= tx.raw.len();
-            queued -= 1;
-            victims.push(tx.hash);
+            let end = cut.get(&tx.sender).copied().unwrap_or(u64::MAX);
+            if tx.nonce >= end {
+                continue;
+            }
+            let tail = self.queues[&tx.sender].txs.range(tx.nonce..);
+            for (_, gone) in tail.take_while(|(n, _)| **n < end) {
+                count -= 1;
+                bytes -= gone.raw.len();
+                queued -= usize::from(!pending(gone));
+                victims.push(gone.hash);
+            }
+            cut.insert(tx.sender, tx.nonce);
         }
         (!over(count, bytes, queued)).then_some(victims)
     }

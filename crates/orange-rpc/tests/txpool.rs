@@ -132,20 +132,23 @@ fn a_full_pool_says_so() {
 #[test]
 fn large_answers_are_refused() {
     assert_eq!(orange_rpc::methods::MAX_RESPONSE_BYTES, 25_000_000);
-    let alice = Wallet::new(1);
-    let mut rpc = Rpc::new(node(&alice));
+    let (alice, bob) = (Wallet::new(1), Wallet::new(2));
+    let mut rpc = Rpc::new(common::node_funding(&[&alice, &bob]));
     assert_eq!(rpc.max_response_bytes, 25_000_000);
-    // 110 transactions of 120 000 bytes of calldata: over 26 MB as JSON.
-    let input = vec![0xab; 120_000];
-    for nonce in 0..110 {
-        let raw = alice.legacy(&common::Fields {
-            nonce,
-            to: Some([7; 20]),
-            value: 0,
-            gas_limit: 5_000_000,
-            data: &input,
-        });
-        send(&mut rpc, &raw);
+    // 110 transactions of 120 000 bytes of calldata: over 26 MB as JSON,
+    // from two senders, each within the pool's gas per sender (spec 14 §4).
+    let input = vec![0; 120_000];
+    for wallet in [&alice, &bob] {
+        for nonce in 0..55 {
+            let raw = wallet.legacy(&common::Fields {
+                nonce,
+                to: Some([7; 20]),
+                value: 0,
+                gas_limit: 1_300_000,
+                data: &input,
+            });
+            send(&mut rpc, &raw);
+        }
     }
     let too_large = (-32003, "response too large".to_owned());
     assert_eq!(err(&mut rpc, "txpool_content", json!([])), too_large);
@@ -153,8 +156,10 @@ fn large_answers_are_refused() {
     // answer that passes the limit.
     rpc.max_response_bytes = 30_000_000;
     let content = ok(&mut rpc, "txpool_content", json!([]));
-    let key = checksum(&alice.address);
-    assert_eq!(content["pending"][&key].as_object().unwrap().len(), 110);
+    for wallet in [&alice, &bob] {
+        let key = checksum(&wallet.address);
+        assert_eq!(content["pending"][&key].as_object().unwrap().len(), 55);
+    }
     rpc.max_response_bytes = 1_000;
     let r = rpc.handle_body(
         r#"[{"id":1,"method":"eth_chainId"},{"id":2,"method":"txpool_content"},{"id":3,"method":"eth_chainId"},{"method":"eth_chainId"}]"#,
