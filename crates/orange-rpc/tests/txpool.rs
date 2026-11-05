@@ -124,3 +124,55 @@ fn a_full_pool_says_so() {
     );
     assert_eq!((code, message.as_str()), (-32000, "txpool is full"));
 }
+
+/// `txpool_content` and a batch's answers stop at 25 MB of JSON, as geth's
+/// batches do (spec 20 §8.6). Before, a pool of large transactions was
+/// answered whole, and a batch of 1 000 `txpool_content` built a thousand
+/// copies of it.
+#[test]
+fn large_answers_are_refused() {
+    assert_eq!(orange_rpc::methods::MAX_RESPONSE_BYTES, 25_000_000);
+    let alice = Wallet::new(1);
+    let mut rpc = Rpc::new(node(&alice));
+    assert_eq!(rpc.max_response_bytes, 25_000_000);
+    // 110 transactions of 120 000 bytes of calldata: over 26 MB as JSON.
+    let input = vec![0xab; 120_000];
+    for nonce in 0..110 {
+        let raw = alice.legacy(&common::Fields {
+            nonce,
+            to: Some([7; 20]),
+            value: 0,
+            gas_limit: 5_000_000,
+            data: &input,
+        });
+        send(&mut rpc, &raw);
+    }
+    let too_large = (-32003, "response too large".to_owned());
+    assert_eq!(err(&mut rpc, "txpool_content", json!([])), too_large);
+    // Under a larger limit it is answered, and a batch stops after the
+    // answer that passes the limit.
+    rpc.max_response_bytes = 30_000_000;
+    let content = ok(&mut rpc, "txpool_content", json!([]));
+    let key = checksum(&alice.address);
+    assert_eq!(content["pending"][&key].as_object().unwrap().len(), 110);
+    rpc.max_response_bytes = 1_000;
+    let r = rpc.handle_body(
+        r#"[{"id":1,"method":"eth_chainId"},{"id":2,"method":"txpool_content"},{"id":3,"method":"eth_chainId"},{"method":"eth_chainId"}]"#,
+    );
+    assert_eq!(r[0]["result"], json!("0x539"));
+    assert_eq!(r[1]["error"]["code"], json!(-32003), "past its own limit");
+    assert_eq!(r[2]["result"], json!("0x539"), "errors are small");
+    rpc.max_response_bytes = 30;
+    let r = rpc.handle_body(
+        r#"[{"id":1,"method":"eth_chainId"},{"id":2,"method":"eth_chainId"},{"method":"eth_chainId"}]"#,
+    );
+    assert_eq!(
+        r[0]["result"],
+        json!("0x539"),
+        "the answer that passes is kept"
+    );
+    let refused = json!({ "code": -32003, "message": "response too large" });
+    assert_eq!(r[1], json!({ "jsonrpc": "2.0", "id": 2, "error": refused }));
+    assert_eq!(r[2]["id"], Value::Null);
+    assert_eq!(r[2]["error"], refused);
+}

@@ -15,6 +15,10 @@ use crate::methods::{RpcError, param_str};
 /// Most blocks one `eth_feeHistory` request reports, as in geth.
 pub const MAX_FEE_HISTORY: u64 = 1024;
 
+/// Most reward percentiles one `eth_feeHistory` request may ask for, geth's
+/// `maxQueryLimit` (spec 20 §8.6): each costs a value per block reported.
+pub const MAX_REWARD_PERCENTILES: usize = 100;
+
 /// Blocks the tip oracle samples below the head: geth samples 20, which at
 /// twelve-second blocks span four minutes; OrangeSDK's blocks are many times
 /// shorter, so the oracle looks at 100 (spec 23 §7.1). It looks at up to
@@ -52,7 +56,8 @@ fn block_count(value: Option<&Value>) -> Result<u64, RpcError> {
     count.ok_or(RpcError::invalid_params("invalid block count"))
 }
 
-/// `eth_feeHistory`'s reward percentiles: increasing, within 0 to 100.
+/// `eth_feeHistory`'s reward percentiles: increasing, within 0 to 100, at
+/// most [`MAX_REWARD_PERCENTILES`] of them.
 fn percentiles(value: Option<&Value>) -> Result<Vec<f64>, RpcError> {
     let invalid = || RpcError::invalid_params("invalid reward percentile");
     let list = match value {
@@ -60,6 +65,11 @@ fn percentiles(value: Option<&Value>) -> Result<Vec<f64>, RpcError> {
         Some(Value::Array(list)) => list,
         Some(_) => return Err(invalid()),
     };
+    if list.len() > MAX_REWARD_PERCENTILES {
+        return Err(RpcError::invalid_params(format!(
+            "invalid reward percentile: over the query limit {MAX_REWARD_PERCENTILES}"
+        )));
+    }
     let mut out: Vec<f64> = Vec::with_capacity(list.len());
     for p in list.iter().map(Value::as_f64) {
         match p {

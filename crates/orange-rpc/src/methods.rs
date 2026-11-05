@@ -27,6 +27,15 @@ pub const MAX_LOG_RANGE: u64 = 10_000;
 /// default.
 pub const MAX_BATCH: usize = 1000;
 
+/// Default most bytes of JSON one batch answers, and one `txpool_content`
+/// ([`Rpc::max_response_bytes`]), geth's `BatchResponseMaxSize` (spec 20
+/// §8.6).
+pub const MAX_RESPONSE_BYTES: usize = 25_000_000;
+
+/// Default most logs one `eth_getLogs` request answers ([`Rpc::max_logs`],
+/// spec 20 §8.6).
+pub const MAX_LOGS: usize = 10_000;
+
 /// Work the node must keep doing while requests are served: polling the
 /// network and ticking the clock. Requests run on the thread that drives
 /// consensus, so the server runs this after each request it answers, and
@@ -168,6 +177,12 @@ pub struct Rpc {
     pub max_log_range: u64,
     /// Most requests one batch may carry; [`MAX_BATCH`] unless changed.
     pub max_batch: usize,
+    /// Most bytes of JSON one batch's answers, and one `txpool_content`,
+    /// may take; [`MAX_RESPONSE_BYTES`] unless changed.
+    pub max_response_bytes: usize,
+    /// Most logs one `eth_getLogs` request answers; [`MAX_LOGS`] unless
+    /// changed.
+    pub max_logs: usize,
     /// The installed filters of `eth_newFilter` and its kin.
     pub(crate) filters: crate::filters::Filters,
     /// How long a filter lives without being polled;
@@ -200,6 +215,8 @@ impl Rpc {
             oracle: crate::fees::Oracle::default(),
             max_log_range: MAX_LOG_RANGE,
             max_batch: MAX_BATCH,
+            max_response_bytes: MAX_RESPONSE_BYTES,
+            max_logs: MAX_LOGS,
             filters: crate::filters::Filters::default(),
             filter_timeout: crate::filters::FILTER_TIMEOUT,
             max_filters: crate::filters::MAX_FILTERS,
@@ -257,7 +274,9 @@ impl Rpc {
 
     /// Handles a request body: a single request or a batch. A batch longer
     /// than [`Rpc::max_batch`] gets one error, under the id of its first
-    /// request, as geth answers it.
+    /// request, as geth answers it; once a batch's answers pass
+    /// [`Rpc::max_response_bytes`], the requests after are answered
+    /// `response too large` without being run, as geth answers them.
     pub fn handle_body(&mut self, body: &str) -> Value {
         match serde_json::from_str::<Value>(body) {
             Ok(Value::Array(batch)) if batch.len() > self.max_batch => {
@@ -267,9 +286,17 @@ impl Rpc {
             }
             Ok(Value::Array(batch)) => {
                 let mut out = Vec::with_capacity(batch.len());
+                let mut spent = 0;
                 for request in &batch {
+                    if spent > self.max_response_bytes {
+                        let id = request.get("id").cloned().unwrap_or(Value::Null);
+                        out.push(error_response(&id, &too_large()));
+                        continue;
+                    }
                     self.run_background();
-                    out.push(self.handle(request));
+                    let answer = self.handle(request);
+                    spent += encoded_len(&answer);
+                    out.push(answer);
                 }
                 Value::Array(out)
             }
@@ -507,7 +534,9 @@ impl Rpc {
                 ));
             }
             "txpool_status" => crate::txpool::status(self.node.mempool()),
-            "txpool_content" => crate::txpool::content(self.node.mempool()),
+            "txpool_content" => {
+                crate::txpool::content(self.node.mempool(), self.max_response_bytes)?
+            }
             "orange_getFinalityProof" => crate::bridge::finality_proof(&mut self.node, params)?,
             "orange_getOutboxProof" => crate::bridge::outbox_proof(&mut self.node, params)?,
             "orange_getRotation" => crate::bridge::rotation(&mut self.node, params)?,
@@ -922,22 +951,34 @@ impl Rpc {
         }
     }
 
-    /// `eth_getLogs`.
+    /// `eth_getLogs`: at most [`Rpc::max_logs`] logs, or an error.
     pub(crate) fn logs(&mut self, filter: &Filter) -> Result<Value, RpcError> {
         let (from, to) = self.filter_heights(&filter.blocks)?;
-        self.scan_logs(filter, from, to).map(Value::Array)
+        let (logs, _) = self.scan_logs(filter, from, to)?;
+        if logs.len() > self.max_logs {
+            return Err(RpcError::with_code(
+                -32005,
+                format!("query returned more than {} results", self.max_logs),
+            ));
+        }
+        Ok(Value::Array(logs))
     }
 
-    /// The logs `filter` matches in the blocks `from..=to`, which exist; the
-    /// node's background work runs before each block.
+    /// The logs `filter` matches in the blocks `from..=to`, which exist, and
+    /// the last block scanned: the scan stops after the block that takes it
+    /// past [`Rpc::max_logs`], or at `to`. The node's background work runs
+    /// before each block.
     pub(crate) fn scan_logs(
         &mut self,
         filter: &Filter,
         from: u64,
         to: u64,
-    ) -> Result<Vec<Value>, RpcError> {
+    ) -> Result<(Vec<Value>, u64), RpcError> {
         let mut out = Vec::new();
         for height in from..=to {
+            if out.len() > self.max_logs {
+                return Ok((out, height - 1));
+            }
             self.run_background();
             let (header, block_hash) = self.header_at(height)?.unwrap_or_default();
             let mut log_index = 0;
@@ -971,7 +1012,7 @@ impl Rpc {
                 }
             }
         }
-        Ok(out)
+        Ok((out, to))
     }
 }
 
@@ -982,6 +1023,16 @@ fn missing_state(root: &[u8; 32], height: u64, oldest: u64) -> String {
         "missing trie node {} (path ) state of block {height} is not available, the node keeps the state from block {oldest}",
         &data(root)[2..]
     )
+}
+
+/// geth's error for an answer past the response limit (-32003).
+pub(crate) fn too_large() -> RpcError {
+    RpcError::with_code(-32003, "response too large".into())
+}
+
+/// The length of `value` as compact JSON, as the server sends it.
+pub(crate) fn encoded_len(value: &Value) -> usize {
+    value.to_string().len()
 }
 
 fn error_response(id: &Value, error: &RpcError) -> Value {

@@ -428,3 +428,31 @@ fn the_oracle_caps_its_suggestion_and_how_far_it_looks() {
         quantity(floor + ORACLE_MAX_TIP)
     );
 }
+
+/// At most 100 reward percentiles, geth's limit (spec 20 §8.6). Before, a
+/// 5 MB request of percentiles over 1 024 blocks made the node build a
+/// value for each pair, tens of gigabytes.
+#[test]
+fn fee_history_takes_at_most_a_hundred_percentiles() {
+    assert_eq!(orange_rpc::fees::MAX_REWARD_PERCENTILES, 100);
+    let alice = Wallet::new(1);
+    let mut rpc = rpc(&[&alice]);
+    let percentiles = |n: u32| -> Vec<f64> { (0..n).map(|i| f64::from(i) / 1_000.0).collect() };
+    let history = ok(
+        &mut rpc,
+        "eth_feeHistory",
+        json!(["0x1", "latest", percentiles(100)]),
+    );
+    assert_eq!(history["reward"][0].as_array().unwrap().len(), 100);
+    assert_eq!(
+        err(
+            &mut rpc,
+            "eth_feeHistory",
+            json!(["0x1", "latest", percentiles(101)])
+        ),
+        (
+            -32602,
+            "invalid reward percentile: over the query limit 100".to_owned()
+        )
+    );
+}

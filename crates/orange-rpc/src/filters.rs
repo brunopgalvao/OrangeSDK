@@ -164,8 +164,9 @@ impl Rpc {
     }
 
     /// `eth_getFilterChanges(id)`: what the filter matches since its last
-    /// poll, at most [`Rpc::max_log_range`] blocks of it; a later poll
-    /// reports the rest.
+    /// poll, at most [`Rpc::max_log_range`] blocks of it, and for a log
+    /// filter up to the block that takes it past [`Rpc::max_logs`]; a later
+    /// poll reports the rest.
     pub(crate) fn filter_changes(&mut self, params: &[Value]) -> Result<Value, RpcError> {
         let id = param_str(params, 0)?.to_owned();
         let now = Instant::now();
@@ -189,7 +190,13 @@ impl Rpc {
                 if matches!(filter.blocks, Blocks::Hash(_)) || lo > hi {
                     return Ok(Vec::new());
                 }
-                self.scan_logs(filter, lo, hi)
+                let (logs, last) = self.scan_logs(filter, lo, hi)?;
+                // A scan cut short at `max_logs` leaves the rest to the next
+                // poll.
+                if last < hi {
+                    installed.next = last + 1;
+                }
+                Ok(logs)
             }
             Kind::Blocks => {
                 let mut out = Vec::new();

@@ -7,7 +7,9 @@ use orange_host::hash::keccak256;
 use orange_node::{Mempool, PoolTx};
 use serde_json::{Map, Value, json};
 
+use crate::RpcError;
 use crate::hex::{data, quantity};
+use crate::methods::{encoded_len, too_large};
 use crate::views::{self, decode_or_blank};
 
 /// An address in EIP-55 mixed-case hex, the form geth keys `txpool_content`
@@ -41,11 +43,21 @@ pub fn status(pool: &Mempool) -> Value {
 /// `txpool_content`: every transaction, pending or queued, by sender and
 /// then by nonce as a decimal string, in the shape `eth_getTransactionByHash`
 /// gives a pending transaction.
-#[must_use]
-pub fn content(pool: &Mempool) -> Value {
+///
+/// # Errors
+/// geth's `response too large` once the transactions' views pass
+/// `max_bytes` of JSON (spec 20 §8.6): a full pool is several times what
+/// one answer should hold.
+pub fn content(pool: &Mempool, max_bytes: usize) -> Result<Value, RpcError> {
     let mut pending: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
     let mut queued: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+    let mut spent = 0;
     for tx in pool.iter() {
+        let view = view(tx);
+        spent += encoded_len(&view);
+        if spent > max_bytes {
+            return Err(too_large());
+        }
         let side = if pool.is_pending(tx) {
             &mut pending
         } else {
@@ -53,9 +65,9 @@ pub fn content(pool: &Mempool) -> Value {
         };
         side.entry(checksum(&tx.sender))
             .or_default()
-            .insert(tx.nonce.to_string(), view(tx));
+            .insert(tx.nonce.to_string(), view);
     }
-    json!({ "pending": pending, "queued": queued })
+    Ok(json!({ "pending": pending, "queued": queued }))
 }
 
 fn view(tx: &PoolTx) -> Value {

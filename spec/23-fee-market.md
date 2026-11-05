@@ -101,7 +101,7 @@ The query `fees` takes nothing and returns `FeeStatus { params: FeeParams, base_
 The JSON-RPC follows geth:
 
 - `eth_gasPrice` is the head block's base fee plus the suggested tip; `eth_maxPriorityFeePerGas` the suggested tip (§7.1);
-- `eth_feeHistory(blockCount, newestBlock, rewardPercentiles)` reports, per block, `baseFeePerGas` from its header and, after the newest, the base fee of the block after it (its header's, or the kernel's next base fee when the newest is the head), `gasUsedRatio`, and `reward`: at each percentile, the tip paid by the transaction at that share of the block's gas, the receipts sorted by the tip they paid over the block's base fee; `blockCount` is at most 1 024, as in geth;
+- `eth_feeHistory(blockCount, newestBlock, rewardPercentiles)` reports, per block, `baseFeePerGas` from its header and, after the newest, the base fee of the block after it (its header's, or the kernel's next base fee when the newest is the head), `gasUsedRatio`, and `reward`: at each percentile, the tip paid by the transaction at that share of the block's gas, the receipts sorted by the tip they paid over the block's base fee; `blockCount` is at most 1 024 and the percentiles at most 100, as in geth (20 §8.6);
 - `eth_sendRawTransaction` refuses reason 8 with `max fee per gas less than block base fee: address …, maxFeePerGas: …, baseFee: …` and reason 24 with `max priority fee per gas higher than max fee per gas: address …, maxPriorityFeePerGas: …, maxFeePerGas: …`, geth's texts with its details;
 - the genesis block (20 §3.4) carries the base fee the chain started with, its floor at genesis, in its header, and block views report each header's `baseFeePerGas` and `miner`.
 

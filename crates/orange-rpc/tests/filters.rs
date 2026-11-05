@@ -306,3 +306,51 @@ fn filters_are_removed_expire_and_are_bounded() {
         true
     );
 }
+
+/// `eth_getLogs` answers at most `max_logs` logs, and a poll of a log
+/// filter stops after the block that takes it past them (spec 20 §8.6).
+/// Before, a range within `max_log_range` answered every log it held.
+#[test]
+fn log_answers_are_bounded() {
+    assert_eq!(orange_rpc::methods::MAX_LOGS, 10_000);
+    let alice = Wallet::new(1);
+    let (mut rpc, counter) = deployed(&alice);
+    assert_eq!(rpc.max_logs, orange_rpc::methods::MAX_LOGS);
+    let c = data(&counter);
+    let filter = ok(
+        &mut rpc,
+        "eth_newFilter",
+        json!([{ "address": c, "fromBlock": "0x2" }]),
+    );
+    // Blocks 2 and 3 log twice each.
+    for block in 0..2 {
+        for i in 0..2 {
+            send(&mut rpc, &increment(&alice, counter, 1 + block * 2 + i, 1));
+        }
+        mine(&mut rpc);
+    }
+    let all = ok(&mut rpc, "eth_getLogs", json!([{ "fromBlock": "0x2" }]));
+    assert_eq!(all.as_array().unwrap().len(), 4);
+    rpc.max_logs = 3;
+    let too_many = (-32005, "query returned more than 3 results".to_owned());
+    assert_eq!(
+        err(&mut rpc, "eth_getLogs", json!([{ "fromBlock": "0x2" }])),
+        too_many
+    );
+    assert_eq!(
+        err(&mut rpc, "eth_getFilterLogs", json!([filter])).0,
+        -32005
+    );
+    rpc.max_logs = 4;
+    assert_eq!(
+        ok(&mut rpc, "eth_getLogs", json!([{ "fromBlock": "0x2" }])),
+        all
+    );
+    // One log is passed by the first block: the poll reports it whole, and
+    // the next poll the block after.
+    rpc.max_logs = 1;
+    let logs = all.as_array().unwrap();
+    assert_eq!(changes(&mut rpc, &filter), json!(logs[..2]));
+    assert_eq!(changes(&mut rpc, &filter), json!(logs[2..]));
+    assert_eq!(changes(&mut rpc, &filter), json!([]));
+}
