@@ -936,9 +936,10 @@ fn state_sync_frames_are_the_hosts() {
     assert!(sync.failed().is_none());
 }
 
-/// A state sync gives up instead of waiting for ever (spec 09 §6): at once
-/// when the only peers are of another genesis, after `SYNC_PEER_WAIT_MS`
-/// when no peer completes a handshake, and never while a peer is handshaken.
+/// A state sync gives up instead of waiting for ever (spec 09 §6): after
+/// `SYNC_PEER_WAIT_MS` when no peer completes a handshake, never while a
+/// peer is handshaken, and not before the wait for an accepted connection's
+/// `Hello` of another genesis, which proves nothing.
 #[test]
 fn a_state_sync_without_peers_gives_up() {
     use orange_node::net::SYNC_PEER_WAIT_MS;
@@ -995,7 +996,8 @@ fn a_state_sync_without_peers_gives_up() {
     };
     assert_eq!(served.sync_stalled(left + SYNC_PEER_WAIT_MS - 1), None);
     assert!(served.sync_stalled(left + SYNC_PEER_WAIT_MS).is_some());
-    // A peer of this chain id on another genesis: stalled at once.
+    // Anybody's Hello of this chain id on another genesis, before any proof:
+    // the sync goes on waiting, and says what it heard once the wait runs out.
     let mut foreign = bind();
     let mut s = Wire::dial(foreign.local_addr().unwrap(), chain, [3; 32]);
     let elsewhere = Chain {
@@ -1005,9 +1007,11 @@ fn a_state_sync_without_peers_gives_up() {
     s.send(&elsewhere.hello(validator_id(&peer_key(3)), [3; 32]));
     let (_, closed) = s.read_until(&mut || foreign.poll_sync(&mut sync, 5), |_| false);
     assert!(closed);
+    assert_eq!(foreign.sync_stalled(5), None);
+    assert_eq!(foreign.sync_stalled(5 + SYNC_PEER_WAIT_MS - 1), None);
     assert_eq!(
-        foreign.sync_stalled(5),
-        Some("a peer is on a chain with another genesis block")
+        foreign.sync_stalled(5 + SYNC_PEER_WAIT_MS),
+        Some("no peer to sync from in time; a peer that proved no id named another genesis block")
     );
 }
 
@@ -1083,8 +1087,12 @@ fn a_state_sync_whose_peers_are_dropped_gives_up() {
     }
 }
 
+/// A configured peer whose `Hello` names this chain id and another genesis
+/// stops a state sync at once (spec 09 §6): the node was pointed at another
+/// chain. It is heard though the peer closes as soon as it has said it.
 #[test]
-fn a_hello_of_another_genesis_is_heard_though_its_peer_closes_at_once() {
+fn a_configured_peer_of_another_genesis_stops_a_state_sync_though_it_closes_at_once() {
+    use orange_node::net::SYNC_PEER_WAIT_MS;
     use orange_node::statesync::{StateSync, SyncConfig};
     let keys = keys(1);
     let dir = orange_scratch::Scratch::new("net", "foreign");
@@ -1095,19 +1103,42 @@ fn a_hello_of_another_genesis_is_heard_though_its_peer_closes_at_once() {
         dir: dir.to_path_buf(),
     })
     .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let configured = vec![listener.local_addr().unwrap()];
     let mut transport =
-        Transport::bind("127.0.0.1:0", peer_key(1), CHAIN_ID, [7; 32], vec![]).unwrap();
+        Transport::bind("127.0.0.1:0", peer_key(1), CHAIN_ID, [7; 32], configured).unwrap();
     let elsewhere = Chain {
         chain_id: CHAIN_ID,
         genesis: [8; 32],
     };
+    let mut clock = 0;
+    // The transport's dial; one whose Hello names another node is another
+    // test's, at a port this one reused, and is let go.
+    let me = validator_id(&peer_key(1));
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut peer = loop {
+        clock += 1;
+        transport.poll_sync(&mut sync, clock);
+        if let Ok((c, _)) = listener.accept() {
+            let mut w = Wire::over(c, elsewhere, [3; 32]);
+            let (frames, _) = w.read_until(&mut || transport.poll_sync(&mut sync, clock), |f| {
+                raw_peer::nonce_of(f).is_some()
+            });
+            if frames
+                .iter()
+                .any(|f| matches!(f, Frame::Hello { id, .. } if *id == me))
+            {
+                break w;
+            }
+        }
+        assert!(std::time::Instant::now() < deadline, "no dial");
+        std::thread::sleep(Duration::from_millis(2));
+    };
     // The Hello and the close arrive together, as from a node that refuses
     // this one's genesis as soon as it reads it.
-    let mut peer = raw_peer::Wire::dial(transport.local_addr().unwrap(), elsewhere, [3; 32]);
     peer.send_clear(&peer.hello(validator_id(&peer_key(4))));
     drop(peer);
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let mut clock = 0;
     let why = loop {
         clock += 1;
         transport.poll_sync(&mut sync, clock);
@@ -1120,7 +1151,14 @@ fn a_hello_of_another_genesis_is_heard_though_its_peer_closes_at_once() {
         );
         std::thread::sleep(Duration::from_millis(2));
     };
-    assert_eq!(why, "a peer is on a chain with another genesis block");
+    assert_eq!(
+        why,
+        "a peer this node was given is on a chain with another genesis block"
+    );
+    assert!(
+        clock < SYNC_PEER_WAIT_MS,
+        "stopped at once, not after the wait"
+    );
 }
 
 /// A transaction a node accepted while it had no peer reaches the peers it

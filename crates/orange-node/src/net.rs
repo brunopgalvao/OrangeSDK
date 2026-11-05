@@ -741,8 +741,11 @@ pub struct Transport {
     traffic: Traffic,
     /// Peer exchange, when enabled.
     exchange: Option<Exchange>,
-    /// Whether a `Hello` of this chain id named another genesis.
+    /// Whether a configured peer's or a bootstrap address's `Hello` of this
+    /// chain id named another genesis.
     foreign: bool,
+    /// Whether any connection's `Hello` of this chain id did.
+    foreign_heard: bool,
     /// Since when a state sync has had no handshaken peer.
     alone_since_ms: Option<u64>,
 }
@@ -784,6 +787,7 @@ impl Transport {
             traffic: Traffic::default(),
             exchange: None,
             foreign: false,
+            foreign_heard: false,
             alone_since_ms: None,
         })
     }
@@ -1090,7 +1094,12 @@ impl Transport {
                     version, chain_id, ..
                 },
             ) if version == VERSION && chain_id == self.chain_id => {
-                self.foreign = true;
+                // Anybody can say so in a `Hello`, which proves nothing; only
+                // an address the operator named stops a state sync with it
+                // (spec 09 §6).
+                let named = conn.dialled.is_some() || matches!(conn.target, Some(Target::Boot(_)));
+                self.foreign |= named;
+                self.foreign_heard = true;
                 conn.dead = true;
             }
             _ => conn.dead = true,
@@ -1098,16 +1107,23 @@ impl Transport {
     }
 
     /// Why a state sync over this transport cannot go on (spec 09 §6), while
-    /// it has no handshaken peer it still asks: a peer of this chain id named
-    /// another genesis, or it has had no such peer for
-    /// [`SYNC_PEER_WAIT_MS`]. Read after [`Transport::poll_sync`].
+    /// it has no handshaken peer it still asks: a configured peer or a
+    /// bootstrap address answered with this chain id and another genesis,
+    /// or it has had no such peer for [`SYNC_PEER_WAIT_MS`]. A `Hello` of
+    /// another genesis on any other connection proves nothing and stops
+    /// nothing; it is only mentioned when the wait runs out. Read after
+    /// [`Transport::poll_sync`].
     #[must_use]
     pub fn sync_stalled(&self, now_ms: u64) -> Option<&'static str> {
         let since = self.alone_since_ms?;
         if self.foreign {
-            return Some("a peer is on a chain with another genesis block");
+            return Some("a peer this node was given is on a chain with another genesis block");
         }
-        (now_ms >= since + SYNC_PEER_WAIT_MS).then_some("no peer to sync from in time")
+        (now_ms >= since + SYNC_PEER_WAIT_MS).then_some(if self.foreign_heard {
+            "no peer to sync from in time; a peer that proved no id named another genesis block"
+        } else {
+            "no peer to sync from in time"
+        })
     }
 
     /// Connection `index` completed its handshake as `id`. A peer that is
