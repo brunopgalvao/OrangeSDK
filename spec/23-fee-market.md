@@ -34,6 +34,8 @@ Ethereum changes its base fee by at most 12.5% per 12-second block. At slots of 
 
 A development chain keeps a zero base fee, so transactions and wallets that pay nothing keep working, and its priority fees go where they went before (§4). The genesis JSON names the parameters as `"fees": {"denominator", "elasticity", "minBaseFee", "treasury"}`; `orange devnet init` funds every validator's account and the governance account, since on its chain their signals and upgrades pay the base fee.
 
+The default stays what it is, since it is part of every existing genesis's hash and of what its chain executes; but on a chain of several validators a base fee of zero makes every transaction, and so every way of spamming the network, the pools and the blocks, cost nothing beyond a priority fee nobody requires. So `orange node` (and `orange devnet node`, which runs it) logs at start, on standard error, a line beginning `WARNING:` when its genesis names more than one validator and its parameters leave every base fee at zero (the market off and `min_base_fee` 0, as without a `fees` object). Nothing else changes: the node runs that chain as any other.
+
 ## 3. The base fee of a block
 
 With `L` the block gas limit (`BLOCK_GAS_LIMIT`, 30 000 000) and `T = L / elasticity` the gas target, the base fee of block `h + 1` follows from block `h`'s header, its `base_fee` `b` and `gas_used` `g`:

@@ -1003,6 +1003,9 @@ pub(crate) fn run_inner(
     check_options(args, command)?;
     let kernel = load_kernel(&arg(args, "--kernel").ok_or("--kernel is required")?)?;
     let (genesis, bootnodes) = genesis_argument(args, command)?;
+    if command == "node" {
+        fees::warn_free(&genesis, &mut std::io::stderr());
+    }
     let rpc_arg = arg(args, "--rpc");
     let rpc_addr = rpc_arg.as_deref().unwrap_or(DEFAULT_RPC);
     let max_blocks = parse_number(args, "--blocks")?;

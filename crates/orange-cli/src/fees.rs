@@ -15,11 +15,15 @@
 //! account the base fee is credited to, never the staking address, and is
 //! absent, or the zero address, when it is burned.
 
+use orange_abi::Decode;
+use orange_abi::chain::{GenesisParams, ValidatorSet};
 use orange_abi::fees::{
     DEFAULT_DENOMINATOR, DEFAULT_ELASTICITY, DEFAULT_MIN_BASE_FEE, FeeParams, MAX_MIN_BASE_FEE,
 };
 use orange_abi::staking::STAKING_ADDRESS;
+use orange_abi::types::Genesis;
 use serde_json::{Map, Value, json};
+use std::io::Write;
 
 fn number(fields: &Map<String, Value>, name: &str) -> Result<u64, String> {
     match fields.get(name) {
@@ -92,6 +96,24 @@ pub fn unworkable(params: &FeeParams, prefix: &str) -> Option<String> {
     })
 }
 
+/// Writes to `log` the warning `orange node` gives at start (spec 23 §2.1)
+/// when `genesis` names more than one validator and leaves every base fee
+/// at zero: transactions, and every way of spamming the chain, then cost
+/// nothing. A genesis that does not decode is the kernel's to refuse.
+pub fn warn_free(genesis: &Genesis, log: &mut dyn Write) {
+    let validators =
+        ValidatorSet::from_bytes(&genesis.validators).map_or(0, |s| s.validators.0.len());
+    let fees = GenesisParams::from_bytes(&genesis.params)
+        .map(|p| p.fees)
+        .unwrap_or_default();
+    if validators > 1 && !fees.market_on() && fees.min_base_fee == 0 {
+        let _ = writeln!(
+            log,
+            "WARNING: this genesis has {validators} validators and no fee market (no `fees` object, or one with the market off and no floor): every base fee is zero, so transactions, and spam of the pools and blocks, cost nothing; give the genesis a `fees` object (spec 23 §2.1)"
+        );
+    }
+}
+
 /// The `fees` object of the production defaults, which `orange devnet init`
 /// writes: [`FeeParams::production`].
 #[must_use]
@@ -134,6 +156,35 @@ mod tests {
                 ..FeeParams::default()
             }
         );
+    }
+
+    /// `orange node` warns at start when a genesis of several validators
+    /// leaves the base fee at zero for ever (spec 23 §2.1).
+    #[test]
+    fn a_free_chain_of_several_validators_is_warned_about() {
+        let warned = |text: Value| {
+            let genesis = crate::parse_genesis(&text.to_string()).unwrap();
+            let mut log = Vec::new();
+            warn_free(&genesis, &mut log);
+            String::from_utf8(log).unwrap()
+        };
+        let ids = json!([
+            format!("0x{}", "11".repeat(32)),
+            format!("0x{}", "22".repeat(32))
+        ]);
+        let free = warned(json!({ "chainId": 7, "validators": ids }));
+        assert!(free.starts_with("WARNING: "), "{free}");
+        assert!(free.contains("2 validators"), "{free}");
+        assert!(free.contains("no fee market"), "{free}");
+        // An explicit market that is off with no floor is as free.
+        let off = json!({ "chainId": 7, "validators": ids, "fees": {} });
+        assert_eq!(warned(off), free);
+        // A market, a floor, or one validator: nothing.
+        let market = json!({ "chainId": 7, "validators": ids, "fees": production_json() });
+        assert_eq!(warned(market), "");
+        let floor = json!({ "chainId": 7, "validators": ids, "fees": {"minBaseFee": 7} });
+        assert_eq!(warned(floor), "");
+        assert_eq!(warned(json!({ "chainId": 7 })), "");
     }
 
     #[test]
