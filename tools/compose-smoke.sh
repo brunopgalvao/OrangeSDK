@@ -142,7 +142,11 @@ log "all nodes agree on block $lowest ($want)"
 # --- each node's operator endpoints ------------------------------------
 
 metric() { # the value of the unlabelled sample $2 in node $1's /metrics
-    curl -sf -m 10 "http://$1/metrics" | awk -v name="$2" '$1 == name { print $2; exit }'
+    # Read whole before awk stops at the sample: under pipefail, curl
+    # writing into a closed pipe fails the script (curl exit 23).
+    local page
+    page=$(curl -sf -m 10 "http://$1/metrics") || return 1
+    awk -v name="$2" '$1 == name { print $2; exit }' <<<"$page"
 }
 peered() { [ "$(curl -sf -m 10 "http://$1/status" | jq -r .peers)" -ge $((N - 1)) ]; }
 for node in "${NODES[@]}"; do

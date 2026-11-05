@@ -47,10 +47,13 @@ jobs:
           cache: npm
           cache-dependency-path: tools/ecosystem/package-lock.json
       - name: Install Foundry
+        # The installer picks $XDG_CONFIG_HOME/.foundry when that is set, as
+        # it is on the runners; FOUNDRY_DIR names the place for both steps.
         run: |
+          export FOUNDRY_DIR="$HOME/.foundry"
           curl -sSfL https://foundry.paradigm.xyz | bash
-          "$HOME/.foundry/bin/foundryup" --install "$FOUNDRY_VERSION"
-          echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
+          "$FOUNDRY_DIR/bin/foundryup" --install "$FOUNDRY_VERSION"
+          echo "$FOUNDRY_DIR/bin" >> "$GITHUB_PATH"
       - run: timeout 1200 cargo build --release --locked -p solo-cli
       - run: npm ci --no-audit --no-fund
         working-directory: tools/ecosystem
