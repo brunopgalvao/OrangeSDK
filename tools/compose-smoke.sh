@@ -3,7 +3,7 @@
 # image, brings the four validators, Prometheus and Grafana up, checks that
 # the chain makes and finalizes blocks that every node agrees on, that the
 # JSON-RPC answers, that each node's /metrics, /health and /status serve,
-# that `solo doctor` passes, that Prometheus scrapes all four with the alert
+# that `orange doctor` passes, that Prometheus scrapes all four with the alert
 # rules loaded and that Grafana has its data source and dashboard; restarts
 # one validator and checks it catches up; then takes the stack down.
 #
@@ -94,7 +94,7 @@ if [ -z "$EXTERNAL" ]; then
     "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
     log "building the image"
     # The nodes share the image the init service builds: build it first, so
-    # that `up` finds it and never tries to pull solo:devnet.
+    # that `up` finds it and never tries to pull orange:devnet.
     "${COMPOSE[@]}" build
     log "starting the stack"
     "${COMPOSE[@]}" up -d
@@ -160,16 +160,16 @@ for node in "${NODES[@]}"; do
     [ -n "$height" ] && [ "${height%.*}" -gt 0 ] || fail "$node ethereum_blockchain_height: '$height'"
     peers=$(metric "$node" ethereum_peer_count)
     [ -n "$peers" ] && [ "${peers%.*}" -ge $((N - 1)) ] || fail "$node ethereum_peer_count: '$peers'"
-    finalized=$(metric "$node" solo_chain_finalized_height)
-    [ -n "$finalized" ] || fail "$node exports no solo_chain_finalized_height"
-    [ -n "$(metric "$node" solo_store_size_bytes)" ] || fail "$node exports no solo_store_size_bytes (no chain store?)"
+    finalized=$(metric "$node" orange_chain_finalized_height)
+    [ -n "$finalized" ] || fail "$node exports no orange_chain_finalized_height"
+    [ -n "$(metric "$node" orange_store_size_bytes)" ] || fail "$node exports no orange_store_size_bytes (no chain store?)"
 done
 log "every node serves /health, /status and /metrics with $((N - 1)) peers"
 
 if [ -z "$EXTERNAL" ]; then
-    out=$("${COMPOSE[@]}" exec -T solo-0 solo doctor --rpc 127.0.0.1:8545 --min-peers $((N - 1)) 2>&1) \
-        || fail "solo doctor on solo-0: $out"
-    log "solo doctor passes on solo-0"
+    out=$("${COMPOSE[@]}" exec -T orange-0 orange doctor --rpc 127.0.0.1:8545 --min-peers $((N - 1)) 2>&1) \
+        || fail "orange doctor on orange-0: $out"
+    log "orange doctor passes on orange-0"
 fi
 
 # --- Prometheus --------------------------------------------------------
@@ -180,7 +180,7 @@ if [ -n "$PROMETHEUS_URL" ]; then
     wait_for prom /-/ready
     all_up() {
         prom /api/v1/targets | jq -e --argjson n "$N" \
-            '[.data.activeTargets[] | select(.labels.job == "solo" and .health == "up")] | length == $n'
+            '[.data.activeTargets[] | select(.labels.job == "orange" and .health == "up")] | length == $n'
     }
     WHAT="Prometheus scraping all $N nodes"
     wait_for all_up
@@ -209,23 +209,23 @@ if [ -n "$GRAFANA_URL" ]; then
     wait_for healthy
     graf /api/datasources/uid/prometheus | jq -e '.type == "prometheus"' >/dev/null \
         || fail "Grafana has no Prometheus data source"
-    dashboard() { graf '/api/search?type=dash-db' | jq -e 'any(.[]; .title == "Solo node")'; }
-    WHAT="the Solo dashboard provisioned in Grafana"
+    dashboard() { graf '/api/search?type=dash-db' | jq -e 'any(.[]; .title == "Orange node")'; }
+    WHAT="the Orange dashboard provisioned in Grafana"
     wait_for dashboard
     through() {
-        graf '/api/datasources/proxy/uid/prometheus/api/v1/query?query=up%7Bjob%3D%22solo%22%7D' \
+        graf '/api/datasources/proxy/uid/prometheus/api/v1/query?query=up%7Bjob%3D%22orange%22%7D' \
             | jq -e --argjson n "$N" '.data.result | length == $n'
     }
     WHAT="Grafana querying Prometheus"
     wait_for through
-    log "Grafana has its data source and the Solo dashboard, and queries Prometheus"
+    log "Grafana has its data source and the Orange dashboard, and queries Prometheus"
 fi
 
 # --- a validator restart -----------------------------------------------
 
 if [ -z "$EXTERNAL" ]; then
     last=${NODES[N - 1]}
-    service=solo-$((N - 1))
+    service=orange-$((N - 1))
     "${COMPOSE[@]}" stop "$service"
     before=$(head_of "${NODES[0]}")
     WHAT="the other nodes going on without $service"

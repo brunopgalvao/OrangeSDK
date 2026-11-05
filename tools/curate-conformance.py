@@ -2,7 +2,7 @@
 """Selects the committed conformance subset from a full execution-spec-tests
 fixture set (spec 07 §4.2).
 
-    tools/curate-conformance.py <fixtures>/state_tests crates/solo-conformance/tests/fixtures/state_tests
+    tools/curate-conformance.py <fixtures>/state_tests crates/orange-conformance/tests/fixtures/state_tests
 
 For each category (fork directory / EIP directory) it takes up to its quota
 of cases, round-robin across the category's fixture files so that every test

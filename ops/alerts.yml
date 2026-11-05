@@ -1,15 +1,15 @@
-# Prometheus alert rules for Solo nodes (spec 11 section 7).
+# Prometheus alert rules for Orange nodes (spec 11 section 7).
 #
 # Load with `rule_files: [alerts.yml]` (see prometheus.yml). The thresholds
-# are the defaults `solo doctor` judges by (solo_metrics::DEFAULT_LIMITS).
-# Keep every `expr` on one line: crates/solo-metrics/tests/ops.rs checks
+# are the defaults `orange doctor` judges by (orange_metrics::DEFAULT_LIMITS).
+# Keep every `expr` on one line: crates/orange-metrics/tests/ops.rs checks
 # that each names only metrics the node exports and that the thresholds
 # still match the doctor's.
 groups:
-  - name: solo
+  - name: orange
     rules:
-      - alert: SoloNodeDown
-        expr: up{job="solo"} == 0
+      - alert: OrangeNodeDown
+        expr: up{job="orange"} == 0
         for: 1m
         labels:
           severity: critical
@@ -17,8 +17,8 @@ groups:
           summary: "{{ $labels.instance }} does not answer GET /metrics"
           description: "Prometheus has not scraped the node for a minute: the process is down or its JSON-RPC address is unreachable."
 
-      - alert: SoloHeadNotAdvancing
-        expr: solo_chain_head_age_seconds > 60
+      - alert: OrangeHeadNotAdvancing
+        expr: orange_chain_head_age_seconds > 60
         for: 1m
         labels:
           severity: critical
@@ -26,8 +26,8 @@ groups:
           summary: "{{ $labels.instance }} has not executed a block for {{ $value | humanizeDuration }}"
           description: "The reference kernel produces a block every slot, empty or not. A head that stands still means consensus has stalled or this node has lost the chain."
 
-      - alert: SoloFinalityLag
-        expr: ethereum_blockchain_height - solo_chain_finalized_height > 16
+      - alert: OrangeFinalityLag
+        expr: ethereum_blockchain_height - orange_chain_finalized_height > 16
         for: 2m
         labels:
           severity: warning
@@ -35,7 +35,7 @@ groups:
           summary: "{{ $labels.instance }} finalized height trails the head by {{ $value }} blocks"
           description: "Blocks are executed but not finalized: votes are not reaching quorum, or kernel_stf_finalize_block is failing."
 
-      - alert: SoloNoPeers
+      - alert: OrangeNoPeers
         expr: ethereum_peer_count < 1
         for: 2m
         labels:
@@ -44,8 +44,8 @@ groups:
           summary: "{{ $labels.instance }} has no peers"
           description: "The node runs a peer-to-peer transport but no peer completed the handshake. Check --peer addresses, firewalls and the chain id of the peers."
 
-      - alert: SoloMempoolBacklog
-        expr: solo_mempool_transactions > 1000
+      - alert: OrangeMempoolBacklog
+        expr: orange_mempool_transactions > 1000
         for: 5m
         labels:
           severity: warning
@@ -53,24 +53,24 @@ groups:
           summary: "{{ $labels.instance }} holds {{ $value }} pending transactions"
           description: "Transactions arrive faster than blocks take them, or blocks are not being produced."
 
-      - alert: SoloDriverFault
-        expr: increase(solo_kernel_faults_total{entrypoint=~"kernel_driver_.*"}[5m]) > 0
+      - alert: OrangeDriverFault
+        expr: increase(orange_kernel_faults_total{entrypoint=~"kernel_driver_.*"}[5m]) > 0
         labels:
           severity: critical
         annotations:
           summary: "{{ $labels.instance }} consensus driver faulted ({{ $labels.status }})"
           description: "A driver entrypoint ended in anything but halt (spec 06 section 6). A deterministic fault recurs on every node: it is a kernel bug or a kernel upgrade waiting to happen."
 
-      - alert: SoloKernelFault
-        expr: increase(solo_kernel_faults_total{entrypoint!~"kernel_driver_.*"}[5m]) > 0
+      - alert: OrangeKernelFault
+        expr: increase(orange_kernel_faults_total{entrypoint!~"kernel_driver_.*"}[5m]) > 0
         labels:
           severity: warning
         annotations:
           summary: "{{ $labels.instance }} {{ $labels.entrypoint }} faulted ({{ $labels.status }})"
           description: "A state-transition or query entrypoint ended in anything but halt. A fault in kernel_stf_execute_block makes the block invalid."
 
-      - alert: SoloKernelCallSlow
-        expr: histogram_quantile(0.99, sum by (le, instance, entrypoint) (rate(solo_kernel_call_duration_seconds_bucket[5m]))) > 1
+      - alert: OrangeKernelCallSlow
+        expr: histogram_quantile(0.99, sum by (le, instance, entrypoint) (rate(orange_kernel_call_duration_seconds_bucket[5m]))) > 1
         for: 10m
         labels:
           severity: warning
@@ -78,16 +78,16 @@ groups:
           summary: "{{ $labels.instance }} {{ $labels.entrypoint }} p99 is {{ $value | humanizeDuration }}"
           description: "Kernel calls this slow eat into the slot time; consensus timeouts follow."
 
-      - alert: SoloEmittedMetricsDropped
-        expr: increase(solo_emitted_dropped_total[15m]) > 0
+      - alert: OrangeEmittedMetricsDropped
+        expr: increase(orange_emitted_dropped_total[15m]) > 0
         labels:
           severity: info
         annotations:
           summary: "{{ $labels.instance }} dropped emitted metrics ({{ $labels.reason }})"
           description: "The kernel or a module emitted metrics with bad names, unknown kinds, negative counter steps, or more names than the node keeps (spec 11 section 5)."
 
-      - alert: SoloUpgradeBlocked
-        expr: solo_upgrade_blocked + solo_upgrade_missing_gates > 0
+      - alert: OrangeUpgradeBlocked
+        expr: orange_upgrade_blocked + orange_upgrade_missing_gates > 0
         labels:
           severity: critical
         annotations:

@@ -35,9 +35,9 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use solo_module::Store;
-use solo_module::abi::{address, arg, as_u64, bytes_arg, encode, selector, word};
-use solo_module::solo_abi::modules::{CallContext, ModuleCall};
+use orange_module::Store;
+use orange_module::abi::{address, arg, as_u64, bytes_arg, encode, selector, word};
+use orange_module::orange_abi::modules::{CallContext, ModuleCall};
 
 const COUNT: &[u8] = b"count";
 const INITIAL: &[u8] = b"initial";
@@ -97,7 +97,7 @@ fn dispatch(
         [0x13, 0x2e, 0x4f, 0x3c] => Err(encode(FAILED, &[arg(data, 0).unwrap_or_default()])),
         [0x29, 0x5b, 0x4e, 0x17] => words(word(context.map_or(0, |c| c.value))),
         [0xf0, 0xac, 0xd7, 0xd5] => spin(),
-        [0xa0, 0x49, 0x0f, 0xa0] => words(solo_module::keccak256(
+        [0xa0, 0x49, 0x0f, 0xa0] => words(orange_module::keccak256(
             &bytes_arg(data, 0).ok_or_else(Vec::new)?,
         )),
         [0xb3, 0xb3, 0x6b, 0xb3] => words(address(&context.map_or([0; 20], |c| c.caller))),
@@ -137,4 +137,4 @@ fn spin() -> ! {
     }
 }
 
-solo_module::module!(handle);
+orange_module::module!(handle);

@@ -1,0 +1,42 @@
+[package]
+name = "orange-node"
+description = "Hosts an Orange kernel: privileged host functions, the driver loop, mempool and queries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+orange-abi = { path = "../orange-abi" }
+orange-eth = { path = "../orange-eth" }
+orange-host = { path = "../orange-host" }
+orange-trie = { path = "../orange-trie" }
+orange-store = { path = "../orange-store" }
+orange-metrics = { path = "../orange-metrics" }
+orange-vm = { path = "../orange-vm" }
+orange-upgrade = { path = "../orange-upgrade" }
+orange-bls = { path = "../orange-bls" }
+orange-rlp = { path = "../orange-rlp" }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "std"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+hkdf = "0.12"
+sha2 = "0.10"
+getrandom = "0.3"
+
+[features]
+# `Node::inject_store_fault`, over the store's own `fault-injection`: the
+# crash-recovery tests drop a block's write on purpose. The tests below turn
+# it on; no release build has it.
+fault-injection = ["orange-store/fault-injection"]
+
+[dev-dependencies]
+orange-scratch = { path = "../orange-scratch" }
+orange-fuzz = { path = "../orange-fuzz" }
+orange-node = { path = ".", features = ["fault-injection"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+orange-recompile = { path = "../orange-recompile" }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+orange-ethlc = { path = "../orange-ethlc", features = ["testing"] }
+
+[lints]
+workspace = true

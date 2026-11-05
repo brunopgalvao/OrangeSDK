@@ -1,0 +1,25 @@
+[package]
+name = "orange-bridge"
+description = "Relayer library of the Orange-to-Ethereum bridge (spec 17): light-client submissions from threshold certificates, outbox proofs and inbox calldata; and the token bridge's messages and calldata (spec 21)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+orange-abi = { path = "../orange-abi" }
+orange-bls = { path = "../orange-bls" }
+orange-node = { path = "../orange-node" }
+orange-trie = { path = "../orange-trie" }
+
+[dev-dependencies]
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+revm = { version = "43.0.3", default-features = false, features = ["std"] }
+sha2 = { version = "0.10", default-features = false }
+orange-ethlc = { path = "../orange-ethlc", features = ["testing"] }
+orange-fuzz = { path = "../orange-fuzz" }
+orange-recompile = { path = "../orange-recompile" }
+orange-rlp = { path = "../orange-rlp" }
+
+[lints]
+workspace = true

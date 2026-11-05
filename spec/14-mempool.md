@@ -2,7 +2,7 @@
 
 ## 1. Scope
 
-The mempool is the host's store of transactions waiting for a block. It is policy, not validity: the kernel decides whether a transaction is valid (06 §5.1) and checks every transaction again when it executes a block, so a host whose pool differs from this document stays in consensus. This document fixes the policy of the reference host (`solo-node`) so that wallets, scripts and other hosts can rely on its behaviour. It follows geth's transaction pool where the two can be compared.
+The mempool is the host's store of transactions waiting for a block. It is policy, not validity: the kernel decides whether a transaction is valid (06 §5.1) and checks every transaction again when it executes a block, so a host whose pool differs from this document stays in consensus. This document fixes the policy of the reference host (`orange-node`) so that wallets, scripts and other hosts can rely on its behaviour. It follows geth's transaction pool where the two can be compared.
 
 A pool transaction carries its sender, nonce, fee cap (the gas price, or the maximum fee per gas), tip cap (the gas price, or the maximum priority fee per gas), gas limit and cost (value plus gas limit times fee cap), and for a set-code transaction the authorities its authorizations name (those whose signatures recover, spec 20 §2.2), read from the raw transaction, and the priority the kernel's validation returned. A transaction the host cannot read in this way is handed to the kernel with `Ahead` zero and refused for the reason the kernel gives; if the kernel accepts it anyway, it is refused as malformed.
 
@@ -67,7 +67,7 @@ A transaction is sent to peers (09 §4) when it first becomes pending, at admiss
 ## 7. RPC
 
 - `eth_getTransactionCount` at `pending` is the account nonce plus the sender's pending transactions: the nonce of the sender's next transaction. Every other tag gives the account nonce.
-- `eth_sendRawTransaction` reports the refusals of §2 and §4 as JSON-RPC error `-32000` with geth's texts: `nonce too low: address …, tx: … state: …`, `nonce has max value: …`, `replacement transaction underpriced`, `insufficient funds for gas * price + value` (the overdraft of §2), `oversized data`, `in-flight transaction limit reached for delegated accounts`, `authority already reserved`, `txpool is full`, `max fee per gas less than block base fee: address …, maxFeePerGas: …, baseFee: …` and `max priority fee per gas higher than max fee per gas: address …, maxPriorityFeePerGas: …, maxFeePerGas: …` (23 §7), and the kernel's other reasons as in `solo-rpc`.
+- `eth_sendRawTransaction` reports the refusals of §2 and §4 as JSON-RPC error `-32000` with geth's texts: `nonce too low: address …, tx: … state: …`, `nonce has max value: …`, `replacement transaction underpriced`, `insufficient funds for gas * price + value` (the overdraft of §2), `oversized data`, `in-flight transaction limit reached for delegated accounts`, `authority already reserved`, `txpool is full`, `max fee per gas less than block base fee: address …, maxFeePerGas: …, baseFee: …` and `max priority fee per gas higher than max fee per gas: address …, maxPriorityFeePerGas: …, maxFeePerGas: …` (23 §7), and the kernel's other reasons as in `orange-rpc`.
 - `eth_getTransactionByHash` finds pool transactions, with null block fields.
 - `txpool_status` returns `{"pending": quantity, "queued": quantity}`.
 - `txpool_content` returns `{"pending": {address: {nonce: transaction}}, "queued": {…}}`, keyed by the sender in EIP-55 mixed case and the nonce in decimal, as geth does.

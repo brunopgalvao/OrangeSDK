@@ -2,15 +2,15 @@
 
 ## 1. Overview
 
-Codex ADR 0003 makes Solo a Type 2 Ethereum chain: standard EVM bytecode at exact gas, every transaction type a wallet sends, the full RPC, and Solo's own state tree, consensus and block format underneath. This document specifies where the reference kernel and host meet Ethereum tooling beyond the EVM itself (codex ADR 0033):
+Codex ADR 0003 makes Orange a Type 2 Ethereum chain: standard EVM bytecode at exact gas, every transaction type a wallet sends, the full RPC, and Orange's own state tree, consensus and block format underneath. This document specifies where the reference kernel and host meet Ethereum tooling beyond the EVM itself (codex ADR 0033):
 
 - the transaction types the kernel accepts, including EIP-7702 set-code transactions, and the one it refuses, EIP-4844 blob transactions (§2);
-- the block header: every block, the genesis block included, has an Ethereum header whose `keccak256` of the RLP is the block hash, with Merkle-Patricia transactions and receipts roots and a logs bloom, while the state root stays Solo's binary trie (§3); the genesis block's hash and the chain id identify the chain (§3.4);
+- the block header: every block, the genesis block included, has an Ethereum header whose `keccak256` of the RLP is the block hash, with Merkle-Patricia transactions and receipts roots and a logs bloom, while the state root stays Orange's binary trie (§3); the genesis block's hash and the chain id identify the chain (§3.4);
 - `eth_getProof`, which answers with spec 10 proofs in EIP-1186's response shape (§4);
 - historical state: the state methods answer at any block within a retention window, or at every block on an archive node (§5);
 - the polled filters and the smaller methods standard clients call, the differences from geth that remain, and the suite of standard clients that checks them (§8).
 
-It extends codex ADR 0020, which specified the RPC with state at the head only and Solo's own block commitments; §3 and §5 replace its points 2 and 5. What this document does not change: proposals, anchors and threshold certificates (spec 08, 12, 17) keep their formats, since none of them carries the block hash or the receipts root; the state commitment is spec 10's.
+It extends codex ADR 0020, which specified the RPC with state at the head only and Orange's own block commitments; §3 and §5 replace its points 2 and 5. What this document does not change: proposals, anchors and threshold certificates (spec 08, 12, 17) keep their formats, since none of them carries the block hash or the receipts root; the state commitment is spec 10's.
 
 ## 2. Transactions
 
@@ -25,9 +25,9 @@ It extends codex ADR 0020, which specified the RPC with state at the head only a
 | `0x04` | EIP-7702 set code | yes |
 | any other byte below `0x80` | — | no: reason 7 |
 
-Decoding refuses with reason 1 (`MALFORMED`) a transaction whose RLP nests lists more than 16 deep (`solo_rlp::MAX_DEPTH`). No transaction type nests more than four (a typed transaction's access-list entry's storage keys), so the limit refuses nothing of a valid shape; it bounds the stack of a recursive decoder, which a short string of nested lists could otherwise overflow.
+Decoding refuses with reason 1 (`MALFORMED`) a transaction whose RLP nests lists more than 16 deep (`orange_rlp::MAX_DEPTH`). No transaction type nests more than four (a typed transaction's access-list entry's storage keys), so the limit refuses nothing of a valid shape; it bounds the stack of a recursive decoder, which a short string of nested lists could otherwise overflow.
 
-A blob transaction pays for data that a data-availability layer keeps for a while; a solochain has none, so the kernel refuses the type before execution (`solo-eth` decodes it as unsupported). Every header therefore records zero blob gas used and zero excess blob gas (§3.1), and `BLOBBASEFEE` is the minimum, 1.
+A blob transaction pays for data that a data-availability layer keeps for a while; a solochain has none, so the kernel refuses the type before execution (`orange-eth` decodes it as unsupported). Every header therefore records zero blob gas used and zero excess blob gas (§3.1), and `BLOBBASEFEE` is the minimum, 1.
 
 ### 2.2 Set-code transactions
 
@@ -65,7 +65,7 @@ A set-code transaction's view has `type` `0x4`, the dynamic-fee fields, `accessL
 
 ### 3.1 Ethereum header and block hash
 
-The kernel stores, for each block, the record `solo_abi::chain::BlockHeader`:
+The kernel stores, for each block, the record `orange_abi::chain::BlockHeader`:
 
 | Field | Content |
 |---|---|
@@ -82,14 +82,14 @@ The kernel stores, for each block, the record `solo_abi::chain::BlockHeader`:
 | `base_fee` | the block's base fee per gas (23 §3) |
 | `beneficiary` | the fee recipient: the fee vault `0x…4645` on a chain with staking, the zero address without (23 §4) |
 
-The block's **Ethereum header** is the Prague/Osaka header with these values, in RLP order (`solo_eth::header::Header::of`):
+The block's **Ethereum header** is the Prague/Osaka header with these values, in RLP order (`orange_eth::header::Header::of`):
 
 | Header field | Value |
 |---|---|
 | `parentHash` | `parent_hash` |
 | `ommersHash` | `keccak256(rlp([]))` = `1dcc4de8…d49347` |
 | `beneficiary` | `beneficiary` |
-| `stateRoot` | `state_root`: Solo's binary-trie root, not a Merkle-Patricia root (§3.3) |
+| `stateRoot` | `state_root`: Orange's binary-trie root, not a Merkle-Patricia root (§3.3) |
 | `transactionsRoot` | `transactions_root` |
 | `receiptsRoot` | `receipts_root` |
 | `logsBloom` | `logs_bloom` |
@@ -112,7 +112,7 @@ The **block hash** is `keccak256` of the header's RLP. The kernel computes it af
 
 ### 3.2 Transactions and receipts roots
 
-Both are roots of Ethereum's hexary Merkle-Patricia trie (Yellow Paper, appendices C and D; `solo_eth::mpt::ordered_root`) holding item `i` of a list under the key `rlp(i)`:
+Both are roots of Ethereum's hexary Merkle-Patricia trie (Yellow Paper, appendices C and D; `orange_eth::mpt::ordered_root`) holding item `i` of a list under the key `rlp(i)`:
 
 - the **transactions root** over the raw transactions the block records, in order, each exactly as received (for a typed transaction its type byte and payload, for a legacy one its RLP list): the bytes whose `keccak256` is the transaction's hash;
 - the **receipts root** over their receipts, each in its EIP-2718 encoding: the type byte for a typed transaction, then `rlp([status, cumulative_gas_used, logs_bloom, logs])`, a log being `[address, [topics], data]` and `logs_bloom` the receipt's own.
@@ -123,7 +123,7 @@ The block's `logs_bloom` is the OR of its receipts' blooms. A transaction the bl
 
 ### 3.3 State root
 
-`stateRoot` is Solo's state commitment (spec 10), a binary Merkle trie over the store's entries. It is not, and cannot be checked as, an Ethereum state root: a tool that verifies Ethereum state proofs against it fails, and Solo's state proofs follow spec 10 (§4). What an Ethereum state root would commit to (accounts, storage) is in Solo's store under the keys of §4.1, alongside the kernel's other state.
+`stateRoot` is Orange's state commitment (spec 10), a binary Merkle trie over the store's entries. It is not, and cannot be checked as, an Ethereum state root: a tool that verifies Ethereum state proofs against it fails, and Orange's state proofs follow spec 10 (§4). What an Ethereum state root would commit to (accounts, storage) is in Orange's store under the keys of §4.1, alongside the kernel's other state.
 
 ### 3.4 The genesis block
 
@@ -146,13 +146,13 @@ and its Ethereum header and hash follow from it exactly as for every block (§3.
 
 The host keeps the trie behind the genesis header's root as version 0 of its state (22 §3), the trie `storage_commit` returned, not the state after the header was stored, exactly as it keeps the trie behind each block's root (§4.3); the genesis root the node and its store report is that root, and `eth_getProof` at block 0 verifies against block 0's `stateRoot`. The RPC serves block 0 from the stored record like any other block: `eth_getBlockByNumber(0)` (and `earliest`), `eth_getBlockByHash` with its hash, `eth_getBlockReceipts` and `eth_getLogs` with its hash (none), and its hash as a state method's block parameter (§5.2). The zero hash names no block.
 
-**Genesis time.** `GenesisParams::genesis_time` (`u64`, Unix seconds) is the chain's genesis time: the genesis block's timestamp, so its header's `timestamp`, and through `meta/params` part of the state the genesis hash commits to. It is the last field of `GenesisParams` and encoded only when it is not zero; parameters that end before it decode with a genesis time of zero. So a genesis without a time encodes, stores and hashes exactly as before the field existed, and its genesis block keeps timestamp 0: every chain made without one is unchanged. A first block is never made before the genesis time: the driver's initial tip carries `max(now, genesis time)` as its timestamp (08 §3), so the first proposal comes one slot after the later of the two, and its timestamp, like every later one an honest leader makes, exceeds the genesis block's. The `solo` command reads it from the genesis JSON as `timestamp`, Unix seconds as geth writes it (a number, or a decimal or `0x` hex string); `solo devnet init` writes the time it ran, or `--genesis-time`; `solo dev` gives a genesis without one the time it starts when it keeps its chain in memory, and takes the file as written with `--data-dir`, so that a restart and the snapshot commands, which read the file, find the same chain. A genesis time in the future delays the first block until then, which is how a chain is launched at an announced time.
+**Genesis time.** `GenesisParams::genesis_time` (`u64`, Unix seconds) is the chain's genesis time: the genesis block's timestamp, so its header's `timestamp`, and through `meta/params` part of the state the genesis hash commits to. It is the last field of `GenesisParams` and encoded only when it is not zero; parameters that end before it decode with a genesis time of zero. So a genesis without a time encodes, stores and hashes exactly as before the field existed, and its genesis block keeps timestamp 0: every chain made without one is unchanged. A first block is never made before the genesis time: the driver's initial tip carries `max(now, genesis time)` as its timestamp (08 §3), so the first proposal comes one slot after the later of the two, and its timestamp, like every later one an honest leader makes, exceeds the genesis block's. The `orange` command reads it from the genesis JSON as `timestamp`, Unix seconds as geth writes it (a number, or a decimal or `0x` hex string); `orange devnet init` writes the time it ran, or `--genesis-time`; `orange dev` gives a genesis without one the time it starts when it keeps its chain in memory, and takes the file as written with `--data-dir`, so that a restart and the snapshot commands, which read the file, find the same chain. A genesis time in the future delays the first block until then, which is how a chain is launched at an announced time.
 
-**Chain name.** `GenesisParams::name` (`bytes`) is the chain's name for people, such as `tangerine`: empty for a chain without one, otherwise 1 to `MAX_CHAIN_NAME` = 32 bytes of ASCII lower-case letters, digits and `-`, the first a letter (`[a-z][a-z0-9-]*`). It is the last field of `GenesisParams`, after the genesis time, and encoded only when it is not empty, the genesis time then encoded even when it is zero; parameters that end before it decode with no name, so a genesis without one encodes, stores and hashes exactly as before the field existed. `kernel_init` traps on a name that breaks these rules. Through `meta/params` the name is part of the state the genesis hash commits to: two genesis files that differ only in their names are two chains. A name does not identify a chain on its own, and it is not unique: a testnet and the mainnet launched from the same template may share one and are told apart by chain id and genesis hash. The `solo` command reads it from the genesis JSON as `name` and refuses one that breaks the rules before the kernel sees it; a node shows it beside the chain id when it starts and in `/status` (11 §6).
+**Chain name.** `GenesisParams::name` (`bytes`) is the chain's name for people, such as `tangerine`: empty for a chain without one, otherwise 1 to `MAX_CHAIN_NAME` = 32 bytes of ASCII lower-case letters, digits and `-`, the first a letter (`[a-z][a-z0-9-]*`). It is the last field of `GenesisParams`, after the genesis time, and encoded only when it is not empty, the genesis time then encoded even when it is zero; parameters that end before it decode with no name, so a genesis without one encodes, stores and hashes exactly as before the field existed. `kernel_init` traps on a name that breaks these rules. Through `meta/params` the name is part of the state the genesis hash commits to: two genesis files that differ only in their names are two chains. A name does not identify a chain on its own, and it is not unique: a testnet and the mainnet launched from the same template may share one and are told apart by chain id and genesis hash. The `orange` command reads it from the genesis JSON as `name` and refuses one that breaks the rules before the kernel sees it; a node shows it beside the chain id when it starts and in `/status` (11 §6).
 
 **Chain identity.** A chain is identified by its chain id together with its genesis hash. Through the state root the genesis hash commits to the chain id (`meta/chain_id`), the stored genesis parameters (`meta/params`: fees, governance, staking, upgrades, the genesis time, the name), the genesis validator set (`meta/validators`), every allocated account with its code and storage, the genesis modules and the bridge's configuration: every chain parameter genesis fixes. Two chains that share a chain id but differ in any of these have different genesis hashes and are different chains; a snapshot of one does not import into the other (22 §7.3). The genesis hash does not commit to the genesis kernel's code hash: two kernels whose `kernel_init` writes the same state give the same genesis block, and a node is held to the kernel that wrote its store by the store itself (22 §5).
 
-**Chains that predate the genesis block.** A chain's genesis block is whatever its genesis kernel's `kernel_init` stored; nothing stores it later. A reference kernel built before 2026-10-23 stored none: on a chain whose genesis kernel is such a kernel, block 1's parent hash is zero, `BLOCKHASH(0)` answers zero and the RPC answers `null` for block 0 and for its hash. A kernel upgrade cannot give such a chain a genesis block, since every block hash from block 1 on commits to a parent hash of zero; a later kernel runs on it unchanged, reading `meta/last_hash` as before, and the chain keeps its identity as its chain id and the hash of its block 1. Data directories and devnets made with an earlier kernel fixture are made again (`solo devnet init`), as after any rebuild of the genesis kernel: a node refuses a store written by a kernel that is neither the one it is given nor an upgrade in that store's chain state (22 §5).
+**Chains that predate the genesis block.** A chain's genesis block is whatever its genesis kernel's `kernel_init` stored; nothing stores it later. A reference kernel built before 2026-10-23 stored none: on a chain whose genesis kernel is such a kernel, block 1's parent hash is zero, `BLOCKHASH(0)` answers zero and the RPC answers `null` for block 0 and for its hash. A kernel upgrade cannot give such a chain a genesis block, since every block hash from block 1 on commits to a parent hash of zero; a later kernel runs on it unchanged, reading `meta/last_hash` as before, and the chain keeps its identity as its chain id and the hash of its block 1. Data directories and devnets made with an earlier kernel fixture are made again (`orange devnet init`), as after any rebuild of the genesis kernel: a node refuses a store written by a kernel that is neither the one it is given nor an upgrade in that store's chain state (22 §5).
 
 ### 3.5 System receipts
 
@@ -171,14 +171,14 @@ The end of a block can log: a fast-track proposal executed there (13 §9.2) logs
 | `logs` | what the end of the block logged, in order |
 | `tx_type` | 0 |
 
-It exists only for a block whose end logged something. The kernel stores it after the block's header, under `receipt/` ‖ its hash, the *system receipt hash* `keccak256("solo/system-receipt" ‖ block hash)` (`solo_abi::chain::system_receipt_preimage`), which no transaction hashes to and which names one block of one chain. It is committed by the next block's state root, as the block's header is. It is not in the header: the transactions root, the receipts root, the logs bloom and `gas_used` stay the Ethereum functions of the block's transactions of §3.1–§3.2, so a header rebuilt from `eth_getBlockByNumber` and `eth_getBlockReceipts` verifies as on any Ethereum chain, and the block hash does not depend on it.
+It exists only for a block whose end logged something. The kernel stores it after the block's header, under `receipt/` ‖ its hash, the *system receipt hash* `keccak256("orange/system-receipt" ‖ block hash)` (`orange_abi::chain::system_receipt_preimage`), which no transaction hashes to and which names one block of one chain. It is committed by the next block's state root, as the block's header is. It is not in the header: the transactions root, the receipts root, the logs bloom and `gas_used` stay the Ethereum functions of the block's transactions of §3.1–§3.2, so a header rebuilt from `eth_getBlockByNumber` and `eth_getBlockReceipts` verifies as on any Ethereum chain, and the block hash does not depend on it.
 
 The RPC serves it the way Polygon PoS serves its state-sync receipts, which Ethereum indexers already read:
 
 - `eth_getLogs` returns its logs after the block's transactions' logs, with `transactionHash` the system receipt hash, `transactionIndex` its `index` and `logIndex` continuing the block's count; a filter by address or topic matches them as any log.
 - `eth_getTransactionReceipt(system receipt hash)` returns it, `to` the governance address, its logs as `eth_getLogs` numbers them.
 - `eth_getTransactionByHash(system receipt hash)` returns `null`: there is no transaction. `eth_getBlockByNumber` and `eth_getBlockReceipts` do not list it, and the block's `transactions` and receipts are its transactions' alone.
-- `solo_getProposal(id)` of a fast-track proposal executed at the end of a block names the system receipt hash (13 §9.8).
+- `orange_getProposal(id)` of a fast-track proposal executed at the end of a block names the system receipt hash (13 §9.8).
 
 Choosing a receipt outside the header over a system transaction inside it: a pseudo-transaction in the transactions root would need a transaction type that no Ethereum tool decodes (Optimism's deposit type `0x7E` is the precedent, and tools decode it only with chain-specific code), would put unsigned bytes where every tool expects a signed transaction, and would change what a header commits to for every block. A receipt beside the header changes no header and no transaction, and reaches tools through the one method they use to read logs.
 
@@ -193,9 +193,9 @@ Choosing a receipt outside the header over a system transaction inside it: a pse
 | `address` | the address |
 | `balance`, `nonce` | the account's, at that block |
 | `codeHash` | `keccak256` of the account's code; `keccak256("")` for an account without code |
-| `storageHash` | the block's state root (Solo has no per-account storage trie) |
+| `storageHash` | the block's state root (Orange has no per-account storage trie) |
 | `stateRoot` | the block's state root, the header's `stateRoot` |
-| `proofFormat` | `solo-binary-trie-v0`: the proofs are spec 10's |
+| `proofFormat` | `orange-binary-trie-v0`: the proofs are spec 10's |
 | `accountKey` | the account's state key, `acct/ ‖ address` (`61 63 63 74 2f` then 20 bytes) |
 | `accountValue` | the entry's value: the account record, `balance` (16 bytes, little-endian) ‖ `nonce` (8 bytes, little-endian) ‖ `code_hash` (32 bytes, zero for no code), 56 bytes (06 §2); `0x` when the account is not in state |
 | `accountProof` | the proof of `accountKey` (§4.2) |
@@ -205,7 +205,7 @@ Choosing a receipt outside the header over a system transaction inside it: a pse
 
 A proof is a list of hex strings: the `d` sibling hashes of spec 10 §5.1 from the root down, then the terminal, `0x00` for an empty subtree or `0x01 ‖ path ‖ value_hash` (65 bytes) for a leaf. It is the spec 10 §5.1 encoding with the count dropped and the parts listed separately, so the count is the list's length less one.
 
-To verify an account: take `stateRoot` from the block's header, `k = accountKey`, and run spec 10 §5.3. The account is present with the response's fields when the outcome is *present* with value hash `keccak256(accountValue)` and `accountValue` decodes to `balance`, `nonce` and `codeHash` (a zero code hash being `keccak256("")`); it is absent, with zero balance and nonce and no code, when the outcome is *absent*. A slot holds `value` when the outcome for its state key is *present* with value hash `keccak256` of `value` as 32 big-endian bytes, and is unset (value 0) when it is *absent*. `crates/solo-rpc/tests/ethereum.rs` checks the responses with a verifier written from spec 10, independent of `solo-trie`.
+To verify an account: take `stateRoot` from the block's header, `k = accountKey`, and run spec 10 §5.3. The account is present with the response's fields when the outcome is *present* with value hash `keccak256(accountValue)` and `accountValue` decodes to `balance`, `nonce` and `codeHash` (a zero code hash being `keccak256("")`); it is absent, with zero balance and nonce and no code, when the outcome is *absent*. A slot holds `value` when the outcome for its state key is *present* with value hash `keccak256` of `value` as 32 big-endian bytes, and is unset (value 0) when it is *absent*. `crates/orange-rpc/tests/ethereum.rs` checks the responses with a verifier written from spec 10, independent of `orange-trie`.
 
 ### 4.3 Heights
 
@@ -215,7 +215,7 @@ A proof is against the trie behind the root of the block's header, which the nod
 
 ### 5.1 Retention
 
-The reference node keeps the state of its latest `state_history` executed blocks, 1 024 by default (`STATE_HISTORY`; `solo node --state-history <blocks>`), or of every block from genesis on an archive node (`--archive`, `ARCHIVE`). It keeps, per executed block, the value every committed key held before the block (and the host writes between it and the block before) changed it, and the state trie behind the block's root, which shares every node the block did not change. A block that leaves the window takes both with it. Keys under `local/` are outside history, as outside the commitment (10 §2).
+The reference node keeps the state of its latest `state_history` executed blocks, 1 024 by default (`STATE_HISTORY`; `orange node --state-history <blocks>`), or of every block from genesis on an archive node (`--archive`, `ARCHIVE`). It keeps, per executed block, the value every committed key held before the block (and the host writes between it and the block before) changed it, and the state trie behind the block's root, which shares every node the block did not change. A block that leaves the window takes both with it. Keys under `local/` are outside history, as outside the commitment (10 §2).
 
 History is also bounded in key writes, so that blocks that write heavily cannot make it outgrow the node's memory: the node keeps at most `512 × state_history` of them (`HISTORY_KEYS_PER_BLOCK`), a key counting once for each block that wrote it. When the blocks of the window wrote more, it drops the oldest of them until the rest fit, and the window holds fewer blocks; the head's state is always kept. Each key write kept costs its old value and the trie nodes on its path, about 1 to 1.5 KB (measured 2026-10-21 over 200 000 entries: 1.4 KB per write at 1 500 writes per block, 1.0 KB at 6 000), so the default window holds at most about 0.5 to 0.75 GB of history whatever its blocks write, while blocks that write 512 keys or fewer each on average keep all 1 024. An archive node has no bound.
 
@@ -247,7 +247,7 @@ The execution-spec state tests run set-code transactions through the kernel's ow
 
 - A genesis without a genesis time (§3.4) keeps a genesis header timestamp of 0, as every chain made before the field existed does.
 - A system receipt (§3.5) is outside the header: the logs bloom does not cover its logs, so a tool that skips blocks by their bloom misses them, and it is not in `eth_getBlockReceipts`; `eth_getLogs` and `eth_getTransactionReceipt` are the way to it.
-- `stateRoot` is not an Ethereum state root (§3.3), and `eth_getProof` answers in Solo's proof format, which Ethereum's verifiers do not read.
+- `stateRoot` is not an Ethereum state root (§3.3), and `eth_getProof` answers in Orange's proof format, which Ethereum's verifiers do not read.
 - A node without a data directory keeps its history in memory and has none from before it started; while blocks write heavily a window is shorter than `state_history` (§5.1). A node started from a snapshot has no state from before the snapshot (22 §7).
 - The pool's rules for delegation are geth's, plus the take's rule for authorities ahead (§2.4); a pool of another host may differ without affecting consensus (14 §1).
 - Proposals are not run before they are made: a delegated account's code can spend the account's balance, or move its nonce by creating a contract, during another sender's transaction, and a later transaction of that account in the same block is then recorded as failed (06 §5.1) where a geth builder would have left it out; so is a transaction priced below the base fee of the block it lands in (23 §10).
@@ -255,7 +255,7 @@ The execution-spec state tests run set-code transactions through the kernel's ow
 
 ## 8. Filters and the client surface
 
-What standard clients call beyond the methods above, as they call it over HTTP. `tools/ecosystem` runs ethers 6, viem 2 and Foundry (`cast`, `forge create`, `forge script`, `cast run`) against `solo dev`, and CI runs it on every change (§8.4).
+What standard clients call beyond the methods above, as they call it over HTTP. `tools/ecosystem` runs ethers 6, viem 2 and Foundry (`cast`, `forge create`, `forge script`, `cast run`) against `orange dev`, and CI runs it on every change (§8.4).
 
 ### 8.1 Filters
 
@@ -279,8 +279,8 @@ Deliberate differences from geth, each found by the suite of §8.4:
 - **No subscriptions.** The server answers one request per connection (`Connection: close`), so it has no WebSocket and no `eth_subscribe`: it answers `eth_subscribe` and `eth_unsubscribe` with geth's answer over HTTP, -32601 `notifications not supported`. Clients poll: ethers' `JsonRpcProvider` and viem's `http` transport do so by default, through the filters of §8.1 or `eth_getLogs` and `eth_blockNumber`.
 - **No tracing, no access-list generation, no simulation.** `debug_*`, `trace_*`, `eth_createAccessList` and `eth_simulateV1` would need an inspector in the kernel's EVM; they get -32601. `cast run` works without them: it replays a transaction in Foundry's own EVM over historical state (§5), and the suite checks it charges the gas the kernel charged. `cast access-list` does not work.
 - **Methods geth removed** (`eth_coinbase`, `eth_mining`, `eth_hashrate`, `eth_protocolVersion`) and the node-held-key methods (`eth_sign`, `eth_sendTransaction`, `eth_signTransaction`; `eth_accounts` is empty) are not served.
-- **Client caches and short slots.** A block every 400 ms is shorter than some client caches: ethers 6 answers a request identical to one made in the last 250 ms from its cache (`cacheTimeout`), so a script that sends, waits for the receipt and sends again within that can sign with a stale pending nonce, which the node refuses as `nonce too low`, as it does against anvil or hardhat with automine. A client on a Solo chain sets `cacheTimeout: -1` (or manages nonces, as ethers' `NonceManager` does); viem has no such cache for nonces.
+- **Client caches and short slots.** A block every 400 ms is shorter than some client caches: ethers 6 answers a request identical to one made in the last 250 ms from its cache (`cacheTimeout`), so a script that sends, waits for the receipt and sends again within that can sign with a stale pending nonce, which the node refuses as `nonce too low`, as it does against anvil or hardhat with automine. A client on an Orange chain sets `cacheTimeout: -1` (or manages nonces, as ethers' `NonceManager` does); viem has no such cache for nonces.
 
 ### 8.4 The ecosystem suite
 
-`tools/ecosystem` (its README says how to run it) starts nothing itself: CI builds `solo`, starts `solo dev` with the suite's genesis (chain id 1337, a 1 gwei base-fee floor) and runs `npm test` (ethers 6.17.0 and viem 2.57.7, pinned, with solc-js 0.8.28) and `foundry.sh` (cast and forge) against it. Together they cover the chain id and blocks by number, hash and tag; balances and nonces, `pending` included; signed EIP-1559, EIP-155 legacy, EIP-2930 and EIP-7702 transactions and their receipts; an ERC-20 deployed with `forge create`, `forge script` (several transactions of one sender before any is mined) and both clients' factories, its calls, gas estimates and events through `eth_getLogs`, the filters of §8.1 and both clients' watchers; `eth_feeHistory`, `eth_maxPriorityFeePerGas` and the clients' fee estimates (spec 23 §7); `eth_getProof`; and revert reasons, a custom error and a revert string decoded by each client from `eth_call` and `eth_estimateGas`, and a reverted transaction reported as failed.
+`tools/ecosystem` (its README says how to run it) starts nothing itself: CI builds `orange`, starts `orange dev` with the suite's genesis (chain id 1337, a 1 gwei base-fee floor) and runs `npm test` (ethers 6.17.0 and viem 2.57.7, pinned, with solc-js 0.8.28) and `foundry.sh` (cast and forge) against it. Together they cover the chain id and blocks by number, hash and tag; balances and nonces, `pending` included; signed EIP-1559, EIP-155 legacy, EIP-2930 and EIP-7702 transactions and their receipts; an ERC-20 deployed with `forge create`, `forge script` (several transactions of one sender before any is mined) and both clients' factories, its calls, gas estimates and events through `eth_getLogs`, the filters of §8.1 and both clients' watchers; `eth_feeHistory`, `eth_maxPriorityFeePerGas` and the clients' fee estimates (spec 23 §7); `eth_getProof`; and revert reasons, a custom error and a revert string decoded by each client from `eth_call` and `eth_estimateGas`, and a reverted transaction reported as failed.

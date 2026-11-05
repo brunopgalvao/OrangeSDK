@@ -1,0 +1,28 @@
+[package]
+name = "orange-jit"
+description = "Native code backend for the Orange VM: compiles a validated program ahead of time and runs it in-process, bit-exact with the reference interpreter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+orange-vm = { path = "../orange-vm" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+orange-fuzz = { path = "../orange-fuzz" }
+orange-scratch = { path = "../orange-scratch" }
+orange-store = { path = "../orange-store" }
+orange-abi = { path = "../orange-abi" }
+orange-host = { path = "../orange-host" }
+orange-node = { path = "../orange-node" }
+orange-recompile = { path = "../orange-recompile" }
+orange-rlp = { path = "../orange-rlp" }
+
+[lints]
+workspace = true

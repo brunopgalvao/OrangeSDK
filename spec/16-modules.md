@@ -2,11 +2,11 @@
 
 ## 1. Overview
 
-A *kernel module* is a Solo module (03) that the kernel installs at an address, records with a capability set, initializes, and calls at block boundaries (codex ADR 0009). A *native contract* is an account whose code designates a Solo module: an EVM message call to it runs the module instead of the EVM interpreter (codex ADR 0004, ADR 0026). Every installed kernel module is also a native contract at its address; a native contract need not be an installed module.
+A *kernel module* is an Orange module (03) that the kernel installs at an address, records with a capability set, initializes, and calls at block boundaries (codex ADR 0009). A *native contract* is an account whose code designates an Orange module: an EVM message call to it runs the module instead of the EVM interpreter (codex ADR 0004, ADR 0026). Every installed kernel module is also a native contract at its address; a native contract need not be an installed module.
 
 The kernel reaches a module only through the host's `invoke` (05 §4.4), and always *static*: a module never writes storage through the host. It returns its writes in its output, and the kernel applies them. That is what lets a native contract's writes follow the EVM's revert rules exactly without any host function beyond those of 05.
 
-This document specifies the module interface (§2), capabilities (§3), installation and the registry (§4), native contracts (§5), gas (§6) and block hooks (§7) for the reference kernel. The records and constants are in `solo_abi::modules`; the module-side runtime is `guest/solo-module`, and `guest/modules/counter` is the example module.
+This document specifies the module interface (§2), capabilities (§3), installation and the registry (§4), native contracts (§5), gas (§6) and block hooks (§7) for the reference kernel. The records and constants are in `orange_abi::modules`; the module-side runtime is `guest/orange-module`, and `guest/modules/counter` is the example module.
 
 ## 2. Module interface
 
@@ -43,7 +43,7 @@ struct ModuleOutput { status: u8, data: bytes, writes: vec<Write> }
 
 ### 2.3 Storage
 
-A module reads its storage with `storage_get` and `storage_iter_*` (05 §4.2). A sandboxed module's keys are behind its namespace, the 32-byte word that holds its address left-padded with zeros (`namespace(a) = 0x00^12 ‖ a`); a privileged module's keys are full keys. A module reads its own writes and the pending writes of §2.1 before host storage; `solo-module`'s `Store` does that.
+A module reads its storage with `storage_get` and `storage_iter_*` (05 §4.2). A sandboxed module's keys are behind its namespace, the 32-byte word that holds its address left-padded with zeros (`namespace(a) = 0x00^12 ‖ a`); a privileged module's keys are full keys. A module reads its own writes and the pending writes of §2.1 before host storage; `orange-module`'s `Store` does that.
 
 The kernel applies a write set in order: `Some(v)` sets the stored key to `v`, `None` deletes it. The stored key is `namespace(address) ‖ key` for a sandboxed module and `key` for a privileged one. Two modules at different addresses therefore never share a key, even when they run the same code.
 
@@ -87,14 +87,14 @@ An allocation may also give an account the designator of a module directly; that
 
 `kernel_init` also traps if an allocation that is a native contract, one whose code is a designator or one at the address of a `Genesis::modules` entry, has any non-zero storage slot: slot 0 of a native contract's EVM storage tracks its writes within a transaction (§5.4) and starts every transaction at zero.
 
-The `solo` command reads genesis modules from a `"modules"` array of `{"address", "code", "capabilities", "init"}`, `code` being the module's bytes in hex, and adds the code to the address's allocation (which must not have code of its own).
+The `orange` command reads genesis modules from a `"modules"` array of `{"address", "code", "capabilities", "init"}`, `code` being the module's bytes in hex, and adds the code to the address's allocation (which must not have code of its own).
 
 ### 4.2 By governance
 
 The *module address* is `0x0000000000000000000000000000000000005011`. A transaction to it carries an install in its calldata, the Solidity ABI encoding of
 
 ```solidity
-interface ISoloModules {
+interface IOrangeModules {
     function install(address target, bytes32 codeHash, uint64 capabilities, bytes calldata init) external; // 0xd38ebbe9
     event ModuleInstalled(address indexed target, bytes32 indexed codeHash, uint64 capabilities);
 }
@@ -159,7 +159,7 @@ Every write a native call makes is thus kept exactly when the EVM would have kep
 
 ### 5.6 Nesting
 
-EVM code calls native contracts at any depth, and a native call may be made from any frame, including one inside a static call (then with an empty write set). A module cannot call back into the EVM: the host functions it may use reach only Solo modules, and `invoke` from a static module is static (05 §4.4), so a native contract may invoke other modules for computation but never causes an EVM frame or a write outside its write set. A nested EVM → native → EVM call is therefore not expressible in this kernel version.
+EVM code calls native contracts at any depth, and a native call may be made from any frame, including one inside a static call (then with an empty write set). A module cannot call back into the EVM: the host functions it may use reach only Orange modules, and `invoke` from a static module is static (05 §4.4), so a native contract may invoke other modules for computation but never causes an EVM frame or a write outside its write set. A nested EVM → native → EVM call is therefore not expressible in this kernel version.
 
 ### 5.7 Deployment
 

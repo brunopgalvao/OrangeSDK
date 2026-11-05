@@ -363,8 +363,8 @@ checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 name = "counter"
 version = "0.0.1"
 dependencies = [
- "solo-guest",
- "solo-module",
+ "orange-guest",
+ "orange-module",
 ]
 
 [[package]]
@@ -561,18 +561,18 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 name = "eth-light-client"
 version = "0.0.1"
 dependencies = [
- "solo-ethlc",
- "solo-guest",
- "solo-module",
+ "orange-ethlc",
+ "orange-guest",
+ "orange-module",
 ]
 
 [[package]]
 name = "eth-message-verifier"
 version = "0.0.1"
 dependencies = [
- "solo-ethlc",
- "solo-guest",
- "solo-module",
+ "orange-ethlc",
+ "orange-guest",
+ "orange-module",
 ]
 
 [[package]]
@@ -581,11 +581,11 @@ version = "0.0.1"
 dependencies = [
  "alloy-primitives",
  "revm",
- "solo-abi",
- "solo-eth",
- "solo-guest",
- "solo-rlp",
- "solo-upgrade",
+ "orange-abi",
+ "orange-eth",
+ "orange-guest",
+ "orange-rlp",
+ "orange-upgrade",
 ]
 
 [[package]]
@@ -652,7 +652,7 @@ dependencies = [
 name = "hello"
 version = "0.0.1"
 dependencies = [
- "solo-guest",
+ "orange-guest",
 ]
 
 [[package]]
@@ -732,12 +732,12 @@ version = "0.0.1"
 dependencies = [
  "alloy-primitives",
  "revm",
- "solo-abi",
- "solo-eth",
- "solo-ethlc",
- "solo-guest",
- "solo-rlp",
- "solo-upgrade",
+ "orange-abi",
+ "orange-eth",
+ "orange-ethlc",
+ "orange-guest",
+ "orange-rlp",
+ "orange-upgrade",
 ]
 
 [[package]]
@@ -868,7 +868,7 @@ dependencies = [
 name = "precompiles"
 version = "0.0.1"
 dependencies = [
- "solo-guest",
+ "orange-guest",
 ]
 
 [[package]]
@@ -1294,46 +1294,46 @@ dependencies = [
 ]
 
 [[package]]
-name = "solo-abi"
+name = "orange-abi"
 version = "0.0.1"
 
 [[package]]
-name = "solo-eth"
+name = "orange-eth"
 version = "0.0.1"
 dependencies = [
- "solo-abi",
- "solo-rlp",
+ "orange-abi",
+ "orange-rlp",
 ]
 
 [[package]]
-name = "solo-ethlc"
+name = "orange-ethlc"
 version = "0.0.1"
 dependencies = [
- "solo-abi",
- "solo-rlp",
+ "orange-abi",
+ "orange-rlp",
 ]
 
 [[package]]
-name = "solo-guest"
+name = "orange-guest"
 version = "0.0.1"
 
 [[package]]
-name = "solo-module"
+name = "orange-module"
 version = "0.0.1"
 dependencies = [
- "solo-abi",
- "solo-guest",
+ "orange-abi",
+ "orange-guest",
 ]
 
 [[package]]
-name = "solo-rlp"
+name = "orange-rlp"
 version = "0.0.1"
 
 [[package]]
-name = "solo-upgrade"
+name = "orange-upgrade"
 version = "0.0.1"
 dependencies = [
- "solo-abi",
+ "orange-abi",
 ]
 
 [[package]]

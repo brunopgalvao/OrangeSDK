@@ -2,22 +2,22 @@
 pragma solidity 0.8.28;
 
 import {EthereumOutbox} from "../EthereumOutbox.sol";
-import {ISoloMessageRecipient} from "../ISoloBridge.sol";
-import {SoloInbox} from "../SoloInbox.sol";
+import {IOrangeMessageRecipient} from "../IOrangeBridge.sol";
+import {OrangeInbox} from "../OrangeInbox.sol";
 import {TokenGateway} from "./TokenGateway.sol";
 
 /// @title The token gateway deployed on Ethereum (spec 21 §5.1)
-/// @notice Sends through the chain's `EthereumOutbox` (spec 18 §6.1) to the gateway on Solo, and
-/// receives from a `SoloInbox` (spec 17 §6) what the gateway on Solo sent through the outbox. ETH is
-/// its native currency; it arrives on Solo as the wrapped token of origin zero.
-contract TokenGatewayOnEthereum is TokenGateway, ISoloMessageRecipient {
-    /// @notice The outbox of the Solo chain.
+/// @notice Sends through the chain's `EthereumOutbox` (spec 18 §6.1) to the gateway on Orange, and
+/// receives from an `OrangeInbox` (spec 17 §6) what the gateway on Orange sent through the outbox. ETH is
+/// its native currency; it arrives on Orange as the wrapped token of origin zero.
+contract TokenGatewayOnEthereum is TokenGateway, IOrangeMessageRecipient {
+    /// @notice The outbox of the Orange chain.
     EthereumOutbox public immutable outbox;
-    /// @notice The Solo chain the paired gateway is on.
-    uint64 public immutable soloChainId;
+    /// @notice The Orange chain the paired gateway is on.
+    uint64 public immutable orangeChainId;
     /// @notice The inbox whose deliveries count; the owner moves it to a successor inbox.
     address public inbox;
-    /// @notice The gas each message gives the gateway on Solo (spec 18 §6.5).
+    /// @notice The gas each message gives the gateway on Orange (spec 18 §6.5).
     uint64 public messageGas;
     /// @notice The least `messageGas`: enough to create a wrapped token, and far more than a
     /// release needs, so that no setting strands the messages sent under it.
@@ -41,29 +41,29 @@ contract TokenGatewayOnEthereum is TokenGateway, ISoloMessageRecipient {
     constructor(
         EthereumOutbox outbox_,
         address inbox_,
-        uint64 soloChainId_,
-        address soloGateway,
+        uint64 orangeChainId_,
+        address orangeGateway,
         address owner_,
         address guardian_,
         uint64 messageGas_
-    ) TokenGateway(soloGateway, owner_, guardian_, "Ether", "ETH") {
+    ) TokenGateway(orangeGateway, owner_, guardian_, "Ether", "ETH") {
         if (address(outbox_) == address(0) || inbox_ == address(0)) revert ZeroAddress();
         if (messageGas_ < MIN_MESSAGE_GAS) revert MessageGasTooLow();
         outbox = outbox_;
         inbox = inbox_;
-        soloChainId = soloChainId_;
+        orangeChainId = orangeChainId_;
         messageGas = messageGas_;
         // Tells the paired gateway this one exists (spec 21 §5.7).
         _send(abi.encode(HELLO, false));
     }
 
-    /// @notice A message from Solo, delivered by the inbox: only the paired gateway's count, and
+    /// @notice A message from Orange, delivered by the inbox: only the paired gateway's count, and
     /// they carry no value.
-    function onSoloMessage(uint64 sourceChainId, uint64 nonce, address sender, uint256 value, bytes calldata payload)
+    function onOrangeMessage(uint64 sourceChainId, uint64 nonce, address sender, uint256 value, bytes calldata payload)
         external
     {
         if (msg.sender != inbox) revert NotInbox();
-        if (sourceChainId != soloChainId) revert WrongChain();
+        if (sourceChainId != orangeChainId) revert WrongChain();
         if (sender != remoteGateway) revert NotRemoteGateway();
         if (value != 0) revert WrongValue();
         _receive(nonce, payload);
@@ -71,21 +71,21 @@ contract TokenGatewayOnEthereum is TokenGateway, ISoloMessageRecipient {
 
     /// @notice Tells the paired gateway that its message `nonce` was vetoed in the inbox, so that
     /// nothing is ever delivered with that nonce: a `SPENT(nonce, VOID)`, after which the gateway on
-    /// Solo refunds or sends again what it sent with it. Anyone may call it, once per nonce.
+    /// Orange refunds or sends again what it sent with it. Anyone may call it, once per nonce.
     function reportVetoed(uint64 nonce) external returns (uint64) {
-        (,, SoloInbox.Status status) = SoloInbox(inbox).entries(nonce);
-        if (status != SoloInbox.Status.Vetoed) revert NotVetoed();
+        (,, OrangeInbox.Status status) = OrangeInbox(inbox).entries(nonce);
+        if (status != OrangeInbox.Status.Vetoed) revert NotVetoed();
         return _report(nonce, VOID);
     }
 
     /// @notice Tells the paired gateway what the inbox delivered as its message `m.nonce`: a
-    /// `SPENT` with the identity of `m` if it came here, else `VOID`. What the gateway on Solo sent
+    /// `SPENT` with the identity of `m` if it came here, else `VOID`. What the gateway on Orange sent
     /// with that nonce, if it differs (a forgery took its nonce), never arrives, and it refunds or
     /// sends it again. Anyone may call it, once per nonce.
-    function reportDelivered(SoloInbox.Message calldata m) external returns (uint64) {
-        SoloInbox source = SoloInbox(inbox);
-        (bytes32 messageHash,, SoloInbox.Status status) = source.entries(m.nonce);
-        if (status != SoloInbox.Status.Delivered || messageHash != source.hashMessage(m)) revert NotDelivered();
+    function reportDelivered(OrangeInbox.Message calldata m) external returns (uint64) {
+        OrangeInbox source = OrangeInbox(inbox);
+        (bytes32 messageHash,, OrangeInbox.Status status) = source.entries(m.nonce);
+        if (status != OrangeInbox.Status.Delivered || messageHash != source.hashMessage(m)) revert NotDelivered();
         return _report(m.nonce, m.recipient == address(this) ? _identity(m.payload) : VOID);
     }
 
@@ -96,7 +96,7 @@ contract TokenGatewayOnEthereum is TokenGateway, ISoloMessageRecipient {
         emit InboxChanged(inbox_);
     }
 
-    /// @notice Sets the gas messages sent from now on give the gateway on Solo, at least
+    /// @notice Sets the gas messages sent from now on give the gateway on Orange, at least
     /// `MIN_MESSAGE_GAS`.
     function setMessageGas(uint64 gas) external onlyOwner {
         if (gas < MIN_MESSAGE_GAS) revert MessageGasTooLow();

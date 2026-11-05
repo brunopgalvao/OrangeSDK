@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# orange-host: everything that happens on one host of an Orange network, one
+# node per host. `orange-ops` runs it over ssh; systemd and the container run
+# `orange-host run`. Every command is idempotent and prints what it did, so a
+# configuration tool (Ansible, a shell loop) can call it as is.
+#
+# usage: orange-host <command> [args]
+#
+#   env                     the configuration it resolved
+#   args                    the `orange node` command line `run` would exec
+#   check-config            files present, key modes, the genesis hash the
+#                           kernel computes is ORANGE_GENESIS_HASH
+#   run                     exec the node in the foreground (systemd, container)
+#   start | stop | restart  through systemd, or as a background process
+#   status                  running or not, and the node's /status
+#   graceful-stop           orange_stop over the local JSON-RPC, then wait; a
+#                           node that refuses it (--no-rpc-stop) gets SIGTERM
+#   health [doctor flags]   `orange doctor` against the local JSON-RPC
+#   finalized               "<height> <hash>" of the latest finalized block
+#   block-hash <height>     the hash of a block
+#   install-binary <file>   install a new `orange` beside the old, switch to it
+#   rollback                switch back to the binary before
+#   trust-key <rpc,...>     the group key those nodes agree on
+#   logs [lines]            the node's recent log
+#   backup-keys             a tar of the key directory on stdout
+#   resources               pid, RSS, CPU time, data size, p2p bytes in/out
+#
+# Layout (every path under ORANGE_ROOT, empty on a real host):
+#   /opt/orange/bin/orange, orange-<hash>   the binaries, `orange` a symlink
+#   /opt/orange/bin/orange-host           this script
+#   /etc/orange/node.env                the node's configuration (below)
+#   /etc/orange/genesis.json            the published genesis
+#   /etc/orange/kernel.elf              the genesis kernel
+#   /etc/orange/keys/validator.key      a validator's consensus key (0600), or
+#   /etc/orange/keys/node.key           an observer's lasting node key (0600)
+#   /var/lib/orange/                    the data directory: driver.state,
+#                                     persist.log, chain.redb, peers.records,
+#                                     snapshots/
+#   /var/log/orange/node.log            the log in process mode (systemd: journald)
+#   /run/orange/node.pid                the pid in process mode
+#
+# node.env (shell syntax, KEY=value, read by systemd too):
+#   ORANGE_ROLE=validator|rpc|bootnode  ORANGE_NAME=<name>
+#   ORANGE_LISTEN=<ip:port to bind for peers>   ORANGE_ADVERTISE=<ip:port peers dial>
+#   ORANGE_RPC=<private ip:port of JSON-RPC, /metrics, /status>
+#   ORANGE_BOOTSTRAP="<ip:port> ..."    beyond the genesis bootnodes
+#   ORANGE_GENESIS_HASH=0x...           the published hash check-config checks
+#   ORANGE_PUBLIC_RPC=1                 the RPC faces the public: no orange_stop
+#   ORANGE_JOIN=sync                    an empty data directory joins from the
+#                                     peers' snapshots (spec 22 §7.4) ...
+#   ORANGE_TRUST_FROM=<rpc,...>         ... trusting the group key these nodes
+#                                     agree on, or ORANGE_TRUST_KEY=0x...
+#   ORANGE_SERVE_SNAPSHOTS=1            serve snapshots to joining nodes (default 1)
+#   ORANGE_STATE_HISTORY=<blocks> | ORANGE_ARCHIVE=1
+#   ORANGE_MAX_PEERS, ORANGE_OUTBOUND_PEERS, ORANGE_EXTRA_ARGS
+#
+# Environment: ORANGE_ROOT (default empty), ORANGE_SERVICE (systemd | process;
+# default systemd when systemctl exists), ORANGE_BIN (default
+# $ORANGE_ROOT/opt/orange/bin/orange), ORANGE_ENV (default /etc/orange/node.env).
+set -euo pipefail
+
+ROOT=${ORANGE_ROOT:-}
+ETC=$ROOT/etc/orange
+DATA=$ROOT/var/lib/orange
+OPT=$ROOT/opt/orange
+LOGDIR=$ROOT/var/log/orange
+RUNDIR=$ROOT/run/orange
+ENV_FILE=${ORANGE_ENV:-$ETC/node.env}
+UNIT=orange-node
+if [ -z "${ORANGE_SERVICE:-}" ]; then
+    if command -v systemctl >/dev/null 2>&1 && [ -z "$ROOT" ]; then
+        ORANGE_SERVICE=systemd
+    else
+        ORANGE_SERVICE=process
+    fi
+fi
+
+die() {
+    printf 'orange-host: %s\n' "$*" >&2
+    exit 1
+}
+
+load_env() {
+    [ -f "$ENV_FILE" ] || die "$ENV_FILE: missing (orange-ops configure writes it)"
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+    ORANGE_BIN=${ORANGE_BIN:-$OPT/bin/orange}
+    case "${ORANGE_ROLE:-}" in
+        validator | rpc | bootnode) ;;
+        *) die "ORANGE_ROLE must be validator, rpc or bootnode, not '${ORANGE_ROLE:-}'" ;;
+    esac
+    [ -n "${ORANGE_RPC:-}" ] || die "ORANGE_RPC missing"
+    [ -n "${ORANGE_LISTEN:-}" ] || die "ORANGE_LISTEN missing"
+}
+
+key_file() {
+    if [ "$ORANGE_ROLE" = validator ]; then
+        echo "$ETC/keys/validator.key"
+    else
+        echo "$ETC/keys/node.key"
+    fi
+}
+
+# One JSON-RPC call to the local node; prints the raw response.
+rpc() {
+    local method=$1 params=${2:-[]}
+    curl -sf -m 10 -H 'content-type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}" \
+        "http://$ORANGE_RPC"
+}
+
+# The value of "field":"0x..." in JSON on stdin.
+field() { sed -n "s/.*\"$1\":\"\\(0x[0-9a-fA-F]*\\)\".*/\\1/p" | head -n 1; }
+
+chain_exists() { [ -f "$DATA/chain.redb" ]; }
+
+# The `orange node` command line, one word per line.
+node_args() {
+    local key
+    key=$(key_file)
+    printf '%s\n' "$ORANGE_BIN" node \
+        --kernel "$ETC/kernel.elf" --genesis "$ETC/genesis.json" \
+        --data-dir "$DATA" --listen "$ORANGE_LISTEN" --rpc "$ORANGE_RPC"
+    if [ "$ORANGE_ROLE" = validator ]; then
+        printf '%s\n' --key-file "$key"
+    elif [ -f "$key" ]; then
+        printf '%s\n' --node-key-file "$key"
+    fi
+    [ -z "${ORANGE_ADVERTISE:-}" ] || printf '%s\n' --advertise "$ORANGE_ADVERTISE"
+    local addr
+    for addr in ${ORANGE_BOOTSTRAP:-}; do
+        printf '%s\n' --bootstrap "$addr"
+    done
+    [ -z "${ORANGE_MAX_PEERS:-}" ] || printf '%s\n' --max-peers "$ORANGE_MAX_PEERS"
+    [ -z "${ORANGE_OUTBOUND_PEERS:-}" ] || printf '%s\n' --outbound-peers "$ORANGE_OUTBOUND_PEERS"
+    [ "${ORANGE_SERVE_SNAPSHOTS:-1}" != 1 ] || printf '%s\n' --serve-snapshots
+    [ "${ORANGE_PUBLIC_RPC:-0}" != 1 ] || printf '%s\n' --no-rpc-stop
+    if [ "${ORANGE_ARCHIVE:-0}" = 1 ]; then
+        printf '%s\n' --archive
+    elif [ -n "${ORANGE_STATE_HISTORY:-}" ]; then
+        printf '%s\n' --state-history "$ORANGE_STATE_HISTORY"
+    fi
+    # A node with nothing on disk yet joins from its peers' snapshots.
+    if [ "${ORANGE_JOIN:-}" = sync ] && ! chain_exists; then
+        printf '%s\n' --sync-from-peers
+        local trust=${ORANGE_TRUST_KEY:-}
+        if [ -z "$trust" ] && [ -n "${ORANGE_TRUST_FROM:-}" ]; then
+            trust=$("$ORANGE_BIN" snapshot trust-key --rpc "$ORANGE_TRUST_FROM")
+        fi
+        [ -z "$trust" ] || printf '%s\n' --trust-key "$trust"
+    fi
+    local extra
+    for extra in ${ORANGE_EXTRA_ARGS:-}; do
+        printf '%s\n' "$extra"
+    done
+}
+
+pid_of() {
+    local pid
+    pid=$(cat "$RUNDIR/node.pid" 2>/dev/null) || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    echo "$pid"
+}
+
+running() {
+    if [ "$ORANGE_SERVICE" = systemd ]; then
+        systemctl is-active --quiet "$UNIT"
+    else
+        pid_of >/dev/null
+    fi
+}
+
+wait_gone() {
+    local deadline=$((SECONDS + ${1:-60}))
+    while running; do
+        [ "$SECONDS" -lt "$deadline" ] || return 1
+        sleep 0.5
+    done
+}
+
+graceful_stop() {
+    # The process, in process mode; systemd's MAINPID for ExecStop.
+    local pid=${MAINPID:-}
+    [ -n "$pid" ] || pid=$(pid_of) || return 0
+    if rpc orange_stop | grep -q '"result":true'; then
+        local deadline=$((SECONDS + 60))
+        while kill -0 "$pid" 2>/dev/null; do
+            [ "$SECONDS" -lt "$deadline" ] || break
+            sleep 0.5
+        done
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        local deadline=$((SECONDS + 30))
+        while kill -0 "$pid" 2>/dev/null; do
+            [ "$SECONDS" -lt "$deadline" ] || {
+                kill -KILL "$pid" 2>/dev/null || true
+                break
+            }
+            sleep 0.5
+        done
+    fi
+    rm -f "$RUNDIR/node.pid"
+}
+
+start() {
+    if running; then
+        echo "$ORANGE_NAME: already running"
+        return 0
+    fi
+    if [ "$ORANGE_SERVICE" = systemd ]; then
+        systemctl start "$UNIT"
+    else
+        mkdir -p "$LOGDIR" "$RUNDIR"
+        local log=$LOGDIR/node.log
+        # Keep one older log: process mode has no journald.
+        if [ -f "$log" ] && [ "$(wc -c <"$log")" -gt 104857600 ]; then
+            mv "$log" "$log.1"
+        fi
+        nohup "$0" run >>"$log" 2>&1 </dev/null &
+        echo $! >"$RUNDIR/node.pid"
+    fi
+    echo "$ORANGE_NAME: started"
+}
+
+stop() {
+    if [ "$ORANGE_SERVICE" = systemd ]; then
+        systemctl stop "$UNIT"
+    else
+        graceful_stop
+    fi
+    echo "$ORANGE_NAME: stopped"
+}
+
+check_config() {
+    local missing=0 f
+    for f in "$ETC/genesis.json" "$ETC/kernel.elf" "$ORANGE_BIN"; do
+        [ -e "$f" ] || {
+            echo "missing: $f" >&2
+            missing=1
+        }
+    done
+    local key
+    key=$(key_file)
+    if [ "$ORANGE_ROLE" = validator ] && [ ! -f "$key" ]; then
+        echo "missing: $key (the operator puts the validator key there)" >&2
+        missing=1
+    fi
+    [ "$missing" = 0 ] || die "configuration incomplete"
+    if [ -f "$key" ]; then
+        local mode
+        mode=$(stat -c %a "$key" 2>/dev/null || stat -f %Lp "$key")
+        [ "$mode" = 600 ] || [ "$mode" = 400 ] || die "$key: mode $mode, must be 600 or 400"
+    fi
+    local hash
+    hash=$("$ORANGE_BIN" genesis hash --genesis "$ETC/genesis.json" --kernel "$ETC/kernel.elf")
+    if [ -n "${ORANGE_GENESIS_HASH:-}" ] && [ "$hash" != "$ORANGE_GENESIS_HASH" ]; then
+        die "genesis hash $hash is not the published $ORANGE_GENESIS_HASH"
+    fi
+    echo "$ORANGE_NAME: configuration ok, $ORANGE_ROLE, genesis $hash"
+}
+
+resources() {
+    local pid rss=0 cpu=0 data in=0 out=0
+    pid=$(if [ "$ORANGE_SERVICE" = systemd ]; then
+        systemctl show -p MainPID --value "$UNIT"
+    else
+        pid_of || echo 0
+    fi)
+    if [ "${pid:-0}" != 0 ]; then
+        rss=$(ps -o rss= -p "$pid" | tr -d ' ')
+        cpu=$(ps -o time= -p "$pid" | tr -d ' ')
+    fi
+    data=$(du -sk "$DATA" 2>/dev/null | cut -f1)
+    local metrics
+    if metrics=$(curl -sf -m 10 "http://$ORANGE_RPC/metrics"); then
+        in=$(awk '$1 ~ /^orange_p2p_bytes_total/ && $1 ~ /"in"/ { print $2 }' <<<"$metrics")
+        out=$(awk '$1 ~ /^orange_p2p_bytes_total/ && $1 ~ /"out"/ { print $2 }' <<<"$metrics")
+    fi
+    echo "name=$ORANGE_NAME pid=${pid:-0} rss_kib=${rss:-0} cpu=${cpu:-0} data_kib=${data:-0} p2p_in_bytes=${in:-0} p2p_out_bytes=${out:-0}"
+}
+
+command=${1:-}
+[ -n "$command" ] || die "usage: orange-host <command> (see the header of this script)"
+shift
+
+case "$command" in
+    install-binary)
+        file=${1:?install-binary <file>}
+        mkdir -p "$OPT/bin"
+        sum=$( (sha256sum "$file" 2>/dev/null || shasum -a 256 "$file") | cut -c1-12)
+        target=$OPT/bin/orange-$sum
+        install -m 0755 "$file" "$target"
+        if [ -L "$OPT/bin/orange" ] && [ "$(readlink "$OPT/bin/orange")" != "orange-$sum" ]; then
+            ln -sfn "$(readlink "$OPT/bin/orange")" "$OPT/bin/orange.previous"
+        fi
+        ln -sfn "orange-$sum" "$OPT/bin/orange"
+        echo "orange-$sum installed"
+        exit 0
+        ;;
+    rollback)
+        [ -L "$OPT/bin/orange.previous" ] || die "no previous binary"
+        prev=$(readlink "$OPT/bin/orange.previous")
+        cur=$(readlink "$OPT/bin/orange")
+        ln -sfn "$prev" "$OPT/bin/orange"
+        ln -sfn "$cur" "$OPT/bin/orange.previous"
+        echo "back to $prev (restart the node)"
+        exit 0
+        ;;
+esac
+
+load_env
+case "$command" in
+    env)
+        echo "root=${ROOT:-/} service=$ORANGE_SERVICE env=$ENV_FILE bin=$ORANGE_BIN data=$DATA"
+        grep -E '^ORANGE_' "$ENV_FILE"
+        ;;
+    args) node_args ;;
+    check-config) check_config ;;
+    run)
+        args=()
+        while IFS= read -r word; do args+=("$word"); done < <(node_args)
+        exec "${args[@]}"
+        ;;
+    start) start ;;
+    stop) stop ;;
+    restart)
+        stop
+        start
+        ;;
+    graceful-stop) graceful_stop ;;
+    status)
+        if running; then
+            echo "$ORANGE_NAME: running"
+            curl -sf -m 10 "http://$ORANGE_RPC/status" && echo
+        else
+            echo "$ORANGE_NAME: stopped"
+            exit 3
+        fi
+        ;;
+    health) "$ORANGE_BIN" doctor --rpc "$ORANGE_RPC" "$@" ;;
+    finalized)
+        body=$(rpc eth_getBlockByNumber '["finalized",false]') || die "$ORANGE_RPC does not answer"
+        number=$(field number <<<"$body")
+        echo "$((number)) $(field hash <<<"$body")"
+        ;;
+    block-hash)
+        height=${1:?block-hash <height>}
+        body=$(rpc eth_getBlockByNumber "[\"$(printf '0x%x' "$height")\",false]") || die "$ORANGE_RPC does not answer"
+        field hash <<<"$body"
+        ;;
+    trust-key) "$ORANGE_BIN" snapshot trust-key --rpc "${1:?trust-key <rpc,...>}" ;;
+    logs)
+        lines=${1:-200}
+        if [ "$ORANGE_SERVICE" = systemd ]; then
+            journalctl -u "$UNIT" -n "$lines" --no-pager
+        else
+            tail -n "$lines" "$LOGDIR/node.log"
+        fi
+        ;;
+    backup-keys) tar -C "$ETC" -cf - keys ;;
+    resources) resources ;;
+    *) die "unknown command $command" ;;
+esac

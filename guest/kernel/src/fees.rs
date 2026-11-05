@@ -2,10 +2,10 @@
 //! next block from the head's header, where each part of a fee goes, and
 //! the sweep of the fee vault into the reward pool at the end of a block.
 
-use solo_abi::chain::{Account, BLOCK_GAS_LIMIT};
-use solo_abi::fees::{FEE_VAULT, FeeParams, FeeStatus, keys};
-use solo_abi::staking::STAKING_ADDRESS;
-use solo_abi::types::Address;
+use orange_abi::chain::{Account, BLOCK_GAS_LIMIT};
+use orange_abi::fees::{FEE_VAULT, FeeParams, FeeStatus, keys};
+use orange_abi::staking::STAKING_ADDRESS;
+use orange_abi::types::Address;
 
 use crate::evm::BlockFields;
 use crate::state;
@@ -20,7 +20,7 @@ pub fn params() -> FeeParams {
 /// chain never starts with them.
 pub fn init() {
     if !params().workable() {
-        solo_guest::trap();
+        orange_guest::trap();
     }
 }
 

@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # Downloads the pinned execution-spec-tests fixture set for a full EVM
 # conformance run (spec 07 §4.2) into .conformance/ (gitignored) and checks
-# its SHA-256. The committed subset in crates/solo-conformance needs nothing
+# its SHA-256. The committed subset in crates/orange-conformance needs nothing
 # from here; this is the opt-in run over every state test of the set.
 #
 #   tools/fetch-conformance.sh
-#   cargo run --release -p solo-conformance -- --both \
-#     --expected crates/solo-conformance/tests/fixtures/expected-failures.txt \
+#   cargo run --release -p orange-conformance -- --both \
+#     --expected crates/orange-conformance/tests/fixtures/expected-failures.txt \
 #     .conformance/fixtures/state_tests
 #
-# SOLO_CONFORMANCE_URL and SOLO_CONFORMANCE_SHA256 select another release
+# ORANGE_CONFORMANCE_URL and ORANGE_CONFORMANCE_SHA256 select another release
 # (both must be given); the runner reads each fixture's Osaka expectations.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-URL=${SOLO_CONFORMANCE_URL:-https://github.com/ethereum/execution-spec-tests/releases/download/fusaka-devnet-5%40v2.1.0/fixtures_fusaka-devnet-5.tar.gz}
-SHA256=${SOLO_CONFORMANCE_SHA256:-96a39d8eb8de742e450a7e7c63ffb4c2b82187f4fed9c1406f39ff3ef9f53a91}
+URL=${ORANGE_CONFORMANCE_URL:-https://github.com/ethereum/execution-spec-tests/releases/download/fusaka-devnet-5%40v2.1.0/fixtures_fusaka-devnet-5.tar.gz}
+SHA256=${ORANGE_CONFORMANCE_SHA256:-96a39d8eb8de742e450a7e7c63ffb4c2b82187f4fed9c1406f39ff3ef9f53a91}
 DIR=.conformance
 TAR="$DIR/fixtures.tar.gz"
 

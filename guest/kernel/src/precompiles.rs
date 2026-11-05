@@ -19,16 +19,16 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use orange_abi::types::Hash;
+use orange_guest::host;
 use revm::precompile::bls12_381::{G1Point, G1PointScalar, G2Point, G2PointScalar};
 use revm::precompile::{Crypto, PrecompileHalt};
-use solo_abi::types::Hash;
-use solo_guest::host;
 
 use crate::state;
 
 /// The precompile module, `guest/modules/precompiles` as `tools/build-guest.sh`
 /// recompiles it.
-pub const MODULE: &[u8] = include_bytes!("../precompiles.solo");
+pub const MODULE: &[u8] = include_bytes!("../precompiles.orange");
 
 /// The operations, by the index the module takes (spec 05 §4.8 order).
 pub mod op {
@@ -98,7 +98,7 @@ static HASHED: AtomicBool = AtomicBool::new(false);
 pub unsafe extern "C" fn native_keccak256(bytes: *const u8, len: usize, output: *mut u8) {
     // SAFETY: the caller's pointers; the host checks the ranges anyway.
     unsafe {
-        host::__solo_import_hash_keccak256(bytes, len as u32, output);
+        host::__orange_import_hash_keccak256(bytes, len as u32, output);
     }
 }
 
@@ -110,7 +110,7 @@ impl Crypto for Guest {}
 
 fn gas_remaining() -> u64 {
     // SAFETY: no arguments.
-    unsafe { host::__solo_import_gas_remaining() }
+    unsafe { host::__orange_import_gas_remaining() }
 }
 
 /// Starts a block (or query): the precompiles run on the host if
@@ -176,7 +176,7 @@ fn accelerate(op: u8, operands: &[u8]) -> (u8, Vec<u8>) {
     let limit = gas_remaining().saturating_sub(INVOKE_RESERVE);
     // SAFETY: valid pointers into our own buffers of the stated sizes; flag 2 is `static`.
     let result = unsafe {
-        host::__solo_import_invoke(
+        host::__orange_import_invoke(
             hash.as_ptr(),
             [0u8; 32].as_ptr(),
             input.as_ptr(),
@@ -186,18 +186,18 @@ fn accelerate(op: u8, operands: &[u8]) -> (u8, Vec<u8>) {
         )
     };
     if result.a0 != 0 {
-        solo_guest::trap();
+        orange_guest::trap();
     }
     // SAFETY: no arguments, then a buffer of the reported length.
     let out = unsafe {
-        let len = host::__solo_import_invoke_output_len() as usize;
+        let len = host::__orange_import_invoke_output_len() as usize;
         let mut buf = vec![0u8; len];
-        host::__solo_import_invoke_output_read(buf.as_mut_ptr(), 0, len as u32);
+        host::__orange_import_invoke_output_read(buf.as_mut_ptr(), 0, len as u32);
         buf
     };
     match out.split_first() {
         Some((&status, result)) => (status, result.to_vec()),
-        None => solo_guest::trap(),
+        None => orange_guest::trap(),
     }
 }
 

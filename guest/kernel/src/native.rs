@@ -1,5 +1,5 @@
 //! Native contracts from the EVM (spec 16 §5): an account whose code is
-//! `0xEF02 ‖ code hash` runs that Solo module instead of EVM bytecode.
+//! `0xEF02 ‖ code hash` runs that Orange module instead of EVM bytecode.
 //!
 //! revm consults its precompile provider for every message call, after the
 //! value transfer and inside the call's journal checkpoint, and hands it the
@@ -21,15 +21,15 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use orange_abi::codec::Seq;
+use orange_abi::modules::{self, CallContext, ModuleCall, Write, status};
+use orange_abi::types::Address;
 use revm::context_interface::{ContextTr, JournalTr};
 use revm::handler::{EthPrecompiles, PrecompileProvider};
 use revm::interpreter::{CallInputs, CallScheme, Gas, InstructionResult, InterpreterResult};
 use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address as RAddress, AddressSet, Bytes, U256};
 use revm::state::Account as RAccount;
-use solo_abi::codec::Seq;
-use solo_abi::modules::{self, CallContext, ModuleCall, Write, status};
-use solo_abi::types::Address;
 
 use crate::evm::{self, BlockFields, Env, Message, Outcome, Precompiles};
 use crate::modules::{Invoked, invoke};
@@ -163,7 +163,7 @@ impl NativeProvider {
         let Invoked { output, gas_used } = invoke(
             code_hash,
             &modules::namespace(&address),
-            &solo_abi::Encode::to_bytes(&call),
+            &orange_abi::Encode::to_bytes(&call),
             vm_limit,
             false,
         );

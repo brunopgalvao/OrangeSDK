@@ -8,7 +8,7 @@ This document fixes the entrypoint names, the encoding of inputs and effects, th
 
 ## 2. Encoding
 
-All structured data crossing the boundary uses the *Solo canonical encoding*:
+All structured data crossing the boundary uses the *Orange canonical encoding*:
 
 - Fixed-width integers little-endian: `u8`, `u16`, `u32`, `u64`, `u128`, `i64`.
 - `bytes`: `u:n` length (canonical ULEB128) followed by the bytes.
@@ -110,7 +110,7 @@ A mempool holds transactions that cannot run yet because others of the same send
 
 The host computes `ahead` from its pool. For a transaction with nonce `n` from a sender whose account nonce is `s`: when `n > s`, `nonces = n − s` and `reserved` is the saturating sum of the costs of the pool's transactions of that sender with nonces in `[s, n)`; otherwise both are zero, and a transaction with `n < s` is rejected for its nonce.
 
-The kernel cannot check what `ahead` claims and does not need to. Only admission reads it: `kernel_stf_execute_block` checks every transaction against the state the transactions before it in the block left, and the reference kernel's `kernel_stf_build_block` checks it against its sender's account as the transactions it selected before leave it, their nonces and worst-case costs. Neither that builder nor the reference driver, which proposes the host pool's order (14 §3), runs code, so neither foresees all that earlier transactions do to other accounts. An EIP-7702 authorization moves its authority's nonce: the pool's take leaves out the authority's transactions after it (14 §3), `kernel_stf_build_block` does not. A delegated account's code can spend its balance, or create a contract and so move its nonce, during another sender's transaction, which neither foresees. A transaction selected after such a change cannot run: the block records it with the failed receipt of codex ADR 0022, and nothing else changes. A host that reports `ahead` wrongly admits transactions that will not run, or refuses ones that would; it cannot make a block invalid or change what a valid block does. The reference kernel's `reason` codes for a rejection are those of `solo_abi::chain::reason`.
+The kernel cannot check what `ahead` claims and does not need to. Only admission reads it: `kernel_stf_execute_block` checks every transaction against the state the transactions before it in the block left, and the reference kernel's `kernel_stf_build_block` checks it against its sender's account as the transactions it selected before leave it, their nonces and worst-case costs. Neither that builder nor the reference driver, which proposes the host pool's order (14 §3), runs code, so neither foresees all that earlier transactions do to other accounts. An EIP-7702 authorization moves its authority's nonce: the pool's take leaves out the authority's transactions after it (14 §3), `kernel_stf_build_block` does not. A delegated account's code can spend its balance, or create a contract and so move its nonce, during another sender's transaction, which neither foresees. A transaction selected after such a change cannot run: the block records it with the failed receipt of codex ADR 0022, and nothing else changes. A host that reports `ahead` wrongly admits transactions that will not run, or refuses ones that would; it cannot make a block invalid or change what a valid block does. The reference kernel's `reason` codes for a rejection are those of `orange_abi::chain::reason`.
 
 ## 6. Faults and resource limits
 

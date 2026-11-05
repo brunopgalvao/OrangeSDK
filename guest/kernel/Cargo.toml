@@ -16,12 +16,12 @@ bench = false
 upgrade-test = []
 
 [dependencies]
-solo-guest = { path = "../solo-guest" }
-solo-abi = { path = "../../crates/solo-abi", default-features = false }
-solo-rlp = { path = "../../crates/solo-rlp", default-features = false }
-solo-eth = { path = "../../crates/solo-eth", default-features = false }
-solo-upgrade = { path = "../../crates/solo-upgrade", default-features = false }
-solo-ethlc = { path = "../../crates/solo-ethlc" }
+orange-guest = { path = "../orange-guest" }
+orange-abi = { path = "../../crates/orange-abi", default-features = false }
+orange-rlp = { path = "../../crates/orange-rlp", default-features = false }
+orange-eth = { path = "../../crates/orange-eth", default-features = false }
+orange-upgrade = { path = "../../crates/orange-upgrade", default-features = false }
+orange-ethlc = { path = "../../crates/orange-ethlc" }
 revm = { version = "43.0.3", default-features = false, features = ["optional_eip3607", "optional_no_base_fee"] }
 # revm's keccak256 through the host (`precompiles::native_keccak256`, spec 19 §4).
 alloy-primitives = { version = "1.7.3", default-features = false, features = ["native-keccak"] }

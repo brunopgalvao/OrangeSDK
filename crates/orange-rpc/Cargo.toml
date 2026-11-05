@@ -1,0 +1,32 @@
+[package]
+name = "orange-rpc"
+description = "Ethereum JSON-RPC over an Orange node, with a minimal HTTP server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+orange-abi = { path = "../orange-abi" }
+orange-bridge = { path = "../orange-bridge" }
+orange-eth = { path = "../orange-eth" }
+orange-host = { path = "../orange-host" }
+orange-metrics = { path = "../orange-metrics" }
+orange-node = { path = "../orange-node" }
+orange-rlp = { path = "../orange-rlp" }
+orange-trie = { path = "../orange-trie" }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+serde_json = "1"
+
+[dev-dependencies]
+orange-scratch = { path = "../orange-scratch" }
+alloy-consensus = { version = "1.8.3", default-features = false, features = ["k256"] }
+alloy-eips = { version = "1.8.3", default-features = false }
+alloy-primitives = "1.7.3"
+alloy-rlp = "0.3"
+alloy-trie = { version = "0.9", default-features = false, features = ["ethereum"] }
+orange-recompile = { path = "../orange-recompile" }
+tiny-keccak = { version = "2", features = ["keccak"] }
+
+[lints]
+workspace = true

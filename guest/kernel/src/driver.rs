@@ -8,25 +8,25 @@
 //! to epochs: the set of each epoch votes in its views, and a node enters
 //! the next epoch's first view once it has executed the epoch's last block.
 //! With one validator it degenerates into a paced single-node chain, which
-//! is what `solo dev` runs.
+//! is what `orange dev` runs.
 
 use alloc::vec::Vec;
 
-use solo_abi::bridge::FinalityProof;
-use solo_abi::chain::consensus::{
+use orange_abi::bridge::FinalityProof;
+use orange_abi::chain::consensus::{
     EQUIVOCATION_PENALTY, KEY_ROLE, KIND_FETCH, KIND_FINALIZE, KIND_PROPOSE, KIND_VOTE,
     MAX_BACKOFF, MAX_EVIDENCE, TOPIC, identity_preimage, leader, propose_timer, signing_preimage,
     timeout_timer, timer_view, view_timeout_ms,
 };
-use solo_abi::chain::{
+use orange_abi::chain::{
     BLOCK_GAS_LIMIT, BlockHeader, Certificate, ConsensusMessage, Evidence, GenesisParams,
     LiveSigner, Participation, Proposal, Signature, SignedHash, SignedVote, SigningGuard,
     SimplexState, SyncRequest, SyncResponse, keys,
 };
-use solo_abi::codec::Seq;
-use solo_abi::staking::{MAX_DKG, PartialShare, epoch_end, epoch_of, first_view, view_epoch};
-use solo_abi::types::{Block, Effect, Hash, Input, MigrateArgs};
-use solo_abi::{Decode, Encode};
+use orange_abi::codec::Seq;
+use orange_abi::staking::{MAX_DKG, PartialShare, epoch_end, epoch_of, first_view, view_epoch};
+use orange_abi::types::{Block, Effect, Hash, Input, MigrateArgs};
+use orange_abi::{Decode, Encode};
 
 use crate::{dkg, persist, staking, state, stf, tx};
 
@@ -93,7 +93,7 @@ fn anchored(p: &Proposal) -> bool {
 /// node stored for `height` and the encoded proposal it certifies.
 pub fn finality_proof(height: u64) -> Option<FinalityProof> {
     let certificate = persist::get_raw(&key(b"bcert/", &[&height.to_le_bytes()]))?;
-    let hash = solo_abi::rotation::threshold_certificate(&certificate)?.block_hash;
+    let hash = orange_abi::rotation::threshold_certificate(&certificate)?.block_hash;
     let proposal = persist::get_raw(&key(b"prop/", &[&hash]))?;
     Some(FinalityProof {
         certificate,
@@ -117,7 +117,7 @@ fn save(s: &SimplexState) {
 pub fn migrate(args: &MigrateArgs) {
     match SimplexState::from_bytes(&args.driver_state) {
         Ok(s) => save(&s),
-        Err(_) => solo_guest::trap(),
+        Err(_) => orange_guest::trap(),
     }
 }
 
@@ -281,7 +281,7 @@ impl Ctx {
     fn guard() -> Option<SigningGuard> {
         persist::get_raw(GUARD_KEY)
             .filter(|b| !b.is_empty())
-            .map(|b| SigningGuard::from_bytes(&b).unwrap_or_else(|_| solo_guest::trap()))
+            .map(|b| SigningGuard::from_bytes(&b).unwrap_or_else(|_| orange_guest::trap()))
     }
 
     /// Whether the signing guard keeps this node from proposing, voting for

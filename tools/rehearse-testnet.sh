@@ -8,7 +8,7 @@
 #      the template, the cards and a governance key; every operator
 #      verifies it against the published hash, and a tampered copy fails;
 #   2. deploy: an inventory of N validators, an RPC node and a late joiner,
-#      all `local` hosts; solo-ops installs the binary, pushes the
+#      all `local` hosts; orange-ops installs the binary, pushes the
 #      configuration and keys, checks it on every host, and `--dry-run`
 #      prints what it would run over ssh for the same hosts;
 #   3. start the validators and the RPC node, wait until every host is
@@ -26,7 +26,7 @@
 #
 # usage: tools/rehearse-testnet.sh [work dir]
 #
-# Environment: SOLO_BIN (default target/release/solo, built if missing),
+# Environment: ORANGE_BIN (default target/release/orange, built if missing),
 # VALIDATORS (4), SLOT_MS (400), EPOCH_BLOCKS (40), DKG_PHASE_BLOCKS (5),
 # P2P_PORT (31301), RPC_PORT (18545), SOAK (120), LOAD (1), KEEP=1 to keep
 # the work directory.
@@ -35,10 +35,10 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
-OPS=$ROOT/ops/testnet/solo-ops
-SOLO=${SOLO_BIN:-$ROOT/target/release/solo}
-KERNEL=$ROOT/crates/solo-node/tests/fixtures/kernel.elf
-KERNEL_V2=$ROOT/crates/solo-node/tests/fixtures/kernel_v2.elf
+OPS=$ROOT/ops/testnet/orange-ops
+ORANGE=${ORANGE_BIN:-$ROOT/target/release/orange}
+KERNEL=$ROOT/crates/orange-node/tests/fixtures/kernel.elf
+KERNEL_V2=$ROOT/crates/orange-node/tests/fixtures/kernel_v2.elf
 N=${VALIDATORS:-4}
 SLOT_MS=${SLOT_MS:-400}
 EPOCH=${EPOCH_BLOCKS:-40}
@@ -46,14 +46,14 @@ DKG=${DKG_PHASE_BLOCKS:-5}
 P2P=${P2P_PORT:-31301}
 RPC=${RPC_PORT:-18545}
 CHAIN_ID=${CHAIN_ID:-424242}
-WORK=${1:-$(mktemp -d "${TMPDIR:-/tmp}/solo-testnet.XXXXXX")}
+WORK=${1:-$(mktemp -d "${TMPDIR:-/tmp}/orange-testnet.XXXXXX")}
 mkdir -p "$WORK"
 WORK=$(cd "$WORK" && pwd -P)
 INV=$WORK/inventory
-export SOLO_OPS_LOCAL=$WORK/hosts
+export ORANGE_OPS_LOCAL=$WORK/hosts
 # A loaded machine: the doctor's defaults are a real host's.
-export SOLO_DOCTOR_ARGS=${SOLO_DOCTOR_ARGS:---max-head-age 60 --max-call-ms 60000}
-export SOLO_OPS_TIMEOUT=${SOLO_OPS_TIMEOUT:-300}
+export ORANGE_DOCTOR_ARGS=${ORANGE_DOCTOR_ARGS:---max-head-age 60 --max-call-ms 60000}
+export ORANGE_OPS_TIMEOUT=${ORANGE_OPS_TIMEOUT:-300}
 
 STARTED=$(date +%s)
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
@@ -74,7 +74,7 @@ cleanup() {
     pkill -f "$WORK/hosts/" 2>/dev/null || true
     if [ "$status" -ne 0 ]; then
         echo "--- last log lines of every host" >&2
-        for f in "$WORK"/hosts/*/var/log/solo/node.log; do
+        for f in "$WORK"/hosts/*/var/log/orange/node.log; do
             [ -f "$f" ] || continue
             echo "== $f" >&2
             tail -n 15 "$f" >&2
@@ -90,9 +90,9 @@ cleanup() {
 trap cleanup EXIT
 
 for tool in jq curl; do command -v "$tool" >/dev/null || fail "$tool is required"; done
-if [ ! -x "$SOLO" ]; then
-    log "building $SOLO"
-    (cd "$ROOT" && cargo build --release -p solo-cli)
+if [ ! -x "$ORANGE" ]; then
+    log "building $ORANGE"
+    (cd "$ROOT" && cargo build --release -p orange-cli)
 fi
 
 rpc_of() { echo "127.0.0.1:$((RPC + $1))"; }
@@ -109,8 +109,8 @@ CARDS=()
 for i in $(seq 0 $((N - 1))); do
     dir=$WORK/operators/op-$i
     mkdir -p "$dir"
-    "$SOLO" key generate --out "$dir/validator.key" >/dev/null
-    "$SOLO" genesis operator --key-file "$dir/validator.key" --name "op-$i" \
+    "$ORANGE" key generate --out "$dir/validator.key" >/dev/null
+    "$ORANGE" genesis operator --key-file "$dir/validator.key" --name "op-$i" \
         --chain-id "$CHAIN_ID" --p2p "$(p2p_of "$i")" --out "$dir/card.json" >/dev/null
     # Only the card leaves the operator's directory.
     cp "$dir/card.json" "$WORK/operators/card-$i.json"
@@ -118,8 +118,8 @@ for i in $(seq 0 $((N - 1))); do
 done
 coord=$WORK/coordinator
 mkdir -p "$coord" "$WORK/network"
-"$SOLO" key generate --out "$coord/governance.key" >/dev/null
-governance=$("$SOLO" key --key-file "$coord/governance.key" | awk '$1 == "address" { print $2 }')
+"$ORANGE" key generate --out "$coord/governance.key" >/dev/null
+governance=$("$ORANGE" key --key-file "$coord/governance.key" | awk '$1 == "address" { print $2 }')
 jq --argjson id "$CHAIN_ID" --argjson t "$(date +%s)" --arg gov "$governance" \
     --argjson slot "$SLOT_MS" --argjson epoch "$EPOCH" --argjson dkg "$DKG" '
     .chainId = $id | .timestamp = $t | .slotMs = $slot | .governance = $gov
@@ -127,27 +127,27 @@ jq --argjson id "$CHAIN_ID" --argjson t "$(date +%s)" --arg gov "$governance" \
     | .staking.epochBlocks = $epoch | .staking.dkgPhaseBlocks = $dkg
     | .staking.unbondingEpochs = 4 | .staking.maxKeyAge = 2' \
     "$ROOT/ops/testnet/genesis-template.json" >"$coord/template.json"
-said=$("$SOLO" genesis assemble --template "$coord/template.json" --kernel "$KERNEL" \
+said=$("$ORANGE" genesis assemble --template "$coord/template.json" --kernel "$KERNEL" \
     "${CARDS[@]}" --out "$WORK/network/genesis.json")
 HASH=${said##* }
 echo "$HASH" >"$WORK/network/genesis.hash"
 cp "$KERNEL" "$WORK/network/kernel.elf"
 [ "$(jq -r .name "$WORK/network/genesis.json")" = tangerine ] || fail "ceremony: the genesis is not named tangerine"
 for i in $(seq 0 $((N - 1))); do
-    "$SOLO" genesis verify --genesis "$WORK/network/genesis.json" --kernel "$WORK/network/kernel.elf" \
+    "$ORANGE" genesis verify --genesis "$WORK/network/genesis.json" --kernel "$WORK/network/kernel.elf" \
         --hash "$HASH" --key-file "$WORK/operators/op-$i/validator.key" "${CARDS[@]}" >/dev/null ||
         fail "ceremony: operator $i does not verify the genesis"
 done
 jq '.slotMs = 401' "$WORK/network/genesis.json" >"$WORK/tampered.json"
-if "$SOLO" genesis verify --genesis "$WORK/tampered.json" --kernel "$KERNEL" --hash "$HASH" >/dev/null 2>&1; then
+if "$ORANGE" genesis verify --genesis "$WORK/tampered.json" --kernel "$KERNEL" --hash "$HASH" >/dev/null 2>&1; then
     fail "ceremony: a tampered genesis verifies"
 fi
 pass "ceremony: $N keys and cards, genesis tangerine $HASH assembled and verified by every operator; a tampered copy refused"
 
 # --- 2. deploy ----------------------------------------------------------------
 
-"$SOLO" key generate --out "$coord/rpc-1.key" >/dev/null
-"$SOLO" key generate --out "$coord/late-1.key" >/dev/null
+"$ORANGE" key generate --out "$coord/rpc-1.key" >/dev/null
+"$ORANGE" key generate --out "$coord/late-1.key" >/dev/null
 {
     echo "# The rehearsal's hosts: directories under $WORK/hosts."
     for i in $(seq 0 $((N - 1))); do
@@ -156,13 +156,13 @@ pass "ceremony: $N keys and cards, genesis tangerine $HASH assembled and verifie
     echo "rpc-1 rpc local $(p2p_of "$N") $(rpc_of "$N") key=$coord/rpc-1.key public-rpc=1"
     echo "late-1 rpc local $(p2p_of $((N + 1))) $(rpc_of $((N + 1))) key=$coord/late-1.key join=sync trust=$(rpc_of 0),$(rpc_of 1)"
 } >"$INV"
-ops install --binary "$SOLO" >/dev/null
+ops install --binary "$ORANGE" >/dev/null
 ops configure --network "$WORK/network" | grep -c "configuration ok" | grep -qx $((N + 2)) ||
     fail "deploy: check-config did not pass on every host"
 # The same hosts over ssh, printed and not run.
-sed 's/ local / solo@198.51.100.1 /' "$INV" >"$WORK/inventory.ssh"
+sed 's/ local / orange@198.51.100.1 /' "$INV" >"$WORK/inventory.ssh"
 dry=$("$OPS" --dry-run --inventory "$WORK/inventory.ssh" configure --network "$WORK/network" 2>/dev/null)
-grep -q "scp -q -o BatchMode=yes" <<<"$dry" && grep -q "sudo.*/opt/solo/bin/solo-host.*check-config" <<<"$dry" ||
+grep -q "scp -q -o BatchMode=yes" <<<"$dry" && grep -q "sudo.*/opt/orange/bin/orange-host.*check-config" <<<"$dry" ||
     fail "deploy: --dry-run over ssh does not print the scp and ssh steps"
 "$OPS" --inventory "$INV" render "$WORK/rendered" >/dev/null
 grep -q "127.0.0.1:$RPC" "$WORK/rendered/prometheus.yml" || fail "deploy: prometheus.yml lacks the nodes"
@@ -181,14 +181,14 @@ pass "start: $N validators and rpc-1 healthy, $(tail -n 1 "$WORK/health-1.txt")"
 # --- 4. the late joiner ---------------------------------------------------------
 
 log "waiting for a second epoch's snapshot and an adopted threshold key"
-"$SOLO" devnet wait --rpc "$VALIDATOR_RPCS" --finalized $((2 * EPOCH + 8)) --timeout 600 >/dev/null ||
+"$ORANGE" devnet wait --rpc "$VALIDATOR_RPCS" --finalized $((2 * EPOCH + 8)) --timeout 600 >/dev/null ||
     fail "join: the validators did not finalize two epochs"
-until "$SOLO" snapshot trust-key --rpc "$(rpc_of 0),$(rpc_of 1)" >/dev/null 2>&1; do sleep 1; done
+until "$ORANGE" snapshot trust-key --rpc "$(rpc_of 0),$(rpc_of 1)" >/dev/null 2>&1; do sleep 1; done
 JOINED_AT=$(date +%s)
 ops --hosts late-1 start >/dev/null
 joined=0
 for _ in $(seq 1 3); do
-    if "$SOLO" devnet wait --rpc "$ALL_RPCS" --caught-up --timeout 240 >/dev/null 2>&1; then
+    if "$ORANGE" devnet wait --rpc "$ALL_RPCS" --caught-up --timeout 240 >/dev/null 2>&1; then
         joined=1
         break
     fi
@@ -197,15 +197,15 @@ for _ in $(seq 1 3); do
     ops --hosts late-1 start >/dev/null || true
 done
 [ "$joined" = 1 ] || fail "join: late-1 did not catch up"
-grep -q "fetched from peers and imported" "$WORK/hosts/late-1/var/log/solo/node.log" ||
+grep -q "fetched from peers and imported" "$WORK/hosts/late-1/var/log/orange/node.log" ||
     fail "join: late-1 caught up without a snapshot"
-pass "join: late-1 fetched a snapshot from its peers and caught up in $(($(date +%s) - JOINED_AT))s ($(grep -m1 'fetched from peers' "$WORK/hosts/late-1/var/log/solo/node.log" | sed 's/ fetched.*//'))"
+pass "join: late-1 fetched a snapshot from its peers and caught up in $(($(date +%s) - JOINED_AT))s ($(grep -m1 'fetched from peers' "$WORK/hosts/late-1/var/log/orange/node.log" | sed 's/ fetched.*//'))"
 
 # --- 5. a kernel upgrade ---------------------------------------------------------
 
-"$SOLO" upgrade --rpc "$(rpc_of 0)" --key-file "$coord/governance.key" --kernel "$KERNEL_V2" >"$WORK/upgrade.txt" ||
+"$ORANGE" upgrade --rpc "$(rpc_of 0)" --key-file "$coord/governance.key" --kernel "$KERNEL_V2" >"$WORK/upgrade.txt" ||
     fail "upgrade: $(cat "$WORK/upgrade.txt")"
-"$SOLO" devnet wait --rpc "$ALL_RPCS" --kernel-version 2 --timeout 300 >/dev/null ||
+"$ORANGE" devnet wait --rpc "$ALL_RPCS" --kernel-version 2 --timeout 300 >/dev/null ||
     fail "upgrade: not every node switched to kernel version 2"
 pass "upgrade: every node runs kernel version 2 ($(tail -n 1 "$WORK/upgrade.txt"))"
 
@@ -213,7 +213,7 @@ pass "upgrade: every node runs kernel version 2 ($(tail -n 1 "$WORK/upgrade.txt"
 
 ops rolling-restart >"$WORK/rolling.txt" 2>&1 || fail "rolling restart: $(tail -n 5 "$WORK/rolling.txt")"
 ops wait-healthy 300 >"$WORK/health-2.txt" || fail "rolling restart: $(cat "$WORK/health-2.txt")"
-"$SOLO" devnet wait --rpc "$ALL_RPCS" --no-equivocations --caught-up --kernel-version 2 --timeout 120 >/dev/null ||
+"$ORANGE" devnet wait --rpc "$ALL_RPCS" --no-equivocations --caught-up --kernel-version 2 --timeout 120 >/dev/null ||
     fail "rolling restart: an equivocation, or a node behind"
 pass "rolling restart: $((N + 2)) hosts one at a time, $(tail -n 1 "$WORK/health-2.txt"), no equivocation"
 
@@ -229,7 +229,7 @@ seconds_of() { # ps time ([[dd-]hh:]mm:ss[.xx]) in seconds
 }
 value_of() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" <<<" $2"; }
 sample() { ops resources >"$1"; }
-head_now() { "$SOLO" devnet status --rpc "$(rpc_of 0)" --json | jq '.[0].head'; }
+head_now() { "$ORANGE" devnet status --rpc "$(rpc_of 0)" --json | jq '.[0].head'; }
 sample "$WORK/res-0.txt"
 H0=$(head_now)
 LOAD_PID=

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity 0.8.28;
 
-import {ISoloMessageRecipient} from "../ISoloBridge.sol";
+import {IOrangeMessageRecipient} from "../IOrangeBridge.sol";
 
 /// @notice Test recipient on Ethereum: keeps the last message an inbox delivered, and reverts while told to.
-contract MessageRecipient is ISoloMessageRecipient {
+contract MessageRecipient is IOrangeMessageRecipient {
     address public immutable inbox;
     bool public rejecting;
     uint256 public received;
@@ -22,7 +22,7 @@ contract MessageRecipient is ISoloMessageRecipient {
         rejecting = rejecting_;
     }
 
-    function onSoloMessage(uint64 sourceChainId, uint64 nonce, address sender, uint256 value, bytes calldata payload)
+    function onOrangeMessage(uint64 sourceChainId, uint64 nonce, address sender, uint256 value, bytes calldata payload)
         external
     {
         require(msg.sender == inbox, "not the inbox");

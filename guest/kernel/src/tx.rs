@@ -1,11 +1,11 @@
-//! Transactions: decoding through `solo-eth` and sender recovery through the host.
+//! Transactions: decoding through `orange-eth` and sender recovery through the host.
 
 use alloc::vec::Vec;
 
-use solo_abi::chain::reason;
-use solo_abi::types::{Address, Hash};
-use solo_eth::Tx;
-use solo_guest::host;
+use orange_abi::chain::reason;
+use orange_abi::types::{Address, Hash};
+use orange_eth::Tx;
+use orange_guest::host;
 
 use crate::state::keccak256;
 
@@ -24,7 +24,7 @@ pub struct Signed {
 
 /// The authority that signed an authorization, through the host's
 /// `secp256k1_recover` (spec 20 §2.2).
-pub fn authority(auth: &solo_eth::Authorization) -> Option<Address> {
+pub fn authority(auth: &orange_eth::Authorization) -> Option<Address> {
     recover_address(&keccak256(&auth.signing_payload()), &auth.signature()?)
 }
 
@@ -33,7 +33,7 @@ pub fn recover_pubkey(msg: &Hash, sig: &[u8; 65]) -> Option<[u8; 64]> {
     let mut pubkey = [0u8; 64];
     // SAFETY: valid pointers into our own buffers of the stated sizes.
     let status = unsafe {
-        host::__solo_import_secp256k1_recover(msg.as_ptr(), sig.as_ptr(), pubkey.as_mut_ptr())
+        host::__orange_import_secp256k1_recover(msg.as_ptr(), sig.as_ptr(), pubkey.as_mut_ptr())
     };
     (status == 0).then_some(pubkey)
 }
@@ -50,10 +50,10 @@ pub fn recover_address(msg: &Hash, sig: &[u8; 65]) -> Option<Address> {
 /// Decodes a raw transaction, checks its chain id and recovers its sender.
 /// Pre-EIP-155 legacy transactions are accepted, as Ethereum does.
 pub fn decode_signed(raw: &[u8], chain_id: u64) -> Result<Signed, u32> {
-    let tx = solo_eth::decode(raw).map_err(|e| match e {
-        solo_eth::Error::Malformed => reason::MALFORMED,
-        solo_eth::Error::Unsupported => reason::UNSUPPORTED,
-        solo_eth::Error::BadSignature => reason::BAD_SIGNATURE,
+    let tx = orange_eth::decode(raw).map_err(|e| match e {
+        orange_eth::Error::Malformed => reason::MALFORMED,
+        orange_eth::Error::Unsupported => reason::UNSUPPORTED,
+        orange_eth::Error::BadSignature => reason::BAD_SIGNATURE,
     })?;
     if tx.chain_id.is_some_and(|id| id != chain_id) {
         return Err(reason::WRONG_CHAIN);

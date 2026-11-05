@@ -1,19 +1,19 @@
-//! Storage access and the state layout (`solo_abi::chain::keys`).
+//! Storage access and the state layout (`orange_abi::chain::keys`).
 
 use alloc::vec::Vec;
 
-use solo_abi::chain::consensus::EVIDENCE_PAGE;
-use solo_abi::chain::{Account, BlockHeader, Evidence, GenesisParams, Receipt, keys};
-use solo_abi::types::{Address, Genesis, Hash};
-use solo_abi::{Decode, Encode};
-use solo_guest::host;
+use orange_abi::chain::consensus::EVIDENCE_PAGE;
+use orange_abi::chain::{Account, BlockHeader, Evidence, GenesisParams, Receipt, keys};
+use orange_abi::types::{Address, Genesis, Hash};
+use orange_abi::{Decode, Encode};
+use orange_guest::host;
 
 /// Reads a raw value.
 pub fn get_raw(key: &[u8]) -> Option<Vec<u8>> {
     let mut buf = alloc::vec![0u8; 4096];
     // SAFETY: valid pointers into our own buffers.
     let len = unsafe {
-        host::__solo_import_storage_get(
+        host::__orange_import_storage_get(
             key.as_ptr(),
             key.len() as u32,
             buf.as_mut_ptr(),
@@ -28,7 +28,7 @@ pub fn get_raw(key: &[u8]) -> Option<Vec<u8>> {
         buf = alloc::vec![0u8; len];
         // SAFETY: as above, with a buffer large enough for the whole value.
         unsafe {
-            host::__solo_import_storage_get(
+            host::__orange_import_storage_get(
                 key.as_ptr(),
                 key.len() as u32,
                 buf.as_mut_ptr(),
@@ -44,7 +44,7 @@ pub fn get_raw(key: &[u8]) -> Option<Vec<u8>> {
 pub fn set_raw(key: &[u8], value: &[u8]) {
     // SAFETY: valid pointers into our own buffers.
     unsafe {
-        host::__solo_import_storage_set(
+        host::__orange_import_storage_set(
             key.as_ptr(),
             key.len() as u32,
             value.as_ptr(),
@@ -56,12 +56,12 @@ pub fn set_raw(key: &[u8], value: &[u8]) {
 /// Deletes a value.
 pub fn delete(key: &[u8]) {
     // SAFETY: a valid pointer into our own buffer.
-    unsafe { host::__solo_import_storage_delete(key.as_ptr(), key.len() as u32) };
+    unsafe { host::__orange_import_storage_delete(key.as_ptr(), key.len() as u32) };
 }
 
 /// Reads a decoded value, trapping on a corrupt encoding.
 pub fn get<T: Decode>(key: &[u8]) -> Option<T> {
-    get_raw(key).map(|b| T::from_bytes(&b).unwrap_or_else(|_| solo_guest::trap()))
+    get_raw(key).map(|b| T::from_bytes(&b).unwrap_or_else(|_| orange_guest::trap()))
 }
 
 /// Writes an encoded value.
@@ -219,13 +219,13 @@ pub fn slot_key(address: &Address, slot: &Hash) -> Vec<u8> {
 pub fn init(genesis: &Genesis) {
     set(keys::CHAIN_ID, &genesis.chain_id);
     let mut params =
-        GenesisParams::from_bytes(&genesis.params).unwrap_or_else(|_| solo_guest::trap());
+        GenesisParams::from_bytes(&genesis.params).unwrap_or_else(|_| orange_guest::trap());
     // A name, when there is one, is a chain name (spec 20 §3.4).
-    if !solo_abi::chain::valid_chain_name(&params.name) {
-        solo_guest::trap();
+    if !orange_abi::chain::valid_chain_name(&params.name) {
+        orange_guest::trap();
     }
     let allocations = core::mem::take(&mut params.allocations.0);
-    params.bridge_in = solo_abi::bridge_in::BridgeInParams::default();
+    params.bridge_in = orange_abi::bridge_in::BridgeInParams::default();
     set(b"meta/params", &params);
     set_raw(b"meta/validators", &genesis.validators);
     for allocation in &allocations {
@@ -235,7 +235,7 @@ pub fn init(genesis: &Genesis) {
             .iter()
             .any(|slot| slot.value != [0; 32]);
         if has_storage && allocation.code.is_empty() && allocation.nonce == 0 {
-            solo_guest::trap();
+            orange_guest::trap();
         }
         let code_hash = if allocation.code.is_empty() {
             [0; 32]
@@ -266,7 +266,7 @@ pub fn keccak256(data: &[u8]) -> Hash {
     let mut out = [0u8; 32];
     // SAFETY: valid pointers into our own buffers.
     unsafe {
-        host::__solo_import_hash_keccak256(data.as_ptr(), data.len() as u32, out.as_mut_ptr())
+        host::__orange_import_hash_keccak256(data.as_ptr(), data.len() as u32, out.as_mut_ptr())
     };
     out
 }
@@ -275,6 +275,6 @@ pub fn keccak256(data: &[u8]) -> Hash {
 pub fn commit() -> Hash {
     let mut out = [0u8; 32];
     // SAFETY: a 32-byte destination.
-    unsafe { host::__solo_import_storage_commit(out.as_mut_ptr()) };
+    unsafe { host::__orange_import_storage_commit(out.as_mut_ptr()) };
     out
 }

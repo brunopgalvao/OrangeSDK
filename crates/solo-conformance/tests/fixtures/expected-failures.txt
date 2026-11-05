@@ -1,9 +1,0 @@
-# Expected failures of the EVM conformance suite (spec 07 §4.2).
-#
-# Every case that fails must match an entry here, with the documented reason
-# the reference kernel differs from Ethereum; anything else is a bug in the
-# pipeline. An entry naming a single test must fail (when it passes, the entry
-# goes); `prefix*` and `type:N` entries cover a class of cases and must excuse
-# at least one failure in the committed subset. Format: `<entry> | <reason>`.
-
-type:3 | EIP-4844 blob transactions are not accepted: the reference kernel takes legacy, EIP-2930, EIP-1559 and EIP-7702 transactions (solo-eth decodes type 3 as Unsupported, so the kernel refuses it before execution). A solochain has no blob data-availability layer for them to pay for. Cases whose fixture expects the transaction to be rejected pass.

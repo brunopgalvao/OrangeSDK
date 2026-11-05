@@ -9,23 +9,23 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use solo_abi::chain::consensus::signing_preimage;
-use solo_abi::chain::{
+use orange_abi::chain::consensus::signing_preimage;
+use orange_abi::chain::{
     Account, BLOCK_GAS_LIMIT, Evidence, Log, Validator, ValidatorSet, call_status, reason,
 };
-use solo_abi::codec::Seq;
-use solo_abi::fees::mul_div;
-use solo_abi::rotation::{HANDOFF_EPOCHS, REPORT_GAS, ThresholdEvidence};
-use solo_abi::staking::{
+use orange_abi::codec::Seq;
+use orange_abi::fees::mul_div;
+use orange_abi::rotation::{HANDOFF_EPOCHS, REPORT_GAS, ThresholdEvidence};
+use orange_abi::staking::{
     Delegation, DelegationEntry, DkgEnvelope, DkgProgress, DkgRun, G1_LENGTH, G2_LENGTH, GWEI,
     KIND_DKG, KeySetRecord, KeySetVote, MAX_DELEGATIONS, MAX_DELEGATORS, MAX_DKG, MAX_REGISTERED,
     SLASH_BPS, STAKING_ADDRESS, StakeEntry, StakeRecord, StakingAction, StakingParams,
     StakingStatus, address_word, complaint_dealers, dkg_header, envelope, epoch_of, epoch_start,
     event, keys, query, session_preimage, stake_shares, view_epoch, word,
 };
-use solo_abi::types::{Address, Genesis, Hash, QueryResult};
-use solo_abi::{Decode, Encode};
-use solo_guest::host;
+use orange_abi::types::{Address, Genesis, Hash, QueryResult};
+use orange_abi::{Decode, Encode};
+use orange_guest::host;
 
 use crate::evm::{BlockFields, Message, Outcome};
 use crate::tx::{self, Signed};
@@ -334,7 +334,7 @@ fn valid_key(key: &[u8]) -> bool {
     let mut pair = key.to_vec();
     pair.extend_from_slice(&g2_identity());
     // SAFETY: a valid pointer to one 144-byte pair.
-    unsafe { host::__solo_import_bls12381_pairing_check(pair.as_ptr(), 1) == 0 }
+    unsafe { host::__orange_import_bls12381_pairing_check(pair.as_ptr(), 1) == 0 }
 }
 
 fn address_of(id: &Hash) -> Address {
@@ -366,20 +366,21 @@ pub fn init(genesis: &Genesis) {
         return;
     }
     if p.dkg_phase_blocks.saturating_mul(4) > p.epoch_blocks {
-        solo_guest::trap();
+        orange_guest::trap();
     }
     if p.dkg_phase_blocks != 0
         && (p.max_key_age == 0
             || p.unbonding_epochs <= p.max_key_age.saturating_add(HANDOFF_EPOCHS))
     {
-        solo_guest::trap();
+        orange_guest::trap();
     }
-    let set = ValidatorSet::from_bytes(&genesis.validators).unwrap_or_else(|_| solo_guest::trap());
+    let set =
+        ValidatorSet::from_bytes(&genesis.validators).unwrap_or_else(|_| orange_guest::trap());
     if set.validators.0.len() > MAX_REGISTERED {
-        solo_guest::trap();
+        orange_guest::trap();
     }
     if p.keys.0.iter().any(|k| !valid_key(&k.dkg_key)) {
-        solo_guest::trap();
+        orange_guest::trap();
     }
     let mut total = 0u128;
     let mut registered = Vec::new();

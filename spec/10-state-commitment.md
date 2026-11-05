@@ -136,7 +136,7 @@ b600ff7b28e7cb984a9a124e17ac49a2a76d6474e0a7ff4a1ebcd147fe7d9ce8
 00
 ```
 
-`crates/solo-trie/tests/example.rs` asserts every value in this section.
+`crates/orange-trie/tests/example.rs` asserts every value in this section.
 
 ## 8. Not in version 0
 

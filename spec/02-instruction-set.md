@@ -2,7 +2,7 @@
 
 ## 1. Scope
 
-This document defines every instruction a Solo module may contain: its encoding, its operands, and its semantics. Semantics are those of RISC-V RV64I plus M wherever an instruction has a RISC-V counterpart; the encoding is Solo's own. Anything not listed here is not an instruction, and a module containing it is invalid at load time (03 §7). Nothing is decided at run time that can be decided at load time.
+This document defines every instruction an Orange module may contain: its encoding, its operands, and its semantics. Semantics are those of RISC-V RV64I plus M wherever an instruction has a RISC-V counterpart; the encoding is Orange's own. Anything not listed here is not an instruction, and a module containing it is invalid at load time (03 §7). Nothing is decided at run time that can be decided at load time.
 
 ## 2. Encoding primitives
 
@@ -135,7 +135,7 @@ Operands: `rs1`, `rs2`, `s:off`, where `rs1` is the base and `rs2` the value. Ef
 
 ## 9. Control transfer
 
-Blocks are numbered from 0 in code-section order (03 §4). The *jump table* (03 §6) is a list of block indices; slot 0 is reserved and always empty. The *slot address* of slot `k` is `8k`. Function pointers and return addresses in a Solo program are slot addresses, never byte addresses; the recompiler assigns a slot to every block whose address is taken and to every call continuation (03 §8).
+Blocks are numbered from 0 in code-section order (03 §4). The *jump table* (03 §6) is a list of block indices; slot 0 is reserved and always empty. The *slot address* of slot `k` is `8k`. Function pointers and return addresses in an Orange program are slot addresses, never byte addresses; the recompiler assigns a slot to every block whose address is taken and to every call continuation (03 §8).
 
 | Opcode | Mnemonic | Operands | Semantics |
 |---|---|---|---|
@@ -177,5 +177,5 @@ Extensions planned for a later minor, each behind a feature gate and each additi
 - **Floating point (F, D)**: nondeterminism and spec surface. Toolchains target soft-float.
 - **Atomics (A)**: an instance is single-threaded. The recompiler lowers each `amo*` and `lr/sc` to the equivalent plain load, operation, and store, using `tp` as its scratch register; `lr/sc` always succeeds.
 - **`fence`, `fence.i`, CSRs, `wfi`, `mret`, and every privileged instruction**: nothing to order, no CSRs exist. The recompiler deletes fences and rejects the rest.
-- **Compressed (C)**: an encoding concern of the input ELF; the recompiler expands it. Solo's own encoding is already compact.
+- **Compressed (C)**: an encoding concern of the input ELF; the recompiler expands it. Orange's own encoding is already compact.
 - **Immediate-form branches, conditional moves, bit-manipulation (B)**: candidates for a later minor if profiling justifies them. Not in 0.1.

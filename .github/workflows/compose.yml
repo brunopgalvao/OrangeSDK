@@ -12,12 +12,12 @@ on:
       - Cargo.lock
       - Cargo.toml
       - rust-toolchain.toml
-      - crates/solo-abi/**
-      - crates/solo-cli/**
-      - crates/solo-metrics/**
-      - crates/solo-node/**
-      - crates/solo-rpc/**
-      - crates/solo-store/**
+      - crates/orange-abi/**
+      - crates/orange-cli/**
+      - crates/orange-metrics/**
+      - crates/orange-node/**
+      - crates/orange-rpc/**
+      - crates/orange-store/**
       - .github/workflows/compose.yml
   pull_request:
     paths:
@@ -27,12 +27,12 @@ on:
       - Cargo.lock
       - Cargo.toml
       - rust-toolchain.toml
-      - crates/solo-abi/**
-      - crates/solo-cli/**
-      - crates/solo-metrics/**
-      - crates/solo-node/**
-      - crates/solo-rpc/**
-      - crates/solo-store/**
+      - crates/orange-abi/**
+      - crates/orange-cli/**
+      - crates/orange-metrics/**
+      - crates/orange-node/**
+      - crates/orange-rpc/**
+      - crates/orange-store/**
       - .github/workflows/compose.yml
   workflow_dispatch:
 concurrency:

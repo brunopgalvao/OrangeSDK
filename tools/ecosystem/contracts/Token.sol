@@ -5,7 +5,7 @@ pragma solidity 0.8.28;
 /// custom error and one revert string, so that clients decode reverts both
 /// ways.
 contract Token {
-    string public constant name = "Solo Test Token";
+    string public constant name = "Orange Test Token";
     string public constant symbol = "STT";
     uint8 public constant decimals = 18;
 

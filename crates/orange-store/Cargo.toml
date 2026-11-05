@@ -1,0 +1,28 @@
+[package]
+name = "orange-store"
+description = "Chain state on disk: the flat state, the trie nodes of every kept root, the history window and the block log, written atomically per block; and committee-signed state snapshots"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+orange-abi = { path = "../orange-abi" }
+orange-bls = { path = "../orange-bls" }
+orange-host = { path = "../orange-host" }
+orange-trie = { path = "../orange-trie" }
+# The embedded key-value store: pure Rust, one file, ACID transactions with
+# copy-on-write B-trees, range scans over tuple keys (codex ADR 0037).
+redb = "4.4"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+
+[dev-dependencies]
+orange-scratch = { path = "../orange-scratch" }
+
+[features]
+# `Fault` and `DiskStore::inject`: a commit dropped on purpose, for the
+# crash-recovery tests of crates above this one. Never in a release build.
+fault-injection = []
+
+[lints]
+workspace = true

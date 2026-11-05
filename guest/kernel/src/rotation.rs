@@ -5,17 +5,17 @@
 
 use alloc::vec::Vec;
 
-use solo_abi::Decode;
-use solo_abi::codec::Seq;
-use solo_abi::rotation::{
+use orange_abi::Decode;
+use orange_abi::codec::Seq;
+use orange_abi::rotation::{
     Handoff, MAX_EVIDENCE_QUERY, RotationCertificate, ThresholdEvidence, keys, offence, query,
     rotation_message,
 };
-use solo_abi::staking::{
+use orange_abi::staking::{
     DST_SIGNATURE, G1_LENGTH, G2_LENGTH, KeySetRecord, epoch_of, keys as skeys,
 };
-use solo_abi::types::{Hash, QueryResult};
-use solo_guest::host;
+use orange_abi::types::{Hash, QueryResult};
+use orange_guest::host;
 
 use crate::{staking, state};
 
@@ -31,7 +31,7 @@ pub fn verify(message: &[u8], signature: &[u8], key: &[u8]) -> bool {
     }
     // SAFETY: valid pointers into our own buffers of the sizes the host reads.
     unsafe {
-        host::__solo_import_bls12381_verify(
+        host::__orange_import_bls12381_verify(
             message.as_ptr(),
             message.len() as u32,
             signature.as_ptr(),
@@ -203,7 +203,7 @@ pub fn query(method: &str, params: &[u8]) -> Option<QueryResult> {
             let records: Vec<ThresholdEvidence> = (first..end)
                 .filter_map(|i| state::get(&id_key(keys::EVIDENCE, i)))
                 .collect();
-            Some(found(Some(solo_abi::Encode::to_bytes(&Seq(records)))))
+            Some(found(Some(orange_abi::Encode::to_bytes(&Seq(records)))))
         }
         _ => None,
     }

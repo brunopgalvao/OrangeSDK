@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity 0.8.28;
 
-/// The Ethereum light client of a Solo chain (spec 18 §5.1): a native
+/// The Ethereum light client of an Orange chain (spec 18 §5.1): a native
 /// contract at 0x000000000000000000000000000000000000454C running the
 /// light-client module. Updates are SSZ-encoded at the Electra format.
 interface IEthereumLightClient {

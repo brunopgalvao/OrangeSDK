@@ -1,4 +1,4 @@
-// ethers v6 against a Solo node: what a dapp or a backend does with it.
+// ethers v6 against an Orange node: what a dapp or a backend does with it.
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import {
@@ -135,7 +135,7 @@ describe('ethers: a token contract', () => {
 
   it('serves the deployed code and the calls', async () => {
     assert.ok((await provider.getCode(address)).length > 2);
-    assert.equal(await erc20.name(), 'Solo Test Token');
+    assert.equal(await erc20.name(), 'Orange Test Token');
     assert.equal(await erc20.symbol(), 'STT');
     assert.equal(await erc20.decimals(), 18n);
     assert.equal(await erc20.totalSupply(), SUPPLY);

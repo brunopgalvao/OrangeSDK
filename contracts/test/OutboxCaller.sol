@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity 0.8.28;
 
-import {ISoloOutbox} from "../ISoloOutbox.sol";
+import {IOrangeOutbox} from "../IOrangeOutbox.sol";
 
-/// @notice Test contract on Solo: sends through the outbox from a contract, and tries the calls the
+/// @notice Test contract on Orange: sends through the outbox from a contract, and tries the calls the
 /// outbox refuses or that a revert undoes.
 contract OutboxCaller {
-    ISoloOutbox public constant OUTBOX = ISoloOutbox(0x0000000000000000000000000000000000004F42);
+    IOrangeOutbox public constant OUTBOX = IOrangeOutbox(0x0000000000000000000000000000000000004F42);
 
     event Sent(uint64 nonce);
 
@@ -26,10 +26,10 @@ contract OutboxCaller {
         view
         returns (bool ok)
     {
-        (ok,) = address(OUTBOX).staticcall(abi.encodeCall(ISoloOutbox.send, (destChainId, recipient, payload)));
+        (ok,) = address(OUTBOX).staticcall(abi.encodeCall(IOrangeOutbox.send, (destChainId, recipient, payload)));
     }
 
     function relayDelegate(uint64 destChainId, address recipient, bytes calldata payload) external returns (bool ok) {
-        (ok,) = address(OUTBOX).delegatecall(abi.encodeCall(ISoloOutbox.send, (destChainId, recipient, payload)));
+        (ok,) = address(OUTBOX).delegatecall(abi.encodeCall(IOrangeOutbox.send, (destChainId, recipient, payload)));
     }
 }

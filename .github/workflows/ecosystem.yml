@@ -1,4 +1,4 @@
-# Standard Ethereum tooling against a freshly built `solo dev`: ethers,
+# Standard Ethereum tooling against a freshly built `orange dev`: ethers,
 # viem and Foundry (tools/ecosystem, spec 20 §8.4). Runs when the node, the
 # RPC, the kernel fixtures or the suite change.
 name: ecosystem
@@ -54,7 +54,7 @@ jobs:
           curl -sSfL https://foundry.paradigm.xyz | bash
           "$FOUNDRY_DIR/bin/foundryup" --install "$FOUNDRY_VERSION"
           echo "$FOUNDRY_DIR/bin" >> "$GITHUB_PATH"
-      - run: timeout 1200 cargo build --release --locked -p solo-cli
+      - run: timeout 1200 cargo build --release --locked -p orange-cli
       - run: npm ci --no-audit --no-fund
         working-directory: tools/ecosystem
       - run: timeout 600 tools/ecosystem/run.sh

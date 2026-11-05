@@ -9,12 +9,12 @@
 # across its restart (spec 08 §9). Prints a PASS or FAIL line per phase and
 # exits non-zero on the first failure.
 #
-# usage: tools/rehearse-upgrade.sh <devnet dir> [kernel_v2.elf|kernel_v2.solo]
+# usage: tools/rehearse-upgrade.sh <devnet dir> [kernel_v2.elf|kernel_v2.orange]
 #
-# The devnet is one `solo devnet init` made and `solo devnet up` runs, or the
+# The devnet is one `orange devnet init` made and `orange devnet up` runs, or the
 # compose stack of ops/docker-compose.yml (then the first argument is unused
 # and RPCS names the nodes). Environment:
-#   SOLO              the solo binary (default: solo on PATH)
+#   ORANGE              the orange binary (default: orange on PATH)
 #   DEVNET_DRIVER     process (default): the nodes are the processes of <devnet dir>;
 #                     compose: the services of ops/docker-compose.yml, reached at RPCS
 #   RPCS              comma-separated JSON-RPC addresses of the nodes (compose driver)
@@ -29,8 +29,8 @@ set -euo pipefail
 
 DIR=${1:?usage: tools/rehearse-upgrade.sh <devnet dir> [kernel_v2]}
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
-KERNEL_V2=${2:-$ROOT/crates/solo-node/tests/fixtures/kernel_v2.elf}
-SOLO=${SOLO:-solo}
+KERNEL_V2=${2:-$ROOT/crates/orange-node/tests/fixtures/kernel_v2.elf}
+ORANGE=${ORANGE:-orange}
 DRIVER=${DEVNET_DRIVER:-process}
 GATES=${GATES:-0,1,2}
 TIMEOUT=${REHEARSE_TIMEOUT:-600}
@@ -58,16 +58,16 @@ compose)
 esac
 stop_node() {
     if [ "$DRIVER" = process ]; then
-        "$SOLO" devnet stop --dir "$DIR" --node "$1"
+        "$ORANGE" devnet stop --dir "$DIR" --node "$1"
     else
-        "${COMPOSE[@]}" stop "solo-$1"
+        "${COMPOSE[@]}" stop "orange-$1"
     fi
 }
 start_node() {
     if [ "$DRIVER" = process ]; then
-        "$SOLO" devnet start --dir "$DIR" --node "$1"
+        "$ORANGE" devnet start --dir "$DIR" --node "$1"
     else
-        "${COMPOSE[@]}" start "solo-$1"
+        "${COMPOSE[@]}" start "orange-$1"
     fi
 }
 
@@ -78,11 +78,11 @@ STOP_NODE=${STOP_NODE:-$((N - 1))}
 SIGNER_NODE=${SIGNER_NODE:-$((N - 2))}
 
 # --- governance: how an upgrade is submitted ---------------------------------
-# Main offers a single governance key (spec 13 §1.1); `solo upgrade` stages the
+# Main offers a single governance key (spec 13 §1.1); `orange upgrade` stages the
 # module and proposes it with that key. A governance with proposals and votes
 # replaces this one function.
 submit_upgrade() {
-    "$SOLO" upgrade --rpc "$RPC0" --key "$GOVERNANCE_KEY" --kernel "$KERNEL_V2" --timeout "$TIMEOUT"
+    "$ORANGE" upgrade --rpc "$RPC0" --key "$GOVERNANCE_KEY" --kernel "$KERNEL_V2" --timeout "$TIMEOUT"
 }
 
 # --- helpers -----------------------------------------------------------------
@@ -107,11 +107,11 @@ summary() {
 wait_nodes() {
     local what=$1
     shift
-    "$SOLO" devnet wait "${TARGET[@]}" --timeout "$TIMEOUT" "$@" || fail "$what"
+    "$ORANGE" devnet wait "${TARGET[@]}" --timeout "$TIMEOUT" "$@" || fail "$what"
 }
 # A number from node $1's status: the value of field $2.
 field() {
-    "$SOLO" devnet status "${TARGET[@]}" --nodes "$1" --json | sed -n "s/^ *\"$2\": \([0-9]*\).*/\1/p" | head -1
+    "$ORANGE" devnet status "${TARGET[@]}" --nodes "$1" --json | sed -n "s/^ *\"$2\": \([0-9]*\).*/\1/p" | head -1
 }
 # Every node but the ones given, as a --nodes list.
 others() {

@@ -1,0 +1,25 @@
+[package]
+name = "orange-recompile"
+description = "Turns standard RV64 ELF binaries into Orange modules (spec 03 §8)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "orange-recompile"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+orange-vm = { path = "../orange-vm" }
+object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
+
+[dev-dependencies]
+orange-fuzz = { path = "../orange-fuzz" }
+orange-scratch = { path = "../orange-scratch" }
+tiny-keccak = { version = "2", features = ["keccak"] }
+
+[lints]
+workspace = true

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity 0.8.28;
 
-/// The message verifier of a Solo chain (spec 18 §5.2): a native contract at
+/// The message verifier of an Orange chain (spec 18 §5.2): a native contract at
 /// 0x000000000000000000000000000000000000454D running the verifier module.
 /// It proves messages of the `EthereumOutbox`, records each delivered once,
 /// and paces and pauses deliveries.

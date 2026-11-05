@@ -5,15 +5,15 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use solo_abi::chain::{GenesisParams, Log};
-use solo_abi::codec::Seq;
-use solo_abi::modules::{
+use orange_abi::chain::{GenesisParams, Log};
+use orange_abi::codec::Seq;
+use orange_abi::modules::{
     self, Install, ModuleCall, ModuleOutput, ModuleQuery, ModuleRecord, Write, capability, keys,
     status,
 };
-use solo_abi::types::{Address, Genesis, Hash, QueryResult};
-use solo_abi::{Decode, Encode};
-use solo_guest::host;
+use orange_abi::types::{Address, Genesis, Hash, QueryResult};
+use orange_abi::{Decode, Encode};
+use orange_guest::host;
 
 use crate::evm;
 use crate::state;
@@ -33,7 +33,7 @@ const STATIC: u64 = 2;
 /// The VM gas this kernel instance has left.
 pub fn gas_remaining() -> u64 {
     // SAFETY: no arguments.
-    unsafe { host::__solo_import_gas_remaining() }
+    unsafe { host::__orange_import_gas_remaining() }
 }
 
 /// Invokes the module `code_hash` static under `namespace`, with the
@@ -49,7 +49,7 @@ pub fn invoke(
     let flags = STATIC | if privileged { PRIVILEGED } else { 0 };
     // SAFETY: valid pointers into our own buffers of the stated sizes.
     let result = unsafe {
-        host::__solo_import_invoke(
+        host::__orange_import_invoke(
             code_hash.as_ptr(),
             namespace.as_ptr(),
             input.as_ptr(),
@@ -66,9 +66,9 @@ pub fn invoke(
     }
     // SAFETY: no arguments, then a buffer of the reported length.
     let bytes = unsafe {
-        let len = host::__solo_import_invoke_output_len() as usize;
+        let len = host::__orange_import_invoke_output_len() as usize;
         let mut buf = vec![0u8; len];
-        host::__solo_import_invoke_output_read(buf.as_mut_ptr(), 0, len as u32);
+        host::__orange_import_invoke_output_read(buf.as_mut_ptr(), 0, len as u32);
         buf
     };
     let output = ModuleOutput::from_bytes(&bytes).ok().filter(|o| {
@@ -181,12 +181,13 @@ fn install(
 /// EVM storage for a native contract: slot 0 of its storage tracks its
 /// writes within a transaction (spec 16 §5.4) and must start at zero.
 pub fn init(genesis: &Genesis) {
-    let params = GenesisParams::from_bytes(&genesis.params).unwrap_or_else(|_| solo_guest::trap());
+    let params =
+        GenesisParams::from_bytes(&genesis.params).unwrap_or_else(|_| orange_guest::trap());
     for a in &params.allocations.0 {
         let native = modules::designated(&a.code).is_some()
             || genesis.modules.0.iter().any(|m| m.address == a.address);
         if native && a.storage.0.iter().any(|slot| slot.value != [0; 32]) {
-            solo_guest::trap();
+            orange_guest::trap();
         }
     }
     for m in &genesis.modules.0 {
@@ -198,10 +199,10 @@ pub fn init(genesis: &Genesis) {
             || size == 0
             || size > modules::MAX_MODULE_SIZE
         {
-            solo_guest::trap();
+            orange_guest::trap();
         }
         if !install(&m.address, &m.code_hash, m.capabilities, &m.init, 0) {
-            solo_guest::trap();
+            orange_guest::trap();
         }
     }
 }
@@ -238,7 +239,7 @@ pub fn end_block(height: u64, timestamp_ms: u64) {
 fn staged(code_hash: &Hash) -> Vec<u8> {
     let mut code = Vec::new();
     let mut index = 0;
-    while let Some(chunk) = state::get_raw(&solo_upgrade::keys::chunk(code_hash, index)) {
+    while let Some(chunk) = state::get_raw(&orange_upgrade::keys::chunk(code_hash, index)) {
         code.extend_from_slice(&chunk);
         index += 1;
     }

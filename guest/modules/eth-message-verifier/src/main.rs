@@ -1,7 +1,7 @@
 //! `eth-message-verifier`: the message-verifier module (spec 18). The
 //! kernel makes the verifier address `0x…454D` a native contract running it
 //! (spec 16 §5); its interface is `contracts/IMessageVerifier.sol` and its
-//! logic `solo_ethlc::verifier`. It needs no gated host function.
+//! logic `orange_ethlc::verifier`. It needs no gated host function.
 
 #![no_std]
 #![no_main]
@@ -10,11 +10,11 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use solo_ethlc::client::{Context, Storage};
-use solo_ethlc::{Crypto, Hash, verifier};
-use solo_guest::host;
-use solo_module::Store;
-use solo_module::solo_abi::modules::ModuleCall;
+use orange_ethlc::client::{Context, Storage};
+use orange_ethlc::{Crypto, Hash, verifier};
+use orange_guest::host;
+use orange_module::Store;
+use orange_module::orange_abi::modules::ModuleCall;
 
 /// Hashing through the host; this module checks no signature.
 struct HostCrypto;
@@ -24,13 +24,13 @@ impl Crypto for HostCrypto {
         let mut out = [0u8; 32];
         // SAFETY: valid pointers into our own buffers.
         unsafe {
-            host::__solo_import_hash_sha256(data.as_ptr(), data.len() as u32, out.as_mut_ptr())
+            host::__orange_import_hash_sha256(data.as_ptr(), data.len() as u32, out.as_mut_ptr())
         };
         out
     }
 
     fn keccak256(&self, data: &[u8]) -> Hash {
-        solo_module::keccak256(data)
+        orange_module::keccak256(data)
     }
 
     fn fast_aggregate_verify(&self, _: &[u8], _: &Hash, _: &[u8; 96]) -> bool {
@@ -69,4 +69,4 @@ fn handle(call: &ModuleCall, store: &mut Store) -> Result<Vec<u8>, Vec<u8>> {
     }
 }
 
-solo_module::module!(handle);
+orange_module::module!(handle);

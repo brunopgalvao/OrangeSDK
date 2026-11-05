@@ -1,0 +1,22 @@
+[package]
+name = "orange-upgrade"
+description = "Governed kernel upgrades and host feature gates (spec 13): the system-address actions, their records, and the gate state machine, no_std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+orange-abi = { path = "../orange-abi", default-features = false }
+
+[dev-dependencies]
+tiny-keccak = { version = "2", features = ["keccak"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+orange-fuzz = { path = "../orange-fuzz" }
+
+[lints]
+workspace = true

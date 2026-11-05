@@ -3,18 +3,18 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use solo_abi::chain::consensus::{MAX_EVIDENCE, signing_preimage};
-use solo_abi::chain::{
+use orange_abi::chain::consensus::{MAX_EVIDENCE, signing_preimage};
+use orange_abi::chain::{
     Account, BLOCK_GAS_LIMIT, BlockHeader, CallRequest, CallResult, Evidence, Participation,
     Receipt, SNAPSHOT_INTERVAL, SnapshotRecord, StorageQuery, call_status, keys, query, reason,
 };
-use solo_abi::codec::Seq;
-use solo_abi::types::{
+use orange_abi::codec::Seq;
+use orange_abi::types::{
     Address, Ahead, Block, BuildArgs, ExecuteArgs, ExecuteResult, ExecuteSummary, FinalizeArgs,
     Hash, QueryArgs, QueryResult, ValidateArgs, ValidateResult,
 };
-use solo_abi::{Decode, Encode};
-use solo_eth::{MAX_TX_GAS, header, mpt};
+use orange_abi::{Decode, Encode};
+use orange_eth::{MAX_TX_GAS, header, mpt};
 
 use crate::evm::{self, BlockFields, Message};
 use crate::tx::{self, Signed, decode_signed};
@@ -342,7 +342,7 @@ fn snapshot(params: &[u8]) -> QueryResult {
 pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let chain_id = state::chain_id();
     let template =
-        BlockHeader::from_bytes(&args.block.header).unwrap_or_else(|_| solo_guest::trap());
+        BlockHeader::from_bytes(&args.block.header).unwrap_or_else(|_| orange_guest::trap());
     let height = template.height;
     // The base fee follows from the parent's header and the treasury from the
     // parameters in force (spec 23 §3), both read before anything in this
@@ -356,7 +356,7 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     };
     record_snapshot(height);
     crate::precompiles::begin(crate::governance::gate_active(
-        solo_upgrade::gate::PRECOMPILES,
+        orange_upgrade::gate::PRECOMPILES,
         height,
     ));
     record_participation(&args.block.participation, height);
@@ -413,10 +413,10 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     if !system_logs.is_empty() {
         // What the end of the block logged, in a receipt of no transaction
         // after the block's own (spec 20 §3.5).
-        let hash = state::keccak256(&solo_abi::chain::system_receipt_preimage(&block_hash));
+        let hash = state::keccak256(&orange_abi::chain::system_receipt_preimage(&block_hash));
         let receipt = Receipt {
             status: 1,
-            to: solo_abi::governance::GOVERNANCE_ADDRESS,
+            to: orange_abi::governance::GOVERNANCE_ADDRESS,
             height,
             index: receipts.len() as u32,
             cumulative_gas_used: cumulative,
@@ -467,7 +467,7 @@ pub fn genesis() {
 
 /// `kernel_stf_finalize_block`.
 pub fn finalize(args: &FinalizeArgs) {
-    state::set(solo_abi::chain::keys::FINALIZED, &args.height);
+    state::set(orange_abi::chain::keys::FINALIZED, &args.height);
 }
 
 fn found<T: Encode>(v: Option<T>) -> QueryResult {
@@ -511,11 +511,11 @@ fn call(request: CallRequest) -> CallResult {
     } else {
         request.gas.min(MAX_TX_GAS)
     };
-    let access_list: Vec<solo_eth::AccessItem> = request
+    let access_list: Vec<orange_eth::AccessItem> = request
         .access_list
         .0
         .into_iter()
-        .map(|item| solo_eth::AccessItem {
+        .map(|item| orange_eth::AccessItem {
             address: item.address,
             keys: item.keys.0,
         })
@@ -524,7 +524,7 @@ fn call(request: CallRequest) -> CallResult {
         .authorization_list
         .0
         .into_iter()
-        .map(|a| solo_eth::Authorization {
+        .map(|a| orange_eth::Authorization {
             chain_id: a.chain_id,
             address: a.address,
             nonce: a.nonce,
@@ -540,7 +540,7 @@ fn call(request: CallRequest) -> CallResult {
     let tx_type = if authorization_list.is_empty() {
         u8::from(!access_list.is_empty())
     } else {
-        solo_eth::SET_CODE_TX_TYPE
+        orange_eth::SET_CODE_TX_TYPE
     };
     // A governance call's gas includes its surcharge (spec 13 §9.9), so that
     // an estimate is a gas limit admission takes.
@@ -560,7 +560,7 @@ fn call(request: CallRequest) -> CallResult {
     };
     // The host serves the gates active for the next block (spec 13 §7.1).
     crate::precompiles::begin(crate::governance::gate_active(
-        solo_upgrade::gate::PRECOMPILES,
+        orange_upgrade::gate::PRECOMPILES,
         height + 1,
     ));
     let outcome = crate::native::run(message, block, false);
@@ -578,7 +578,7 @@ pub fn query(args: &QueryArgs) -> QueryResult {
         query::CHAIN_ID => found(Some(state::chain_id())),
         query::BLOCK_NUMBER => found(Some(state::height().unwrap_or(0))),
         query::FINALIZED => found(Some(
-            state::get::<u64>(solo_abi::chain::keys::FINALIZED).unwrap_or(0),
+            state::get::<u64>(orange_abi::chain::keys::FINALIZED).unwrap_or(0),
         )),
         query::ACCOUNT => match Address::from_bytes(&args.params) {
             Ok(address) => found(Some(state::account(&address))),
@@ -617,11 +617,11 @@ pub fn query(args: &QueryArgs) -> QueryResult {
             Err(_) => bad_params(),
         },
         query::SNAPSHOT => snapshot(&args.params),
-        solo_abi::bridge::query::FINALITY_PROOF => match u64::from_bytes(&args.params) {
+        orange_abi::bridge::query::FINALITY_PROOF => match u64::from_bytes(&args.params) {
             Ok(height) => found(crate::driver::finality_proof(height)),
             Err(_) => bad_params(),
         },
-        solo_abi::fees::query::FEES => found(Some(fees::status())),
+        orange_abi::fees::query::FEES => found(Some(fees::status())),
         _ => crate::staking::query(method, &args.params)
             .or_else(|| crate::rotation::query(method, &args.params))
             .or_else(|| crate::modules::query(method, &args.params))

@@ -1,4 +1,4 @@
-# A Prometheus configuration for Solo nodes (spec 11). Each node serves
+# A Prometheus configuration for Orange nodes (spec 11). Each node serves
 # GET /metrics on its JSON-RPC address (`--rpc`, 127.0.0.1:8545 by default).
 global:
   scrape_interval: 15s
@@ -8,7 +8,7 @@ rule_files:
   - alerts.yml
 
 scrape_configs:
-  - job_name: solo
+  - job_name: orange
     metrics_path: /metrics
     static_configs:
       - targets:

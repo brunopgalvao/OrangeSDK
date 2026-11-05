@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Builds every guest program for the Solo target (hello, the kernel, the
+# Builds every guest program for the Orange target (hello, the kernel, the
 # example module, the two bridge modules, the precompile module and the
 # conformance guest), refreshes the test fixtures and prints the ELF paths.
 # The precompile module (spec 19) is built first and recompiled with the
-# host's solo-recompile into guest/kernel/precompiles.solo, which the kernel
+# host's orange-recompile into guest/kernel/precompiles.orange, which the kernel
 # and the conformance guest embed. The kernel is built twice: as is, and with
 # the `upgrade-test` feature, the next kernel version the upgrade tests switch to.
 # The example module `counter` (spec 16) becomes the module tests' fixture,
@@ -20,17 +20,17 @@
 # home-directory paths remapped; a rebuild from any checkout with the same
 # toolchain leaves `git status` clean. Builds from several checkouts take
 # turns on a lock. The staging directory, target included, is removed at
-# the end unless SOLO_GUEST_KEEP=1 keeps it for faster rebuilds.
+# the end unless ORANGE_GUEST_KEEP=1 keeps it for faster rebuilds.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
-BUILD=/tmp/solo-guest-build
+BUILD=/tmp/orange-guest-build
 LOCK=$BUILD.lock
 until mkdir "$LOCK" 2>/dev/null; do
     echo "waiting for another guest build ($LOCK)" >&2
     sleep 5
 done
 cleanup() {
-    [ "${SOLO_GUEST_KEEP:-0}" = 1 ] || rm -rf "$BUILD"
+    [ "${ORANGE_GUEST_KEEP:-0}" = 1 ] || rm -rf "$BUILD"
     rmdir "$LOCK"
 }
 trap cleanup EXIT
@@ -44,17 +44,17 @@ REMAP="target.riscv64imac-unknown-none-elf.rustflags=[\"--remap-path-prefix=$HOM
 OUT=target/riscv64imac-unknown-none-elf/release
 FIX=$ROOT/crates
 cargo build --config "$REMAP" --release -p precompiles "$@"
-(cd "$BUILD" && cargo run --release -q -p solo-recompile -- "guest/$OUT/precompiles" guest/kernel/precompiles.solo)
-cp kernel/precompiles.solo "$ROOT/guest/kernel/precompiles.solo"
+(cd "$BUILD" && cargo run --release -q -p orange-recompile -- "guest/$OUT/precompiles" guest/kernel/precompiles.orange)
+cp kernel/precompiles.orange "$ROOT/guest/kernel/precompiles.orange"
 cargo build --config "$REMAP" --release -p kernel --features upgrade-test "$@"
-"$OBJCOPY" --strip-debug "$OUT/kernel" "$FIX/solo-node/tests/fixtures/kernel_v2.elf"
+"$OBJCOPY" --strip-debug "$OUT/kernel" "$FIX/orange-node/tests/fixtures/kernel_v2.elf"
 cargo build --config "$REMAP" --release "$@"
 ls -1 "$OUT/hello" "$OUT/kernel" "$OUT/counter" "$OUT/eth-light-client" "$OUT/eth-message-verifier" "$OUT/precompiles" "$OUT/evm-conformance"
-cp "$OUT/hello" "$FIX/solo-recompile/tests/fixtures/hello.elf"
-"$OBJCOPY" --strip-debug "$OUT/kernel" "$FIX/solo-node/tests/fixtures/kernel.elf"
-"$OBJCOPY" --strip-debug "$OUT/counter" "$FIX/solo-node/tests/fixtures/counter.elf"
-"$OBJCOPY" --strip-debug "$OUT/eth-light-client" "$FIX/solo-node/tests/fixtures/eth-light-client.elf"
-"$OBJCOPY" --strip-debug "$OUT/eth-message-verifier" "$FIX/solo-node/tests/fixtures/eth-message-verifier.elf"
-mkdir -p "$FIX/solo-conformance/tests/fixtures"
-"$OBJCOPY" --strip-debug "$OUT/evm-conformance" "$FIX/solo-conformance/tests/fixtures/evm-conformance.elf"
+cp "$OUT/hello" "$FIX/orange-recompile/tests/fixtures/hello.elf"
+"$OBJCOPY" --strip-debug "$OUT/kernel" "$FIX/orange-node/tests/fixtures/kernel.elf"
+"$OBJCOPY" --strip-debug "$OUT/counter" "$FIX/orange-node/tests/fixtures/counter.elf"
+"$OBJCOPY" --strip-debug "$OUT/eth-light-client" "$FIX/orange-node/tests/fixtures/eth-light-client.elf"
+"$OBJCOPY" --strip-debug "$OUT/eth-message-verifier" "$FIX/orange-node/tests/fixtures/eth-message-verifier.elf"
+mkdir -p "$FIX/orange-conformance/tests/fixtures"
+"$OBJCOPY" --strip-debug "$OUT/evm-conformance" "$FIX/orange-conformance/tests/fixtures/evm-conformance.elf"
 echo "fixtures refreshed"

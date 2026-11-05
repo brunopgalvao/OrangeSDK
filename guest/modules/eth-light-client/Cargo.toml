@@ -12,6 +12,6 @@ test = false
 bench = false
 
 [dependencies]
-solo-guest = { path = "../../solo-guest" }
-solo-module = { path = "../../solo-module" }
-solo-ethlc = { path = "../../../crates/solo-ethlc" }
+orange-guest = { path = "../../orange-guest" }
+orange-module = { path = "../../orange-module" }
+orange-ethlc = { path = "../../../crates/orange-ethlc" }

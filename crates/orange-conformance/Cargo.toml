@@ -1,0 +1,30 @@
+[package]
+name = "orange-conformance"
+description = "Runs Ethereum execution-spec state tests through the Orange pipeline: the kernel's EVM recompiled to an Orange module, on the interpreter and the native backend (spec 07 §4.2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "orange-conformance"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+orange-abi = { path = "../orange-abi" }
+orange-host = { path = "../orange-host" }
+orange-recompile = { path = "../orange-recompile" }
+orange-eth = { path = "../orange-eth" }
+orange-rlp = { path = "../orange-rlp" }
+orange-vm = { path = "../orange-vm" }
+serde_json = "1"
+
+[dev-dependencies]
+orange-scratch = { path = "../orange-scratch" }
+serde_json = "1"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+
+[lints]
+workspace = true

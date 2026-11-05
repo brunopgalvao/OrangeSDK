@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # The Foundry half of the ecosystem suite: cast and forge against a running
-# Solo node, as a developer drives them by hand or from a deploy pipeline.
+# Orange node, as a developer drives them by hand or from a deploy pipeline.
 #
-# usage: SOLO_RPC=http://127.0.0.1:8545 tools/ecosystem/foundry.sh
+# usage: ORANGE_RPC=http://127.0.0.1:8545 tools/ecosystem/foundry.sh
 #
 # The node must run the suite's genesis (genesis.json: chain id 1337, the
 # key 0x01…01 funded, a 1 gwei base-fee floor). Needs cast, forge and jq;
@@ -11,8 +11,8 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd -P)
-export ETH_RPC_URL=${SOLO_RPC:-http://127.0.0.1:8545}
-CHAIN_ID=${SOLO_CHAIN_ID:-1337}
+export ETH_RPC_URL=${ORANGE_RPC:-http://127.0.0.1:8545}
+CHAIN_ID=${ORANGE_CHAIN_ID:-1337}
 KEY=0x0101010101010101010101010101010101010101010101010101010101010101
 FUNDED=0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1
 # A fresh account for each run, so a rerun against the same node starts clean.

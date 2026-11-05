@@ -12,4 +12,4 @@ test = false
 bench = false
 
 [dependencies]
-solo-guest = { path = "../../solo-guest" }
+orange-guest = { path = "../../orange-guest" }

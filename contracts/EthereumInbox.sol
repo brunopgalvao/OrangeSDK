@@ -4,14 +4,14 @@ pragma solidity 0.8.28;
 import {IEthereumLightClient} from "./IEthereumLightClient.sol";
 import {IMessageVerifier} from "./IMessageVerifier.sol";
 
-/// What a contract on Solo implements to receive messages from Ethereum.
+/// What a contract on Orange implements to receive messages from Ethereum.
 interface IEthereumMessageReceiver {
     /// Called by the inbox (0x0000000000000000000000000000000000004549) once
     /// per message; `sender` is the account that called the outbox on Ethereum.
     function onEthereumMessage(uint64 nonce, address sender, bytes calldata payload) external;
 }
 
-/// The Solo inbox (spec 18 §6). The kernel places this code at
+/// The Orange inbox (spec 18 §6). The kernel places this code at
 /// 0x0000000000000000000000000000000000004549 at genesis, without running a
 /// constructor, so it keeps no immutables and no storage.
 contract EthereumInbox {

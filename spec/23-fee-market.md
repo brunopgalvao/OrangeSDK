@@ -19,7 +19,7 @@ struct FeeParams { denominator: u64, elasticity: u64, min_base_fee: u64, treasur
 - `min_base_fee`: the floor, in wei per gas, at most `MAX_MIN_BASE_FEE` = 10^12 (1 000 gwei, a thousand times the production default). The base fee of every block while the market is off.
 - `treasury`: the account the base fee is credited to; the zero address burns it. Never the staking address (15 §3): its balance is the stakes and the reward pool, and nothing pays out what else reaches it, so a base fee credited there would be locked for good.
 
-Parameters are *workable* when the floor is at most `MAX_MIN_BASE_FEE`, the treasury is not the staking address, and the market is off with both factors zero, or on with both within their ranges (`solo_abi::fees::FeeParams::workable`). `kernel_init` traps on parameters that are not, so the chain never starts with them, and the `solo` command refuses such a genesis before a node does, naming the field.
+Parameters are *workable* when the floor is at most `MAX_MIN_BASE_FEE`, the treasury is not the staking address, and the market is off with both factors zero, or on with both within their ranges (`orange_abi::fees::FeeParams::workable`). `kernel_init` traps on parameters that are not, so the chain never starts with them, and the `orange` command refuses such a genesis before a node does, naming the field.
 
 The floor's bound keeps the chain able to lower it. Governance transactions pay the base fee like any other, and the base fee never falls below the floor, so a floor set higher than the governance account (or, under the stake track, the proposers and voters) can pay for would leave the chain without the transaction that would lower it. At the bound a `setFeeParams` submission of about 200 000 gas costs 0.2 of the native token at the base fee, and a full block's base fee is at most `30 000 000 · 10^12` wei per block at the floor: high enough for any chain that prices in a token worth less than Ethereum's, low enough that a typo or a hostile proposal cannot price governance out.
 
@@ -29,10 +29,10 @@ Ethereum changes its base fee by at most 12.5% per 12-second block. At slots of 
 
 | Chain | `denominator` | `elasticity` | `min_base_fee` | `treasury` |
 |---|---|---|---|---|
-| `solo dev`, and every genesis without a `fees` object | 0 | 0 | 0 | burn |
-| `solo devnet init`, the production defaults (`FeeParams::production`) | 125 | 2 | 1 gwei | burn |
+| `orange dev`, and every genesis without a `fees` object | 0 | 0 | 0 | burn |
+| `orange devnet init`, the production defaults (`FeeParams::production`) | 125 | 2 | 1 gwei | burn |
 
-A development chain keeps a zero base fee, so transactions and wallets that pay nothing keep working, and its priority fees go where they went before (§4). The genesis JSON names the parameters as `"fees": {"denominator", "elasticity", "minBaseFee", "treasury"}`; `solo devnet init` funds every validator's account and the governance account, since on its chain their signals and upgrades pay the base fee.
+A development chain keeps a zero base fee, so transactions and wallets that pay nothing keep working, and its priority fees go where they went before (§4). The genesis JSON names the parameters as `"fees": {"denominator", "elasticity", "minBaseFee", "treasury"}`; `orange devnet init` funds every validator's account and the governance account, since on its chain their signals and upgrades pay the base fee.
 
 ## 3. The base fee of a block
 
@@ -46,7 +46,7 @@ next_base_fee(b, g) =
   max(min_base_fee, b − b · (T − g) / T / denominator)      if g < T
 ```
 
-Divisions round down, as in EIP-1559, whose formula this is with the floor applied last; the result saturates at `2^64 − 1`. The genesis counts as a parent at the floor that used nothing, so block 1's base fee is `min_base_fee`; the genesis block's header carries exactly that parent, base fee `min_base_fee` and no gas used (20 §3.4). `solo_abi::fees::FeeParams::next_base_fee` is the one implementation, shared by the kernel, the node and the RPC.
+Divisions round down, as in EIP-1559, whose formula this is with the floor applied last; the result saturates at `2^64 − 1`. The genesis counts as a parent at the floor that used nothing, so block 1's base fee is `min_base_fee`; the genesis block's header carries exactly that parent, base fee `min_base_fee` and no gas used (20 §3.4). `orange_abi::fees::FeeParams::next_base_fee` is the one implementation, shared by the kernel, the node and the RPC.
 
 The base fee of block `h` applies to:
 
@@ -83,7 +83,7 @@ So for every transaction that ran: `sender paid = treasury or burn + beneficiary
 event FeeParamsSet(uint64 denominator, uint64 elasticity, uint64 minBaseFee, address treasury);
 ```
 
-`solo gov set-fee-params <denominator> <elasticity> <minBaseFee wei> <treasury address|burn>` prints the call, and refuses parameters that are not workable, naming the field.
+`orange gov set-fee-params <denominator> <elasticity> <minBaseFee wei> <treasury address|burn>` prints the call, and refuses parameters that are not workable, naming the field.
 
 ## 6. State
 
@@ -107,7 +107,7 @@ The JSON-RPC follows geth:
 
 ### 7.1 The tip oracle
 
-The suggested tip is geth's `SuggestTipCap` over Solo's blocks. Of each of the `ORACLE_BLOCKS = 100` blocks below the head it takes the `ORACLE_SAMPLE = 3` cheapest tips paid by senders other than the beneficiary, leaving out tips below `ORACLE_IGNORE_TIP = 2` wei; a block without any contributes the last suggestion once and makes the oracle look one block further, up to twice as many blocks. The suggestion is the `ORACLE_PERCENTILE = 60`th percentile of the sample (index `⌊(n − 1) · 60 / 100⌋` of the sorted sample), at most `ORACLE_MAX_TIP` = 500 gwei; with no sample it is the last suggestion, and before any block the node's default, 1 gwei. The oracle looks at 100 blocks where geth looks at 20 because Solo's blocks are many times shorter: 20 blocks of 400 ms are eight seconds of history. It is computed once per head; the node's background work runs between the blocks it reads, and a block's sample is kept once read, since an executed block never changes.
+The suggested tip is geth's `SuggestTipCap` over Orange's blocks. Of each of the `ORACLE_BLOCKS = 100` blocks below the head it takes the `ORACLE_SAMPLE = 3` cheapest tips paid by senders other than the beneficiary, leaving out tips below `ORACLE_IGNORE_TIP = 2` wei; a block without any contributes the last suggestion once and makes the oracle look one block further, up to twice as many blocks. The suggestion is the `ORACLE_PERCENTILE = 60`th percentile of the sample (index `⌊(n − 1) · 60 / 100⌋` of the sorted sample), at most `ORACLE_MAX_TIP` = 500 gwei; with no sample it is the last suggestion, and before any block the node's default, 1 gwei. The oracle looks at 100 blocks where geth looks at 20 because Orange's blocks are many times shorter: 20 blocks of 400 ms are eight seconds of history. It is computed once per head; the node's background work runs between the blocks it reads, and a block's sample is kept once read, since an executed block never changes.
 
 ## 8. The pool (14 §3)
 

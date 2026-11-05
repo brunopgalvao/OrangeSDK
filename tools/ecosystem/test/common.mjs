@@ -8,10 +8,10 @@ const require = createRequire(import.meta.url);
 const solc = require('solc');
 
 /** The node's JSON-RPC URL. */
-export const RPC = process.env.SOLO_RPC ?? 'http://127.0.0.1:8545';
+export const RPC = process.env.ORANGE_RPC ?? 'http://127.0.0.1:8545';
 
 /** The chain id the suite's genesis sets (../genesis.json). */
-export const CHAIN_ID = Number(process.env.SOLO_CHAIN_ID ?? 1337);
+export const CHAIN_ID = Number(process.env.ORANGE_CHAIN_ID ?? 1337);
 
 /** The key the genesis funds, 32 bytes of 0x01 (the README's key). */
 export const FUNDED_KEY = '0x' + '01'.repeat(32);

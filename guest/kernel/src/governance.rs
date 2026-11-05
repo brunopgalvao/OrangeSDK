@@ -14,23 +14,23 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use solo_abi::bridge_in::{LIGHT_CLIENT_ADDRESS, VERIFIER_ADDRESS};
-use solo_abi::chain::{Account, Log, UpgradeParams, ValidatorSet, call_status, reason};
-use solo_abi::codec::Seq;
-use solo_abi::governance::{
+use orange_abi::bridge_in::{LIGHT_CLIENT_ADDRESS, VERIFIER_ADDRESS};
+use orange_abi::chain::{Account, Log, UpgradeParams, ValidatorSet, call_status, reason};
+use orange_abi::codec::Seq;
+use orange_abi::governance::{
     self as gov, ACTION_GAS, Ballot, BallotEntry, Call, DelegatorBallot, Execution,
     GOVERNANCE_ADDRESS, GOVERNANCE_GAS, GovernanceParams, GovernanceStatus, MAX_CALL_GAS,
     MAX_OPEN_PROPOSALS, Member, Moved, OpenProposal, Proposal, ProposalView, SWEEP_BALLOTS, Sweep,
     mode, status,
 };
-use solo_abi::modules::{Install, MODULE_ADDRESS};
-use solo_abi::staking::GWEI;
-use solo_abi::types::{Address, Genesis, Hash, MigrateArgs, QueryResult};
-use solo_abi::{Decode, Encode};
-use solo_ethlc::abi as lcabi;
-use solo_upgrade::action::{cancelled_log, proposed_log};
-use solo_upgrade::gates::{ended_epoch, epoch_of};
-use solo_upgrade::{
+use orange_abi::modules::{Install, MODULE_ADDRESS};
+use orange_abi::staking::GWEI;
+use orange_abi::types::{Address, Genesis, Hash, MigrateArgs, QueryResult};
+use orange_abi::{Decode, Encode};
+use orange_ethlc::abi as lcabi;
+use orange_upgrade::action::{cancelled_log, proposed_log};
+use orange_upgrade::gates::{ended_epoch, epoch_of};
+use orange_upgrade::{
     Action, EnactedUpgrade, GateBook, MAX_CHUNKS, PendingUpgrade, Signal, UpgradeStatus,
     ValidatorSignal, keys, query,
 };
@@ -108,15 +108,15 @@ fn workable(voting_blocks: u64, quorum_bps: u64) -> bool {
 /// chain never starts with them: an unknown mode, a quorum above the whole,
 /// or the stake track with rules that are not workable.
 pub fn init(genesis: &Genesis) {
-    let Ok(params) = solo_abi::chain::GenesisParams::from_bytes(&genesis.params) else {
-        solo_guest::trap()
+    let Ok(params) = orange_abi::chain::GenesisParams::from_bytes(&genesis.params) else {
+        orange_guest::trap()
     };
     let g = &params.governance;
     if g.mode > mode::STAKE
         || g.quorum_bps > 10_000
         || (g.mode == mode::STAKE && !workable(g.voting_blocks, g.quorum_bps))
     {
-        solo_guest::trap();
+        orange_guest::trap();
     }
 }
 
@@ -782,7 +782,7 @@ fn claimed(code_hash: &Hash) -> bool {
 }
 
 /// What a message to `to` with calldata `data` pays beyond the plain call
-/// (spec 13 §9.9): the surcharge of `solo_abi::governance::surcharge`, and
+/// (spec 13 §9.9): the surcharge of `orange_abi::governance::surcharge`, and
 /// for an `execute` of an open call proposal the call's gas, which the
 /// executor gives it.
 pub fn surcharge(to: Option<&Address>, data: &[u8]) -> u64 {
@@ -1224,7 +1224,7 @@ pub fn end_block(height: u64, block: BlockFields) -> Vec<Log> {
     if pending().is_some_and(|up| height > up.activation_height) {
         // This kernel was superseded at the activation height. A host still
         // running it past there must halt rather than fork the chain.
-        solo_guest::trap();
+        orange_guest::trap();
     }
     // What pruning left of delegators' votes leaves state at a bounded pace.
     sweep();
@@ -1424,12 +1424,12 @@ pub fn query(method: &str, params: &[u8]) -> QueryResult {
 /// between nodes and must not reach the commitment.
 pub fn migrate(args: &MigrateArgs) {
     let Some(up) = pending() else {
-        solo_guest::trap()
+        orange_guest::trap()
     };
     if args.from_version.checked_add(1) != Some(KERNEL_VERSION)
         || state::height() != Some(up.activation_height)
     {
-        solo_guest::trap();
+        orange_guest::trap();
     }
     state::delete(keys::PENDING);
     let enacted = EnactedUpgrade {

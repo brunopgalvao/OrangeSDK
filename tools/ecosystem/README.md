@@ -1,6 +1,6 @@
 # Ecosystem suite
 
-Standard Ethereum clients against a real Solo node, to show the Type 2 surface works with the tools people use rather than only with our own tests (spec 20 §8.4). CI runs it on every change to the node, the RPC or the suite (`.github/workflows/ecosystem.yml`).
+Standard Ethereum clients against a real Orange node, to show the Type 2 surface works with the tools people use rather than only with our own tests (spec 20 §8.4). CI runs it on every change to the node, the RPC or the suite (`.github/workflows/ecosystem.yml`).
 
 - `test/ethers.test.mjs` — ethers 6.17.0: blocks by number, hash and tag; balances and nonces; EIP-1559, legacy EIP-155 and EIP-2930 transfers and their receipts; a nonce refused in geth's words; fee data and `eth_feeHistory`; an ERC-20 deployed with `ContractFactory`, its calls, gas estimates, `queryFilter` (`eth_getLogs`), `contract.once` (the polled filters of spec 20 §8.1) and block events; a custom error and a revert string decoded from `eth_call` and `eth_estimateGas`; a reverted transaction reported as failed.
 - `test/viem.test.mjs` — viem 2.57.7: the same ground through public and wallet clients, plus `watchBlockNumber`, transactions by block position, `getBlobBaseFee`, an EIP-7702 authorization and the delegation it writes, `getProof`, `simulateContract`, log, block and pending-transaction filters polled by hand, and `watchContractEvent`.
@@ -11,17 +11,17 @@ Standard Ethereum clients against a real Solo node, to show the Type 2 surface w
 ## Running it
 
 ```sh
-cargo build --release -p solo-cli
+cargo build --release -p orange-cli
 (cd tools/ecosystem && npm ci)
-tools/ecosystem/run.sh            # starts solo dev on 127.0.0.1:18545, runs both halves, stops it
+tools/ecosystem/run.sh            # starts orange dev on 127.0.0.1:18545, runs both halves, stops it
 ```
 
-`run.sh` takes `SOLO` (the binary), `SOLO_RPC_PORT` and `SKIP_FOUNDRY=1` (where Foundry is not installed). Against a node started some other way, with this genesis:
+`run.sh` takes `ORANGE` (the binary), `ORANGE_RPC_PORT` and `SKIP_FOUNDRY=1` (where Foundry is not installed). Against a node started some other way, with this genesis:
 
 ```sh
 cd tools/ecosystem
-SOLO_RPC=http://127.0.0.1:8545 npm test
-SOLO_RPC=http://127.0.0.1:8545 ./foundry.sh
+ORANGE_RPC=http://127.0.0.1:8545 npm test
+ORANGE_RPC=http://127.0.0.1:8545 ./foundry.sh
 ```
 
 Each run uses fresh accounts and contracts, so it can run again against the same node. It takes about a minute.
@@ -33,5 +33,5 @@ Every difference from geth it turned up is fixed in the node or written down in 
 - `eth_newFilter` and the other polled filters were missing, so ethers' `contract.on` failed and viem fell back to `eth_getLogs`: now served (spec 20 §8.1).
 - The block-position methods (`eth_getTransactionByBlockNumberAndIndex` and kin), the uncle counts, `web3_sha3`, `net_listening`, `net_peerCount` and `eth_blobBaseFee` were missing: now served (spec 20 §8.2).
 - `eth_subscribe` answered "method not found": it now answers as geth does over HTTP, `notifications not supported`. There is no WebSocket server; clients poll (spec 20 §8.3).
-- ethers caches identical requests for 250 ms, shorter than a slot would need: a send right after a receipt can reuse the cached pending nonce and be refused as `nonce too low`, as against anvil. The suite sets `cacheTimeout: -1`, which a Solo chain's ethers clients should too (spec 20 §8.3).
+- ethers caches identical requests for 250 ms, shorter than a slot would need: a send right after a receipt can reuse the cached pending nonce and be refused as `nonce too low`, as against anvil. The suite sets `cacheTimeout: -1`, which an Orange chain's ethers clients should too (spec 20 §8.3).
 - `debug_*`, `trace_*`, `eth_createAccessList` and `eth_simulateV1` are not served, so `cast access-list` does not work; `cast run` does (spec 20 §8.3).

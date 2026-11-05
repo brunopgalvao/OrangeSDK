@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-A Solo *instance* executes one *module* (03) in isolation. It has thirty-two 64-bit general registers, a 32-bit byte-addressed little-endian memory, a gas counter, and a program position. It communicates with the outside world only through *host calls* (05). Execution is deterministic: given the same module, the same initial register arguments, the same memory image, the same gas limit, and the same sequence of host-call results, every conforming implementation produces the same registers, memory, gas remaining, and termination status.
+An Orange *instance* executes one *module* (03) in isolation. It has thirty-two 64-bit general registers, a 32-bit byte-addressed little-endian memory, a gas counter, and a program position. It communicates with the outside world only through *host calls* (05). Execution is deterministic: given the same module, the same initial register arguments, the same memory image, the same gas limit, and the same sequence of host-call results, every conforming implementation produces the same registers, memory, gas remaining, and termination status.
 
 ## 2. Registers
 

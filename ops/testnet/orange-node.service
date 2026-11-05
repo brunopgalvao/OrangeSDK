@@ -1,0 +1,58 @@
+# systemd unit of an Orange node, one per host: `orange-ops install` puts it in
+# /etc/systemd/system/orange-node.service. The node reads /etc/orange/node.env
+# through orange-host, which builds the `orange node` command line from it and
+# execs it, so systemd supervises the node process itself.
+[Unit]
+Description=Orange node
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=orange
+Group=orange
+EnvironmentFile=/etc/orange/node.env
+ExecStartPre=/opt/orange/bin/orange-host check-config
+ExecStart=/opt/orange/bin/orange-host run
+# orange_stop over the private RPC first, so the node stops between steps
+# (its stores are crash-safe either way: spec 08 §7, spec 22 §4); SIGTERM
+# after that, and at once for a node with --no-rpc-stop.
+ExecStop=/opt/orange/bin/orange-host graceful-stop
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+# Logs go to journald; cap them with SystemMaxUse= in journald.conf (see
+# ops/testnet/README.md).
+SyslogIdentifier=orange-node
+
+# Hardening. The node writes only its data directory. The interpreter it
+# runs by default allocates no executable memory; if the native backend
+# (orange-jit) is ever turned on, MemoryDenyWriteExecute must go.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/orange
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

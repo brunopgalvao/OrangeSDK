@@ -9,11 +9,11 @@ rule_files:
   - alerts.yml
 
 scrape_configs:
-  - job_name: solo
+  - job_name: orange
     metrics_path: /metrics
     static_configs:
       - targets:
-          - solo-0:8545
-          - solo-1:8545
-          - solo-2:8545
-          - solo-3:8545
+          - orange-0:8545
+          - orange-1:8545
+          - orange-2:8545
+          - orange-3:8545

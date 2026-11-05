@@ -1,6 +1,6 @@
 [package]
 name = "hello"
-description = "The smallest Solo guest: adds its first two arguments, hashes a constant, returns both"
+description = "The smallest Orange guest: adds its first two arguments, hashes a constant, returns both"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,4 +12,4 @@ test = false
 bench = false
 
 [dependencies]
-solo-guest = { path = "../solo-guest" }
+orange-guest = { path = "../orange-guest" }

@@ -1,31 +1,31 @@
-# The container alternative to solo-node.service: one node per host from the
+# The container alternative to orange-node.service: one node per host from the
 # image ops/Dockerfile builds, with the same layout and node.env, run by
-# solo-host as systemd would run it. On the host:
+# orange-host as systemd would run it. On the host:
 #
-#   docker build -f ops/Dockerfile -t solo:<release> .     # or load a published image
-#   SOLO_IMAGE=solo:<release> docker compose -f compose.node.yml up -d
+#   docker build -f ops/Dockerfile -t orange:<release> .     # or load a published image
+#   ORANGE_IMAGE=orange:<release> docker compose -f compose.node.yml up -d
 #
-# /etc/solo (node.env, genesis.json, kernel.elf, keys/) is mounted read-only
-# and /var/lib/solo is the data directory, owned by SOLO_UID. Host
+# /etc/orange (node.env, genesis.json, kernel.elf, keys/) is mounted read-only
+# and /var/lib/orange is the data directory, owned by ORANGE_UID. Host
 # networking: the node binds the addresses node.env names (p2p public, RPC
 # private) exactly as on bare metal, and the firewall notes of README.md
 # apply unchanged.
-name: solo-node
+name: orange-node
 
 services:
-  solo:
-    image: ${SOLO_IMAGE:-solo:devnet}
+  orange:
+    image: ${ORANGE_IMAGE:-orange:devnet}
     network_mode: host
     restart: unless-stopped
-    user: "${SOLO_UID:-10001}:${SOLO_GID:-10001}"
-    entrypoint: ["/bin/bash", "/opt/solo/bin/solo-host", "run"]
+    user: "${ORANGE_UID:-10001}:${ORANGE_GID:-10001}"
+    entrypoint: ["/bin/bash", "/opt/orange/bin/orange-host", "run"]
     environment:
-      SOLO_BIN: /usr/local/bin/solo
-      SOLO_SERVICE: process
+      ORANGE_BIN: /usr/local/bin/orange
+      ORANGE_SERVICE: process
     volumes:
-      - /etc/solo:/etc/solo:ro
-      - /var/lib/solo:/var/lib/solo
-      - /opt/solo/bin/solo-host:/opt/solo/bin/solo-host:ro
+      - /etc/orange:/etc/orange:ro
+      - /var/lib/orange:/var/lib/orange
+      - /opt/orange/bin/orange-host:/opt/orange/bin/orange-host:ro
     read_only: true
     tmpfs:
       - /tmp

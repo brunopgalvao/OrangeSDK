@@ -10,7 +10,7 @@ The *code hash* of a module is `keccak256` of its entire byte string, including 
 
 | Offset | Size | Field | Value |
 |---|---|---|---|
-| 0 | 4 | magic | ASCII `SOLO` (`0x53 0x4F 0x4C 0x4F`) |
+| 0 | 4 | magic | ASCII `ORNG` (`0x4F 0x52 0x4E 0x47`) |
 | 4 | 1 | spec major | `0` |
 | 5 | 1 | spec minor | `1` |
 | 6 | 2 | flags | Reserved, MUST be 0 |
@@ -137,7 +137,7 @@ The recompiler turns a standard RV64 ELF, produced by a stock toolchain for the 
 2. **Constants.** `lui`, `auipc`, and `addi` chains forming a constant or an address of a data symbol fold into `li` with the absolute address. Addresses of code symbols fold into `li` of the symbol's slot address.
 3. **Direct control.** `jal rd, L` becomes `call rd, block(L), slot(next)` when `rd ≠ zero`, else `jump block(L)`. Conditional branches map one-to-one; a branch with an immediate-zero comparison uses register `zero`.
 4. **Indirect control.** `jalr rd, rs1, off` becomes `call_indirect rd, rs1, off, slot(next)` when `rd ≠ zero`, else `jump_indirect rs1, off`. Every block whose address escapes (function pointers, return continuations, jump-table targets from `switch` lowering) is assigned a jump-table slot; the recompiler rewrites every code-address constant to the slot address.
-5. **Host calls.** A call to a symbol named `__solo_import_<name>` is replaced by `ecall i` where `i` is the index of `<name>` in the import table the recompiler builds, numbered in order of first call site so the table holds only functions the program uses; the arguments are already in `a0`–`a5` by the C calling convention. A call to `__solo_halt` becomes `halt` and a call to `__solo_trap` becomes `trap`. Exports are the symbols named `solo_export_<name>`.
+5. **Host calls.** A call to a symbol named `__orange_import_<name>` is replaced by `ecall i` where `i` is the index of `<name>` in the import table the recompiler builds, numbered in order of first call site so the table holds only functions the program uses; the arguments are already in `a0`–`a5` by the C calling convention. A call to `__orange_halt` becomes `halt` and a call to `__orange_trap` becomes `trap`. Exports are the symbols named `orange_export_<name>`.
 6. **Memory intrinsics.** Calls to `memcpy`, `memmove`, and `memset` with the standard signature MAY be replaced by `memcopy` and `memfill`.
 7. **Removed.** `fence`, `fence.i`, and `nop`-equivalents are deleted. `ebreak`, `unimp`, and any illegal instruction become `trap`. Compressed instructions are expanded first.
 8. **Atomics.** `amo<op>.{w,d}` becomes load, op, store on the same address, with `tp` (register 4) as the scratch register, which guest code therefore must not use; `lr` becomes a load and `sc` becomes a store that writes 0 (success) to its destination. Spec 0.1 lowers swap, add, xor, and, and or; min and max forms are rejected.

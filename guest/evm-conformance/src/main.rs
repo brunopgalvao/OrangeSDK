@@ -44,11 +44,11 @@ mod tx;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use solo_abi::chain::{GenesisParams, call_status};
-use solo_abi::codec::Seq;
-use solo_abi::conformance::{Case, Outcome};
-use solo_abi::types::Genesis;
-use solo_abi::{Decode, Encode};
+use orange_abi::chain::{GenesisParams, call_status};
+use orange_abi::codec::Seq;
+use orange_abi::conformance::{Case, Outcome};
+use orange_abi::types::Genesis;
+use orange_abi::{Decode, Encode};
 
 use crate::evm::{Env, Message};
 
@@ -109,17 +109,17 @@ fn run(case: Case, accelerated: bool) -> Outcome {
     }
 }
 
-solo_guest::solo_export!(conformance_run, |input: &[u8]| -> Vec<u8> {
+orange_guest::orange_export!(conformance_run, |input: &[u8]| -> Vec<u8> {
     match Case::from_bytes(input) {
         Ok(case) => run(case, false).to_bytes(),
-        Err(_) => solo_guest::trap(),
+        Err(_) => orange_guest::trap(),
     }
 });
 
-solo_guest::solo_export!(conformance_run_gated, |input: &[u8]| -> Vec<u8> {
+orange_guest::orange_export!(conformance_run_gated, |input: &[u8]| -> Vec<u8> {
     match Case::from_bytes(input) {
         Ok(case) => run(case, true).to_bytes(),
-        Err(_) => solo_guest::trap(),
+        Err(_) => orange_guest::trap(),
     }
 });
 
@@ -133,7 +133,7 @@ fn address<T: ?Sized>(block: &T) -> usize {
 #[repr(C, align(8192))]
 struct PageAligned([u8; 16]);
 
-/// Checks the guest runtime's allocator (`solo_guest::heap::Pool`) from the
+/// Checks the guest runtime's allocator (`orange_guest::heap::Pool`) from the
 /// inside, one byte per property, 1 when it holds, in this order:
 ///
 /// 0. a freed block is the next one handed out in its size class;
@@ -160,12 +160,12 @@ fn heap_check() -> Vec<u8> {
     drop(again);
 
     let mut grown: Vec<u8> = Vec::with_capacity(40);
-    grown.extend_from_slice(b"solo");
+    grown.extend_from_slice(b"orange");
     let first = address(grown.as_slice());
     grown.reserve_exact(56);
     let in_place = address(grown.as_slice()) == first && grown.capacity() >= 60;
     grown.reserve_exact(200);
-    let moved = address(grown.as_slice()) != first && grown == b"solo";
+    let moved = address(grown.as_slice()) != first && grown == b"orange";
     let next = Box::new([3u8; 64]);
     let moved = moved && address(&*next) == first;
     drop(next);
@@ -185,10 +185,10 @@ fn heap_check() -> Vec<u8> {
         .collect()
 }
 
-solo_guest::solo_export!(heap_check, |_input: &[u8]| -> Vec<u8> { heap_check() });
+orange_guest::orange_export!(heap_check, |_input: &[u8]| -> Vec<u8> { heap_check() });
 
 // The VM starts at an export; `main` exists only so the linker is satisfied.
-solo_guest::solo_main!(unused_main);
+orange_guest::orange_main!(unused_main);
 
 fn unused_main(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) -> (u64, u64) {
     (0, 0)

@@ -3,6 +3,10 @@
 use alloc::vec::Vec;
 use core::convert::Infallible;
 
+use orange_abi::chain::{Account, BLOCK_GAS_LIMIT, Log, call_status};
+use orange_abi::codec::Seq;
+use orange_abi::types::{Address, Hash};
+use orange_guest::host;
 use revm::bytecode::Bytecode;
 use revm::context::either::Either;
 use revm::context::result::{ExecutionResult, Output};
@@ -20,10 +24,6 @@ use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address as RAddress, B256, Bytes, KECCAK_EMPTY, TxKind, U256};
 use revm::state::{Account as RAccount, AccountInfo};
 use revm::{Database, ExecuteEvm, MainBuilder, MainContext};
-use solo_abi::chain::{Account, BLOCK_GAS_LIMIT, Log, call_status};
-use solo_abi::codec::Seq;
-use solo_abi::types::{Address, Hash};
-use solo_guest::host;
 
 use crate::state;
 
@@ -222,10 +222,10 @@ pub struct Message {
     /// Nonce; `None` skips the nonce check (calls).
     pub nonce: Option<u64>,
     /// Access list.
-    pub access_list: Vec<solo_eth::AccessItem>,
+    pub access_list: Vec<orange_eth::AccessItem>,
     /// Authorizations of a set-code transaction, each with the authority its
     /// signature names (`tx::authority`); empty for every other type.
-    pub authorization_list: Vec<(solo_eth::Authorization, Option<Address>)>,
+    pub authorization_list: Vec<(orange_eth::Authorization, Option<Address>)>,
 }
 
 /// What a message did.
@@ -443,7 +443,7 @@ pub fn run_in<P: Precompiles>(message: Message, env: &Env, commit_state: bool) -
 /// An authorization as revm applies it: recovered by the kernel through the
 /// host, so revm needs no signature code of its own (spec 20 §2.2).
 fn recovered(
-    (auth, authority): (solo_eth::Authorization, Option<Address>),
+    (auth, authority): (orange_eth::Authorization, Option<Address>),
 ) -> Either<revm::context::transaction::SignedAuthorization, RecoveredAuthorization> {
     let inner = RAuthorization {
         chain_id: U256::from_be_bytes(auth.chain_id),
@@ -474,7 +474,7 @@ impl Crypto for HostCrypto {
         let mut out = [0u8; 32];
         // SAFETY: valid pointers into our own buffers.
         unsafe {
-            host::__solo_import_hash_sha256(input.as_ptr(), input.len() as u32, out.as_mut_ptr())
+            host::__orange_import_hash_sha256(input.as_ptr(), input.len() as u32, out.as_mut_ptr())
         };
         out
     }
@@ -506,7 +506,7 @@ impl Crypto for HostCrypto {
 
     fn secp256r1_verify_signature(&self, msg: &[u8; 32], sig: &[u8; 64], pk: &[u8; 64]) -> bool {
         // SAFETY: valid pointers into our own buffers of the sizes the host function reads.
-        unsafe { host::__solo_import_p256_verify(msg.as_ptr(), sig.as_ptr(), pk.as_ptr()) == 0 }
+        unsafe { host::__orange_import_p256_verify(msg.as_ptr(), sig.as_ptr(), pk.as_ptr()) == 0 }
     }
 
     // The rest run on the host once gate 2 is active (spec 19, `precompiles.rs`).

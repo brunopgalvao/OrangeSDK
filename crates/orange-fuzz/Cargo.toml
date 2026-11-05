@@ -1,0 +1,13 @@
+[package]
+name = "orange-fuzz"
+description = "Deterministic randomness for the fuzz and differential tests: a seeded generator, byte mutations and a case runner with a fixed default budget"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

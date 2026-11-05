@@ -1,7 +1,7 @@
 {
-  "name": "solo-ecosystem",
+  "name": "orange-ecosystem",
   "private": true,
-  "description": "Standard Ethereum clients (ethers, viem) against a Solo devnet",
+  "description": "Standard Ethereum clients (ethers, viem) against an Orange devnet",
   "type": "module",
   "engines": {
     "node": ">=20"

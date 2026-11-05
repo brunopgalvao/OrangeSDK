@@ -3,7 +3,7 @@ pragma solidity 0.8.28;
 
 import {IEthereumMessageReceiver} from "../EthereumInbox.sol";
 
-/// A test recipient on Solo: records the messages the inbox delivers, and
+/// A test recipient on Orange: records the messages the inbox delivers, and
 /// reverts while `failing` is set.
 contract EthereumMessageRecipient is IEthereumMessageReceiver {
     address internal constant INBOX = 0x0000000000000000000000000000000000004549;

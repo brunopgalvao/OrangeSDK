@@ -1,0 +1,20 @@
+[package]
+name = "orange-rlp"
+description = "Minimal RLP encoding and decoding for Ethereum transactions, no_std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+orange-fuzz = { path = "../orange-fuzz" }
+
+[lints]
+workspace = true

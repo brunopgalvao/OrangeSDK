@@ -1,0 +1,30 @@
+[package]
+name = "orange-ethlc"
+description = "The Ethereum-to-Orange bridge of spec 18: SSZ, the Altair sync-committee light client at the Electra header format, Merkle-Patricia proofs and the message inbox, no_std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Native hashing and signatures, a synthetic beacon chain with a signing sync
+# committee, an Ethereum state with eth_getProof-style proofs and an EVM to
+# run contracts in: what tests and relayer tooling need on a host.
+testing = ["dep:sha2", "dep:tiny-keccak", "dep:orange-bls", "dep:revm", "orange-abi/std", "orange-rlp/std"]
+
+[dependencies]
+orange-abi = { path = "../orange-abi", default-features = false }
+orange-rlp = { path = "../orange-rlp", default-features = false }
+sha2 = { version = "0.10", optional = true }
+tiny-keccak = { version = "2", features = ["keccak"], optional = true }
+orange-bls = { path = "../orange-bls", optional = true }
+revm = { version = "43.0.3", default-features = false, features = ["std"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+orange-fuzz = { path = "../orange-fuzz" }
+orange-ethlc = { path = ".", features = ["testing"] }
+
+[lints]
+workspace = true

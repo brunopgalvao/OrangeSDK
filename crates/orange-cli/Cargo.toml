@@ -1,0 +1,33 @@
+[package]
+name = "orange-cli"
+description = "The orange command: run a dev node with JSON-RPC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "orange"
+path = "src/main.rs"
+
+[dependencies]
+orange-abi = { path = "../orange-abi" }
+orange-node = { path = "../orange-node" }
+orange-store = { path = "../orange-store" }
+orange-host = { path = "../orange-host" }
+orange-recompile = { path = "../orange-recompile" }
+orange-rpc = { path = "../orange-rpc" }
+orange-metrics = { path = "../orange-metrics" }
+orange-rlp = { path = "../orange-rlp" }
+orange-upgrade = { path = "../orange-upgrade" }
+serde_json = "1"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+getrandom = "0.3"
+
+[dev-dependencies]
+orange-scratch = { path = "../orange-scratch" }
+orange-fuzz = { path = "../orange-fuzz" }
+orange-rpc = { path = "../orange-rpc" }
+
+[lints]
+workspace = true

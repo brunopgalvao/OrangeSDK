@@ -1,0 +1,499 @@
+#!/usr/bin/env bash
+# orange-ops: deploys and operates the Orange nodes an inventory lists, one node
+# per host, over plain ssh. Each host runs `orange-host` (beside this script),
+# which does the work there; this script only copies files and calls it, so
+# a configuration tool can take its place (`orange-ops ansible-inventory`
+# prints the same hosts as an Ansible inventory).
+#
+# usage: orange-ops [--dry-run] [--inventory <file>] [--hosts a,b] [--role r] <command> [args]
+#
+#   hosts                         the hosts, as parsed
+#   render <dir>                  each host's node.env, and prometheus.yml, into <dir>
+#   install --binary <orange>       orange-host, the systemd unit and the binary on every host
+#   configure --network <dir>     genesis.json, kernel.elf and genesis.hash from <dir>,
+#                                 node.env, each host's key from the inventory; check-config
+#   start | stop | restart | status
+#   rolling-restart               one host at a time, each healthy and caught up before the next
+#   upgrade-binary --binary <orange>  install-binary everywhere, then a rolling restart
+#   rollback                      the previous binary everywhere, then a rolling restart
+#   health                        orange doctor on every host, and that they agree on a finalized block
+#   wait-healthy [seconds]        health, retried until it passes
+#   logs <host> [lines]           a host's recent log
+#   collect-logs <dir>            every host's log into <dir>/<host>.log
+#   backup-keys <dir>             every host's key directory into <dir>/<host>-keys.tar
+#   resources                     every node's pid, RSS, CPU time, data size and p2p bytes
+#   prometheus                    a Prometheus configuration scraping every node
+#   ansible-inventory             the hosts as an Ansible INI inventory
+#
+# Inventory (default ./inventory), one host per line, '#' comments:
+#
+#   <name> <role> <ssh> <p2p> <rpc> [option=value ...]
+#
+#   role     validator | rpc | bootnode
+#   ssh      user@host for ssh, or `local`: the host is a directory on this
+#            machine ($ORANGE_OPS_LOCAL/<name>, or root=<dir>) and its commands
+#            run here, which is how the tooling is tested without servers
+#   p2p      the ip:port peers dial (advertised; listened on unless listen=)
+#   rpc      the ip:port of JSON-RPC, /metrics and /status, on a private interface
+#   options  key=<file on this machine>  the validator key, or an observer's node key,
+#                                        pushed by `configure` (mode 0600)
+#            listen=<ip:port>   bind address, when the host does not own its p2p address (NAT)
+#            join=sync          an empty data directory joins from its peers' snapshots
+#            trust=<rpc,...>    the nodes whose group key a joining node trusts
+#            public-rpc=1       the RPC faces the public: no orange_stop
+#            history=<blocks> | archive=1
+#            root=<dir>         a local host's directory
+#
+# Environment: ORANGE_OPS_SSH (default "ssh -o BatchMode=yes"), ORANGE_OPS_SCP
+# (default "scp -q -o BatchMode=yes"), ORANGE_OPS_SUDO (default sudo, for ssh
+# hosts), ORANGE_OPS_LOCAL (default ./hosts), ORANGE_DOCTOR_ARGS (extra `orange
+# doctor` flags for health), ORANGE_OPS_TIMEOUT (seconds a host may take to
+# become healthy, default 300), ORANGE (an `orange` binary on this machine for
+# local hosts' checks, default the installed one).
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd -P)
+DRY=0
+INVENTORY=inventory
+ONLY_HOSTS=
+ONLY_ROLE=
+SSH=${ORANGE_OPS_SSH:-ssh -o BatchMode=yes}
+SCP=${ORANGE_OPS_SCP:-scp -q -o BatchMode=yes}
+SUDO=${ORANGE_OPS_SUDO-sudo}
+LOCAL=${ORANGE_OPS_LOCAL:-hosts}
+TIMEOUT=${ORANGE_OPS_TIMEOUT:-300}
+
+die() {
+    printf 'orange-ops: %s\n' "$*" >&2
+    exit 1
+}
+log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) DRY=1 ;;
+        --inventory) INVENTORY=${2:?--inventory <file>} && shift ;;
+        --hosts) ONLY_HOSTS=${2:?--hosts a,b} && shift ;;
+        --role) ONLY_ROLE=${2:?--role <role>} && shift ;;
+        -*) die "unknown option $1" ;;
+        *) break ;;
+    esac
+    shift
+done
+COMMAND=${1:-}
+[ -n "$COMMAND" ] || die "usage: orange-ops [--dry-run] [--inventory f] [--hosts a,b] [--role r] <command> (see the header)"
+shift
+# The command's own arguments: parsing the inventory reuses "$@".
+ARGS=("$@")
+
+# --- the inventory -------------------------------------------------------
+
+NAMES=() ROLES=() SSHS=() P2PS=() RPCS=() OPTS=()
+[ -f "$INVENTORY" ] || die "$INVENTORY: no such inventory"
+lineno=0
+while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    line=${line%%#*}
+    # shellcheck disable=SC2086
+    set -- $line
+    [ $# -gt 0 ] || continue
+    [ $# -ge 5 ] || die "$INVENTORY:$lineno: expected <name> <role> <ssh> <p2p> <rpc> [options]"
+    case "$2" in validator | rpc | bootnode) ;; *) die "$INVENTORY:$lineno: role $2 is not validator, rpc or bootnode" ;; esac
+    for n in ${NAMES[@]+"${NAMES[@]}"}; do
+        [ "$n" != "$1" ] || die "$INVENTORY:$lineno: host $1 listed twice"
+    done
+    NAMES+=("$1") ROLES+=("$2") SSHS+=("$3") P2PS+=("$4") RPCS+=("$5")
+    shift 5
+    for o in "$@"; do
+        case "$o" in
+            key=* | listen=* | join=sync | trust=* | public-rpc=1 | history=* | archive=1 | root=*) ;;
+            *) die "$INVENTORY:$lineno: unknown option $o" ;;
+        esac
+    done
+    OPTS+=("$*")
+done <"$INVENTORY"
+[ ${#NAMES[@]} -gt 0 ] || die "$INVENTORY: lists no host"
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+# The value of option $2 of host index $1, or $3.
+opt() {
+    local o
+    for o in ${OPTS[$1]}; do
+        case "$o" in "$2"=*)
+            echo "${o#*=}"
+            return
+            ;;
+        esac
+    done
+    echo "${3:-}"
+}
+
+# The indices of the hosts the command addresses.
+selected() {
+    local i
+    for i in "${!NAMES[@]}"; do
+        if [ -n "$ONLY_HOSTS" ] && ! [[ ",$ONLY_HOSTS," == *",${NAMES[i]},"* ]]; then continue; fi
+        if [ -n "$ONLY_ROLE" ] && [ "${ROLES[i]}" != "$ONLY_ROLE" ]; then continue; fi
+        echo "$i"
+    done
+}
+
+index_of() {
+    local i
+    for i in "${!NAMES[@]}"; do
+        [ "${NAMES[i]}" != "$1" ] || {
+            echo "$i"
+            return
+        }
+    done
+    die "no host $1 in $INVENTORY"
+}
+
+local_root() { opt "$1" root "$LOCAL/${NAMES[$1]}"; }
+
+# --- running things on a host --------------------------------------------
+
+# Prints a command line, quoted, for --dry-run.
+show() {
+    local out= w
+    for w in "$@"; do out+=" $(printf '%q' "$w")"; done
+    echo "+${out}"
+}
+
+# Runs "$@" here, or prints it under --dry-run.
+do_run() {
+    if [ "$DRY" = 1 ]; then
+        show "$@"
+    else
+        "$@"
+    fi
+}
+
+# Runs orange-host on host $1 with the rest as its arguments.
+on() {
+    local i=$1
+    shift
+    if [ "${SSHS[i]}" = local ]; then
+        local root
+        root=$(local_root "$i")
+        do_run env ORANGE_ROOT="$root" ORANGE_SERVICE=process bash "$root/opt/orange/bin/orange-host" "$@"
+    else
+        local quoted= w
+        for w in "$@"; do quoted+=" $(printf '%q' "$w")"; done
+        # shellcheck disable=SC2086
+        do_run $SSH "${SSHS[i]}" "$SUDO /opt/orange/bin/orange-host$quoted"
+    fi
+}
+
+# Copies local file $2 to path $3 (absolute, under the host's root) on host
+# $1 with mode $4.
+put() {
+    local i=$1 file=$2 dest=$3 mode=$4
+    [ "$DRY" = 1 ] || [ -f "$file" ] || die "$file: no such file"
+    if [ "${SSHS[i]}" = local ]; then
+        local root
+        root=$(local_root "$i")
+        do_run mkdir -p "$(dirname "$root$dest")"
+        do_run install -m "$mode" "$file" "$root$dest"
+    else
+        local tmp=/tmp/orange-ops.$$.$(basename "$dest")
+        # shellcheck disable=SC2086
+        do_run $SCP "$file" "${SSHS[i]}:$tmp"
+        local owner=root:orange
+        # shellcheck disable=SC2086
+        do_run $SSH "${SSHS[i]}" "$SUDO install -D -m $mode -o ${owner%%:*} -g ${owner##*:} $tmp $dest && rm -f $tmp"
+    fi
+}
+
+# --- rendering -----------------------------------------------------------
+
+# The node.env of host index $1; $2 is the published genesis hash, if known.
+render_env() {
+    local i=$1 hash=${2:-} listen
+    listen=$(opt "$i" listen "${P2PS[i]}")
+    local bootstrap= j
+    # Every bootnode of the inventory is a bootstrap address beyond the
+    # genesis bootnodes; a host never lists itself.
+    for j in "${!NAMES[@]}"; do
+        [ "$j" != "$i" ] || continue
+        [ "${ROLES[j]}" = bootnode ] || continue
+        bootstrap+="${bootstrap:+ }${P2PS[j]}"
+    done
+    cat <<EOF
+# node.env of ${NAMES[i]}, rendered by orange-ops from $INVENTORY.
+ORANGE_NAME=${NAMES[i]}
+ORANGE_ROLE=${ROLES[i]}
+ORANGE_LISTEN=$listen
+ORANGE_ADVERTISE=${P2PS[i]}
+ORANGE_RPC=${RPCS[i]}
+ORANGE_BOOTSTRAP="$bootstrap"
+ORANGE_GENESIS_HASH=$hash
+ORANGE_SERVE_SNAPSHOTS=1
+ORANGE_PUBLIC_RPC=$(opt "$i" public-rpc 0)
+ORANGE_JOIN=$(opt "$i" join)
+ORANGE_TRUST_FROM=$(opt "$i" trust)
+ORANGE_STATE_HISTORY=$(opt "$i" history)
+ORANGE_ARCHIVE=$(opt "$i" archive 0)
+EOF
+}
+
+render_prometheus() {
+    cat <<EOF
+# Prometheus configuration for the nodes of $INVENTORY, rendered by
+# orange-ops. Run Prometheus where it reaches every node's private RPC
+# address; alerts.yml is ops/alerts.yml.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: orange
+    metrics_path: /metrics
+    static_configs:
+EOF
+    local i
+    for i in "${!NAMES[@]}"; do
+        cat <<EOF
+      - targets: ["${RPCS[i]}"]
+        labels: {host: "${NAMES[i]}", role: "${ROLES[i]}"}
+EOF
+    done
+}
+
+# --- health --------------------------------------------------------------
+
+# "<height> <hash>" of host $1's latest finalized block, or nothing.
+finalized() { on "$1" finalized 2>/dev/null || true; }
+
+# Doctor on every selected host, then agreement: every host has the same
+# hash at the lowest finalized height among them.
+health() {
+    local i failed=0 lowest= line
+    # shellcheck disable=SC2086
+    for i in $(selected); do
+        if on "$i" health ${ORANGE_DOCTOR_ARGS:-} >/dev/null 2>&1; then
+            echo "${NAMES[i]}: healthy"
+        else
+            echo "${NAMES[i]}: UNHEALTHY"
+            on "$i" health ${ORANGE_DOCTOR_ARGS:-} 2>&1 | sed 's/^/    /' || true
+            failed=1
+        fi
+        line=$(finalized "$i")
+        if [ -n "$line" ] && { [ -z "$lowest" ] || [ "${line%% *}" -lt "$lowest" ]; }; then
+            lowest=${line%% *}
+        fi
+    done
+    [ "$failed" = 0 ] || return 1
+    [ -n "$lowest" ] || {
+        echo "no host reports a finalized block"
+        return 1
+    }
+    local want= got
+    for i in $(selected); do
+        got=$(on "$i" block-hash "$lowest" 2>/dev/null || true)
+        [ -n "$want" ] || want=$got
+        if [ -z "$got" ] || [ "$got" != "$want" ]; then
+            echo "${NAMES[i]}: block $lowest is ${got:-missing}, not $want"
+            return 1
+        fi
+    done
+    echo "agreement: every host has block $lowest as $want"
+}
+
+# Waits until host $1 is healthy and has finalized at least $2.
+wait_host() {
+    local i=$1 floor=$2 deadline=$((SECONDS + TIMEOUT)) line
+    while :; do
+        # shellcheck disable=SC2086
+        if on "$i" health ${ORANGE_DOCTOR_ARGS:-} >/dev/null 2>&1; then
+            line=$(finalized "$i")
+            if [ -n "$line" ] && [ "${line%% *}" -ge "$floor" ]; then
+                log "${NAMES[i]}: healthy, finalized ${line%% *}"
+                return 0
+            fi
+        fi
+        [ "$SECONDS" -lt "$deadline" ] || die "${NAMES[i]}: not healthy and caught up within ${TIMEOUT}s"
+        sleep 2
+    done
+}
+
+# The highest finalized height any host but $1 reports.
+top_finalized() {
+    local i top=0 line
+    for i in "${!NAMES[@]}"; do
+        [ "$i" != "$1" ] || continue
+        line=$(finalized "$i")
+        [ -z "$line" ] || [ "${line%% *}" -le "$top" ] || top=${line%% *}
+    done
+    echo "$top"
+}
+
+rolling_restart() {
+    local i floor
+    for i in $(selected); do
+        log "${NAMES[i]}: restarting"
+        on "$i" restart
+        [ "$DRY" = 0 ] || continue
+        floor=$(top_finalized "$i")
+        wait_host "$i" "$floor"
+    done
+}
+
+# --- commands ------------------------------------------------------------
+
+arg_of() { # the value after flag $1 in the remaining arguments
+    local flag=$1
+    shift
+    while [ $# -gt 0 ]; do
+        [ "$1" != "$flag" ] || {
+            echo "${2:?$flag needs a value}"
+            return
+        }
+        shift
+    done
+}
+
+case "$COMMAND" in
+    hosts)
+        for i in $(selected); do
+            printf '%-12s %-9s %-24s p2p %-22s rpc %-22s %s\n' "${NAMES[i]}" "${ROLES[i]}" "${SSHS[i]}" "${P2PS[i]}" "${RPCS[i]}" "${OPTS[i]}"
+        done
+        ;;
+    render)
+        out=${1:?render <dir>}
+        hash=${ORANGE_GENESIS_HASH:-}
+        do_run mkdir -p "$out"
+        for i in $(selected); do
+            if [ "$DRY" = 1 ]; then
+                show render_env "${NAMES[i]}" ">" "$out/${NAMES[i]}.env"
+            else
+                render_env "$i" "$hash" >"$out/${NAMES[i]}.env"
+            fi
+        done
+        if [ "$DRY" = 1 ]; then show render_prometheus ">" "$out/prometheus.yml"; else render_prometheus >"$out/prometheus.yml"; fi
+        echo "rendered into $out"
+        ;;
+    install)
+        binary=$(arg_of --binary "$@")
+        [ -n "$binary" ] || die "install --binary <orange>"
+        for i in $(selected); do
+            log "${NAMES[i]}: installing"
+            if [ "${SSHS[i]}" != local ]; then
+                # The service account, the directories and the unit.
+                # shellcheck disable=SC2086
+                do_run $SSH "${SSHS[i]}" "$SUDO sh -c 'id orange >/dev/null 2>&1 || useradd --system --home /var/lib/orange --shell /usr/sbin/nologin orange; install -d -o root -g orange -m 0750 /etc/orange /etc/orange/keys; install -d -o orange -g orange -m 0700 /var/lib/orange; install -d -m 0755 /opt/orange/bin'"
+                put "$i" "$HERE/orange-node.service" /etc/systemd/system/orange-node.service 0644
+                # shellcheck disable=SC2086
+                do_run $SSH "${SSHS[i]}" "$SUDO systemctl daemon-reload && $SUDO systemctl enable orange-node"
+            fi
+            put "$i" "$HERE/orange-host" /opt/orange/bin/orange-host 0755
+            put "$i" "$binary" /opt/orange/bin/orange.new 0755
+            if [ "${SSHS[i]}" = local ]; then
+                on "$i" install-binary "$(local_root "$i")/opt/orange/bin/orange.new"
+            else
+                on "$i" install-binary /opt/orange/bin/orange.new
+            fi
+        done
+        ;;
+    configure)
+        network=$(arg_of --network "$@")
+        [ -n "$network" ] || die "configure --network <dir>"
+        for f in genesis.json kernel.elf genesis.hash; do
+            [ "$DRY" = 1 ] || [ -f "$network/$f" ] || die "$network/$f: missing"
+        done
+        hash=$(cat "$network/genesis.hash" 2>/dev/null || echo "0x<published hash>")
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        for i in $(selected); do
+            log "${NAMES[i]}: configuring"
+            render_env "$i" "$hash" >"$tmp/${NAMES[i]}.env"
+            put "$i" "$network/genesis.json" /etc/orange/genesis.json 0644
+            put "$i" "$network/kernel.elf" /etc/orange/kernel.elf 0644
+            put "$i" "$tmp/${NAMES[i]}.env" /etc/orange/node.env 0644
+            key=$(opt "$i" key)
+            if [ -n "$key" ]; then
+                if [ "${ROLES[i]}" = validator ]; then dest=validator.key; else dest=node.key; fi
+                put "$i" "$key" "/etc/orange/keys/$dest" 0600
+            fi
+            on "$i" check-config
+        done
+        ;;
+    start | stop | restart | status)
+        status=0
+        for i in $(selected); do on "$i" "$COMMAND" || status=$?; done
+        exit "$status"
+        ;;
+    rolling-restart) rolling_restart ;;
+    upgrade-binary)
+        binary=$(arg_of --binary "$@")
+        [ -n "$binary" ] || die "upgrade-binary --binary <orange>"
+        for i in $(selected); do
+            put "$i" "$binary" /opt/orange/bin/orange.new 0755
+            if [ "${SSHS[i]}" = local ]; then
+                on "$i" install-binary "$(local_root "$i")/opt/orange/bin/orange.new"
+            else
+                on "$i" install-binary /opt/orange/bin/orange.new
+            fi
+        done
+        rolling_restart
+        ;;
+    rollback)
+        for i in $(selected); do on "$i" rollback; done
+        rolling_restart
+        ;;
+    health) if [ "$DRY" = 1 ]; then for i in $(selected); do on "$i" health; done; else health; fi ;;
+    wait-healthy)
+        limit=${1:-$TIMEOUT}
+        deadline=$((SECONDS + limit))
+        until health >/dev/null 2>&1; do
+            [ "$SECONDS" -lt "$deadline" ] || {
+                health || true
+                die "not healthy within ${limit}s"
+            }
+            sleep 2
+        done
+        health
+        ;;
+    logs)
+        i=$(index_of "${1:?logs <host> [lines]}")
+        on "$i" logs "${2:-200}"
+        ;;
+    collect-logs)
+        out=${1:?collect-logs <dir>}
+        do_run mkdir -p "$out"
+        for i in $(selected); do
+            if [ "$DRY" = 1 ]; then on "$i" logs 100000; else on "$i" logs 100000 >"$out/${NAMES[i]}.log" 2>&1 || true; fi
+        done
+        [ "$DRY" = 1 ] || echo "logs in $out"
+        ;;
+    backup-keys)
+        out=${1:?backup-keys <dir>}
+        do_run mkdir -p "$out"
+        for i in $(selected); do
+            if [ "$DRY" = 1 ]; then on "$i" backup-keys; else
+                (umask 077 && on "$i" backup-keys >"$out/${NAMES[i]}-keys.tar")
+            fi
+        done
+        [ "$DRY" = 1 ] || echo "key backups in $out (mode 0600): move them offline"
+        ;;
+    resources) for i in $(selected); do on "$i" resources; done ;;
+    prometheus) render_prometheus ;;
+    ansible-inventory)
+        for role in validator rpc bootnode; do
+            echo "[orange_$role]"
+            for i in "${!NAMES[@]}"; do
+                [ "${ROLES[i]}" = "$role" ] || continue
+                if [ "${SSHS[i]}" = local ]; then
+                    echo "${NAMES[i]} ansible_connection=local orange_root=$(local_root "$i") orange_p2p=${P2PS[i]} orange_rpc=${RPCS[i]}"
+                else
+                    echo "${NAMES[i]} ansible_host=${SSHS[i]#*@} ansible_user=${SSHS[i]%@*} orange_p2p=${P2PS[i]} orange_rpc=${RPCS[i]}"
+                fi
+            done
+            echo
+        done
+        ;;
+    *) die "unknown command $COMMAND" ;;
+esac

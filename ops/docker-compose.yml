@@ -1,29 +1,29 @@
-# A four-validator Solo devnet with Prometheus and Grafana: the topology of
-# `solo devnet init --validators 4` as containers, one image built once from
+# A four-validator Orange devnet with Prometheus and Grafana: the topology of
+# `orange devnet init --validators 4` as containers, one image built once from
 # ops/Dockerfile. See ops/README.md.
 #
 #   docker compose -f ops/docker-compose.yml up --build -d
 #   docker compose -f ops/docker-compose.yml down -v
 #
 # Published on this machine's loopback only, since the RPC carries the
-# unauthenticated `solo_stop` and Grafana runs as an anonymous admin:
+# unauthenticated `orange_stop` and Grafana runs as an anonymous admin:
 # JSON-RPC 127.0.0.1:8545 to 8548 (node 0 to 3), Prometheus 127.0.0.1:9090,
-# Grafana 127.0.0.1:3000 with the Solo dashboard provisioned.
+# Grafana 127.0.0.1:3000 with the Orange dashboard provisioned.
 #
 # `init` runs once and writes the genesis, the kernel module and the keys to
 # the `devnet` volume; it leaves them alone on later runs, so a restart keeps
 # the chain's identities. Each node keeps its driver state in its directory
 # on that volume (`--data-dir`), so a restarted container resumes the view
 # it left (spec 08 §7). The nodes reach each other by fixed addresses on the
-# `solo` network as `solo devnet` does on one machine: every node dials the
+# `orange` network as `orange devnet` does on one machine: every node dials the
 # ones before it and has all the others as bootstrap addresses for peer
 # exchange (spec 09 §5a). Each advertises its own address, since it listens
 # on the unspecified address and would otherwise advertise nothing; peer
 # records carry an ip:port, so these are addresses, not service names.
-name: solo-devnet
+name: orange-devnet
 
 x-node: &node
-  image: solo:devnet
+  image: orange:devnet
   depends_on:
     init:
       condition: service_completed_successfully
@@ -36,31 +36,31 @@ services:
     build:
       context: ..
       dockerfile: ops/Dockerfile
-    image: solo:devnet
+    image: orange:devnet
     command:
       - devnet
       - init
       - --dir
       - /devnet
       - --kernel
-      - /solo/kernel.elf
+      - /orange/kernel.elf
       - --validators
       - "4"
       - --epoch-blocks
-      - ${SOLO_EPOCH_BLOCKS:-20}
+      - ${ORANGE_EPOCH_BLOCKS:-20}
       - --dkg-phase-blocks
-      - ${SOLO_DKG_PHASE_BLOCKS:-5}
+      - ${ORANGE_DKG_PHASE_BLOCKS:-5}
       - --governance-key
-      - ${SOLO_GOVERNANCE_KEY:-6060606060606060606060606060606060606060606060606060606060606060}
+      - ${ORANGE_GOVERNANCE_KEY:-6060606060606060606060606060606060606060606060606060606060606060}
     volumes:
       - devnet:/devnet
 
-  solo-0:
+  orange-0:
     <<: *node
     command:
       - node
       - --kernel
-      - /devnet/kernel.solo
+      - /devnet/kernel.orange
       - --genesis
       - /devnet/genesis.json
       - --key-file
@@ -80,17 +80,17 @@ services:
       - --bootstrap
       - 172.28.0.13:30333
     networks:
-      solo:
+      orange:
         ipv4_address: 172.28.0.10
     ports:
       - "127.0.0.1:8545:8545"
 
-  solo-1:
+  orange-1:
     <<: *node
     command:
       - node
       - --kernel
-      - /devnet/kernel.solo
+      - /devnet/kernel.orange
       - --genesis
       - /devnet/genesis.json
       - --key-file
@@ -112,17 +112,17 @@ services:
       - --bootstrap
       - 172.28.0.13:30333
     networks:
-      solo:
+      orange:
         ipv4_address: 172.28.0.11
     ports:
       - "127.0.0.1:8546:8545"
 
-  solo-2:
+  orange-2:
     <<: *node
     command:
       - node
       - --kernel
-      - /devnet/kernel.solo
+      - /devnet/kernel.orange
       - --genesis
       - /devnet/genesis.json
       - --key-file
@@ -146,17 +146,17 @@ services:
       - --bootstrap
       - 172.28.0.13:30333
     networks:
-      solo:
+      orange:
         ipv4_address: 172.28.0.12
     ports:
       - "127.0.0.1:8547:8545"
 
-  solo-3:
+  orange-3:
     <<: *node
     command:
       - node
       - --kernel
-      - /devnet/kernel.solo
+      - /devnet/kernel.orange
       - --genesis
       - /devnet/genesis.json
       - --key-file
@@ -182,7 +182,7 @@ services:
       - --bootstrap
       - 172.28.0.12:30333
     networks:
-      solo:
+      orange:
         ipv4_address: 172.28.0.13
     ports:
       - "127.0.0.1:8548:8545"
@@ -195,7 +195,7 @@ services:
       - ./prometheus-devnet.yml:/etc/prometheus/prometheus.yml:ro
       - ./alerts.yml:/etc/prometheus/alerts.yml:ro
     networks:
-      - solo
+      - orange
     ports:
       - "127.0.0.1:9090:9090"
 
@@ -207,11 +207,11 @@ services:
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana-solo.json:/var/lib/grafana/dashboards/solo.json:ro
+      - ./grafana-orange.json:/var/lib/grafana/dashboards/orange.json:ro
     depends_on:
       - prometheus
     networks:
-      - solo
+      - orange
     ports:
       - "127.0.0.1:3000:3000"
 
@@ -219,7 +219,7 @@ volumes:
   devnet: {}
 
 networks:
-  solo:
+  orange:
     ipam:
       config:
         - subnet: 172.28.0.0/24

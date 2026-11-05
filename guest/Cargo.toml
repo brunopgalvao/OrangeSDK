@@ -1,8 +1,8 @@
-# Guest workspace: programs compiled for the Solo VM. Kept separate from the
+# Guest workspace: programs compiled for the Orange VM. Kept separate from the
 # host workspace because everything here targets riscv64imac-unknown-none-elf.
 [workspace]
 resolver = "2"
-members = ["solo-guest", "solo-module", "hello", "kernel", "modules/counter", "modules/eth-light-client", "modules/eth-message-verifier", "modules/precompiles", "evm-conformance"]
+members = ["orange-guest", "orange-module", "hello", "kernel", "modules/counter", "modules/eth-light-client", "modules/eth-message-verifier", "modules/precompiles", "evm-conformance"]
 
 [workspace.package]
 version = "0.0.1"
@@ -24,7 +24,7 @@ opt-level = "z"
 [profile.release.package.eth-message-verifier]
 opt-level = "z"
 
-[profile.release.package.solo-ethlc]
+[profile.release.package.orange-ethlc]
 opt-level = "z"
 
 [profile.dev]

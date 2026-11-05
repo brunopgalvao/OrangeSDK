@@ -12,20 +12,20 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use solo_abi::chain::Proposal;
-use solo_abi::chain::consensus::{KEY_ROLE, identity_preimage, signing_preimage};
-use solo_abi::codec::Seq;
-use solo_abi::rotation::{
+use orange_abi::chain::Proposal;
+use orange_abi::chain::consensus::{KEY_ROLE, identity_preimage, signing_preimage};
+use orange_abi::codec::Seq;
+use orange_abi::rotation::{
     RotationCertificate, RotationShare, ThresholdEvidence, certificate_bytes, certificate_message,
     offence, rotation_message, threshold_certificate,
 };
-use solo_abi::staking::{
+use orange_abi::staking::{
     DkgEnvelope, DkgReply, DkgRequest, DkgRun, KEY_ROLE_THRESHOLD, KIND_DKG, KeySetRecord,
     KeystoreRequest, MAX_DKG, PartialShare, dkg_header, envelope, epoch_of,
 };
-use solo_abi::types::Hash;
-use solo_abi::{Decode, Encode};
-use solo_guest::host;
+use orange_abi::types::Hash;
+use orange_abi::{Decode, Encode};
+use orange_guest::host;
 
 use crate::{persist, rotation, staking, state, tx};
 
@@ -57,7 +57,7 @@ pub fn keystore(request: &KeystoreRequest) -> Option<Vec<u8>> {
     let call = |buf: &mut Vec<u8>| {
         // SAFETY: valid pointers into our own buffers of the stated sizes.
         unsafe {
-            host::__solo_import_sign(
+            host::__orange_import_sign(
                 KEY_ROLE_THRESHOLD,
                 msg.as_ptr(),
                 msg.len() as u32,

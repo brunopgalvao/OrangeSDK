@@ -2027,6 +2027,277 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "orange-abi"
+version = "0.0.1"
+dependencies = [
+ "orange-fuzz",
+ "proptest",
+]
+
+[[package]]
+name = "orange-bls"
+version = "0.0.1"
+dependencies = [
+ "ark-bls12-381",
+ "ark-ec",
+ "ark-ff 0.6.0",
+ "ark-serialize 0.6.0",
+ "bls12_381",
+ "hkdf",
+ "orange-abi",
+ "orange-fuzz",
+ "proptest",
+ "sha2 0.10.9",
+ "zeroize",
+]
+
+[[package]]
+name = "orange-bridge"
+version = "0.0.1"
+dependencies = [
+ "k256",
+ "orange-abi",
+ "orange-bls",
+ "orange-ethlc",
+ "orange-fuzz",
+ "orange-node",
+ "orange-recompile",
+ "orange-rlp",
+ "orange-trie",
+ "revm",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "orange-cli"
+version = "0.0.1"
+dependencies = [
+ "getrandom 0.3.4",
+ "k256",
+ "orange-abi",
+ "orange-fuzz",
+ "orange-host",
+ "orange-metrics",
+ "orange-node",
+ "orange-recompile",
+ "orange-rlp",
+ "orange-rpc",
+ "orange-scratch",
+ "orange-store",
+ "orange-upgrade",
+ "serde_json",
+]
+
+[[package]]
+name = "orange-conformance"
+version = "0.0.1"
+dependencies = [
+ "k256",
+ "orange-abi",
+ "orange-eth",
+ "orange-host",
+ "orange-recompile",
+ "orange-rlp",
+ "orange-scratch",
+ "orange-vm",
+ "serde_json",
+]
+
+[[package]]
+name = "orange-eth"
+version = "0.0.1"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 1.8.3",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
+ "k256",
+ "orange-abi",
+ "orange-fuzz",
+ "orange-rlp",
+ "serde_json",
+ "tiny-keccak",
+]
+
+[[package]]
+name = "orange-ethlc"
+version = "0.0.1"
+dependencies = [
+ "orange-abi",
+ "orange-bls",
+ "orange-ethlc",
+ "orange-fuzz",
+ "orange-rlp",
+ "revm",
+ "serde_json",
+ "sha2 0.10.9",
+ "tiny-keccak",
+]
+
+[[package]]
+name = "orange-fuzz"
+version = "0.0.1"
+
+[[package]]
+name = "orange-host"
+version = "0.0.1"
+dependencies = [
+ "blake2",
+ "k256",
+ "orange-bls",
+ "orange-jit",
+ "orange-recompile",
+ "orange-trie",
+ "orange-vm",
+ "p256",
+ "proptest",
+ "revm-precompile",
+ "sha2 0.10.9",
+ "tiny-keccak",
+]
+
+[[package]]
+name = "orange-jit"
+version = "0.0.1"
+dependencies = [
+ "k256",
+ "libc",
+ "orange-abi",
+ "orange-fuzz",
+ "orange-host",
+ "orange-node",
+ "orange-recompile",
+ "orange-rlp",
+ "orange-scratch",
+ "orange-store",
+ "orange-vm",
+ "proptest",
+]
+
+[[package]]
+name = "orange-metrics"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+ "serde_json",
+]
+
+[[package]]
+name = "orange-node"
+version = "0.0.1"
+dependencies = [
+ "chacha20poly1305",
+ "getrandom 0.3.4",
+ "hkdf",
+ "k256",
+ "orange-abi",
+ "orange-bls",
+ "orange-eth",
+ "orange-ethlc",
+ "orange-fuzz",
+ "orange-host",
+ "orange-metrics",
+ "orange-node",
+ "orange-recompile",
+ "orange-rlp",
+ "orange-scratch",
+ "orange-store",
+ "orange-trie",
+ "orange-upgrade",
+ "orange-vm",
+ "p256",
+ "proptest",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "orange-recompile"
+version = "0.0.1"
+dependencies = [
+ "object",
+ "orange-fuzz",
+ "orange-scratch",
+ "orange-vm",
+ "tiny-keccak",
+]
+
+[[package]]
+name = "orange-rlp"
+version = "0.0.1"
+dependencies = [
+ "orange-fuzz",
+ "proptest",
+]
+
+[[package]]
+name = "orange-rpc"
+version = "0.0.1"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 1.8.3",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
+ "k256",
+ "orange-abi",
+ "orange-bridge",
+ "orange-eth",
+ "orange-host",
+ "orange-metrics",
+ "orange-node",
+ "orange-recompile",
+ "orange-rlp",
+ "orange-scratch",
+ "orange-trie",
+ "serde_json",
+ "tiny-keccak",
+]
+
+[[package]]
+name = "orange-scratch"
+version = "0.0.1"
+
+[[package]]
+name = "orange-store"
+version = "0.0.1"
+dependencies = [
+ "k256",
+ "orange-abi",
+ "orange-bls",
+ "orange-host",
+ "orange-scratch",
+ "orange-trie",
+ "redb",
+]
+
+[[package]]
+name = "orange-trie"
+version = "0.0.1"
+dependencies = [
+ "orange-fuzz",
+ "proptest",
+ "tiny-keccak",
+]
+
+[[package]]
+name = "orange-upgrade"
+version = "0.0.1"
+dependencies = [
+ "orange-abi",
+ "orange-fuzz",
+ "proptest",
+ "tiny-keccak",
+]
+
+[[package]]
+name = "orange-vm"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "p256"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2953,277 +3224,6 @@ name = "smallvec"
 version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
-
-[[package]]
-name = "solo-abi"
-version = "0.0.1"
-dependencies = [
- "proptest",
- "solo-fuzz",
-]
-
-[[package]]
-name = "solo-bls"
-version = "0.0.1"
-dependencies = [
- "ark-bls12-381",
- "ark-ec",
- "ark-ff 0.6.0",
- "ark-serialize 0.6.0",
- "bls12_381",
- "hkdf",
- "proptest",
- "sha2 0.10.9",
- "solo-abi",
- "solo-fuzz",
- "zeroize",
-]
-
-[[package]]
-name = "solo-bridge"
-version = "0.0.1"
-dependencies = [
- "k256",
- "revm",
- "sha2 0.10.9",
- "solo-abi",
- "solo-bls",
- "solo-ethlc",
- "solo-fuzz",
- "solo-node",
- "solo-recompile",
- "solo-rlp",
- "solo-trie",
-]
-
-[[package]]
-name = "solo-cli"
-version = "0.0.1"
-dependencies = [
- "getrandom 0.3.4",
- "k256",
- "serde_json",
- "solo-abi",
- "solo-fuzz",
- "solo-host",
- "solo-metrics",
- "solo-node",
- "solo-recompile",
- "solo-rlp",
- "solo-rpc",
- "solo-scratch",
- "solo-store",
- "solo-upgrade",
-]
-
-[[package]]
-name = "solo-conformance"
-version = "0.0.1"
-dependencies = [
- "k256",
- "serde_json",
- "solo-abi",
- "solo-eth",
- "solo-host",
- "solo-recompile",
- "solo-rlp",
- "solo-scratch",
- "solo-vm",
-]
-
-[[package]]
-name = "solo-eth"
-version = "0.0.1"
-dependencies = [
- "alloy-consensus",
- "alloy-eips 1.8.3",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-trie",
- "k256",
- "serde_json",
- "solo-abi",
- "solo-fuzz",
- "solo-rlp",
- "tiny-keccak",
-]
-
-[[package]]
-name = "solo-ethlc"
-version = "0.0.1"
-dependencies = [
- "revm",
- "serde_json",
- "sha2 0.10.9",
- "solo-abi",
- "solo-bls",
- "solo-ethlc",
- "solo-fuzz",
- "solo-rlp",
- "tiny-keccak",
-]
-
-[[package]]
-name = "solo-fuzz"
-version = "0.0.1"
-
-[[package]]
-name = "solo-host"
-version = "0.0.1"
-dependencies = [
- "blake2",
- "k256",
- "p256",
- "proptest",
- "revm-precompile",
- "sha2 0.10.9",
- "solo-bls",
- "solo-jit",
- "solo-recompile",
- "solo-trie",
- "solo-vm",
- "tiny-keccak",
-]
-
-[[package]]
-name = "solo-jit"
-version = "0.0.1"
-dependencies = [
- "k256",
- "libc",
- "proptest",
- "solo-abi",
- "solo-fuzz",
- "solo-host",
- "solo-node",
- "solo-recompile",
- "solo-rlp",
- "solo-scratch",
- "solo-store",
- "solo-vm",
-]
-
-[[package]]
-name = "solo-metrics"
-version = "0.0.1"
-dependencies = [
- "proptest",
- "serde_json",
-]
-
-[[package]]
-name = "solo-node"
-version = "0.0.1"
-dependencies = [
- "chacha20poly1305",
- "getrandom 0.3.4",
- "hkdf",
- "k256",
- "p256",
- "proptest",
- "sha2 0.10.9",
- "solo-abi",
- "solo-bls",
- "solo-eth",
- "solo-ethlc",
- "solo-fuzz",
- "solo-host",
- "solo-metrics",
- "solo-node",
- "solo-recompile",
- "solo-rlp",
- "solo-scratch",
- "solo-store",
- "solo-trie",
- "solo-upgrade",
- "solo-vm",
-]
-
-[[package]]
-name = "solo-recompile"
-version = "0.0.1"
-dependencies = [
- "object",
- "solo-fuzz",
- "solo-scratch",
- "solo-vm",
- "tiny-keccak",
-]
-
-[[package]]
-name = "solo-rlp"
-version = "0.0.1"
-dependencies = [
- "proptest",
- "solo-fuzz",
-]
-
-[[package]]
-name = "solo-rpc"
-version = "0.0.1"
-dependencies = [
- "alloy-consensus",
- "alloy-eips 1.8.3",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-trie",
- "k256",
- "serde_json",
- "solo-abi",
- "solo-bridge",
- "solo-eth",
- "solo-host",
- "solo-metrics",
- "solo-node",
- "solo-recompile",
- "solo-rlp",
- "solo-scratch",
- "solo-trie",
- "tiny-keccak",
-]
-
-[[package]]
-name = "solo-scratch"
-version = "0.0.1"
-
-[[package]]
-name = "solo-store"
-version = "0.0.1"
-dependencies = [
- "k256",
- "redb",
- "solo-abi",
- "solo-bls",
- "solo-host",
- "solo-scratch",
- "solo-trie",
-]
-
-[[package]]
-name = "solo-trie"
-version = "0.0.1"
-dependencies = [
- "proptest",
- "solo-fuzz",
- "tiny-keccak",
-]
-
-[[package]]
-name = "solo-upgrade"
-version = "0.0.1"
-dependencies = [
- "proptest",
- "solo-abi",
- "solo-fuzz",
- "tiny-keccak",
-]
-
-[[package]]
-name = "solo-vm"
-version = "0.0.1"
-dependencies = [
- "proptest",
-]
 
 [[package]]
 name = "spki"

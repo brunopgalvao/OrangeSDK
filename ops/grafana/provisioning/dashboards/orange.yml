@@ -1,0 +1,9 @@
+# Loads ops/grafana-orange.json, mounted at /var/lib/grafana/dashboards.
+apiVersion: 1
+providers:
+  - name: orange
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

@@ -1,0 +1,23 @@
+[package]
+name = "orange-trie"
+description = "The binary Merkle trie of the Orange state commitment, with inclusion and exclusion proofs, no_std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["keccak"]
+# keccak256 from tiny-keccak. Without it the caller supplies the hash
+# function, as a guest does through the host's `hash_keccak256`.
+keccak = ["dep:tiny-keccak"]
+
+[dependencies]
+tiny-keccak = { version = "2", features = ["keccak"], optional = true }
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+orange-fuzz = { path = "../orange-fuzz" }
+
+[lints]
+workspace = true
