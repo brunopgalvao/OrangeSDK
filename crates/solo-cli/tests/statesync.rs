@@ -30,14 +30,14 @@ fn a_sync_without_peers_stops() {
     );
     // A sync's own failure comes first; a trust too old for what the peers
     // offered says so when they ran out (spec 22 §7.5).
-    let old = || Some("too old".to_owned());
-    assert_eq!(stopped(None, || None, old), None);
+    let old = &|| Some("too old".to_owned());
+    assert_eq!(stopped(None, &|| None, old), None);
     assert_eq!(
-        stopped(None, || Some("no peer to sync from in time"), old).as_deref(),
+        stopped(None, &|| Some("no peer to sync from in time"), old).as_deref(),
         Some("state sync: no peer to sync from in time: too old")
     );
     assert_eq!(
-        stopped(Some("another genesis"), || None, old).as_deref(),
+        stopped(Some("another genesis"), &|| None, old).as_deref(),
         Some("state sync: another genesis")
     );
 }
@@ -57,4 +57,14 @@ fn a_sync_alert_is_logged_when_it_changes() {
         change(Some("a"), None).as_deref(),
         Some("catch-up: peers serve the blocks this node needs again")
     );
+    // The node loop logs each change once.
+    let (mut seen, mut log) = (None, Vec::new());
+    for now in [None, Some("far"), Some("far"), None, None] {
+        solo_cli::report_sync_alert(now.map(str::to_owned), &mut seen, &mut log);
+    }
+    assert_eq!(
+        String::from_utf8(log).unwrap(),
+        "catch-up: far\ncatch-up: peers serve the blocks this node needs again\n"
+    );
+    assert_eq!(seen, None);
 }

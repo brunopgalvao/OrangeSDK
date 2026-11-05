@@ -221,11 +221,12 @@ pub fn describe_event(event: &solo_node::statesync::SyncEvent) -> String {
 /// the snapshots they offered, if anything (spec 22 §7.5).
 pub fn stopped<'a>(
     failed: Option<&'a str>,
-    stalled: impl FnOnce() -> Option<&'a str>,
-    hint: impl FnOnce() -> Option<String>,
+    stalled: &dyn Fn() -> Option<&'a str>,
+    hint: &dyn Fn() -> Option<String>,
 ) -> Option<String> {
     let why = failed.or_else(stalled)?;
-    Some(match failed.map_or_else(hint, |_| None) {
+    let hint = if failed.is_some() { None } else { hint() };
+    Some(match hint {
         Some(hint) => format!("state sync: {why}: {hint}"),
         None => format!("state sync: {why}"),
     })
@@ -254,7 +255,7 @@ pub fn sync_from_peers(
             eprintln!("state sync: {}", describe_event(&event));
         }
         let stall = || transport.sync_stalled(now());
-        if let Some(why) = stopped(sync.failed(), stall, || sync.hint()) {
+        if let Some(why) = stopped(sync.failed(), &stall, &|| sync.hint()) {
             return Err(why);
         }
         if let Some(snapshot) = sync.done() {

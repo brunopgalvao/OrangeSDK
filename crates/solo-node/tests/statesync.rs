@@ -1367,6 +1367,17 @@ fn a_joiner_trusting_an_old_key_set_follows_the_handoffs_to_the_newest_snapshot(
         .collect();
     assert_eq!(followed.last().map(|f| f.1), Some(certifying), "{events:?}");
     assert!(followed.iter().map(|f| f.0).sum::<usize>() >= 3);
+    // A trust whose horizon ends before the snapshot's epoch refuses it.
+    let header = &sync.done().unwrap().header;
+    assert_eq!(
+        header.verify(
+            genesis.chain_id,
+            &Trust::KeySet(KeyChain::new(anchor, anchor_key, 1))
+        ),
+        Err(solo_store::snapshot::SnapshotError::Verify(
+            solo_store::snapshot::PAST_HORIZON
+        ))
+    );
     finish(&mut joiner, sync.done().unwrap()).unwrap();
     assert_eq!(joiner.block_number().unwrap(), newest.height);
     assert!(!target.join("statesync").exists());

@@ -1817,9 +1817,27 @@ mod tests {
         assert!(sync(&dir.join("genesis"), None).key_chain_mut().is_none());
         let blocked = dir.join("blocked");
         fs::create_dir_all(blocked.join("handoffs")).unwrap();
-        let mut s = holding(&blocked, trust, 1);
+        let mut s = holding(&blocked, trust.clone(), 1);
         s.on_handoffs([1; 32], &chain[..1]);
         assert!(s.failed().is_some());
+        // An answer that fails a check bans its peer, naming the check.
+        for (i, (answer, wanted, why)) in [
+            (&chain[..], 1, TOO_MANY),
+            (&chain[..2], 1, PASSES_OVER),
+            (&chain[1..2], 2, solo_store::keychain::NOT_FROM_REACHED),
+            (&[][..], 1, STOPS_SHORT),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut s = holding(&dir.join(format!("lie-{i}")), trust.clone(), wanted);
+            s.on_handoffs([1; 32], answer);
+            assert_eq!(
+                s.take_events().last(),
+                Some(&SyncEvent::Banned { peer: [1; 32], why }),
+                "{why}"
+            );
+        }
     }
 
     #[test]

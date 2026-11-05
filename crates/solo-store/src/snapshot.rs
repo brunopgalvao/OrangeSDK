@@ -1301,7 +1301,15 @@ mod tests {
     fn an_empty_run_merges_as_nothing() {
         let empty = scratch("empty.run");
         std::fs::write(&empty, []).unwrap();
-        merge_runs(&[empty], &mut |_, _, _| Err(SnapshotError::Cancelled)).unwrap();
+        let one = scratch("one.run");
+        write_run(&one, &mut vec![([1; 32], b"k".to_vec(), b"v".to_vec())]).unwrap();
+        let mut merged = Vec::new();
+        merge_runs(&[empty, one], &mut |p, key, value| {
+            merged.push((p, key, value));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(merged, vec![([1; 32], b"k".to_vec(), b"v".to_vec())]);
     }
 
     /// Under a key-set trust (spec 22 §7.5), the certificate must be of a
@@ -1504,6 +1512,20 @@ mod tests {
         finalize(&mut tables, &proposal(3, 0, [0; 32]), false);
         finalize(&mut tables, &proposal(4, 3, root3), true);
         tables
+    }
+
+    /// On a chain with a threshold key, an export waits for a threshold
+    /// certificate: the votes certify nothing a verifier accepts there.
+    #[test]
+    fn a_staking_chain_exports_only_under_a_threshold_certificate() {
+        let (mut s, _, root3) = store("staking");
+        s.set(solo_abi::staking::keys::ACTIVE, b"key set");
+        let err = export(&s, &certifying(root3), None, "staking").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no threshold certificate covers a proposal anchoring a kept height above block 1 yet"),
+            "{err}"
+        );
     }
 
     /// The expensive half of an export runs on another thread over the

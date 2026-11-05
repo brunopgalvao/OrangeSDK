@@ -71,6 +71,7 @@ pub mod staking;
 pub mod upgrade;
 
 use std::cell::Cell;
+use std::io::Write;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -826,10 +827,13 @@ pub fn sync_alert_change(seen: Option<&str>, now: Option<&str>) -> Option<String
     }
 }
 
-fn report_sync_alert(node: &solo_node::Node, seen: &mut Option<String>) {
-    let alert = node.sync_alert();
-    let _ = sync_alert_change(seen.as_deref(), alert.as_deref()).inspect(|l| eprintln!("{l}"));
-    *seen = alert;
+/// Writes to `log` how the node's sync alert changed from `seen` to `now`,
+/// if it did, and remembers `now`.
+pub fn report_sync_alert(now: Option<String>, seen: &mut Option<String>, log: &mut dyn Write) {
+    if let Some(line) = sync_alert_change(seen.as_deref(), now.as_deref()) {
+        let _ = writeln!(log, "{line}");
+    }
+    *seen = now;
 }
 
 /// Says where the driver's state lives, which view it started in and, on a
@@ -1064,7 +1068,7 @@ pub(crate) fn run_inner(
         // same before it sends (spec 08 §7).
         report(node.sync_store());
         report_switches(node, &mut switches_seen);
-        report_sync_alert(node, &mut alert_seen);
+        report_sync_alert(node.sync_alert(), &mut alert_seen, &mut std::io::stderr());
         let executed = node.blocks_executed();
         if executed > seen.get()
             && let Some((height, hash)) = node.executed.last()
