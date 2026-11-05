@@ -1441,11 +1441,12 @@ fn sync_requests(w: &mut Wire, bytes: usize) -> Vec<u8> {
     (0..bytes / one).flat_map(|_| w.seal(&request)).collect()
 }
 
-/// Writes `bytes` to `w`'s socket from a thread, giving up once a write
-/// has waited a second: the node stopped reading.
+/// Writes `bytes` to `w`'s socket from a thread until they are written or
+/// the node closes the connection: the bytes written. A write that waits
+/// is not taken to mean the node stopped reading, since a loaded machine
+/// can leave the polling thread unscheduled for longer than any wait.
 fn write_from_a_thread(w: &Wire, bytes: Vec<u8>) -> std::thread::JoinHandle<usize> {
     let mut s = w.s.try_clone().unwrap();
-    s.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
     std::thread::spawn(move || {
         let mut written = 0;
         while written < bytes.len() {
@@ -1471,27 +1472,32 @@ fn a_peer_that_does_not_read_is_not_served_more() {
         ..Limits::default()
     };
     let (mut node, mut transport, mut w) = limited(limits);
-    // Far more than the sockets' buffers hold, so that answers back up.
+    // Far more answers than the sockets' buffers hold (a few MiB on Linux),
+    // so that they back up. Polled until they do, however slowly the
+    // machine runs the poll; the deadline only ends a test that fails.
     let flood = sync_requests(&mut w, 32 << 20);
+    let sent = flood.len();
     let writer = write_from_a_thread(&w, flood);
-    let mut most = 0;
-    while !writer.is_finished() {
+    let deadline = Instant::now() + Duration::from_mins(5);
+    let mut queued = 0;
+    while queued < limits.output_high {
+        assert!(Instant::now() < deadline, "answers never backed up");
+        assert!(!writer.is_finished(), "every request was answered");
         transport.poll(&mut node, 0).unwrap();
-        let (unread, queued) = transport.backlog()[0];
+        let unread;
+        (unread, queued) = transport.backlog()[0];
         assert!(unread <= 4 + MAX_FRAME + TAG);
         // Past the mark only by the one answer read below it.
         assert!(queued < limits.output_high + 100, "{queued} bytes queued");
-        most = most.max(queued);
     }
-    let written = writer.join().unwrap();
-    assert!(written < 32 << 20, "the node read everything");
-    assert!(most >= limits.output_high, "{most}");
-    // No longer read, it is no longer answered.
+    // No longer read, it is no longer answered, and its queue stays put.
     let answered = frames_in(&node, "sync_request");
+    let backlog = transport.backlog();
     for _ in 0..10 {
         transport.poll(&mut node, 0).unwrap();
     }
     assert_eq!(frames_in(&node, "sync_request"), answered);
+    assert_eq!(transport.backlog(), backlog);
     assert_eq!(transport.connected().len(), 1);
     // Taking nothing for `write_stall_ms` closes it; reading while it waits
     // does not count as the peer going quiet.
@@ -1501,6 +1507,8 @@ fn a_peer_that_does_not_read_is_not_served_more() {
     assert_eq!(transport.connected().len(), 1);
     transport.poll(&mut node, limits.write_stall_ms).unwrap();
     assert!(transport.connected().is_empty());
+    // The writer was held back, then cut off: the node never read it all.
+    assert!(writer.join().unwrap() < sent, "the node read everything");
 }
 
 /// A connection whose queue a frame would put past `max_output` is closed
@@ -1515,15 +1523,16 @@ fn a_queue_past_its_cap_closes_the_connection() {
     let (mut node, mut transport, mut w) = limited(limits);
     let flood = sync_requests(&mut w, 32 << 20);
     let writer = write_from_a_thread(&w, flood);
-    let (mut polls, mut most) = (0, 0);
+    let deadline = Instant::now() + Duration::from_mins(5);
+    let mut most = 0;
     while !transport.connected().is_empty() {
+        assert!(Instant::now() < deadline, "the connection was kept");
+        assert!(!writer.is_finished(), "every request was answered");
         transport.poll(&mut node, 0).unwrap();
         if let Some((_, queued)) = transport.backlog().first() {
             assert!(*queued <= limits.max_output, "{queued} bytes queued");
             most = most.max(*queued);
         }
-        polls += 1;
-        assert!(polls < 1_000_000, "the connection was kept");
     }
     // It closed with its queue filling, a poll's answers short of the cap
     // at most, not for anything else.
