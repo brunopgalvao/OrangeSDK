@@ -16,7 +16,7 @@ use k256::{PublicKey, SecretKey};
 use orange_abi::codec::{Decode, Encode};
 use sha2::Sha256;
 
-use crate::net::{Frame, MAX_FRAME};
+use crate::net::Frame;
 
 /// The transport's protocol version, which every `Hello` names (spec 09 §3).
 pub const VERSION: u16 = 1;
@@ -148,19 +148,20 @@ impl Session {
     }
 
     /// Opens the sealed frame at the front of `buf`, if it is all there,
-    /// and removes it. `Err` means the stream is unusable (a length out of
-    /// bounds, a frame that does not open or does not decode) and the
-    /// connection must close.
+    /// carrying a frame of at most `max` bytes: the frame and the bytes of
+    /// `buf` it took, which the caller drops. `buf` is decrypted in place.
+    /// `Err` means the stream is unusable (a length out of bounds, a frame
+    /// that does not open or does not decode) and the connection must close.
     ///
     /// # Errors
     /// A message naming the problem.
-    pub fn open(&mut self, buf: &mut Vec<u8>) -> Result<Option<Frame>, String> {
+    pub fn open(&mut self, buf: &mut [u8], max: usize) -> Result<Option<(Frame, usize)>, String> {
         let Some(&[b0, b1, b2, b3]) = buf.get(..4) else {
             return Ok(None);
         };
         let header = [b0, b1, b2, b3];
         let len = u32::from_le_bytes(header) as usize;
-        if !(TAG..=MAX_FRAME + TAG).contains(&len) {
+        if !(TAG..=max + TAG).contains(&len) {
             return Err(format!("sealed frame of {len} bytes"));
         }
         if buf.len() < 4 + len {
@@ -175,14 +176,14 @@ impl Session {
             .decrypt_in_place_detached(&nonce, &header, body, &tag)
             .map_err(|_| "a frame that does not open")?;
         let frame = Frame::from_bytes(body).map_err(|_| "undecodable frame")?;
-        buf.drain(..4 + len);
-        Ok(Some(frame))
+        Ok(Some((frame, 4 + len)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::MAX_FRAME;
 
     fn pair() -> (Session, Session) {
         let (a, b) = (
@@ -204,6 +205,11 @@ mod tests {
         (one, two)
     }
 
+    /// Opens what `buf` holds of a frame of at most `MAX_FRAME` bytes.
+    fn open(s: &mut Session, buf: &mut [u8]) -> Result<Option<(Frame, usize)>, String> {
+        s.open(buf, MAX_FRAME)
+    }
+
     #[test]
     fn a_frame_opens_once_whole_and_only_the_other_way() {
         let (mut a, mut b) = pair();
@@ -211,17 +217,24 @@ mod tests {
         let sealed = a.seal(&frame).unwrap();
         assert_eq!(sealed.len(), 4 + frame.to_bytes().len() + TAG);
         let mut buf = sealed[..3].to_vec();
-        assert_eq!(b.open(&mut buf), Ok(None));
+        assert_eq!(open(&mut b, &mut buf), Ok(None));
         buf.extend_from_slice(&sealed[3..50]);
-        assert_eq!(b.open(&mut buf), Ok(None));
+        assert_eq!(open(&mut b, &mut buf), Ok(None));
         buf.extend_from_slice(&sealed[50..]);
-        assert_eq!(b.open(&mut buf), Ok(Some(frame)));
-        assert!(buf.is_empty());
+        // What follows the frame is left for the next.
+        buf.push(0);
+        assert_eq!(open(&mut b, &mut buf), Ok(Some((frame, sealed.len()))));
         // Each direction has its own key: a frame sent back to its sealer does not open.
         let mut back = b.seal(&Frame::GetPeers).unwrap();
         let mut own = back.clone();
-        assert_eq!(b.open(&mut own).unwrap_err(), "a frame that does not open");
-        assert_eq!(a.open(&mut back), Ok(Some(Frame::GetPeers)));
+        assert_eq!(
+            open(&mut b, &mut own).unwrap_err(),
+            "a frame that does not open"
+        );
+        assert_eq!(
+            open(&mut a, &mut back),
+            Ok(Some((Frame::GetPeers, back.len())))
+        );
     }
 
     #[test]
@@ -229,8 +242,20 @@ mod tests {
         let (_, mut b) = pair();
         for len in [0, TAG - 1, MAX_FRAME + TAG + 1] {
             let mut buf = u32::try_from(len).unwrap().to_le_bytes().to_vec();
-            assert!(b.open(&mut buf).unwrap_err().starts_with("sealed frame of"));
+            assert!(
+                open(&mut b, &mut buf)
+                    .unwrap_err()
+                    .starts_with("sealed frame of")
+            );
         }
+        // Nor one longer than the caller takes, however little of it came.
+        let mut buf = u32::try_from(11 + TAG).unwrap().to_le_bytes().to_vec();
+        assert!(
+            b.open(&mut buf, 10)
+                .unwrap_err()
+                .starts_with("sealed frame of")
+        );
+        assert_eq!(b.open(&mut buf, 11), Ok(None));
     }
 
     #[test]
@@ -240,7 +265,7 @@ mod tests {
         a.send.counter = u64::MAX;
         assert!(a.seal(&Frame::GetPeers).is_none());
         b.recv.counter = u64::MAX;
-        assert_eq!(b.open(&mut sealed).unwrap_err(), "counter spent");
+        assert_eq!(open(&mut b, &mut sealed).unwrap_err(), "counter spent");
     }
 
     #[test]
@@ -258,6 +283,6 @@ mod tests {
         let mut wire = header.to_vec();
         wire.extend_from_slice(&body);
         wire.extend_from_slice(&tag);
-        assert_eq!(b.open(&mut wire).unwrap_err(), "undecodable frame");
+        assert_eq!(open(&mut b, &mut wire).unwrap_err(), "undecodable frame");
     }
 }

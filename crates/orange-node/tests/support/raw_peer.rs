@@ -139,15 +139,18 @@ impl Wire {
     /// The whole frames read so far: a `Hello` in the clear agrees the
     /// session, and what follows it is opened under it.
     fn frames(&mut self) -> Vec<Frame> {
-        let mut out = Vec::new();
+        let (mut out, mut taken) = (Vec::new(), 0);
         loop {
+            let rest = &mut self.buf[taken..];
             let frame = match self.session.as_mut() {
-                Some(session) => session.open(&mut self.buf).expect("a frame that opens"),
-                None => take_frame(&mut self.buf, MAX_FRAME).unwrap(),
+                Some(session) => session.open(rest, MAX_FRAME).expect("a frame that opens"),
+                None => take_frame(rest, MAX_FRAME).unwrap(),
             };
-            let Some(frame) = frame else {
+            let Some((frame, n)) = frame else {
+                self.buf.drain(..taken);
                 return out;
             };
+            taken += n;
             if let Frame::Hello {
                 nonce, ephemeral, ..
             } = frame

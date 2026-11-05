@@ -18,7 +18,8 @@ use orange_abi::types::Genesis;
 use orange_abi::{Decode, Encode};
 use orange_host::hash::keccak256;
 use orange_node::net::{
-    Frame, HELLO_LEN, MAX_FRAME, Transport, frame_bytes, fresh_key, hello_digest, take_frames,
+    AUTH_LEN, Frame, HELLO_LEN, IDLE_MS, Limits, MAX_FRAME, MAX_SERVING, READ_FRAMES, SERVE_MS,
+    Transport, frame_bytes, fresh_key, hello_digest, take_frames,
 };
 use orange_node::peers::recover_id;
 use orange_node::session::{Side, TAG, VERSION};
@@ -1323,4 +1324,288 @@ fn a_validator_whose_journal_lost_its_finalized_head_catches_up() {
             .map(|n| n.finalized.last().copied())
             .collect::<Vec<_>>()
     );
+}
+
+/// What the transport counted of frames of `kind` coming in.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn frames_in(node: &Node, kind: &str) -> usize {
+    let frames = &orange_metrics::node::P2P_FRAMES;
+    let value = node.telemetry().registry().value(frames, &["in", kind]);
+    // A count, held exactly by an f64 this small.
+    value.unwrap_or_default() as usize
+}
+
+/// A transport of a started one-validator node, without peer exchange, with
+/// `limits`, and a raw peer handshaken with it at time 0.
+fn limited(limits: Limits) -> (Node, Transport, Wire) {
+    let (mut node, chain) = one_node();
+    let mut transport =
+        Transport::bind("127.0.0.1:0", peer_key(1), CHAIN_ID, chain.genesis, vec![]).unwrap();
+    let addr = transport.local_addr().unwrap();
+    let key = peer_key(2);
+    let (w, _) = raw_peer::connect(addr, &key, chain, &mut || {
+        poll_n(&mut transport, &mut node, 0);
+    });
+    assert!(connected_as(
+        &mut transport,
+        &mut node,
+        &[validator_id(&key)]
+    ));
+    // Limits apply to the connections open already.
+    transport.set_limits(limits);
+    assert_eq!(transport.limits(), limits);
+    assert!(format!("{limits:?}").contains("max_output"));
+    (node, transport, w)
+}
+
+/// A peer that streams tiny frames is read a share at a time: at most
+/// `READ_FRAMES` frames a poll, however many it has sent (spec 09 §5b), so
+/// that it cannot hold the thread the node's consensus runs on.
+#[test]
+fn a_peer_streaming_tiny_frames_is_handled_a_share_a_poll() {
+    let (mut node, mut transport, mut w) = limited(Limits::default());
+    let sent = 4 * READ_FRAMES + 10;
+    let flood: Vec<u8> = (0..sent).flat_map(|_| w.seal(&Frame::GetPeers)).collect();
+    assert_eq!(flood.len(), sent * (4 + 1 + TAG));
+    w.write(&flood);
+    // Loopback carries the flood at once; give the socket a moment anyway.
+    std::thread::sleep(Duration::from_millis(200));
+    let before = frames_in(&node, "get_peers");
+    let mut polls = 0;
+    while frames_in(&node, "get_peers") < before + sent {
+        let seen = frames_in(&node, "get_peers");
+        transport.poll(&mut node, 0).unwrap();
+        let handled = frames_in(&node, "get_peers") - seen;
+        assert!(handled <= READ_FRAMES, "{handled} frames in one poll");
+        if polls == 0 {
+            assert_eq!(handled, READ_FRAMES);
+            let (unread, _) = transport.backlog()[0];
+            assert_eq!(unread, (sent - READ_FRAMES) * (4 + 1 + TAG));
+        }
+        polls += 1;
+        assert!(polls < 1_000, "the flood was not taken");
+    }
+    assert!(polls > 4, "{polls}");
+    assert_eq!(transport.backlog()[0].0, 0);
+    assert_eq!(transport.connected().len(), 1);
+}
+
+/// Before its handshake completes, a peer may send nothing longer than an
+/// `Auth`: a sealed length past it closes the connection at once, before the
+/// frame it announces arrives (spec 09 §3).
+#[test]
+fn a_frame_before_the_proof_is_no_longer_than_one() {
+    let (mut node, chain) = one_node();
+    let mut transport =
+        Transport::bind("127.0.0.1:0", peer_key(1), CHAIN_ID, chain.genesis, vec![]).unwrap();
+    let addr = transport.local_addr().unwrap();
+    let mut poll = || poll_n(&mut transport, &mut node, 0);
+    let hello = |w: &mut Wire, poll: &mut dyn FnMut()| {
+        w.send_clear(&w.hello(validator_id(&peer_key(2))));
+        let (_, closed) = w.read_until(poll, |f| raw_peer::nonce_of(f).is_some());
+        assert!(!closed);
+    };
+    let mut w = Wire::dial(addr, chain, [7; 32]);
+    hello(&mut w, &mut poll);
+    w.write(&u32::try_from(MAX_FRAME + TAG).unwrap().to_le_bytes());
+    let (_, closed) = w.read_for(Duration::from_secs(5), &mut poll, |_| false);
+    assert!(closed, "a frame of 16 MiB was awaited before the proof");
+    let mut w = Wire::dial(addr, chain, [8; 32]);
+    hello(&mut w, &mut poll);
+    w.write(&u32::try_from(AUTH_LEN + TAG + 1).unwrap().to_le_bytes());
+    let (_, closed) = w.read_for(Duration::from_secs(5), &mut poll, |_| false);
+    assert!(
+        closed,
+        "a frame longer than an Auth was awaited before the proof"
+    );
+    // An Auth's length is read: a proof that does not recover closes as such.
+    assert_eq!(
+        Frame::Auth { signature: [0; 65] }.to_bytes().len(),
+        AUTH_LEN
+    );
+    let mut w = Wire::dial(addr, chain, [9; 32]);
+    hello(&mut w, &mut poll);
+    w.send(&Frame::Auth { signature: [0; 65] });
+    assert!(w.closes(&mut poll));
+    assert!(connected_as(&mut transport, &mut node, &[]));
+}
+
+/// Sealed `SyncRequest`s, which a node answers without its driver, from
+/// `w`'s session: about `bytes` of them.
+fn sync_requests(w: &mut Wire, bytes: usize) -> Vec<u8> {
+    let request = Frame::SyncRequest {
+        request_id: 0,
+        payload: orange_node::statesync::SyncRequest::Offers.to_bytes(),
+    };
+    let one = 4 + request.to_bytes().len() + TAG;
+    (0..bytes / one).flat_map(|_| w.seal(&request)).collect()
+}
+
+/// Writes `bytes` to `w`'s socket from a thread, giving up once a write
+/// has waited a second: the node stopped reading.
+fn write_from_a_thread(w: &Wire, bytes: Vec<u8>) -> std::thread::JoinHandle<usize> {
+    let mut s = w.s.try_clone().unwrap();
+    s.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+    std::thread::spawn(move || {
+        let mut written = 0;
+        while written < bytes.len() {
+            match s.write(&bytes[written..]) {
+                Ok(n) if n > 0 => written += n,
+                _ => break,
+            }
+        }
+        written
+    })
+}
+
+/// A peer that asks and never reads the answers is no longer read once
+/// `output_high` bytes wait for it, and its connection closes once they
+/// have waited `write_stall_ms` without a byte taken (spec 09 §5b): about
+/// 50 bytes of request buy a snapshot page or a batch of blocks, and the
+/// node would otherwise queue whatever the peer asks.
+#[test]
+fn a_peer_that_does_not_read_is_not_served_more() {
+    let limits = Limits {
+        output_high: 64 << 10,
+        read_frames: 4_096,
+        ..Limits::default()
+    };
+    let (mut node, mut transport, mut w) = limited(limits);
+    // Far more than the sockets' buffers hold, so that answers back up.
+    let flood = sync_requests(&mut w, 32 << 20);
+    let writer = write_from_a_thread(&w, flood);
+    let mut most = 0;
+    while !writer.is_finished() {
+        transport.poll(&mut node, 0).unwrap();
+        let (unread, queued) = transport.backlog()[0];
+        assert!(unread <= 4 + MAX_FRAME + TAG);
+        // Past the mark only by the one answer read below it.
+        assert!(queued < limits.output_high + 100, "{queued} bytes queued");
+        most = most.max(queued);
+    }
+    let written = writer.join().unwrap();
+    assert!(written < 32 << 20, "the node read everything");
+    assert!(most >= limits.output_high, "{most}");
+    // No longer read, it is no longer answered.
+    let answered = frames_in(&node, "sync_request");
+    for _ in 0..10 {
+        transport.poll(&mut node, 0).unwrap();
+    }
+    assert_eq!(frames_in(&node, "sync_request"), answered);
+    assert_eq!(transport.connected().len(), 1);
+    // Taking nothing for `write_stall_ms` closes it; reading while it waits
+    // does not count as the peer going quiet.
+    transport
+        .poll(&mut node, limits.write_stall_ms - 1)
+        .unwrap();
+    assert_eq!(transport.connected().len(), 1);
+    transport.poll(&mut node, limits.write_stall_ms).unwrap();
+    assert!(transport.connected().is_empty());
+}
+
+/// A connection whose queue a frame would put past `max_output` is closed
+/// instead of queueing it (spec 09 §5b).
+#[test]
+fn a_queue_past_its_cap_closes_the_connection() {
+    let limits = Limits {
+        output_high: usize::MAX,
+        max_output: 64 << 10,
+        ..Limits::default()
+    };
+    let (mut node, mut transport, mut w) = limited(limits);
+    let flood = sync_requests(&mut w, 32 << 20);
+    let writer = write_from_a_thread(&w, flood);
+    let (mut polls, mut most) = (0, 0);
+    while !transport.connected().is_empty() {
+        transport.poll(&mut node, 0).unwrap();
+        if let Some((_, queued)) = transport.backlog().first() {
+            assert!(*queued <= limits.max_output, "{queued} bytes queued");
+            most = most.max(*queued);
+        }
+        polls += 1;
+        assert!(polls < 1_000_000, "the connection was kept");
+    }
+    // It closed with its queue filling, a poll's answers short of the cap
+    // at most, not for anything else.
+    assert!(most > limits.max_output / 2, "{most}");
+    assert!(transport.backlog().is_empty());
+    drop(w);
+    let _ = writer.join();
+}
+
+/// A connection that sends nothing for `IDLE_MS` is closed, in every mode;
+/// a node keeps its own connections from going idle by asking for peers
+/// every `EXCHANGE_MS`, with or without peer exchange (spec 09 §5b).
+#[test]
+fn a_quiet_connection_is_closed() {
+    let (mut node, mut transport, mut w) = limited(Limits::default());
+    let mut poll = || transport.poll(&mut node, 0).unwrap();
+    let (got, _) = w.read_until(&mut poll, |f| f.contains(&Frame::GetPeers));
+    assert!(got.contains(&Frame::GetPeers), "{got:?}");
+    transport.poll(&mut node, IDLE_MS - 1).unwrap();
+    assert_eq!(transport.connected().len(), 1);
+    transport.poll(&mut node, IDLE_MS).unwrap();
+    assert!(transport.connected().is_empty());
+}
+
+/// Without peer exchange, a node still accepts no more than `max_peers`
+/// connections (spec 09 §5).
+#[test]
+fn accepted_connections_are_limited_without_peer_exchange() {
+    let (mut node, chain) = one_node();
+    let mut transport =
+        Transport::bind("127.0.0.1:0", peer_key(1), CHAIN_ID, chain.genesis, vec![]).unwrap();
+    transport.set_limits(Limits {
+        max_peers: 2,
+        ..Limits::default()
+    });
+    let addr = transport.local_addr().unwrap();
+    let mut poll = || poll_n(&mut transport, &mut node, 0);
+    let (mut first, _) = raw_peer::connect(addr, &peer_key(2), chain, &mut poll);
+    let (mut second, _) = raw_peer::connect(addr, &peer_key(3), chain, &mut poll);
+    let both = [validator_id(&peer_key(2)), validator_id(&peer_key(3))];
+    assert!(connected_as(&mut transport, &mut node, &both));
+    // A third is closed as it is accepted, before any handshake.
+    let mut third = Wire::dial(addr, chain, [3; 32]);
+    let mut poll = || poll_n(&mut transport, &mut node, 0);
+    let (got, closed) = third.read_for(Duration::from_secs(5), &mut poll, |_| false);
+    assert!(closed && got.is_empty(), "{got:?}");
+    let short = Duration::from_millis(100);
+    assert!(!first.read_for(short, &mut poll, |_| false).1);
+    assert!(!second.read_for(short, &mut poll, |_| false).1);
+    assert_eq!(transport.connected().len(), 2);
+}
+
+/// A peer's driver requests that the driver leaves unanswered are answered
+/// with nothing, by the host: at once past `MAX_SERVING` of them, without a
+/// step of the driver, and the others after `SERVE_MS` (spec 09 §4).
+#[test]
+fn a_request_the_driver_leaves_unanswered_is_answered_with_nothing() {
+    let (mut node, mut transport, mut w) = limited(Limits::default());
+    // The reference driver answers no request whose payload does not decode.
+    let asked = MAX_SERVING as u64 + 2;
+    for request_id in 1..=asked {
+        w.send(&Frame::Request {
+            request_id,
+            payload: vec![0xFF],
+        });
+    }
+    let answer = |f: &Frame| match f {
+        Frame::Response {
+            request_id,
+            payload,
+        } if payload.is_empty() => Some(*request_id),
+        _ => None,
+    };
+    let answered = |frames: &[Frame]| frames.iter().filter_map(answer).collect::<Vec<_>>();
+    let mut poll = || transport.poll(&mut node, 0).unwrap();
+    let (got, _) = w.read_until(&mut poll, |f| answered(f).len() == 2);
+    assert_eq!(answered(&got), [asked - 1, asked]);
+    let (got, _) = w.read_for(Duration::from_millis(200), &mut poll, |_| false);
+    assert!(answered(&got).is_empty());
+    let mut poll = || transport.poll(&mut node, SERVE_MS).unwrap();
+    let (got, _) = w.read_until(&mut poll, |f| answered(f).len() == MAX_SERVING);
+    let early: Vec<u64> = (1..=MAX_SERVING as u64).collect();
+    assert_eq!(answered(&got), early);
+    assert_eq!(transport.connected().len(), 1);
 }

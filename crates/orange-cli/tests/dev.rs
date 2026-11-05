@@ -846,11 +846,12 @@ fn node_command_errors() {
     );
     // An observer with the default listen address stops on request like any
     // node; with a data directory it keeps its driver state there. Without
-    // peer exchange it only dials what it is told to.
+    // peer exchange it only dials what it is told to, and still accepts no
+    // more than --max-peers.
     let mut iterations = 0;
     let data = scratch("observer-data");
     let mut list = base.to_vec();
-    list.extend(["--data-dir", &data, "--no-discovery"]);
+    list.extend(["--data-dir", &data, "--no-discovery", "--max-peers", "4"]);
     run_until(&args(&list), |_| {
         iterations += 1;
         iterations < 5

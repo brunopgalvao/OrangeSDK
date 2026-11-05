@@ -14,6 +14,10 @@
 //! another chain or protocol version, that fails or omits the proof, or
 //! whose frame does not open, is disconnected.
 //!
+//! What one connection may cost the node is bounded (spec 09 §5b,
+//! [`Limits`]): the bytes and frames read from it in one poll, the bytes
+//! queued for it, how long those may wait, and how long it may stay quiet.
+//!
 //! With [`Transport::enable_discovery`] a node also runs peer exchange
 //! (spec 09 §5a): it trades signed address records with its peers, keeps
 //! them in a bounded [`PeerTable`], and dials from it, on threads of their
@@ -35,7 +39,7 @@ use orange_metrics::{Direction, Traffic};
 use crate::extension::Outbound;
 use crate::node::{Node, NodeError};
 use crate::peers::{self, PeerRecord, PeerTable};
-use crate::session::{Ephemeral, Session, Side, VERSION};
+use crate::session::{Ephemeral, Session, Side, TAG, VERSION};
 use crate::statesync::StateSync;
 
 /// Largest frame accepted, in bytes, before it is sealed (spec 09 §2).
@@ -44,6 +48,51 @@ pub const MAX_FRAME: usize = 16 << 20;
 /// Length of an encoded `Hello`, the one frame sent in the clear; a longer
 /// frame before the session is agreed closes the connection.
 pub const HELLO_LEN: usize = 1 + 2 + 32 + 8 + 32 + 32 + 33;
+
+/// Length of an encoded `Auth`, the one sealed frame accepted before the
+/// handshake completes; a longer frame before it closes the connection
+/// (spec 09 §3).
+pub const AUTH_LEN: usize = 1 + 65;
+
+/// Most bytes read from one connection in one poll (spec 09 §5b), so that
+/// a peer that streams holds the node's thread no longer than its share.
+pub const READ_BYTES: usize = 1 << 20;
+
+/// Most frames handled from one connection in one poll (spec 09 §5b): each
+/// costs an opening and a step of its own however short it is.
+pub const READ_FRAMES: usize = 256;
+
+/// Bytes queued for a connection at or above which none of its frames are
+/// read (spec 09 §5b): a peer that does not take what it asked for is not
+/// served more.
+pub const OUTPUT_HIGH: usize = 8 << 20;
+
+/// Most bytes queued for one connection (spec 09 §5b); a frame that would go
+/// past it closes the connection instead. It holds [`OUTPUT_HIGH`], one
+/// frame of [`MAX_FRAME`] answering the last request read below it, and
+/// broadcasts.
+pub const MAX_OUTPUT: usize = 32 << 20;
+
+/// How long a connection with output queued may go without a byte of it
+/// written before it is closed (spec 09 §5b).
+pub const WRITE_STALL_MS: u64 = 30_000;
+
+/// How long a connection may go without a byte read, while this end reads
+/// it, before it is closed (spec 09 §5b). A handshaken peer sends `GetPeers`
+/// every `EXCHANGE_MS`, so an honest one is never this quiet.
+pub const IDLE_MS: u64 = 60_000;
+
+/// Most of one peer's driver requests awaiting the driver's answer (spec 09
+/// §4); one beyond them is answered with nothing at once.
+pub const MAX_SERVING: usize = 8;
+
+/// How long a peer's driver request waits for the driver's answer before
+/// the host answers it with nothing (spec 09 §4).
+pub const SERVE_MS: u64 = 10_000;
+
+/// Most bytes read from a connection and not yet handled: the longest
+/// sealed frame on the wire, so that a whole frame always fits.
+const MAX_BUFFERED: usize = 4 + MAX_FRAME + TAG;
 
 /// How often a lost outbound peer is redialled.
 pub const REDIAL_MS: u64 = 500;
@@ -61,6 +110,46 @@ pub const SYNC_PEER_WAIT_MS: u64 = 60_000;
 /// The most raw transaction bytes a node sends a peer whose handshake just
 /// completed, of the pending transactions it already holds (spec 09 §4).
 pub const POOL_SYNC_BYTES: usize = 4 << 20;
+
+/// What one connection may cost a node (spec 09 §5b). The default is the
+/// constants of this module and peer exchange's default `max_peers`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Most connections accepted, configured peers aside.
+    pub max_peers: usize,
+    /// Most bytes read from one connection in one poll ([`READ_BYTES`]).
+    pub read_bytes: usize,
+    /// Most frames handled from one connection in one poll ([`READ_FRAMES`]).
+    pub read_frames: usize,
+    /// Queued bytes that stop a connection's frames being read ([`OUTPUT_HIGH`]).
+    pub output_high: usize,
+    /// Most bytes queued for one connection ([`MAX_OUTPUT`]).
+    pub max_output: usize,
+    /// How long queued output may go unwritten ([`WRITE_STALL_MS`]).
+    pub write_stall_ms: u64,
+    /// How long a connection may go unheard ([`IDLE_MS`]).
+    pub idle_ms: u64,
+    /// Most of one peer's requests the driver serves at once ([`MAX_SERVING`]).
+    pub serving: usize,
+    /// How long a request waits for the driver ([`SERVE_MS`]).
+    pub serve_ms: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            max_peers: peers::DEFAULT_MAX_PEERS,
+            read_bytes: READ_BYTES,
+            read_frames: READ_FRAMES,
+            output_high: OUTPUT_HIGH,
+            max_output: MAX_OUTPUT,
+            write_stall_ms: WRITE_STALL_MS,
+            idle_ms: IDLE_MS,
+            serving: MAX_SERVING,
+            serve_ms: SERVE_MS,
+        }
+    }
+}
 
 /// Domain of a handshake's signature.
 const HELLO_DOMAIN: &[u8] = b"ORANGE-HELLO";
@@ -268,20 +357,23 @@ pub fn frame_bytes(frame: &Frame) -> Vec<u8> {
 /// # Errors
 /// A message naming the problem.
 pub fn take_frames(buf: &mut Vec<u8>) -> Result<Vec<Frame>, String> {
-    let mut frames = Vec::new();
-    while let Some(frame) = take_frame(buf, MAX_FRAME)? {
+    let (mut frames, mut taken) = (Vec::new(), 0);
+    while let Some((frame, n)) = take_frame(&buf[taken..], MAX_FRAME)? {
         frames.push(frame);
+        taken += n;
     }
+    buf.drain(..taken);
     Ok(frames)
 }
 
-/// Splits the frame in the clear at the front of `buf` off it, if it is all
-/// there. `Err` means the stream is unusable (a frame longer than `max`, or
-/// one that does not decode) and the connection must close.
+/// The frame in the clear at the front of `buf`, if it is all there, and
+/// the bytes it takes, which the caller drops. `Err` means the stream is
+/// unusable (a frame longer than `max`, or one that does not decode) and
+/// the connection must close.
 ///
 /// # Errors
 /// A message naming the problem.
-pub fn take_frame(buf: &mut Vec<u8>, max: usize) -> Result<Option<Frame>, String> {
+pub fn take_frame(buf: &[u8], max: usize) -> Result<Option<(Frame, usize)>, String> {
     let Some(header) = buf.get(..4) else {
         return Ok(None);
     };
@@ -295,30 +387,19 @@ pub fn take_frame(buf: &mut Vec<u8>, max: usize) -> Result<Option<Frame>, String
     let Ok(frame) = Frame::from_bytes(&buf[4..4 + len]) else {
         return Err("undecodable frame".to_owned());
     };
-    buf.drain(..4 + len);
-    Ok(Some(frame))
+    Ok(Some((frame, 4 + len)))
 }
 
-/// Reads everything available into `inbuf`. Returns `false` once the peer
-/// has closed or the stream failed.
-pub fn read_available(stream: &mut impl Read, inbuf: &mut Vec<u8>) -> bool {
+/// Reads what is available into `inbuf`, at most `max` bytes. Returns
+/// `false` once the peer has closed or the stream failed.
+pub fn read_available(stream: &mut impl Read, inbuf: &mut Vec<u8>, max: usize) -> bool {
     let mut chunk = [0u8; 16 * 1024];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(n) if n > 0 => inbuf.extend_from_slice(&chunk[..n]),
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return true,
-            _ => return false,
-        }
-    }
-}
-
-/// Writes as much of `outbuf` as the stream takes. Returns `false` once the
-/// stream failed.
-pub fn write_available(stream: &mut impl Write, outbuf: &mut Vec<u8>) -> bool {
-    while !outbuf.is_empty() {
-        match stream.write(outbuf) {
+    let mut left = max;
+    while left > 0 {
+        match stream.read(&mut chunk[..left.min(16 * 1024)]) {
             Ok(n) if n > 0 => {
-                outbuf.drain(..n);
+                inbuf.extend_from_slice(&chunk[..n]);
+                left -= n;
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => return true,
             _ => return false,
@@ -327,10 +408,65 @@ pub fn write_available(stream: &mut impl Write, outbuf: &mut Vec<u8>) -> bool {
     true
 }
 
+/// Writes as much of `out` as the stream takes: the bytes written, or
+/// `None` once the stream failed.
+pub fn write_available(stream: &mut impl Write, out: &[u8]) -> Option<usize> {
+    let mut written = 0;
+    while written < out.len() {
+        match stream.write(&out[written..]) {
+            Ok(n) if n > 0 => written += n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            _ => return None,
+        }
+    }
+    Some(written)
+}
+
+/// Bytes read and not yet handled, or queued and not yet written: taking
+/// bytes off the front moves a cursor, and the bytes taken are dropped
+/// once they are at least as many as those left, so a byte is moved about
+/// once however finely it is taken (spec 09 §5b).
+#[derive(Default)]
+struct Buffer {
+    bytes: Vec<u8>,
+    start: usize,
+}
+
+impl Buffer {
+    /// Bytes not yet taken.
+    fn len(&self) -> usize {
+        self.bytes.len() - self.start
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The bytes not yet taken.
+    fn front(&mut self) -> &mut [u8] {
+        &mut self.bytes[self.start..]
+    }
+
+    /// Takes `n` bytes off the front.
+    fn take(&mut self, n: usize) {
+        self.start += n;
+        if self.start >= self.len() {
+            self.bytes.drain(..self.start);
+            self.start = 0;
+        }
+    }
+}
+
 struct Conn {
     stream: TcpStream,
-    inbuf: Vec<u8>,
-    outbuf: Vec<u8>,
+    inbuf: Buffer,
+    outbuf: Buffer,
+    /// Most bytes queued for the peer; a frame past it closes the connection.
+    max_output: usize,
+    /// When a byte was last read, or reading last waited on this end's output.
+    heard_ms: u64,
+    /// When the queued output was last empty or last had a byte written.
+    wrote_ms: u64,
     /// What this end's `Hello` committed it to: its nonce and fresh key.
     side: Side,
     /// This end's fresh secret, until the peer's `Hello` agrees the session.
@@ -367,17 +503,23 @@ struct Conn {
 impl Conn {
     fn new(
         stream: TcpStream,
-        side: Side,
-        ephemeral: Ephemeral,
+        (side, ephemeral): (Side, Ephemeral),
         hello: &Frame,
+        max_output: usize,
         now_ms: u64,
     ) -> Conn {
         let _ = stream.set_nonblocking(true);
         let _ = stream.set_nodelay(true);
         Conn {
             stream,
-            inbuf: Vec::new(),
-            outbuf: frame_bytes(hello),
+            inbuf: Buffer::default(),
+            outbuf: Buffer {
+                bytes: frame_bytes(hello),
+                start: 0,
+            },
+            max_output,
+            heard_ms: now_ms,
+            wrote_ms: now_ms,
             side,
             ephemeral: Some(ephemeral),
             session: None,
@@ -397,15 +539,23 @@ impl Conn {
     }
 
     /// Queues `frame` sealed under the session; a connection without one,
-    /// or whose counter is spent, is closed instead.
+    /// whose counter is spent, or whose queue it would put past its cap, is
+    /// closed instead (spec 09 §5b).
     fn send(&mut self, frame: &Frame) {
+        let room = self.max_output.saturating_sub(self.outbuf.len());
         let sealed = self.session.as_mut().and_then(|s| s.seal(frame));
+        let sealed = sealed.filter(|b| b.len() <= room);
         self.dead |= sealed.is_none();
-        self.outbuf.extend(sealed.unwrap_or_default());
+        self.outbuf.bytes.extend(sealed.unwrap_or_default());
     }
 
-    fn read(&mut self) {
-        self.closed |= !read_available(&mut self.stream, &mut self.inbuf);
+    /// Reads at most `max` bytes, and none while a whole frame of the
+    /// longest kind could be waiting already; the bytes read.
+    fn read(&mut self, max: usize) -> usize {
+        let room = MAX_BUFFERED.saturating_sub(self.inbuf.len()).min(max);
+        let before = self.inbuf.bytes.len();
+        self.closed |= !read_available(&mut self.stream, &mut self.inbuf.bytes, room);
+        self.inbuf.bytes.len() - before
     }
 
     /// The next whole frame read: the peer's `Hello` in the clear until the
@@ -417,20 +567,38 @@ impl Conn {
         if self.dead {
             return None;
         }
+        // Before the handshake completes, the only sealed frame is `Auth`.
+        let max = if self.peer.is_some() {
+            MAX_FRAME
+        } else {
+            AUTH_LEN
+        };
         let taken = match self.session.as_mut() {
-            Some(session) => session.open(&mut self.inbuf),
-            None => take_frame(&mut self.inbuf, HELLO_LEN),
+            Some(session) => session.open(self.inbuf.front(), max),
+            None => take_frame(self.inbuf.front(), HELLO_LEN),
         };
         let frame = taken.unwrap_or_else(|_| {
             self.dead = true;
             None
         });
+        let frame = frame.map(|(frame, n)| {
+            self.inbuf.take(n);
+            frame
+        });
         self.dead |= frame.is_none() && self.closed;
         frame
     }
 
-    fn flush(&mut self) {
-        self.dead |= !write_available(&mut self.stream, &mut self.outbuf);
+    /// Writes what the stream takes; the bytes written.
+    fn flush(&mut self, now_ms: u64) -> usize {
+        let written = write_available(&mut self.stream, self.outbuf.front());
+        self.dead |= written.is_none();
+        let written = written.unwrap_or_default();
+        self.outbuf.take(written);
+        if written > 0 || self.outbuf.is_empty() {
+            self.wrote_ms = now_ms;
+        }
+        written
     }
 }
 
@@ -540,6 +708,15 @@ impl Exchange {
     }
 }
 
+/// A peer's driver request being served (spec 09 §4).
+struct Serving {
+    peer: [u8; 32],
+    /// The peer's id for it.
+    request_id: u64,
+    /// When it is answered with nothing if the driver has not answered it.
+    by_ms: u64,
+}
+
 /// A node's TCP endpoint.
 pub struct Transport {
     listener: TcpListener,
@@ -555,8 +732,10 @@ pub struct Transport {
     seed: [u8; 32],
     peers: Vec<SocketAddr>,
     last_dial_ms: Option<u64>,
-    /// Requests this node is serving: local id to `(peer, the peer's id)`.
-    serving: BTreeMap<u64, ([u8; 32], u64)>,
+    /// Requests this node is serving, by local id.
+    serving: BTreeMap<u64, Serving>,
+    /// What one connection may cost (spec 09 §5b).
+    limits: Limits,
     next_local_id: u64,
     /// Traffic counted since the last poll handed it to the node's telemetry.
     traffic: Traffic,
@@ -600,6 +779,7 @@ impl Transport {
             peers,
             last_dial_ms: None,
             serving: BTreeMap::new(),
+            limits: Limits::default(),
             next_local_id: 0,
             traffic: Traffic::default(),
             exchange: None,
@@ -608,8 +788,34 @@ impl Transport {
         })
     }
 
-    /// Runs peer exchange from now on (spec 09 §5a).
+    /// What one connection may cost (spec 09 §5b).
+    #[must_use]
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    /// Bounds what each connection may cost from now on (spec 09 §5b).
+    pub fn set_limits(&mut self, limits: Limits) {
+        self.limits = limits;
+        for conn in &mut self.conns {
+            conn.max_output = limits.max_output;
+        }
+    }
+
+    /// Bytes read and not yet handled, and bytes queued and not yet
+    /// written, of each connection.
+    #[must_use]
+    pub fn backlog(&self) -> Vec<(usize, usize)> {
+        self.conns
+            .iter()
+            .map(|c| (c.inbuf.len(), c.outbuf.len()))
+            .collect()
+    }
+
+    /// Runs peer exchange from now on (spec 09 §5a), with its `max_peers`
+    /// as the limit of accepted connections.
     pub fn enable_discovery(&mut self, discovery: Discovery) {
+        self.limits.max_peers = discovery.max_peers;
         let advertise = discovery
             .advertise
             .or_else(|| self.local_addr().ok().filter(peers::dialable));
@@ -669,7 +875,13 @@ impl Transport {
             ephemeral: side.ephemeral,
         };
         self.traffic.frame(Direction::Out, "hello");
-        Conn::new(stream, side, ephemeral, &hello, now_ms)
+        Conn::new(
+            stream,
+            (side, ephemeral),
+            &hello,
+            self.limits.max_output,
+            now_ms,
+        )
     }
 
     /// The peer table, when peer exchange runs.
@@ -719,22 +931,25 @@ impl Transport {
         }
     }
 
-    /// Whether peer exchange's limits let a connection from `remote` in:
-    /// fewer than `max_peers` connections besides the configured peers', and
-    /// fewer than `PER_PREFIX` from its prefix (spec 09 §5a). Without peer
-    /// exchange, every connection is accepted.
+    /// Whether the limits let a connection from `remote` in: fewer than
+    /// `max_peers` connections besides the configured peers' (spec 09 §5),
+    /// and with peer exchange fewer than `PER_PREFIX` from its prefix (spec
+    /// 09 §5a).
     fn admits(&self, remote: &SocketAddr) -> bool {
-        let Some(x) = &self.exchange else {
-            return true;
-        };
         let open = self.conns.iter().filter(|c| c.dialled.is_none()).count();
+        if open >= self.limits.max_peers {
+            return false;
+        }
+        if self.exchange.is_none() {
+            return true;
+        }
         let prefix = peers::prefix(remote);
         let same = self
             .conns
             .iter()
             .filter(|c| prefix.is_some() && c.remote.as_ref().and_then(peers::prefix) == prefix)
             .count();
-        open < x.max_peers && same < peers::PER_PREFIX
+        same < peers::PER_PREFIX
     }
 
     /// Peer exchange's dialling (spec 09 §5a): takes up the peer file and
@@ -961,11 +1176,10 @@ impl Transport {
     }
 
     /// Asks every handshaken peer for its records when its turn has come:
-    /// right after the handshake, then every `EXCHANGE_MS`.
+    /// right after the handshake, then every `EXCHANGE_MS`. A node without
+    /// peer exchange asks too, and ignores the answer: the question keeps
+    /// the connection from going idle at the other end (spec 09 §5b).
     fn ask_peers(&mut self, now_ms: u64) {
-        if self.exchange.is_none() {
-            return;
-        }
         for conn in self
             .conns
             .iter_mut()
@@ -977,15 +1191,22 @@ impl Transport {
         }
     }
 
-    /// Drops the dead connections. Peer exchange learns from those it
+    /// Drops the dead connections, and closes those still without a
+    /// handshake `HANDSHAKE_MS` after they opened, those unheard for
+    /// `idle_ms` and those whose queued output went `write_stall_ms` without
+    /// a byte written (spec 09 §5b). Peer exchange learns from those it
     /// dialled: one lost after its handshake is dialled again after a
-    /// backoff, one closed before its handshake, or still without one
-    /// `HANDSHAKE_MS` after it opened, counts as a failed dial.
+    /// backoff, and one closed before its handshake counts as a failed dial.
     fn reap(&mut self, now_ms: u64) {
+        let limits = self.limits;
         for conn in &mut self.conns {
             // A peer that has not completed its handshake in time is closed;
-            // one peer exchange dialled counts as a failed dial.
+            // one peer exchange dialled counts as a failed dial. So is one
+            // gone quiet, or that takes none of what is queued for it.
             conn.dead |= conn.peer.is_none() && now_ms >= conn.hello_by_ms;
+            conn.dead |= now_ms >= conn.heard_ms.saturating_add(limits.idle_ms);
+            conn.dead |= !conn.outbuf.is_empty()
+                && now_ms >= conn.wrote_ms.saturating_add(limits.write_stall_ms);
         }
         if let Some(x) = self.exchange.as_mut() {
             for conn in self.conns.iter().filter(|c| c.dead) {
@@ -1005,6 +1226,9 @@ impl Transport {
             }
         }
         self.conns.retain(|c| !c.dead);
+        // A request of a peer no longer connected has nobody to answer.
+        let connected = self.connected();
+        self.serving.retain(|_, s| connected.contains(&s.peer));
     }
 
     /// Writes the peer file at most every `SAVE_MS` (spec 09 §5a.7).
@@ -1082,8 +1306,23 @@ impl Transport {
                 request_id,
                 payload,
             } => {
+                let held = self.serving.values().filter(|s| s.peer == peer).count();
+                if held >= self.limits.serving {
+                    // The driver is not stepped for it: answered with nothing.
+                    self.conns[index].send(&Frame::Response {
+                        request_id,
+                        payload: Vec::new(),
+                    });
+                    self.traffic.frame(Direction::Out, "response");
+                    return Ok(());
+                }
                 self.next_local_id += 1;
-                self.serving.insert(self.next_local_id, (peer, request_id));
+                let serving = Serving {
+                    peer,
+                    request_id,
+                    by_ms: now_ms.saturating_add(self.limits.serve_ms),
+                };
+                self.serving.insert(self.next_local_id, serving);
                 node.step(Input::Request {
                     peer,
                     request_id: self.next_local_id,
@@ -1152,8 +1391,11 @@ impl Transport {
         self.redial(now_ms);
         self.discover(now_ms);
         for i in 0..self.conns.len() {
-            self.read_in(i);
-            while let Some(frame) = self.next_frame(i) {
+            self.read_in(i, now_ms);
+            for _ in 0..self.limits.read_frames {
+                let Some(frame) = self.next_frame(i) else {
+                    break;
+                };
                 self.handle_syncing(i, frame, sync, now_ms);
             }
         }
@@ -1176,33 +1418,67 @@ impl Transport {
                 },
             );
         }
-        self.flush_all();
+        self.flush_all(now_ms);
     }
 
-    /// Reads what connection `i` has.
-    fn read_in(&mut self, i: usize) {
-        let before = self.conns[i].inbuf.len();
-        self.conns[i].read();
-        let read = self.conns[i].inbuf.len() - before;
+    /// Whether connection `i` has at least `output_high` bytes queued, and
+    /// so is neither read nor has its frames handled (spec 09 §5b).
+    fn backlogged(&self, i: usize) -> bool {
+        self.conns[i].outbuf.len() >= self.limits.output_high
+    }
+
+    /// Reads what connection `i` has, up to `read_bytes`; nothing while it
+    /// is backlogged, which does not count as the peer going quiet.
+    fn read_in(&mut self, i: usize, now_ms: u64) {
+        let backlogged = self.backlogged(i);
+        let conn = &mut self.conns[i];
+        if backlogged {
+            conn.heard_ms = now_ms;
+            return;
+        }
+        let read = conn.read(self.limits.read_bytes);
+        if read > 0 {
+            conn.heard_ms = now_ms;
+        }
         self.traffic.bytes(Direction::In, read);
     }
 
     /// The next whole frame connection `i` has read, one at a time, since
     /// the peer's `Hello` changes how the frames after it are read; a
-    /// connection that sends a bad frame is marked dead.
+    /// connection that sends a bad frame is marked dead. None while the
+    /// connection is backlogged.
     fn next_frame(&mut self, i: usize) -> Option<Frame> {
+        if self.backlogged(i) {
+            return None;
+        }
         let frame = self.conns[i].next_frame()?;
         self.traffic.frame(Direction::In, frame.kind());
         Some(frame)
     }
 
     /// Writes what every connection has queued.
-    fn flush_all(&mut self) {
+    fn flush_all(&mut self, now_ms: u64) {
         for conn in &mut self.conns {
-            let before = conn.outbuf.len();
-            conn.flush();
-            self.traffic
-                .bytes(Direction::Out, before - conn.outbuf.len());
+            let written = conn.flush(now_ms);
+            self.traffic.bytes(Direction::Out, written);
+        }
+    }
+
+    /// Answers with nothing, and forgets, every request the driver has not
+    /// answered by its deadline (spec 09 §4).
+    fn expire_serving(&mut self, now_ms: u64) {
+        let (late, kept): (BTreeMap<_, _>, _) = std::mem::take(&mut self.serving)
+            .into_iter()
+            .partition(|(_, s)| now_ms >= s.by_ms);
+        self.serving = kept;
+        for s in late.into_values() {
+            self.send_to(
+                &s.peer,
+                &Frame::Response {
+                    request_id: s.request_id,
+                    payload: Vec::new(),
+                },
+            );
         }
     }
 
@@ -1256,8 +1532,11 @@ impl Transport {
         self.redial(now_ms);
         self.discover(now_ms);
         for i in 0..self.conns.len() {
-            self.read_in(i);
-            while let Some(frame) = self.next_frame(i) {
+            self.read_in(i, now_ms);
+            for _ in 0..self.limits.read_frames {
+                let Some(frame) = self.next_frame(i) else {
+                    break;
+                };
                 self.handle(i, frame, node, now_ms)?;
             }
         }
@@ -1290,11 +1569,11 @@ impl Transport {
                     request_id,
                     payload,
                 } => {
-                    if let Some((peer, their_id)) = self.serving.remove(&request_id) {
+                    if let Some(s) = self.serving.remove(&request_id) {
                         self.send_to(
-                            &peer,
+                            &s.peer,
                             &Frame::Response {
-                                request_id: their_id,
+                                request_id: s.request_id,
                                 payload,
                             },
                         );
@@ -1303,11 +1582,12 @@ impl Transport {
                 Outbound::Disseminate { .. } | Outbound::PeerScore { .. } => {}
             }
         }
+        self.expire_serving(now_ms);
         self.send_pool(node);
         for raw in node.take_tx_gossip() {
             self.broadcast(&Frame::Tx { raw });
         }
-        self.flush_all();
+        self.flush_all(now_ms);
         self.reap(now_ms);
         self.persist(now_ms);
         self.refresh_validators(node, now_ms);
@@ -1339,7 +1619,8 @@ mod tests {
 
     impl Read for Script {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let r = self.0.remove(0);
+            // No more than the buffer holds, as a stream reads.
+            let r = self.0.remove(0).map(|n| n.min(buf.len()));
             if let Ok(n) = r {
                 buf[..n].fill(7);
             }
@@ -1361,37 +1642,64 @@ mod tests {
     }
 
     #[test]
-    fn reading_stops_on_block_close_or_failure() {
+    fn reading_stops_on_block_close_failure_or_its_budget() {
         let mut buf = Vec::new();
         assert!(read_available(
             &mut Script(vec![Ok(2), would_block()]),
-            &mut buf
+            &mut buf,
+            usize::MAX
         ));
         assert_eq!(buf, vec![7, 7]);
-        assert!(!read_available(&mut Script(vec![Ok(0)]), &mut buf));
+        assert!(!read_available(&mut Script(vec![Ok(0)]), &mut buf, 1));
         assert!(!read_available(
             &mut Script(vec![Err(ErrorKind::ConnectionReset.into())]),
-            &mut buf
+            &mut buf,
+            1
         ));
+        // A stream that always has more is read only up to the budget, and
+        // not at all with none.
+        let mut buf = Vec::new();
+        let more = || Script((0..10).map(|_| Ok(16 * 1024)).collect());
+        assert!(read_available(&mut more(), &mut buf, 20_000));
+        assert_eq!(buf.len(), 20_000);
+        assert!(read_available(&mut Script(vec![]), &mut buf, 0));
+        assert_eq!(buf.len(), 20_000);
     }
 
     #[test]
     fn writing_stops_on_block_or_failure() {
-        let mut out = vec![1, 2, 3];
-        assert!(write_available(
-            &mut Script(vec![Ok(1), would_block()]),
-            &mut out
-        ));
-        assert_eq!(out, vec![2, 3]);
-        assert!(write_available(&mut Script(vec![Ok(2)]), &mut out));
-        assert!(out.is_empty());
-        let mut out = vec![1];
-        assert!(!write_available(&mut Script(vec![Ok(0)]), &mut out));
-        assert!(!write_available(
-            &mut Script(vec![Err(ErrorKind::BrokenPipe.into())]),
-            &mut out
-        ));
+        let out = [1, 2, 3];
+        assert_eq!(
+            write_available(&mut Script(vec![Ok(1), would_block()]), &out),
+            Some(1)
+        );
+        assert_eq!(
+            write_available(&mut Script(vec![Ok(2)]), &out[1..]),
+            Some(2)
+        );
+        assert_eq!(write_available(&mut Script(vec![]), &[]), Some(0));
+        assert_eq!(write_available(&mut Script(vec![Ok(0)]), &out), None);
+        assert_eq!(
+            write_available(&mut Script(vec![Err(ErrorKind::BrokenPipe.into())]), &out),
+            None
+        );
         let mut script = Script(vec![]);
         assert!(Write::flush(&mut script).is_ok());
+    }
+
+    #[test]
+    fn a_buffer_moves_what_is_left_only_once_it_is_no_more_than_what_was_taken() {
+        let mut buf = Buffer {
+            bytes: (0..10).collect(),
+            start: 0,
+        };
+        buf.take(3);
+        assert_eq!((buf.len(), buf.start, buf.bytes.len()), (7, 3, 10));
+        assert_eq!(buf.front()[0], 3);
+        buf.take(2);
+        assert_eq!((buf.len(), buf.start, buf.bytes.len()), (5, 0, 5));
+        assert_eq!(buf.front(), [5, 6, 7, 8, 9]);
+        buf.take(5);
+        assert!(buf.is_empty() && buf.bytes.is_empty());
     }
 }

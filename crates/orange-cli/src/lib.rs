@@ -19,9 +19,10 @@
 //! (spec 22 §7.4), and `--serve-snapshots` serves them to such nodes.
 //! `orange node` runs peer exchange (spec 09 §5a) unless `--no-discovery`: it
 //! learns the network from its `--peer`s and `--bootstrap` addresses, keeps
-//! up to `--outbound-peers` connections it dials itself and `--max-peers` in
-//! all, and advertises `--advertise` (by default its listen address) in a
-//! record signed with its key: a validator's consensus key, or an
+//! up to `--outbound-peers` connections it dials itself, accepts up to
+//! `--max-peers` (with or without peer exchange), and advertises
+//! `--advertise` (by default its listen address) in a record signed with
+//! its key: a validator's consensus key, or an
 //! observer's `--node-key-file` (an observer without one dials with a key
 //! fresh at every start and advertises nothing). It also dials the genesis
 //! file's `bootnodes` (see [`ceremony`]). Both commands serve `orange_stop`
@@ -557,12 +558,13 @@ fn parse_addresses(args: &[String], flag: &str) -> Result<Vec<std::net::SocketAd
 
 /// Peer exchange as the options say (spec 09 §5a): on unless
 /// `--no-discovery`, signing the node's record with its consensus key and
-/// keeping its table under `--data-dir` (spec 09 §5a.7).
+/// keeping its table under `--data-dir` (spec 09 §5a.7); and `--max-peers`,
+/// which limits the connections accepted with or without it (spec 09 §5).
 fn discovery(
     args: &[String],
     key: Option<k256::ecdsa::SigningKey>,
     genesis_bootnodes: &[std::net::SocketAddr],
-) -> Result<Option<orange_node::Discovery>, String> {
+) -> Result<(Option<orange_node::Discovery>, usize), String> {
     let defaults = orange_node::Discovery::default();
     let limit = |flag: &str, default: usize| -> Result<usize, String> {
         match parse_number(args, flag)? {
@@ -590,30 +592,26 @@ fn discovery(
             bootstrap.push(*addr);
         }
     }
+    let max_peers = limit("--max-peers", defaults.max_peers)?;
     let discovery = orange_node::Discovery {
         key,
         advertise,
         bootstrap,
-        max_peers: limit("--max-peers", defaults.max_peers)?,
+        max_peers,
         outbound: limit("--outbound-peers", defaults.outbound)?,
         peer_file: arg(args, "--data-dir")
             .map(|dir| std::path::Path::new(&dir).join(orange_node::peers::PEER_FILE)),
     };
     if args.iter().any(|a| a == "--no-discovery") {
-        let given = [
-            "--bootstrap",
-            "--advertise",
-            "--max-peers",
-            "--outbound-peers",
-        ];
+        let given = ["--bootstrap", "--advertise", "--outbound-peers"];
         if let Some(flag) = given.iter().find(|f| args.iter().any(|a| a == *f)) {
             return Err(format!(
                 "{flag} configures peer exchange, which --no-discovery turns off"
             ));
         }
-        return Ok(None);
+        return Ok((None, max_peers));
     }
-    Ok(Some(discovery))
+    Ok((Some(discovery), max_peers))
 }
 
 /// What the commands that run no node print: `key`, `doctor`, `gov` and
@@ -668,12 +666,16 @@ fn bind_transport(
             .ok()
             .ok_or("node key: the operating system gave no randomness")?,
     };
-    let discovery = discovery(args, lasting, genesis_bootnodes)?;
+    let (discovery, max_peers) = discovery(args, lasting, genesis_bootnodes)?;
     let genesis = node.genesis_hash();
     let mut t = match orange_node::Transport::bind(listen, key, chain_id, genesis, peers) {
         Ok(t) => t,
         Err(e) => return Err(format!("{listen}: {e}").into()),
     };
+    t.set_limits(orange_node::net::Limits {
+        max_peers,
+        ..t.limits()
+    });
     let bound = t.local_addr().map_or(listen.to_owned(), |a| a.to_string());
     eprintln!("p2p listening on {bound}");
     if let Some(discovery) = discovery {
