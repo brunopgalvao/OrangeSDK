@@ -28,6 +28,9 @@ pub const MAX_TXS: usize = 8192;
 pub const MAX_QUEUED: usize = 1024;
 /// Most transactions of one sender ([`PoolLimits::per_sender`]).
 pub const PER_SENDER: usize = 256;
+/// Most queued transactions of one sender ([`PoolLimits::per_sender_queued`]):
+/// geth's `AccountQueue`, so that no few senders hold every queued slot.
+pub const PER_SENDER_QUEUED: usize = 64;
 /// Most gas the transactions of one sender declare in all
 /// ([`PoolLimits::per_sender_gas`]): four blocks of the reference kernel's
 /// 30 000 000, since blocks are budgeted by gas limit (spec 14 §4).
@@ -56,6 +59,8 @@ pub struct PoolLimits {
     pub max_queued: usize,
     /// Most transactions of one sender.
     pub per_sender: usize,
+    /// Most queued transactions of one sender.
+    pub per_sender_queued: usize,
     /// Most gas the transactions of one sender declare in all.
     pub per_sender_gas: u64,
     /// Most bytes of raw transactions in all.
@@ -70,6 +75,7 @@ impl Default for PoolLimits {
             max_txs: MAX_TXS,
             max_queued: MAX_QUEUED,
             per_sender: PER_SENDER,
+            per_sender_queued: PER_SENDER_QUEUED,
             per_sender_gas: PER_SENDER_GAS,
             max_bytes: MAX_BYTES,
             max_tx_bytes: MAX_TX_BYTES,
@@ -485,7 +491,7 @@ impl Mempool {
     ///
     /// # Errors
     /// See [`Mempool::check`]; [`PoolError::Full`] when the sender is at a
-    /// per-sender limit, or the pool at another and evicting what the
+    /// per-sender limit (of queued transactions, for a queued newcomer), or the pool at another and evicting what the
     /// newcomer may evict cannot make room (spec 14 §4).
     pub fn insert(
         &mut self,
@@ -498,9 +504,16 @@ impl Mempool {
         }
         self.check(&tx)?;
         let (sender, nonce) = (tx.sender, tx.nonce);
-        let held = self.queues.get(&sender).map(|q| &q.txs);
+        let queue = self.queues.get(&sender);
+        let held = queue.map(|q| &q.txs);
         let replacing = held.is_some_and(|txs| txs.contains_key(&nonce));
         if !replacing && held.map_or(0, BTreeMap::len) >= self.limits.per_sender {
+            return Err(PoolError::Full);
+        }
+        // A newcomer is queued when it does not extend its sender's pending run.
+        let pending_end = queue.map_or(account.nonce, Queue::pending_end);
+        let queued = queue.map_or(0, |q| q.txs.len() - q.pending_len());
+        if !replacing && nonce != pending_end && queued >= self.limits.per_sender_queued {
             return Err(PoolError::Full);
         }
         let gas = held.into_iter().flat_map(BTreeMap::values);

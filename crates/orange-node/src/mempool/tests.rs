@@ -833,7 +833,7 @@ fn check(pool: &Mempool) {
 proptest! {
     #[test]
     fn invariants_hold(ops in prop::collection::vec(op(), 1..60)) {
-        let mut pool = Mempool::new(PoolLimits { max_txs: 10, max_queued: 4, per_sender: 5, per_sender_gas: u64::MAX, max_bytes: usize::MAX, max_tx_bytes: usize::MAX });
+        let mut pool = Mempool::new(PoolLimits { max_txs: 10, max_queued: 4, per_sender: 5, per_sender_queued: 3, per_sender_gas: u64::MAX, max_bytes: usize::MAX, max_tx_bytes: usize::MAX });
         let mut nonce_of = [0u64; 4];
         for op in ops {
             match op {
@@ -887,4 +887,27 @@ fn authorities_come_from_the_authorization_signatures() {
         ..auth
     };
     assert_eq!(authority(&unsigned), None);
+}
+
+/// Spec 14 §4. Before, one sender could hold up to its 256 transactions as
+/// queued ones, which never run and so cost it nothing, and four senders
+/// held every queued slot of the pool. Now a sender holds at most 64 queued.
+#[test]
+fn one_sender_holds_at_most_its_share_of_queued_transactions() {
+    let mut pool = Mempool::new(PoolLimits::default());
+    for nonce in 1..=64 {
+        add(&mut pool, &tx(1, nonce, 1)).unwrap();
+    }
+    assert_eq!(pool.status(), (0, 64));
+    assert_eq!(add(&mut pool, &tx(1, 65, 1)), Err(PoolError::Full));
+    assert_eq!(add(&mut pool, &tx(1, 100, 50)), Err(PoolError::Full));
+    // A replacement of a queued one is not one more.
+    assert!(add(&mut pool, &tx(1, 64, 2)).unwrap().replaced.is_some());
+    // Another sender's queued ones, and this sender's pending ones, still enter.
+    add(&mut pool, &tx(2, 1, 1)).unwrap();
+    add(&mut pool, &tx(1, 0, 1)).unwrap();
+    assert_eq!(pool.status(), (65, 1));
+    // Once the gap is filled, the sender may queue again.
+    add(&mut pool, &tx(1, 66, 1)).unwrap();
+    assert_eq!(pool.status(), (65, 2));
 }
