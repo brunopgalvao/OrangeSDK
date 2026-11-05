@@ -234,22 +234,23 @@ pub fn end_block(height: u64, timestamp_ms: u64) {
     });
 }
 
-/// The staged code of `code_hash` (spec 13 §3): chunks from 0 up to the
+/// `stager`'s upload of `code_hash` (spec 13 §3): chunks from 0 up to the
 /// first missing one, concatenated.
-fn staged(code_hash: &Hash) -> Vec<u8> {
+fn staged(stager: &Address, code_hash: &Hash) -> Vec<u8> {
     let mut code = Vec::new();
     let mut index = 0;
-    while let Some(chunk) = state::get_raw(&orange_upgrade::keys::chunk(code_hash, index)) {
+    while let Some(chunk) = state::get_raw(&orange_upgrade::keys::chunk(stager, code_hash, index)) {
         code.extend_from_slice(&chunk);
         index += 1;
     }
     code
 }
 
-/// A governance install (spec 16 §4.2), authorized by `governance.rs`: the
+/// A governance install (spec 16 §4.2), authorized by `governance.rs`, of
+/// code from `stager`'s upload unless the module is in state: the
 /// `ModuleInstalled` log if it went through, `None` with nothing changed if
 /// any of its checks failed.
-pub fn install_action(action: &Install, height: u64) -> Option<Log> {
+pub fn install_action(action: &Install, stager: &Address, height: u64) -> Option<Log> {
     let target = &action.target;
     let account = state::account(target);
     if action.capabilities & !capability::HOOKS != 0
@@ -263,7 +264,7 @@ pub fn install_action(action: &Install, height: u64) -> Option<Log> {
     let key = state::code_key(&action.code_hash);
     let present = state::get_raw(&key).is_some();
     if !present {
-        let code = staged(&action.code_hash);
+        let code = staged(stager, &action.code_hash);
         if code.is_empty()
             || code.len() > modules::MAX_MODULE_SIZE
             || state::keccak256(&code) != action.code_hash

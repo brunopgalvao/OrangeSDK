@@ -524,13 +524,20 @@ fn track_of(target: &Address, data: &[u8], switch: bool) -> Option<Track> {
 
 /// Applies the governance action `data` to `target` in `block` (spec 13
 /// §9.5), as a passed proposal, the key or the guardian does; `None` if its
-/// checks fail, in which case nothing changed.
-fn apply_action(target: &Address, data: &[u8], block: BlockFields) -> Option<Vec<Log>> {
+/// checks fail, in which case nothing changed. `stager` is the account
+/// whose upload a `propose` or an `install` uses: the proposal's proposer,
+/// or the key (spec 13 §3).
+fn apply_action(
+    target: &Address,
+    data: &[u8],
+    stager: &Address,
+    block: BlockFields,
+) -> Option<Vec<Log>> {
     let height = block.number;
     match *target {
         GOVERNANCE_ADDRESS => match Action::decode(data) {
             Some(action @ (Action::Propose { .. } | Action::Cancel { .. })) => {
-                apply_upgrade(action, &[0; 20], height)
+                apply_upgrade(action, stager, height)
             }
             Some(_) => None,
             None => match Call::decode(data)? {
@@ -572,7 +579,7 @@ fn apply_action(target: &Address, data: &[u8], block: BlockFields) -> Option<Vec
             },
         },
         MODULE_ADDRESS => Install::decode(data)
-            .and_then(|install| crate::modules::install_action(&install, height))
+            .and_then(|install| crate::modules::install_action(&install, stager, height))
             .map(|log| vec![log]),
         LIGHT_CLIENT_ADDRESS | VERIFIER_ADDRESS => {
             crate::bridge::govern(target, data, block, ACTION_GAS).map(|()| Vec::new())
@@ -765,12 +772,13 @@ fn code_of(target: &Address, data: &[u8]) -> Option<Hash> {
     }
 }
 
-/// Whether the code an action names is there to run (spec 13 §9.3): staged
-/// chunks that hash to `code_hash`, or for an install a module already in
-/// state under its hash.
-fn code_complete(code_hash: &Hash, module: bool) -> bool {
+/// Whether the code an action names is there to run (spec 13 §9.3): the
+/// chunks of `stager`'s upload that hash to `code_hash`, or for an install
+/// a module already in state under its hash.
+fn code_complete(stager: &Address, code_hash: &Hash, module: bool) -> bool {
     (module && state::get_raw(&state::code_key(code_hash)).is_some())
-        || assemble(code_hash).is_some_and(|(code, _)| state::keccak256(&code) == *code_hash)
+        || assemble(stager, code_hash)
+            .is_some_and(|(code, _)| state::keccak256(&code) == *code_hash)
 }
 
 /// Whether an open proposal names `code_hash`: its code is frozen while one does.
@@ -844,7 +852,7 @@ pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Out
         let applied = match request {
             Request::Upgrade(action) => apply_upgrade(action, &s.from, height),
             Request::Install(install) => {
-                crate::modules::install_action(&install, height).map(|log| vec![log])
+                crate::modules::install_action(&install, &s.from, height).map(|log| vec![log])
             }
             Request::Call(call) => {
                 // The governance surcharge, paid like every fee (spec 13 §9.9).
@@ -875,7 +883,8 @@ pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Out
 }
 
 /// Applies an authorized upgrade action in the block at `height`; `None`
-/// if its state checks fail.
+/// if its state checks fail. `from` sends it, or for a `propose` is its
+/// stager (spec 13 §3).
 fn apply_upgrade(action: Action, from: &Address, height: u64) -> Option<Vec<Log>> {
     match action {
         Action::Stage {
@@ -884,21 +893,16 @@ fn apply_upgrade(action: Action, from: &Address, height: u64) -> Option<Vec<Log>
             chunk,
         } => {
             // Frozen code: the pending upgrade's, every enacted kernel's, and
-            // what an open proposal names. And a code hash belongs to the
-            // account that staged its first chunk, so nobody spoils another's
-            // upload by writing a chunk of their own under it (spec 13 §3).
+            // what an open proposal names. Each sender stages into an upload
+            // of its own, so nobody spoils another's by writing chunks under
+            // the same code hash (spec 13 §3).
             if pending().is_some_and(|p| p.code_hash == code_hash)
                 || enacted(&code_hash)
                 || claimed(&code_hash)
             {
                 return None;
             }
-            match state::get::<Address>(&keys::staker(&code_hash)) {
-                Some(staker) if staker != *from => return None,
-                Some(_) => {}
-                None => state::set(&keys::staker(&code_hash), from),
-            }
-            state::set_raw(&keys::chunk(&code_hash, index), &chunk);
+            state::set_raw(&keys::chunk(from, &code_hash, index), &chunk);
             Some(Vec::new())
         }
         Action::Propose {
@@ -915,11 +919,13 @@ fn apply_upgrade(action: Action, from: &Address, height: u64) -> Option<Vec<Log>
             {
                 return None;
             }
-            let (code, chunks) = assemble(&code_hash)?;
+            let (code, chunks) = assemble(from, &code_hash)?;
             if state::keccak256(&code) != code_hash {
                 return None;
             }
             let size = u32::try_from(code.len()).ok()?;
+            // Hosts read the code of a pending or enacted kernel from here.
+            state::set(&keys::source(&code_hash), from);
             state::set(
                 keys::PENDING,
                 &PendingUpgrade {
@@ -1095,7 +1101,7 @@ fn apply_call(call: Call, s: &Signed, block: BlockFields, called: &mut u64) -> O
             // opens, and frozen from then on, so validators vote on the code
             // that is there (spec 13 §9.3).
             if let Some(code_hash) = code_of(&target, &data)
-                && !code_complete(&code_hash, target == MODULE_ADDRESS)
+                && !code_complete(&s.from, &code_hash, target == MODULE_ADDRESS)
             {
                 return None;
             }
@@ -1178,7 +1184,7 @@ fn apply_call(call: Call, s: &Signed, block: BlockFields, called: &mut u64) -> O
                 logs.extend(governed_call(id, &p, s, block, called));
                 return Some(logs);
             }
-            logs.extend(apply_action(&p.target, &p.data, block)?);
+            logs.extend(apply_action(&p.target, &p.data, &p.proposer, block)?);
             Some(logs)
         }
         Call::Veto { id } => {
@@ -1198,17 +1204,17 @@ fn apply_call(call: Call, s: &Signed, block: BlockFields, called: &mut u64) -> O
 /// pausing), logging that it did before the action's own logs.
 fn enact(by: &Address, target: &Address, data: &[u8], block: BlockFields) -> Option<Vec<Log>> {
     let mut logs = vec![gov::enacted_log(by, target, data)];
-    logs.extend(apply_action(target, data, block)?);
+    logs.extend(apply_action(target, data, by, block)?);
     Some(logs)
 }
 
-/// The staged code of `code_hash`: chunks 0, 1, … up to the first missing
+/// `stager`'s upload of `code_hash`: chunks 0, 1, … up to the first missing
 /// one, concatenated, and how many there were; `None` without chunk 0.
-fn assemble(code_hash: &Hash) -> Option<(Vec<u8>, u32)> {
+fn assemble(stager: &Address, code_hash: &Hash) -> Option<(Vec<u8>, u32)> {
     let mut code = Vec::new();
     let mut chunks = 0;
     while chunks < MAX_CHUNKS {
-        let Some(chunk) = state::get_raw(&keys::chunk(code_hash, chunks)) else {
+        let Some(chunk) = state::get_raw(&keys::chunk(stager, code_hash, chunks)) else {
             break;
         };
         code.extend_from_slice(&chunk);
@@ -1256,7 +1262,9 @@ pub fn end_block(height: u64, block: BlockFields) -> Vec<Log> {
                 prune(&p, true);
                 record_execution(p.id, height, true);
                 logs.push(gov::executed_log(p.id));
-                logs.extend(apply_action(&p.target, &p.data, block).unwrap_or_default());
+                logs.extend(
+                    apply_action(&p.target, &p.data, &p.proposer, block).unwrap_or_default(),
+                );
             } else if height >= p.voting_end {
                 prune(&p, gov::quorum(yes, no, total, rules().quorum_bps));
             } else {
@@ -1370,14 +1378,17 @@ pub fn query(method: &str, params: &[u8]) -> QueryResult {
     match method {
         query::KERNEL_VERSION => ok(KERNEL_VERSION.to_bytes()),
         query::STATUS => ok(upgrade_status().to_bytes()),
+        // The code of the upload a `propose` of the code hash used.
         query::CODE => match Hash::from_bytes(params) {
-            Ok(code_hash) => assemble(&code_hash).map_or(
-                QueryResult {
-                    status: 1,
-                    body: Vec::new(),
-                },
-                |(code, _)| ok(code.to_bytes()),
-            ),
+            Ok(code_hash) => state::get::<Address>(&keys::source(&code_hash))
+                .and_then(|source| assemble(&source, &code_hash))
+                .map_or(
+                    QueryResult {
+                        status: 1,
+                        body: Vec::new(),
+                    },
+                    |(code, _)| ok(code.to_bytes()),
+                ),
             Err(_) => QueryResult {
                 status: 2,
                 body: Vec::new(),

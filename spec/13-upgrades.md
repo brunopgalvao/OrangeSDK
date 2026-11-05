@@ -84,12 +84,14 @@ Actions cost no gas beyond the intrinsic cost; only the authorized accounts can 
 
 Heights below are those of the block executing the action; under the stake track, `propose` and `cancel` execute when the proposal that carries them does (§9.5), and the height is that block's.
 
-- **`stage(codeHash, index, chunk)`** stores `chunk` as chunk `index` of `codeHash`, replacing any chunk already there. The first `stage` under a code hash makes its sender the code hash's *staker*, recorded under `gov/staker/` ‖ `codeHash` (§5), and only the staker stages further chunks under it, so that nobody spoils another account's upload by writing a chunk of its own under the hash: an account that wants the same code under a hash another holds proposes over that code once it is complete, or stages a build of its own under a hash of its own. Fails if the sender is not the staker, or if `codeHash` is *frozen*: the pending upgrade's, that of a kernel the chain has switched to (§5), or one an open proposal names in its `propose` or `install` (§9.3). Emits nothing.
-- **`propose(codeHash, activationHeight, requiredGates)`** at height `B` makes the code the *pending upgrade*. Fails if an upgrade is pending, if `activationHeight < B + max(N, 1)`, if `activationHeight` is `2^64 − 1` (block `H + 1` must have a height), if the chain has already switched to `codeHash` (a kernel never comes back: versions only increase, 06 §7.1), if chunk 0 of `codeHash` is not staged, or if the chunks staged from index 0 up to the first missing index, concatenated, do not hash to `codeHash` under `keccak256`. Records `PendingUpgrade { code_hash, activation_height, required_gates, size, chunks, proposed_at: B }` and emits `UpgradeProposed(codeHash, activationHeight, requiredGates)`.
+- **`stage(codeHash, index, chunk)`** stores `chunk` as chunk `index` of the sender's *upload* of `codeHash`, replacing any chunk the sender staged there. Every sender stages into uploads of its own, keyed by sender and code hash (§5), so that nobody spoils another account's upload by writing chunks under the same hash: two accounts that stage the same code each assemble their own copy, and nothing one stages changes what the other's hashes to. Fails if `codeHash` is *frozen*: the pending upgrade's, that of a kernel the chain has switched to (§5), or one an open proposal names in its `propose` or `install` (§9.3). Emits nothing.
+- **`propose(codeHash, activationHeight, requiredGates)`** at height `B` makes the code the *pending upgrade*. It uses the upload of its *stager*: the governance key under the key track, the proposer of the proposal that carries it under the stake track (§9.5). Fails if an upgrade is pending, if `activationHeight < B + max(N, 1)`, if `activationHeight` is `2^64 − 1` (block `H + 1` must have a height), if the chain has already switched to `codeHash` (a kernel never comes back: versions only increase, 06 §7.1), if chunk 0 of the stager's upload of `codeHash` is not staged, or if the chunks of that upload from index 0 up to the first missing index, concatenated, do not hash to `codeHash` under `keccak256`. Records `PendingUpgrade { code_hash, activation_height, required_gates, size, chunks, proposed_at: B }`, records the stager as the code hash's *source* (§5), whose upload hosts read the code from (§6), and emits `UpgradeProposed(codeHash, activationHeight, requiredGates)`.
 - **`cancel(codeHash)`** removes the pending upgrade. Fails unless an upgrade is pending and its code hash is `codeHash`. Emits `UpgradeCancelled(codeHash)`. Staged chunks stay; the same code may be proposed again without uploading it again.
 - **`signal(features)`** records `Signal { epoch: epoch(B), features }` as the sender's latest signal (§8.2). Emits nothing.
 
 `requiredGates` names, one bit per gate, the feature gates the new kernel needs (it imports their host functions). It is the "required host ABI" of ADR 0011: the host ABI grows only through gates.
+
+Before 2026-11-06 chunks were keyed by code hash alone, and the first account to stage under a code hash held it for good, alone staging the rest. A validator that saw an honest `stage` waiting in the pool could stage a junk chunk 0 under the same code hash first: the honest upload could then never be completed, by anyone, nor the code staged under another hash, since the hash is the code's.
 
 ## 4. Timeline of a kernel upgrade
 
@@ -108,8 +110,8 @@ Under the reference kernel's state layout (all covered by the state commitment):
 | `gov/pending` | `PendingUpgrade`, while one is pending |
 | `gov/enacted` | `EnactedUpgrade`, the latest switch |
 | `gov/kernel/` ‖ code hash | `EnactedUpgrade`, for every kernel the chain switched to |
-| `gov/chunk/` ‖ code hash ‖ index (big-endian `u32`) | chunk bytes |
-| `gov/staker/` ‖ code hash | `[20]`, the staker of the code hash (§3), for good |
+| `gov/c/` ‖ stager ‖ code hash ‖ index (big-endian `u32`) | chunk bytes of the stager's upload (§3); the prefix is short so that the key fits 64 bytes (05 §4.2) |
+| `gov/source/` ‖ code hash | `[20]`, the stager whose upload the latest `propose` of the code hash used (§3) |
 | `gate/book` | `GateBook` (§8.3) |
 | `gate/signal/` ‖ validator id | `Signal`, the validator's latest |
 
@@ -123,7 +125,7 @@ struct GateRecord     { gate: u8, streak: u32, activation_height: u64 }
 struct GateBook       { next_epoch: u64, gates: vec<GateRecord> }
 ```
 
-The code of an enacted kernel stays staged and cannot be restaged (§3): the running kernel, and every kernel before it in the lineage other than the genesis kernel, is a program in state (ADR 0004), and `upgrade_code` of its code hash serves exactly that program.
+The code of an enacted kernel stays staged in its source's upload and cannot be restaged (§3), and its source is never recorded again, since a kernel the chain switched to is never proposed again: the running kernel, and every kernel before it in the lineage other than the genesis kernel, is a program in state (ADR 0004), and `upgrade_code` of its code hash serves exactly that program.
 
 ## 6. Queries
 
@@ -131,7 +133,7 @@ The code of an enacted kernel stays staged and cannot be restaged (§3): the run
 |---|---|---|
 | `kernel_version` | — | `u32`, the running kernel's version (06 §7.1) |
 | `upgrade_status` | — | `UpgradeStatus` |
-| `upgrade_code` | code hash `[32]` | `bytes`: chunks from index 0 up to the first missing one, concatenated; status 1 if chunk 0 is missing, 2 if the params are not 32 bytes |
+| `upgrade_code` | code hash `[32]` | `bytes`: the chunks of the code hash's source's upload (§5) from index 0 up to the first missing one, concatenated; status 1 if the code hash has no source or chunk 0 is missing, 2 if the params are not 32 bytes |
 
 ```
 struct ValidatorSignal { id: [32], weight: u64, signal: option<Signal> }
@@ -277,7 +279,7 @@ struct Proposal { id: u64, proposer: [20], deposit: u128, target: [20], data: by
 
 `voting_end = B + voting_blocks`; on the normal track `executable_at = voting_end + timelock_blocks + 1` and `expires_at = executable_at + voting_blocks − 1`, on the fast track `executable_at = 0` and `expires_at = voting_end`; `status` 0 is *voting*, 1 *passed*; `deposit` is the value the transaction carried (zero for a validator). It emits `ProposalSubmitted(id, proposer, target, data, votingEnd)`. At most `MAX_OPEN_PROPOSALS = 16` proposals are open at once.
 
-A `submit` whose action runs staged code, `propose` or `install`, opens the proposal only if that code is there: the chunks staged under its code hash (§3) hash to it, or, for an install, the module is already in state under its hash. Otherwise the submission reverts (§9.5). The code hash an open proposal names is frozen until the proposal leaves state (§3), so validators vote on the code that will run, and what passes is what executes.
+A `submit` whose action runs staged code, `propose` or `install`, opens the proposal only if that code is there: the chunks of the proposer's own upload of its code hash (§3) hash to it, or, for an install, the module is already in state under its hash. The validator that staged the code is the one that proposes it; another that wants the same code proposed stages a copy of its own. Otherwise the submission reverts (§9.5). The code hash an open proposal names is frozen until the proposal leaves state (§3), so validators vote on the code that will run, and what passes is what executes.
 
 **Voting.** In any block up to and including `voting_end`, while the proposal is voting, `vote(id, support)` records a vote: a validator's account (§2.2) votes as its validator, and any other account that has bonded stake behind a member that counts (below), however little, votes as a *delegator*. Voting again replaces the vote. Nothing bounds how many delegators vote on a proposal: a tally reads running sums, not the votes (below). The vote emits `Voted(id, voter, support, weight)` with the voter's weight at that moment: a validator's member weight, a delegator's stake behind members that count.
 
@@ -338,8 +340,8 @@ A governance call that can run executes as §2.3 says: the plain call, then the 
 
 An action executes against the state at that point in the block, at that block's height and timestamp, as if sent directly by the authority of the track:
 
-- `propose` and `cancel` as §3 says;
-- `install` as 16 §4.2 says, the `ModuleInstalled` log included;
+- `propose` and `cancel` as §3 says, the proposal's proposer, or the key, as the stager;
+- `install` as 16 §4.2 says, from the same stager's upload, the `ModuleInstalled` log included;
 - a bridge action as a call to the native contract at `target` (16 §5) made by the *governance authority*: the governance key under the key track, the governance address itself under the stake track, which is the account the two modules' configuration names as their governance (18 §4.1, §9.6). The module runs sandboxed with `ACTION_GAS = 2^26` VM gas of the kernel's own, with no value, and its writes are applied if it returns; a module that reverts, fails or is not there (the bridge is off, or the light client's gate is not yet active) fails the action. Nothing is charged to anyone beyond the surcharge: the actions are bounded by the voting and by the proposal bound.
 - `reject(id)` prunes proposal `id`, its deposit returned, and fails unless it is open and on the normal track;
 - `setGuardian(guardian)` records the guardian (zero: none) and emits `GuardianSet`; `setParams(voting, timelock, quorum, deposit)` fails unless `voting ≥ 1` and `1 ≤ quorum ≤ 10 000`, else records the rules under the mode in force and emits `ParamsSet`; `setFeeParams` fails unless its parameters are workable (23 §2), else records them, in force from the next block, and emits `FeeParamsSet` (23 §5); `setMode` is §9.6's.
@@ -412,5 +414,5 @@ A `vote(id, true)` transaction with no other calldata uses 71 860 gas: its intri
 - A proposal carries one action. Several actions take several proposals, which may run at the same time within the bound.
 - The guardian's powers, veto and pause, cover normal-track proposals other than a change of guardian, and the inbox; they do not cancel a pending upgrade or stop a fast-track proposal (both are the validators' majority), nor pause the token gateways of spec 21, which have guardians of their own. A guardian that vetoes what it should not is replaced by a proposal it cannot veto, and delays until then.
 - The deposit is returned or burned, never paid to voters or to anyone who executes; nothing pays for governance beyond the proposer's interest.
-- Staged code is bounded by the block gas limit alone: under the stake track any validator stages any number of code hashes, each up to 7.5 MiB, at the calldata's gas, which costs the base fee of the chain (23), nothing on a chain whose floor is zero; the staker rule of §3 stops interference, not volume, and nothing deletes a chunk. A bound per account is a later change.
+- Staged code is bounded by the block gas limit alone: under the stake track any validator stages any number of code hashes, each up to 7.5 MiB, at the calldata's gas, which costs the base fee of the chain (23), nothing on a chain whose floor is zero; uploads kept per stager (§3) stop interference, not volume, and nothing deletes a chunk. A bound per account is a later change.
 - The only way back from the stake track is a kernel upgrade, which the stake track itself must pass.

@@ -82,22 +82,25 @@ pub mod keys {
     pub const PENDING: &[u8] = b"gov/pending";
     /// `gov/enacted` → `EnactedUpgrade`, the latest switch.
     pub const ENACTED: &[u8] = b"gov/enacted";
-    /// `gov/chunk/` + code hash + index (big-endian u32) → chunk bytes.
-    pub const CHUNK: &[u8] = b"gov/chunk/";
+    /// `gov/c/` + stager + code hash + index (big-endian u32) → chunk bytes
+    /// of the stager's upload (spec 13 §3); a short prefix, so that the key
+    /// fits 64 bytes.
+    pub const CHUNK: &[u8] = b"gov/c/";
     /// `gov/kernel/` + code hash → `EnactedUpgrade`, for every kernel switched to.
     pub const KERNEL: &[u8] = b"gov/kernel/";
-    /// `gov/staker/` + code hash → `[20]`, the account that staged the first
-    /// chunk under the code hash and alone stages the rest (spec 13 §3).
-    pub const STAKER: &[u8] = b"gov/staker/";
+    /// `gov/source/` + code hash → `[20]`, the stager whose upload the
+    /// latest `propose` of the code hash used (spec 13 §3).
+    pub const SOURCE: &[u8] = b"gov/source/";
     /// `gate/book` → `GateBook`.
     pub const BOOK: &[u8] = b"gate/book";
     /// `gate/signal/` + validator id → `Signal`, the validator's latest.
     pub const SIGNAL: &[u8] = b"gate/signal/";
 
-    /// The key of chunk `index` of `code_hash`.
+    /// The key of chunk `index` of `stager`'s upload of `code_hash`.
     #[must_use]
-    pub fn chunk(code_hash: &Hash, index: u32) -> Vec<u8> {
+    pub fn chunk(stager: &[u8; 20], code_hash: &Hash, index: u32) -> Vec<u8> {
         let mut k = CHUNK.to_vec();
+        k.extend_from_slice(stager);
         k.extend_from_slice(code_hash);
         k.extend_from_slice(&index.to_be_bytes());
         k
@@ -111,10 +114,10 @@ pub mod keys {
         k
     }
 
-    /// The key of the staker of `code_hash`.
+    /// The key of the source of `code_hash`.
     #[must_use]
-    pub fn staker(code_hash: &Hash) -> Vec<u8> {
-        let mut k = STAKER.to_vec();
+    pub fn source(code_hash: &Hash) -> Vec<u8> {
+        let mut k = SOURCE.to_vec();
         k.extend_from_slice(code_hash);
         k
     }
@@ -155,11 +158,12 @@ mod tests {
         // A chunk transaction still fits a 64 KiB storage value with room for its envelope.
         const { assert!(CHUNK_SIZE + 1024 < 65_536) };
         assert_eq!(MAX_CHUNKS as usize * CHUNK_SIZE, 15 << 19);
-        let k = keys::chunk(&[7; 32], 0x0102_0304);
-        assert_eq!(k.len(), 46);
+        let k = keys::chunk(&[8; 20], &[7; 32], 0x0102_0304);
+        assert_eq!(k.len(), 62);
         assert!(k.len() <= 64);
-        assert_eq!(&k[..10], keys::CHUNK);
-        assert_eq!(&k[42..], &[1, 2, 3, 4]);
+        assert_eq!(&k[..6], keys::CHUNK);
+        assert_eq!((&k[6..26], &k[26..58]), (&[8u8; 20][..], &[7u8; 32][..]));
+        assert_eq!(&k[58..], &[1, 2, 3, 4]);
         let k = keys::signal(&[9; 32]);
         assert_eq!(k.len(), 44);
         assert_eq!(&k[..12], keys::SIGNAL);
@@ -168,10 +172,10 @@ mod tests {
             (k.len(), &k[..11], &k[11..]),
             (43, keys::KERNEL, &[5u8; 32][..])
         );
-        let k = keys::staker(&[6; 32]);
+        let k = keys::source(&[6; 32]);
         assert_eq!(
             (k.len(), &k[..11], &k[11..]),
-            (43, keys::STAKER, &[6u8; 32][..])
+            (43, keys::SOURCE, &[6u8; 32][..])
         );
         assert_eq!(
             (keys::PENDING, keys::ENACTED, keys::BOOK),

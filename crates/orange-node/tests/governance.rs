@@ -516,8 +516,8 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
         1
     );
 
-    // Proposal 1: Alice, no validator, proposes the module install with the
-    // deposit; validators vote by stake; it passes, waits out the timelock,
+    // Proposal 1: validator 0, which staged the module, proposes its
+    // install; validators vote by stake; it passes, waits out the timelock,
     // and Alice executes it.
     let install_data = install.encode();
     for raw in [
@@ -532,15 +532,23 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
     ] {
         assert_eq!(sim.submit(0, &raw), refused());
     }
+    // Alice, no validator, staged nothing: her proposal of the install
+    // never opens, and her deposit comes back (spec 13 §9.3).
     let r = sim_include(
         &mut sim,
         &alice.call(&submit(MODULE_ADDRESS, &install_data), DEPOSIT),
     );
+    assert_eq!((r.status, gov_status(&mut sim.nodes[0]).next_id), (0, 1));
+    assert_eq!(balance(&mut sim.nodes[0], alice.address()), 100 * ETHER);
+    let r = sim_include(
+        &mut sim,
+        &val[0].call(&submit(MODULE_ADDRESS, &install_data), 0),
+    );
     assert_eq!(r.status, 1);
     let p1 = expected(
         1,
-        alice.address(),
-        DEPOSIT,
+        val[0].address(),
+        0,
         MODULE_ADDRESS,
         &install_data,
         r.height,
@@ -552,11 +560,6 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
         (shown.yes, shown.no, shown.total, shown.votes.0.len()),
         (0, 0, 10, 0)
     );
-    assert_eq!(
-        balance(&mut sim.nodes[0], alice.address()),
-        100 * ETHER - DEPOSIT
-    );
-    assert_eq!(balance(&mut sim.nodes[0], GOVERNANCE_ADDRESS), DEPOSIT);
     let s = gov_status(&mut sim.nodes[0]);
     assert_eq!((s.next_id, s.proposals.0.len()), (2, 1));
     // Only validators vote, only on open proposals; a vote may change.
@@ -958,25 +961,31 @@ fn a_proposal_upgrades_the_kernel_across_four_validators() {
     let stages = stage_actions(code);
     // The key cannot stage; validator 0 does.
     assert_eq!(sim.submit(0, &key.wallet.action(0, &stages[0])), refused());
-    for action in &stages {
-        let raw = val[0].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &action.encode());
-        assert_eq!(sim_include(&mut sim, &raw).status, 1);
-    }
-    // The code hash is validator 0's: a byte another validator appends
-    // after the last chunk, or writes over the first, changes nothing, so
-    // nobody spoils what a proposal will hash. Its staker may still replace
-    // a chunk of its own.
+    // Validator 3 stages a junk chunk 0 under the code hash first, as one
+    // that saw validator 0's upload in the pool would. It stages into an
+    // upload of its own (spec 13 §3): before, the code hash became its own
+    // for good, and validator 0's upload, under the only hash its code has,
+    // could never be completed.
     let spoil = |index: u32| Action::Stage {
         code_hash,
         index,
         chunk: vec![0xFF],
     };
-    for action in [spoil(u32::try_from(stages.len()).unwrap()), spoil(0)] {
-        let raw = val[3].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &action.encode());
-        assert_eq!(sim_include(&mut sim, &raw).status, 0);
+    let raw = val[3].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &spoil(0).encode());
+    assert_eq!(sim_include(&mut sim, &raw).status, 1);
+    for action in &stages {
+        let raw = val[0].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &action.encode());
+        assert_eq!(sim_include(&mut sim, &raw).status, 1);
     }
+    // A byte validator 3 appends after the last chunk changes only its own
+    // upload, so nobody spoils what validator 0's proposal will hash.
+    let after = spoil(u32::try_from(stages.len()).unwrap());
+    let raw = val[3].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &after.encode());
+    assert_eq!(sim_include(&mut sim, &raw).status, 1);
+    // Nothing has proposed the code yet, so the code hash has no source to
+    // serve. A stager may still replace a chunk of its own.
     let served = sim.nodes[0].query(query::CODE, &code_hash).unwrap();
-    assert_eq!(Vec::<u8>::from_bytes(&served.body).unwrap(), code);
+    assert_eq!(served.status, 1);
     let last = stages.len() - 1;
     let raw = val[0].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &stages[last].encode());
     assert_eq!(sim_include(&mut sim, &raw).status, 1);
@@ -1013,6 +1022,13 @@ fn a_proposal_upgrades_the_kernel_across_four_validators() {
         required_gates: 0,
     }
     .encode();
+    // Validator 3's upload does not hash to the code hash, so its proposal
+    // of it never opens: a proposal uses its proposer's upload.
+    let r = sim_include(
+        &mut sim,
+        &val[3].call(&submit(GOVERNANCE_ADDRESS, &propose), 0),
+    );
+    assert_eq!((r.status, gov_status(&mut sim.nodes[0]).next_id), (0, 1));
     let r = sim_include(
         &mut sim,
         &val[0].call(&submit(GOVERNANCE_ADDRESS, &propose), 0),
@@ -1027,7 +1043,7 @@ fn a_proposal_upgrades_the_kernel_across_four_validators() {
         r.height,
     );
     assert_eq!(view(&mut sim.nodes[0], 1).unwrap().proposal, p);
-    // Code an open proposal names is frozen, for its staker too.
+    // Code an open proposal names is frozen, for its stager too.
     let raw = val[0].tx(GOVERNANCE_ADDRESS, 0, STAGE_GAS, &stages[last].encode());
     assert_eq!(sim_include(&mut sim, &raw).status, 0);
     // Validators 0 and 1 carry 80% of the stake; validator 3 says no.
@@ -1058,6 +1074,10 @@ fn a_proposal_upgrades_the_kernel_across_four_validators() {
         )
     );
     assert!(r.height + 2 <= h, "the delay holds");
+    // The proposal made validator 0 the code hash's source, whose upload
+    // hosts read.
+    let served = sim.nodes[0].query(query::CODE, &code_hash).unwrap();
+    assert_eq!(Vec::<u8>::from_bytes(&served.body).unwrap(), code);
     for (i, node) in sim.nodes.iter_mut().enumerate() {
         let pending = node.upgrade_status().unwrap().pending.unwrap();
         assert_eq!(
@@ -1434,9 +1454,11 @@ fn one_validator_meets_the_edge_cases() {
         capabilities: 0,
         init: vec![],
     };
+    // The validator staged the code, so it is the one that proposes it
+    // (spec 13 §9.3).
     let r = include(
         &mut node,
-        &alice.call(&submit(MODULE_ADDRESS, &doomed.encode()), DEPOSIT),
+        &v0.call(&submit(MODULE_ADDRESS, &doomed.encode()), 0),
     );
     let id = 1;
     let p = view(&mut node, id).unwrap().proposal;
