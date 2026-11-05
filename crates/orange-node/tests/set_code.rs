@@ -13,7 +13,7 @@ use orange_abi::chain::{Allocation, GenesisParams, reason};
 use orange_abi::codec::Seq;
 use orange_abi::types::Genesis;
 use orange_host::hash::keccak256;
-use orange_node::mempool::PoolError;
+use orange_node::mempool::{MAX_AUTHORIZATIONS, PoolError};
 use orange_node::{NodeConfig, Sim, SubmitError};
 use orange_rlp::{encode_bytes, encode_list, encode_uint};
 use support::{CHAIN_ID, ETHER, SLOT_MS, Wallet, include, keys, run_until, v1};
@@ -342,6 +342,38 @@ fn a_delegated_account_may_have_one_transaction_in_the_pool() {
         node.submit(&[0x04, 0xC0]),
         Err(SubmitError::Rejected(reason::MALFORMED))
     );
+}
+
+#[test]
+fn a_set_code_transaction_with_too_many_authorizations_is_refused() {
+    let alice = Wallet::new(0x76);
+    let bob = Wallet::new(0x77);
+    let validators = keys(1);
+    let genesis = genesis(&validators, &[alice.address, bob.address]);
+    let mut node = orange_node::Node::open(
+        v1(),
+        &genesis,
+        NodeConfig {
+            key: Some(validators[0].clone()),
+            now_ms: 1_000,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    node.start(None).unwrap();
+    // The pool recovers every authorization before the kernel sees the
+    // transaction, so it reads no more than its cap of them (spec 14 §2).
+    let auth = authorization(&bob, CHAIN_ID, DELEGATE, 0);
+    let many = vec![auth; MAX_AUTHORIZATIONS + 1];
+    assert_eq!(
+        node.submit(&set_code_tx(&alice, 0, alice.address, &many, &[])),
+        Err(SubmitError::Pool(PoolError::TooManyAuthorizations))
+    );
+    assert!(node.mempool().is_empty());
+    // At the cap it reaches the kernel, which finds 200 000 gas short of
+    // 64 authorizations' intrinsic cost.
+    let tx = set_code_tx(&alice, 0, alice.address, &many[1..], &[]);
+    assert!(matches!(node.submit(&tx), Err(SubmitError::Rejected(_))));
 }
 
 #[test]

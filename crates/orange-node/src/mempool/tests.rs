@@ -95,6 +95,10 @@ fn defaults_and_texts() {
         PoolError::AuthorityReserved.to_string(),
         "authority already reserved"
     );
+    assert_eq!(
+        PoolError::TooManyAuthorizations.to_string(),
+        "too many authorizations"
+    );
     let invalid = ValidateResult::Invalid { reason: 4 };
     assert_eq!(rejection(&invalid), 4);
     let valid = ValidateResult::Valid {
@@ -630,6 +634,58 @@ fn parse_reads_a_signed_transaction() {
     assert_eq!((tx.cost, tx.priority), (3 * u128::from(GAS) + 5, 0));
     assert_eq!(PoolTx::parse(&[0xC0]), None, "does not decode");
     assert_eq!(PoolTx::parse(&sign(u128::MAX)), None, "cost overflows");
+    // Admission reads it the same way, once its size is within the cap.
+    let pool = Mempool::default();
+    assert_eq!(pool.read(&raw), Ok(Some(tx)));
+    assert_eq!(pool.read(&[0xC0]), Ok(None));
+    let mut long = raw.clone();
+    long.resize(MAX_TX_BYTES + 1, 0);
+    assert_eq!(pool.read(&long), Err(PoolError::Oversized));
+}
+
+#[test]
+fn read_counts_authorizations_before_recovering_any() {
+    use orange_rlp::{encode_bytes, encode_list, encode_uint};
+    // A set-code transaction of `n` copies of one authorization, signed by
+    // nobody: the count is refused before a signature is looked at.
+    let set_code = |n: usize| {
+        let mut auth = Vec::new();
+        encode_uint(1, &mut auth);
+        encode_bytes(&[2; 20], &mut auth);
+        encode_uint(0, &mut auth);
+        encode_uint(0, &mut auth);
+        encode_bytes(&[3; 32], &mut auth);
+        encode_bytes(&[4; 32], &mut auth);
+        let mut one = Vec::new();
+        encode_list(&auth, &mut one);
+        let mut fields = Vec::new();
+        for n in [1, 0, 0, 0, 100_000] {
+            encode_uint(n, &mut fields);
+        }
+        encode_bytes(&[5; 20], &mut fields);
+        encode_uint(0, &mut fields);
+        encode_bytes(&[], &mut fields);
+        encode_list(&[], &mut fields);
+        encode_list(&one.repeat(n), &mut fields);
+        for _ in 0..3 {
+            encode_uint(1, &mut fields);
+        }
+        let mut raw = vec![0x04];
+        encode_list(&fields, &mut raw);
+        raw
+    };
+    let pool = Mempool::default();
+    // At the cap it is read; its signatures are made up, so it names no
+    // authority.
+    let read = pool.read(&set_code(MAX_AUTHORIZATIONS));
+    assert_eq!(
+        read.map(|tx| tx.map(|tx| tx.authorities.len())),
+        Ok(Some(0))
+    );
+    assert_eq!(
+        pool.read(&set_code(MAX_AUTHORIZATIONS + 1)),
+        Err(PoolError::TooManyAuthorizations)
+    );
 }
 
 #[derive(Debug, Clone)]

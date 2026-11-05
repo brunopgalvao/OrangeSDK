@@ -279,6 +279,24 @@ fn a_transaction_no_block_can_carry_is_refused() {
 }
 
 #[test]
+fn an_oversized_transaction_is_refused_before_it_is_read() {
+    // Reading a transaction recovers its signatures, so the size is checked
+    // first: bytes no transaction decodes from are refused for their size,
+    // not handed to the kernel to find malformed.
+    let alice = Wallet::new(1);
+    let mut node = node(&[(&alice, 10 * ETHER)]);
+    let junk = vec![0x04; MAX_TX_BYTES + 1];
+    assert_eq!(
+        node.submit(&junk),
+        Err(SubmitError::Pool(PoolError::Oversized))
+    );
+    assert_eq!(
+        node.submit(&junk[..100]),
+        Err(SubmitError::Rejected(reason::MALFORMED))
+    );
+}
+
+#[test]
 fn replacements_and_gap_fills_keep_the_pending_run_funded() {
     let alice = Wallet::new(1);
     let mut node = node(&[(&alice, 10 * ETHER)]);

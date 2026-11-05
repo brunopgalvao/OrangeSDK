@@ -21,7 +21,7 @@ use orange_vm::host::Capability;
 use orange_vm::status::Termination;
 
 use crate::extension::{NodeExtension, NodeServices, Outbound, validator_id};
-use crate::mempool::{Mempool, PoolError, PoolLimits, PoolTx, rejection};
+use crate::mempool::{Mempool, PoolError, PoolLimits, rejection};
 use crate::state::{ChainState, StoreConfig};
 use crate::store::DriverStore;
 use crate::upgrade::{GatedExtension, Upgrades};
@@ -1329,7 +1329,8 @@ impl Node {
     }
 
     fn admit(&mut self, raw: &[u8]) -> Result<(), SubmitError> {
-        let Some(mut tx) = PoolTx::parse(raw) else {
+        // Reading recovers signatures, so its size is checked first.
+        let Some(mut tx) = self.pool.read(raw).map_err(SubmitError::Pool)? else {
             let result = self.validate(raw, Ahead::default())?;
             return Err(SubmitError::Rejected(rejection(&result)));
         };

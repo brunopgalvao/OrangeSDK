@@ -34,6 +34,11 @@ pub const MAX_BYTES: usize = 64 << 20;
 /// `txMaxSize`, well under the reference driver's take of 1 MiB, so that
 /// every pending transaction fits a block.
 pub const MAX_TX_BYTES: usize = 128 << 10;
+/// Most authorizations of a set-code transaction the pool reads (spec 14
+/// §2): the pool recovers every authorization's signature before the kernel
+/// sees the transaction, so the count bounds what a transaction of
+/// [`MAX_TX_BYTES`], which could carry about 1 400 of them, costs to read.
+pub const MAX_AUTHORIZATIONS: usize = 64;
 /// The least increase, in percent, of both fee fields that lets a transaction
 /// replace one with the same sender and nonce: geth's default price bump.
 pub const PRICE_BUMP: u128 = 10;
@@ -85,6 +90,9 @@ pub enum PoolError {
     /// A set-code transaction names an authority that has more than one
     /// transaction in the pool.
     AuthorityReserved,
+    /// A set-code transaction carries more than [`MAX_AUTHORIZATIONS`]
+    /// authorizations.
+    TooManyAuthorizations,
 }
 
 impl fmt::Display for PoolError {
@@ -98,6 +106,7 @@ impl fmt::Display for PoolError {
                 "in-flight transaction limit reached for delegated accounts"
             }
             PoolError::AuthorityReserved => "authority already reserved",
+            PoolError::TooManyAuthorizations => "too many authorizations",
         })
     }
 }
@@ -140,7 +149,12 @@ impl PoolTx {
     /// kernel says why such a transaction is invalid.
     #[must_use]
     pub fn parse(raw: &[u8]) -> Option<PoolTx> {
-        let tx = orange_eth::decode(raw).ok()?;
+        PoolTx::recover(raw, &orange_eth::decode(raw).ok()?)
+    }
+
+    /// The pool's fields of `tx`, decoded from `raw`: its sender's and its
+    /// authorizations' signatures recovered.
+    fn recover(raw: &[u8], tx: &orange_eth::Tx) -> Option<PoolTx> {
         let sender = recover(&tx.signing_payload, &tx.signature())?;
         let authorities = tx.authorization_list.iter().filter_map(authority).collect();
         Some(PoolTx {
@@ -370,6 +384,27 @@ impl Mempool {
             nonces: nonce - state_nonce,
             reserved,
         }
+    }
+
+    /// Reads a raw transaction for admission (spec 14 §2, check 2): one
+    /// longer than [`PoolLimits::max_tx_bytes`], or a set-code transaction
+    /// with more than [`MAX_AUTHORIZATIONS`] authorizations, is refused
+    /// before any signature is recovered. `Ok(None)` is a transaction the
+    /// pool cannot read, as for [`PoolTx::parse`].
+    ///
+    /// # Errors
+    /// [`PoolError::Oversized`] or [`PoolError::TooManyAuthorizations`].
+    pub fn read(&self, raw: &[u8]) -> Result<Option<PoolTx>, PoolError> {
+        if raw.len() > self.limits.max_tx_bytes {
+            return Err(PoolError::Oversized);
+        }
+        let Ok(tx) = orange_eth::decode(raw) else {
+            return Ok(None);
+        };
+        if tx.authorization_list.len() > MAX_AUTHORIZATIONS {
+            return Err(PoolError::TooManyAuthorizations);
+        }
+        Ok(PoolTx::recover(raw, &tx))
     }
 
     /// The checks of a newcomer that need no kernel (spec 14 §2): its size,
