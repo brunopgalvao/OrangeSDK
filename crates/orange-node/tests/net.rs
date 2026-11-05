@@ -1585,6 +1585,47 @@ fn accepted_connections_are_limited_without_peer_exchange() {
     assert_eq!(transport.connected().len(), 2);
 }
 
+/// Copies what `from` reads to `to` until either end closes, then closes both.
+fn relay(mut from: TcpStream, mut to: TcpStream) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut from, &mut to);
+        let _ = from.shutdown(std::net::Shutdown::Both);
+        let _ = to.shutdown(std::net::Shutdown::Both);
+    })
+}
+
+/// A party that relays two of a node's connections into each other hands
+/// each the node's own genuine `Hello` and `Auth`; without peer exchange
+/// the node peered with itself. It closes both instead (spec 09 §3).
+#[test]
+fn a_node_relayed_to_itself_closes_both_connections() {
+    let (mut node, _) = one_node();
+    let mut transport = Transport::bind(
+        "127.0.0.1:0",
+        peer_key(1),
+        CHAIN_ID,
+        node.genesis_hash(),
+        vec![],
+    )
+    .unwrap();
+    let addr = transport.local_addr().unwrap();
+    let a = TcpStream::connect(addr).unwrap();
+    let b = TcpStream::connect(addr).unwrap();
+    let relays = [
+        relay(a.try_clone().unwrap(), b.try_clone().unwrap()),
+        relay(b, a),
+    ];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !relays.iter().all(std::thread::JoinHandle::is_finished) {
+        transport.poll(&mut node, 0).unwrap();
+        assert!(transport.connected().is_empty(), "peered with itself");
+        assert!(Instant::now() < deadline, "the connections stay open");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    transport.poll(&mut node, 0).unwrap();
+    assert_eq!(transport.backlog().len(), 0);
+}
+
 /// A peer's driver requests that the driver leaves unanswered are answered
 /// with nothing, by the host: at once past `MAX_SERVING` of them, without a
 /// step of the driver, and the others after `SERVE_MS` (spec 09 §4).

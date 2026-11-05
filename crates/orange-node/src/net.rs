@@ -1047,7 +1047,8 @@ impl Transport {
     /// then the peer's `Auth`, which must recover to the id its `Hello`
     /// named. Anything else closes the connection, and so does a `Hello`
     /// that repeats this end's own nonce or fresh key (a connection looped
-    /// back on itself) or whose key is not a point of the curve.
+    /// back on itself) or whose key is not a point of the curve. An `Auth`
+    /// that proves this node's own id closes it too ([`Transport::authenticated`]).
     fn handshake(&mut self, index: usize, frame: Frame, now_ms: u64) {
         let conn = &mut self.conns[index];
         match (conn.claimed, frame) {
@@ -1109,24 +1110,31 @@ impl Transport {
         (now_ms >= since + SYNC_PEER_WAIT_MS).then_some("no peer to sync from in time")
     }
 
-    /// Connection `index` completed its handshake as `id`. With peer
-    /// exchange, a peer that is this node itself, or another id than the one
-    /// it was dialled for, is closed, and a bootstrap address learns the id
-    /// it answers with.
+    /// Connection `index` completed its handshake as `id`. A peer that is
+    /// this node itself is closed and never counts as a peer, and a
+    /// bootstrap address that answered so is never dialled again. With peer
+    /// exchange, a peer of another id than the one it was dialled for is
+    /// closed, and a bootstrap address learns the id it answers with.
     fn authenticated(&mut self, index: usize, id: [u8; 32], now_ms: u64) {
         let conn = &mut self.conns[index];
+        if id == self.id {
+            conn.dead = true;
+            if let Some(Target::Boot(addr)) = conn.target
+                && let Some(x) = self.exchange.as_mut()
+            {
+                x.boot.retain(|b| b.addr != addr);
+            }
+            return;
+        }
         conn.peer = Some(id);
         conn.owed_pool = true;
         let Some(x) = self.exchange.as_mut() else {
             return;
         };
-        conn.dead |= id == self.id;
         match conn.target {
             Some(Target::Entry(expected)) => {
                 conn.dead |= !x.table.handshake(&expected, &id, now_ms);
             }
-            // A bootstrap address that is this node's own is never dialled again.
-            Some(Target::Boot(addr)) if id == self.id => x.boot.retain(|b| b.addr != addr),
             Some(Target::Boot(addr)) => {
                 if let Some(b) = x.boot(addr) {
                     b.failures = 0;
