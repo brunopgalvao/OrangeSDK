@@ -30,8 +30,9 @@ use orange_abi::types::{Block, Effect, Genesis, Input};
 use orange_abi::{Decode, Encode};
 use orange_host::hash::keccak256;
 use orange_node::keystore::{Keystore, encryption_key};
-use orange_node::{Node, NodeConfig, Sim, SubmitError, validator_id};
+use orange_node::{Node, NodeConfig, Sim, StoreConfig, SubmitError, validator_id};
 use orange_rlp::{encode_bytes, encode_list, encode_uint};
+use orange_scratch::Scratch;
 
 const KERNEL: &[u8] = include_bytes!("fixtures/kernel.elf");
 const CHAIN_ID: u64 = 1337;
@@ -628,6 +629,101 @@ fn a_wiped_validator_replays_the_chain_without_signing_where_it_signed() {
     assert!(!record.jailed);
     assert_eq!(record.stake, u128::from(STAKE) * GWEI);
     assert_agreement(&sim);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_validator_alone_in_an_earlier_set_comes_back_from_a_snapshot_guarded() {
+    // A single-operator bootstrap: validator 0 holds more than two thirds of
+    // the genesis stake, so alone it is a quorum of epoch 0. The other three
+    // bond enough in epoch 0 that from epoch 1 on it no longer is.
+    let keys = keys(4);
+    let kernel = kernel_module();
+    let weights = [8 * STAKE, STAKE, STAKE, STAKE];
+    let genesis = genesis(&keys, &[0, 1, 2, 3], &weights, &staking(8, 0));
+    let source = Scratch::new("node-staking", "alone-source");
+    let target = Scratch::new("node-staking", "alone-target");
+    let stores = [
+        StoreConfig::default(),
+        StoreConfig::Disk(source.to_path_buf()),
+    ];
+    let mut sim = Sim::with_stores(kernel, &genesis, &keys, 0, &at(10_000), 20, &stores).unwrap();
+    for (i, key) in keys.iter().enumerate().skip(1) {
+        sim.submit(
+            i,
+            &action(key, 0, u128::from(8 * STAKE) * GWEI, &StakingAction::Bond),
+        )
+        .unwrap();
+    }
+    let decided = sim
+        .run_until(60 * SLOT_MS, |s| set_of(&mut s.nodes[1], 1).is_some())
+        .unwrap();
+    assert!(decided, "{:?}", sim.finalized_heights().unwrap());
+    let r = sim.nodes[1]
+        .query(query::STAKING_SET, &1u64.to_bytes())
+        .unwrap();
+    let weights: Vec<u64> = ValidatorSet::from_bytes(&r.body)
+        .unwrap()
+        .validators
+        .0
+        .iter()
+        .map(|v| v.weight)
+        .collect();
+    assert_eq!(weights, [8 * STAKE, 9 * STAKE, 9 * STAKE, 9 * STAKE]);
+    // The snapshot of epoch 0, at its last block, once a certificate covers it.
+    let file = Scratch::new("node-staking", "alone.snap");
+    let exported = sim
+        .run_until(40 * SLOT_MS, |s| {
+            s.nodes[1].export_snapshot(Some(0), &file).is_ok()
+        })
+        .unwrap();
+    assert!(exported);
+    let snapshot = sim.nodes[1].export_snapshot(Some(0), &file).unwrap();
+    assert_eq!(snapshot.header.height, 8);
+    // Well into epoch 1, where validator 0 led the first view and signed
+    // in every view since, its data directory is lost; it comes back from
+    // the snapshot of epoch 0.
+    assert!(
+        sim.run_until(80 * SLOT_MS, |s| s.nodes[1].finalized_height().unwrap()
+            >= 14)
+            .unwrap()
+    );
+    sim.crash(0);
+    sim.advance(2 * SLOT_MS).unwrap();
+    sim.revive_from_snapshot(0, kernel, &genesis, &snapshot, target.to_path_buf())
+        .unwrap();
+    // Past height 0 it starts under the signing guard (spec 08 §7b), though
+    // its stake is a quorum of the set it was last finalized under.
+    let guard = sim.nodes[0].persisted()[b"simplex/guard".as_slice()].clone();
+    assert!(!guard.is_empty());
+    // It catches up and signs again, never where it signed before.
+    let head = sim.nodes[1].finalized_height().unwrap() + 8;
+    let on = sim
+        .run_until(300 * SLOT_MS, |s| {
+            s.finalized_heights().unwrap().iter().all(|h| *h >= head)
+        })
+        .unwrap();
+    assert!(on, "{:?}", sim.finalized_heights().unwrap());
+    for (i, node) in sim.nodes.iter().enumerate() {
+        assert!(
+            !node
+                .metrics
+                .iter()
+                .any(|(name, _)| name == b"equivocations"),
+            "node {i} saw an equivocation"
+        );
+    }
+    for i in 0..4 {
+        assert!(sim.nodes[i].evidence(0).unwrap().is_empty(), "node {i}");
+    }
+    assert!(!record_of(&mut sim.nodes[1], &keys[0]).jailed);
+    for h in 9..=head {
+        assert_eq!(
+            sim.nodes[0].block_by_number(h).unwrap(),
+            sim.nodes[1].block_by_number(h).unwrap(),
+            "height {h}"
+        );
+    }
 }
 
 #[test]

@@ -1863,10 +1863,13 @@ pub fn step(input: &Input) -> Seq<Effect> {
             c.s.me = c.identify();
             // A node with no driver state record (a fresh or wiped data
             // directory, or a snapshot) cannot know what it signed: it starts
-            // under the signing guard, unless its own stake is a quorum, when
-            // no quorum it could witness need include anyone else (spec 08 §7b).
-            let alone =
-                c.s.me
+            // under the signing guard, unless it is at height 0 and its own
+            // stake is a quorum of the genesis set, when no quorum it could
+            // witness need include anyone else. Past height 0 the set it is
+            // judged by may not be the one it signs in (spec 08 §7b).
+            let alone = executed == 0
+                && c.s
+                    .me
                     .is_some_and(|me| weighs_quorum(&c.set, core::iter::once(me)));
             let guarded = !recorded && !alone;
             if guarded {
