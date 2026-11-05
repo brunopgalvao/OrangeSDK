@@ -22,8 +22,8 @@ use orange_abi::chain::{
 use orange_abi::codec::Seq;
 use orange_abi::governance::{
     self as gov, Ballot, Call, DelegatorBallot, GOVERNANCE_ADDRESS, GOVERNANCE_GAS,
-    GovernanceParams, GovernanceStatus, MAX_CALL_GAS, MAX_OPEN_PROPOSALS, MAX_PROPOSAL_DATA,
-    Proposal, ProposalView, event, mode, selector, status,
+    GovernanceParams, GovernanceStatus, MAX_CALL_GAS, MAX_OPEN_NORMAL, MAX_OPEN_PROPOSALS,
+    MAX_PROPOSAL_DATA, Proposal, ProposalView, event, mode, selector, status,
 };
 use orange_abi::modules::{self, INSTALLED_TOPIC, Install, MODULE_ADDRESS, capability};
 use orange_abi::staking::{GWEI, STAKING_ADDRESS, StakingAction, StakingParams};
@@ -1296,10 +1296,15 @@ fn single(voting_blocks: u64) -> GovernanceParams {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn one_validator_meets_the_bounds_and_the_gas() {
     let validators = keys(1);
-    let mut node = start(&genesis(&validators, &[1], single(40), None));
+    // Eight depositors besides Alice, to fill the bounds of spec 13 §9.3.
+    let mut depositors: Vec<Sender> = (0..8).map(|i| Sender::new(Wallet::new(0x70 + i))).collect();
+    let funded: Vec<[u8; 20]> = depositors.iter().map(Sender::address).collect();
+    let mut node = start(&staked_with(1, single(40), &funded, false));
     let mut v0 = Sender::new(Wallet::from_key(validators[0].clone()));
+    let mut alice = Sender::new(alice());
     let guardian_action = Call::SetGuardian {
         guardian: [0xAB; 20],
     }
@@ -1322,7 +1327,7 @@ fn one_validator_meets_the_bounds_and_the_gas() {
     let calldata = submit(VERIFIER_ADDRESS, &big).encode();
     let r = include(
         &mut node,
-        &v0.tx(GOVERNANCE_ADDRESS, 0, 3_000_000, &calldata),
+        &alice.tx(GOVERNANCE_ADDRESS, DEPOSIT, 3_000_000, &calldata),
     );
     assert_eq!(r.status, 1);
     #[allow(clippy::naive_bytecount)]
@@ -1366,20 +1371,42 @@ fn one_validator_meets_the_bounds_and_the_gas() {
     );
     assert_eq!(r.status, 1);
     assert_eq!(view(&mut node, 3).unwrap().proposal.data, big_install);
-    // At most 16 proposals are open at once.
-    for _ in 3..MAX_OPEN_PROPOSALS {
-        assert_eq!(
-            include(
-                &mut node,
-                &v0.call(&submit(GOVERNANCE_ADDRESS, &guardian_action), 0)
-            )
-            .status,
-            1
-        );
+    // A proposer holds at most two open normal-track proposals (spec 13
+    // §9.3): before, the validator alone could hold all sixteen slots.
+    let normal = |s: &Sender| s.peek(&submit(GOVERNANCE_ADDRESS, &guardian_action), DEPOSIT);
+    assert_eq!(
+        node.submit(&v0.peek(&submit(GOVERNANCE_ADDRESS, &guardian_action), 0)),
+        refused()
+    );
+    // At most twelve normal-track proposals are open at once: Alice's
+    // second and two from each of four depositors make twelve.
+    let mut senders: Vec<&mut Sender> = vec![&mut alice];
+    senders.extend(depositors.iter_mut().take(4));
+    for sender in senders {
+        while node.submit(&normal(sender)).is_ok() {
+            let raw = sender.call(&submit(GOVERNANCE_ADDRESS, &guardian_action), DEPOSIT);
+            assert_eq!(include(&mut node, &raw).status, 1);
+        }
+    }
+    assert_eq!(gov_status(&mut node).proposals.0.len(), MAX_OPEN_NORMAL);
+    assert_eq!(node.submit(&normal(&depositors[4])), refused());
+    // The other four are the fast track's: the validator's own safety
+    // action still opens, one per proposer, until sixteen are open.
+    let junk = Action::Cancel { code_hash: [5; 32] }.encode();
+    let reject = Call::Reject { id: 2 }.encode();
+    let r = include(&mut node, &v0.call(&submit(GOVERNANCE_ADDRESS, &reject), 0));
+    assert_eq!(r.status, 1);
+    assert_eq!(
+        node.submit(&v0.peek(&submit(GOVERNANCE_ADDRESS, &junk), 0)),
+        refused()
+    );
+    for depositor in &mut depositors[4..7] {
+        let raw = depositor.call(&submit(GOVERNANCE_ADDRESS, &junk), DEPOSIT);
+        assert_eq!(include(&mut node, &raw).status, 1);
     }
     assert_eq!(gov_status(&mut node).proposals.0.len(), MAX_OPEN_PROPOSALS);
     assert_eq!(
-        node.submit(&v0.peek(&submit(GOVERNANCE_ADDRESS, &guardian_action), 0)),
+        node.submit(&depositors[7].peek(&submit(GOVERNANCE_ADDRESS, &junk), DEPOSIT)),
         refused()
     );
     // Unvoted, they all fail at their voting ends and the slots free up;

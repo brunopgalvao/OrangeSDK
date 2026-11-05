@@ -57,6 +57,17 @@ pub mod mode {
 /// Most proposals open at once.
 pub const MAX_OPEN_PROPOSALS: usize = 16;
 
+/// Most normal-track proposals open at once, governed calls included: the
+/// rest of [`MAX_OPEN_PROPOSALS`] is left to the safety actions of the fast
+/// track (spec 13 §9.3).
+pub const MAX_OPEN_NORMAL: usize = 12;
+
+/// Most open normal-track proposals of one proposer.
+pub const MAX_PROPOSER_NORMAL: usize = 2;
+
+/// Most open fast-track proposals of one proposer.
+pub const MAX_PROPOSER_FAST: usize = 1;
+
 /// Largest action a proposal carries, in bytes: room for a mainnet
 /// light-client checkpoint (spec 18 §3.4) within one storage value.
 pub const MAX_PROPOSAL_DATA: usize = 32_768;
@@ -446,13 +457,19 @@ impl Decode for Proposal {
 }
 
 record! {
-    /// One entry of the open list: a proposal and the next height at which
-    /// the end of a block has to look at it (its voting end, then its expiry).
+    /// One entry of the open list: a proposal, the next height at which
+    /// the end of a block has to look at it (its voting end, then its
+    /// expiry), and its proposer and track, which the bounds of spec 13
+    /// §9.3 count.
     OpenProposal {
         /// The proposal's id.
         id: u64,
         /// The height.
         due: u64,
+        /// Who proposed it.
+        proposer: Address,
+        /// Whether it is on the fast track.
+        fast_track: bool,
     }
 }
 
@@ -1154,7 +1171,12 @@ mod tests {
         };
         roundtrip(&params);
         roundtrip(&proposal());
-        roundtrip(&OpenProposal { id: 1, due: 2 });
+        roundtrip(&OpenProposal {
+            id: 1,
+            due: 2,
+            proposer: [3; 20],
+            fast_track: true,
+        });
         let ballot = Ballot {
             validator: [9; 32],
             support: true,

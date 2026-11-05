@@ -277,7 +277,11 @@ struct Proposal { id: u64, proposer: [20], deposit: u128, target: [20], data: by
 
 `value` and `gas` are a governed call's, zero for an action; a proposal carries a governed call exactly when its `target` is not a system address. A record a kernel before ADR 0042 stored ends after `total` and reads as an action.
 
-`voting_end = B + voting_blocks`; on the normal track `executable_at = voting_end + timelock_blocks + 1` and `expires_at = executable_at + voting_blocks − 1`, on the fast track `executable_at = 0` and `expires_at = voting_end`; `status` 0 is *voting*, 1 *passed*; `deposit` is the value the transaction carried (zero for a validator). It emits `ProposalSubmitted(id, proposer, target, data, votingEnd)`. At most `MAX_OPEN_PROPOSALS = 16` proposals are open at once.
+`voting_end = B + voting_blocks`; on the normal track `executable_at = voting_end + timelock_blocks + 1` and `expires_at = executable_at + voting_blocks − 1`, on the fast track `executable_at = 0` and `expires_at = voting_end`; `status` 0 is *voting*, 1 *passed*; `deposit` is the value the transaction carried (zero for a validator). It emits `ProposalSubmitted(id, proposer, target, data, votingEnd)`.
+
+At most `MAX_OPEN_PROPOSALS = 16` proposals are open at once, of which at most `MAX_OPEN_NORMAL = 12` on the normal track, governed calls included: the other four slots are left to the safety actions of the fast track whatever the normal track holds. One proposer holds at most `MAX_PROPOSER_NORMAL = 2` open normal-track proposals and `MAX_PROPOSER_FAST = 1` open fast-track one, each counted on its own track, so that a validator whose normal-track proposals are open can still propose a safety action. Junk then fills the normal track only from six accounts, and the four slots kept for the fast track only from four, each a validator's account, which the validator set bounds, or a depositor's, which forfeits its deposit when its proposal fails without quorum (Pruning, below), as one nobody votes on does. A fast-track proposal frees its slot as soon as a majority passes it, so validators that reject junk (`reject`, §9.2) free the normal track one block at a time.
+
+Before 2026-11-06 the sixteen slots were shared by every track and every proposer: sixteen junk proposals from one validator, at no cost, kept `reject`, `cancel` and `pause` from opening while they were open, and the validator opened sixteen more as they failed.
 
 A `submit` whose action runs staged code, `propose` or `install`, opens the proposal only if that code is there: the chunks of the proposer's own upload of its code hash (§3) hash to it, or, for an install, the module is already in state under its hash. The validator that staged the code is the one that proposes it; another that wants the same code proposed stages a copy of its own. Otherwise the submission reverts (§9.5). The code hash an open proposal names is frozen until the proposal leaves state (§3), so validators vote on the code that will run, and what passes is what executes.
 
@@ -316,8 +320,8 @@ A governance call *can run* in the block at height `h` (for admission, the execu
 
 | Call | Key track | Stake track |
 |---|---|---|
-| `submit(target, data)` | the sender is the governance key, no value, and `(target, data)` is an action of §9.2 (`setMode` included, `reject` not) | the sender is a validator's account sending no value, or any account sending exactly `deposit` wei while `deposit` is non-zero; `(target, data)` is an action of §9.2 other than `setMode`; fewer than 16 proposals are open |
-| `submitCall(target, value, gas, data)` | the sender is the governance key, no value; `target` is no system address and `gas ≤ MAX_CALL_GAS` | bonded as for `submit`; `target` is no system address and `gas ≤ MAX_CALL_GAS`; fewer than 16 proposals are open |
+| `submit(target, data)` | the sender is the governance key, no value, and `(target, data)` is an action of §9.2 (`setMode` included, `reject` not) | the sender is a validator's account sending no value, or any account sending exactly `deposit` wei while `deposit` is non-zero; `(target, data)` is an action of §9.2 other than `setMode`; the bounds of §9.3 leave room on its track, for its sender |
+| `submitCall(target, value, gas, data)` | the sender is the governance key, no value; `target` is no system address and `gas ≤ MAX_CALL_GAS` | bonded as for `submit`; `target` is no system address and `gas ≤ MAX_CALL_GAS`; the bounds of §9.3 leave room on the normal track, for its sender |
 | `vote(id, support)` | never | no value; proposal `id` is open, voting, and `h ≤ voting_end`; the sender is a validator's account, or a delegator that may vote on it (§9.3) |
 | `execute(id)` | never | no value; proposal `id` is open, passed, and `executable_at ≤ h ≤ expires_at` |
 | `veto(id)` | never | the sender is the guardian, no value; proposal `id` is open, on the normal track, and its action is not `setGuardian` |
@@ -360,7 +364,7 @@ Under the key track, the key submits `setMode(1)`; the action fails unless the r
 | `gov/guardian` | `[20]`, once a guardian was named |
 | `gov/params` | `GovernanceParams`, once `setParams` ran; its `mode` is the track in force |
 | `gov/next` | `u64`, the id of the next proposal |
-| `gov/open` | `vec<OpenProposal { id: u64, due: u64 }>`, the open proposals in id order, `due` the next height the end of a block must look at each (its voting end, then its expiry) |
+| `gov/open` | `vec<OpenProposal { id: u64, due: u64, proposer: [20], fast_track: bool }>`, the open proposals in id order, `due` the next height the end of a block must look at each (its voting end, then its expiry), with each one's proposer and track, so that a submission counts the bounds of §9.3 without reading the proposals |
 | `gov/proposal/` ‖ id (big-endian u64) | `Proposal` |
 | `gov/vote/` ‖ id ‖ validator id | `bool`, the validator's vote |
 | `gov/voters/` ‖ id | `vec<[32]>`, the validators that voted, so pruning finds every vote |
@@ -398,6 +402,8 @@ A view's `yes`, `no` and `total` are the live tally (§9.3), computed for the qu
 | `GOVERNANCE_GAS`, the surcharge of every governance call | 50 000 |
 | `ACTION_GAS`, the VM gas of a governed bridge call | 2^26 |
 | `MAX_OPEN_PROPOSALS` | 16 |
+| `MAX_OPEN_NORMAL`, open normal-track proposals | 12 |
+| `MAX_PROPOSER_NORMAL`, `MAX_PROPOSER_FAST`, open proposals of one proposer on each track | 2, 1 |
 | `MAX_PROPOSAL_DATA` | 32 768 bytes |
 | `SWEEP_BALLOTS`, pruned proposals' delegators' votes the end of a block deletes | 1 024 |
 | `MAX_CALL_GAS`, the gas of a governed call | 10 000 000 |

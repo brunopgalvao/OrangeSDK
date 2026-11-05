@@ -20,8 +20,8 @@ use orange_abi::codec::Seq;
 use orange_abi::governance::{
     self as gov, ACTION_GAS, Ballot, BallotEntry, Call, DelegatorBallot, Execution,
     GOVERNANCE_ADDRESS, GOVERNANCE_GAS, GovernanceParams, GovernanceStatus, MAX_CALL_GAS,
-    MAX_OPEN_PROPOSALS, Member, Moved, OpenProposal, Proposal, ProposalView, SWEEP_BALLOTS, Sweep,
-    mode, status,
+    MAX_OPEN_NORMAL, MAX_OPEN_PROPOSALS, MAX_PROPOSER_FAST, MAX_PROPOSER_NORMAL, Member, Moved,
+    OpenProposal, Proposal, ProposalView, SWEEP_BALLOTS, Sweep, mode, status,
 };
 use orange_abi::modules::{Install, MODULE_ADDRESS};
 use orange_abi::staking::GWEI;
@@ -378,7 +378,7 @@ fn set_due(id: u64, due: u64) {
         .into_iter()
         .map(|o| {
             if o.id == id {
-                OpenProposal { id, due }
+                OpenProposal { due, ..o }
             } else {
                 o
             }
@@ -696,10 +696,10 @@ fn call_allowed(call: &Call, s: &Signed, height: u64) -> bool {
     };
     match call {
         Call::Submit { target, data } => {
-            bonded() && track_of(target, data, false).is_some() && open().len() < MAX_OPEN_PROPOSALS
+            bonded() && track_of(target, data, false).is_some_and(|t| room(from, t == Track::Fast))
         }
         Call::SubmitCall { target, gas, .. } => {
-            bonded() && callable(target, *gas) && open().len() < MAX_OPEN_PROPOSALS
+            bonded() && callable(target, *gas) && room(from, false)
         }
         Call::Vote { id, .. } => {
             value == 0
@@ -728,6 +728,23 @@ fn call_allowed(call: &Call, s: &Signed, height: u64) -> bool {
         | Call::SetFeeParams { .. }
         | Call::Reject { .. } => false,
     }
+}
+
+/// Whether `from` may open one more proposal on the fast track, `fast`, or
+/// the normal one (spec 13 §9.3): fewer than [`MAX_OPEN_PROPOSALS`] open,
+/// fewer than [`MAX_OPEN_NORMAL`] of them on the normal track, so that junk
+/// never takes the slots of the safety actions, and fewer of `from`'s own
+/// on that track than [`MAX_PROPOSER_NORMAL`] or [`MAX_PROPOSER_FAST`].
+fn room(from: &Address, fast: bool) -> bool {
+    let open = open();
+    let track = || open.iter().filter(|o| o.fast_track == fast);
+    let own = track().filter(|o| o.proposer == *from).count();
+    let own_cap = if fast {
+        MAX_PROPOSER_FAST
+    } else {
+        MAX_PROPOSER_NORMAL
+    };
+    open.len() < MAX_OPEN_PROPOSALS && (fast || track().count() < MAX_OPEN_NORMAL) && own < own_cap
 }
 
 /// Whether a governed call may go to `target` with `gas` (spec 13 §9.2):
@@ -1010,6 +1027,8 @@ fn open_proposal(
     list.push(OpenProposal {
         id,
         due: voting_end,
+        proposer: s.from,
+        fast_track: fast,
     });
     set_open(&list);
     state::set(gov::keys::NEXT, &(id + 1));
