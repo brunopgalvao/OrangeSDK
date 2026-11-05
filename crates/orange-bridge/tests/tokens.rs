@@ -113,7 +113,7 @@ const REFUND_SPENT_GAS: u64 = 47_282;
 /// Of `reportVetoed` on Ethereum, through `EthereumOutbox`.
 const REPORT_GAS: u64 = 114_619;
 /// Of the delivery on the OrangeSDK chain of the `SPENT` it sends.
-const SPENT_GAS: u64 = 106_449;
+const SPENT_GAS: u64 = 106_437;
 
 /// The OrangeSDK side: the simulated chain and its wallets' nonces.
 struct Orange {

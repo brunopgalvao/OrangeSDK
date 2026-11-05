@@ -1520,6 +1520,38 @@ fn transfers_over_the_rate_limit_wait_in_the_queue() {
 }
 
 #[test]
+fn a_transfer_whose_time_does_not_fit_64_bits_stays_in_its_channel() {
+    let mut w = World::new();
+    let (on_eth, on_orange) = (w.on_eth, w.on_orange);
+    w.eth.fund(ALICE, ETHER);
+    let weth = wrapped_of(on_orange, NATIVE);
+    // A limit of 1 wei per 2^32 s: a mint of 2^32 + 1 wei waits 2^64 s,
+    // which a 64-bit time would wrap to now, paying it out at once.
+    ok(&w.eth.call(
+        OWNER,
+        on_orange,
+        &set_mint_limit_calldata(&NATIVE, 1, 1 << 32),
+    ));
+    let amount = (1u128 << 32) + 1;
+    ok(&w.deposit(ALICE, on_eth, NATIVE, BOB, amount));
+    reverted_with(&w.deliver(0), "QueueTooLong()");
+    assert_eq!(w.gateway_view(on_orange, "mintsQueued(address)", NATIVE), 0);
+    assert!(w.queued.is_empty());
+    assert_eq!(w.pending.len(), 1);
+    // Once the owner sets a limit it fits, the same delivery waits its time.
+    ok(&w.eth.call(
+        OWNER,
+        on_orange,
+        &set_mint_limit_calldata(&NATIVE, 1, 1_000),
+    ));
+    ok(&w.deliver(0));
+    let now = w.eth.timestamp();
+    assert_eq!(w.queued, vec![(on_orange, 0, now + (1 << 32) * 1_000)]);
+    assert_eq!(w.balance_of(weth, BOB), 0);
+    w.check(on_eth, NATIVE, &[]);
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn one_queued_transfer_is_frozen_or_cancelled_alone() {
     let mut w = World::new();

@@ -189,6 +189,8 @@ abstract contract TokenGateway {
     error NotRecorded();
     error NotSpent();
     error NotResendable();
+    /// @notice A transfer's time to wait does not fit 64 bits; its delivery reverts and stays in its channel.
+    error QueueTooLong();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -581,7 +583,13 @@ abstract contract TokenGateway {
         limit.updated = uint64(block.timestamp);
         if (used <= cap) return uint64(block.timestamp);
         // Rounded up, so that nothing is paid out before it has refilled.
-        return uint64(block.timestamp + ((used - cap) * limit.window + cap - 1) / cap);
+        return _toUint64(block.timestamp + ((used - cap) * limit.window + cap - 1) / cap);
+    }
+
+    /// @dev `v` as a 64-bit time, reverting rather than wrapping it to an earlier one.
+    function _toUint64(uint256 v) private pure returns (uint64) {
+        if (v > type(uint64).max) revert QueueTooLong();
+        return uint64(v);
     }
 
     /// @dev Gives `amount` back to `limit`: what it has used, refilled up to now, less `amount`, never
