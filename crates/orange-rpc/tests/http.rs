@@ -37,6 +37,7 @@ fn request_parsing() {
             path: "/".to_owned(),
             body: b"hello".to_vec(),
             origin: None,
+            websocket: None,
         }
     );
     // The origin of a browser page, whatever the header's case; a line
@@ -87,6 +88,7 @@ fn request_parsing() {
         path: "/".into(),
         body: vec![],
         origin: None,
+        websocket: None,
     }
     .clone();
     assert!(format!("{clone:?}").contains('A'));
@@ -108,6 +110,11 @@ fn limits_default_to_the_constants() {
             request_ms: REQUEST_MS,
             write_ms: WRITE_MS,
             per_turn: REQUESTS_PER_TURN,
+            max_ws_connections: 32,
+            max_subscriptions: 128,
+            max_message: MAX_BODY,
+            ws_queue_bytes: 32 << 20,
+            ping_ms: 30_000,
         }
     );
     assert_eq!(
@@ -235,6 +242,7 @@ fn browser_pages_are_answered_only_from_allowed_origins() {
         path: path.to_owned(),
         body: stop.as_bytes().to_vec(),
         origin: origin.map(str::to_owned),
+        websocket: None,
     };
     let post = |origin| request("POST", "/", origin);
     let ask = |rpc: &mut Rpc, req: Request| String::from_utf8(answer(rpc, &req)).unwrap();

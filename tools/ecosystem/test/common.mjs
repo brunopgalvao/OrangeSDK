@@ -10,6 +10,9 @@ const solc = require('solc');
 /** The node's JSON-RPC URL. */
 export const RPC = process.env.ORANGE_RPC ?? 'http://127.0.0.1:8545';
 
+/** The same port as a WebSocket (spec 20 §8.7). */
+export const WS = process.env.ORANGE_WS ?? RPC.replace(/^http/, 'ws');
+
 /** The chain id the suite's genesis sets (../genesis.json). */
 export const CHAIN_ID = Number(process.env.ORANGE_CHAIN_ID ?? 1337);
 

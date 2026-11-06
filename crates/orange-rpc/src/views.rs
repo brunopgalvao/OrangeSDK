@@ -249,6 +249,18 @@ pub fn block(header: &BlockHeader, hash: &[u8; 32], transactions: &[Value], size
     })
 }
 
+/// A block's header as `newHeads` announces it (spec 20 §8.7.3): the
+/// fields of [`block`] without the block's body and size.
+#[must_use]
+pub fn head(header: &BlockHeader, hash: &[u8; 32]) -> Value {
+    let mut view = block(header, hash, &[], 0);
+    let body = ["transactions", "uncles", "withdrawals", "size"];
+    view.as_object_mut()
+        .into_iter()
+        .for_each(|fields| fields.retain(|name, _| !body.contains(&name.as_str())));
+    view
+}
+
 /// The length of a block's RLP encoding, `[header, transactions, ommers,
 /// withdrawals]`, where a typed transaction is the string of its bytes and
 /// a legacy one its list (EIP-2718).

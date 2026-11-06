@@ -25,9 +25,11 @@ pub mod http;
 pub mod indexed;
 pub mod methods;
 pub mod proof;
+pub mod subscriptions;
 pub mod txpool;
 pub mod upgrades;
 pub mod views;
+pub mod ws;
 
 pub use methods::{Rpc, RpcError};
 

@@ -10,8 +10,13 @@
 //! deadlines and bounds of [`Limits`]; the thread that drives the node only
 //! answers parsed requests, between its steps ([`Server::turn`]), so no
 //! client can hold it (spec 20 §8.6).
+//!
+//! A `GET` that asks for a WebSocket is upgraded (spec 20 §8.7, [`crate::ws`]):
+//! the socket's messages are answered in the same turns, and the
+//! subscriptions made on it are notified after them.
 //! Deliberately small; a production node fronts this with a real server.
 
+use std::cell::RefCell;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
@@ -21,6 +26,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::Rpc;
+use crate::subscriptions::Subscriptions;
 
 /// A parsed request: method, path, body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +40,20 @@ pub struct Request {
     /// The `Origin` header, which browsers send with every cross-origin
     /// request and every `POST`, if there is one.
     pub origin: Option<String>,
+    /// What the request says of a WebSocket, when its `Upgrade` header is
+    /// `websocket` (spec 20 §8.7.1).
+    pub websocket: Option<Handshake>,
+}
+
+/// The headers of a request to upgrade to a WebSocket.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Handshake {
+    /// Whether the `Connection` header lists `upgrade`.
+    pub connection_upgrade: bool,
+    /// `Sec-WebSocket-Key`.
+    pub key: Option<String>,
+    /// `Sec-WebSocket-Version`.
+    pub version: Option<String>,
 }
 
 /// Largest request body read, geth's default: a `Content-Length` above it is
@@ -85,6 +105,17 @@ pub struct Limits {
     pub write_ms: u64,
     /// Most requests answered per turn ([`REQUESTS_PER_TURN`]).
     pub per_turn: usize,
+    /// Most sockets open at once ([`crate::ws::MAX_WS_CONNECTIONS`]).
+    pub max_ws_connections: usize,
+    /// Most subscriptions per socket ([`crate::ws::MAX_SUBSCRIPTIONS`]).
+    pub max_subscriptions: usize,
+    /// Longest frame or message on a socket ([`crate::ws::MAX_MESSAGE`]).
+    pub max_message: usize,
+    /// Most bytes queued for one socket ([`crate::ws::WS_QUEUE_BYTES`]).
+    pub ws_queue_bytes: usize,
+    /// How long a socket may be silent before it is pinged, and again
+    /// before it is closed ([`crate::ws::PING_MS`]).
+    pub ping_ms: u64,
 }
 
 impl Default for Limits {
@@ -98,6 +129,11 @@ impl Default for Limits {
             request_ms: REQUEST_MS,
             write_ms: WRITE_MS,
             per_turn: REQUESTS_PER_TURN,
+            max_ws_connections: crate::ws::MAX_WS_CONNECTIONS,
+            max_subscriptions: crate::ws::MAX_SUBSCRIPTIONS,
+            max_message: crate::ws::MAX_MESSAGE,
+            ws_queue_bytes: crate::ws::WS_QUEUE_BYTES,
+            ping_ms: crate::ws::PING_MS,
         }
     }
 }
@@ -188,6 +224,8 @@ pub fn read_request(
     let path = parts.next().ok_or_else(|| bad("missing path"))?.to_owned();
     let mut content_length = 0usize;
     let mut origin = None;
+    let mut upgrade = false;
+    let mut handshake = Handshake::default();
     let mut headers = 0;
     loop {
         let header = read_line(&mut reader, limits, &mut spent)?;
@@ -211,6 +249,16 @@ pub fn read_request(
                 .map_err(|_| bad("bad content-length"))?;
         } else if name.eq_ignore_ascii_case("origin") {
             origin = Some(value.trim().to_owned());
+        } else if name.eq_ignore_ascii_case("upgrade") {
+            upgrade = value.trim().eq_ignore_ascii_case("websocket");
+        } else if name.eq_ignore_ascii_case("connection") {
+            handshake.connection_upgrade = value
+                .split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"));
+        } else if name.eq_ignore_ascii_case("sec-websocket-key") {
+            handshake.key = Some(value.trim().to_owned());
+        } else if name.eq_ignore_ascii_case("sec-websocket-version") {
+            handshake.version = Some(value.trim().to_owned());
         }
     }
     if content_length > limits.max_body {
@@ -226,6 +274,7 @@ pub fn read_request(
         path,
         body,
         origin,
+        websocket: upgrade.then_some(handshake),
     })
 }
 
@@ -260,7 +309,7 @@ fn with_cors(reply: &[u8], allowed: &str) -> Vec<u8> {
 
 /// The entry of `cors` that allows `origin`: `*`, or the origin itself
 /// (compared without case, as origins' schemes and hosts are).
-fn allowed_by<'a>(cors: &'a [String], origin: &str) -> Option<&'a str> {
+pub(crate) fn allowed_by<'a>(cors: &'a [String], origin: &str) -> Option<&'a str> {
     cors.iter()
         .find(|a| *a == "*" || a.eq_ignore_ascii_case(origin))
         .map(String::as_str)
@@ -273,13 +322,18 @@ pub fn answer(rpc: &mut Rpc, req: &Request) -> Vec<u8> {
         None => dispatch(rpc, req),
         Some(origin) => match allowed_by(&rpc.cors, origin).map(str::to_owned) {
             Some(allowed) => with_cors(&dispatch(rpc, req), &allowed),
-            None => response(
-                "403 Forbidden",
-                "text/plain",
-                "this node answers browser pages only from the origins its --rpc-cors names",
-            ),
+            None => forbidden(),
         },
     }
+}
+
+/// The `403` of a page whose origin `--rpc-cors` does not name.
+pub(crate) fn forbidden() -> Vec<u8> {
+    response(
+        "403 Forbidden",
+        "text/plain",
+        "this node answers browser pages only from the origins its --rpc-cors names",
+    )
 }
 
 /// The reply to one request whose origin, if any, is allowed.
@@ -311,10 +365,27 @@ pub fn bind(addr: impl ToSocketAddrs) -> std::io::Result<TcpListener> {
     Ok(listener)
 }
 
-/// A parsed request waiting for the node, and where its answer goes.
-struct Job {
-    request: Request,
-    reply: SyncSender<Vec<u8>>,
+/// What a connection hands the node's thread.
+pub(crate) enum Job {
+    /// A parsed request, and where its answer goes.
+    Http {
+        request: Request,
+        reply: SyncSender<Vec<u8>>,
+    },
+    /// A request to upgrade to a WebSocket, the socket it would open, and
+    /// where the answer goes, with the socket's id when it opened.
+    Upgrade {
+        request: Request,
+        socket: Arc<crate::ws::Socket>,
+        reply: SyncSender<(Vec<u8>, Option<u64>)>,
+    },
+    /// A message of an open socket, answered on the socket; `done` says
+    /// it was.
+    Message {
+        socket: u64,
+        body: String,
+        done: SyncSender<()>,
+    },
 }
 
 /// The time left until `at`; none left is a timeout.
@@ -344,7 +415,7 @@ impl Read for Deadline<'_> {
 
 /// Writes `bytes` to `stream` by `at`; a write that has not finished then
 /// fails, as does any write that fails.
-fn write_by(mut stream: &TcpStream, mut bytes: &[u8], at: Instant) -> io::Result<()> {
+pub(crate) fn write_by(mut stream: &TcpStream, mut bytes: &[u8], at: Instant) -> io::Result<()> {
     while !bytes.is_empty() {
         // As for reads: refused only when the write fails at once anyway.
         let _ = stream.set_write_timeout(Some(left_until(at)?));
@@ -354,20 +425,28 @@ fn write_by(mut stream: &TcpStream, mut bytes: &[u8], at: Instant) -> io::Result
     Ok(())
 }
 
+/// Waits while `busy` holds, at most `wait`.
+pub(crate) fn wait_while(wait: Duration, busy: impl Fn() -> bool) {
+    let until = Instant::now() + wait;
+    while busy() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// What the acceptor, the connections and the node's loop share.
-struct Shared {
-    limits: Limits,
-    /// Connections open.
+pub(crate) struct Shared {
+    pub(crate) limits: Limits,
+    /// Connections open, sockets aside.
     open: AtomicUsize,
     /// Requests handed to the node and not yet taken.
-    waiting: AtomicUsize,
+    pub(crate) waiting: AtomicUsize,
     /// Answers handed back and not yet written.
-    writing: AtomicUsize,
+    pub(crate) writing: AtomicUsize,
     stop: AtomicBool,
 }
 
 /// Counts a connection open for as long as it lives, panics included.
-struct Open(Arc<Shared>);
+pub(crate) struct Open(pub(crate) Arc<Shared>);
 
 impl Drop for Open {
     fn drop(&mut self) {
@@ -376,18 +455,24 @@ impl Drop for Open {
 }
 
 /// One connection, on its own thread: read the request by its deadline,
-/// hand it to the node, write the answer by its deadline.
-fn connection(stream: &TcpStream, shared: &Shared, jobs: &SyncSender<Job>) {
+/// hand it to the node, write the answer by its deadline. A request to
+/// upgrade goes on as a WebSocket ([`crate::ws`]).
+fn connection(stream: TcpStream, open: Open, jobs: &SyncSender<Job>) {
+    let shared = Arc::clone(&open.0);
     let limits = shared.limits;
     let mut reader = Deadline {
-        stream,
+        stream: &stream,
         at: Instant::now() + Duration::from_millis(limits.request_ms),
     };
     let (reply, answered) = match read_request(&mut reader, &limits) {
+        Ok(request) if request.method == "GET" && request.websocket.is_some() => {
+            crate::ws::serve(stream, request, open, jobs);
+            return;
+        }
         Ok(request) => {
             let (reply, answered) = sync_channel(1);
             shared.waiting.fetch_add(1, Ordering::SeqCst);
-            let sent = jobs.send(Job { request, reply }).is_ok();
+            let sent = jobs.send(Job::Http { request, reply }).is_ok();
             // Nothing answers once the node's loop has stopped.
             let Some(reply) = sent.then(|| answered.recv().ok()).flatten() else {
                 return;
@@ -400,7 +485,7 @@ fn connection(stream: &TcpStream, shared: &Shared, jobs: &SyncSender<Job>) {
         ),
     };
     let _ = write_by(
-        stream,
+        &stream,
         &reply,
         Instant::now() + Duration::from_millis(limits.write_ms),
     );
@@ -432,7 +517,7 @@ fn accept(listener: &TcpListener, shared: &Arc<Shared>, jobs: &SyncSender<Job>) 
         shared.open.fetch_add(1, Ordering::SeqCst);
         let open = Open(Arc::clone(shared));
         let jobs = jobs.clone();
-        std::thread::spawn(move || connection(&stream, &open.0, &jobs));
+        std::thread::spawn(move || connection(stream, open, &jobs));
     }
 }
 
@@ -444,6 +529,8 @@ pub struct Server {
     shared: Arc<Shared>,
     jobs: Receiver<Job>,
     acceptor: Option<JoinHandle<()>>,
+    /// The open sockets and their subscriptions (spec 20 §8.7).
+    sockets: RefCell<Subscriptions>,
 }
 
 impl Server {
@@ -458,8 +545,9 @@ impl Server {
             writing: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
         });
-        // One request per connection, so the queue never makes one wait.
-        let (send, jobs) = sync_channel(limits.max_connections);
+        // One request per connection or socket, so the queue never makes
+        // one wait.
+        let (send, jobs) = sync_channel(limits.max_connections + limits.max_ws_connections);
         let acceptor = {
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || accept(&listener, &shared, &send))
@@ -468,6 +556,7 @@ impl Server {
             shared,
             jobs,
             acceptor: Some(acceptor),
+            sockets: RefCell::new(Subscriptions::new(limits.max_subscriptions)),
         }
     }
 
@@ -475,6 +564,13 @@ impl Server {
     #[must_use]
     pub fn connections(&self) -> usize {
         self.shared.open.load(Ordering::SeqCst)
+    }
+
+    /// Sockets open, as the node's thread counts them: those it opened
+    /// and has not yet seen close.
+    #[must_use]
+    pub fn sockets(&self) -> usize {
+        self.sockets.borrow().len()
     }
 
     /// Requests read and waiting for the node.
@@ -485,16 +581,15 @@ impl Server {
 
     /// One turn of the node's loop: waits up to `wait` for a request, then
     /// answers at most [`Limits::per_turn`] of those waiting, running the
-    /// node's background work after each answer, or once when none came.
+    /// node's background work after each answer, or once when none came,
+    /// and then sends the sockets' notifications (spec 20 §8.7.3).
     /// Returns how many it answered.
     pub fn turn(&self, rpc: &mut Rpc, wait: Duration) -> usize {
         let mut answered = 0;
         let mut next = self.jobs.recv_timeout(wait).ok();
+        let mut sockets = self.sockets.borrow_mut();
         while let Some(job) = next {
-            self.shared.waiting.fetch_sub(1, Ordering::SeqCst);
-            let reply = answer(rpc, &job.request);
-            self.shared.writing.fetch_add(1, Ordering::SeqCst);
-            let _ = job.reply.send(reply);
+            self.take(rpc, &mut sockets, job);
             answered += 1;
             rpc.run_background();
             next = if answered < self.shared.limits.per_turn {
@@ -506,7 +601,39 @@ impl Server {
         if answered == 0 {
             rpc.run_background();
         }
+        sockets.notify(rpc);
         answered
+    }
+
+    /// Answers one job.
+    fn take(&self, rpc: &mut Rpc, sockets: &mut Subscriptions, job: Job) {
+        match job {
+            Job::Http { request, reply } => {
+                self.shared.waiting.fetch_sub(1, Ordering::SeqCst);
+                let answer = answer(rpc, &request);
+                self.shared.writing.fetch_add(1, Ordering::SeqCst);
+                let _ = reply.send(answer);
+            }
+            Job::Upgrade {
+                request,
+                socket,
+                reply,
+            } => {
+                self.shared.waiting.fetch_sub(1, Ordering::SeqCst);
+                sockets.sweep();
+                let max = self.shared.limits.max_ws_connections;
+                let answer = match crate::ws::handshake(&rpc.cors, &request, sockets.len(), max) {
+                    Ok(accepted) => (accepted, Some(sockets.open(socket))),
+                    Err(refused) => (refused, None),
+                };
+                self.shared.writing.fetch_add(1, Ordering::SeqCst);
+                let _ = reply.send(answer);
+            }
+            Job::Message { socket, body, done } => {
+                sockets.message(rpc, socket, &body);
+                let _ = done.send(());
+            }
+        }
     }
 }
 
@@ -516,10 +643,10 @@ impl Drop for Server {
         if let Some(acceptor) = self.acceptor.take() {
             let _ = acceptor.join();
         }
-        let until = Instant::now() + Duration::from_millis(self.shared.limits.write_ms);
-        while self.shared.writing.load(Ordering::SeqCst) > 0 && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        let wait = Duration::from_millis(self.shared.limits.write_ms);
+        let shared = &self.shared;
+        wait_while(wait, || shared.writing.load(Ordering::SeqCst) > 0);
+        self.sockets.get_mut().close_all(wait);
     }
 }
 

@@ -2,7 +2,7 @@
 
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use orange_abi::chain::{
-    BLOCK_GAS_LIMIT, BlockHeader, CallRequest, CallResult, Receipt, call_status, reason,
+    BLOCK_GAS_LIMIT, BlockHeader, CallRequest, CallResult, Log, Receipt, call_status, reason,
 };
 use orange_eth::{MAX_INITCODE_SIZE, MAX_TX_GAS};
 use orange_host::hash::keccak256;
@@ -41,6 +41,11 @@ pub const MAX_LOGS: usize = 10_000;
 /// consensus, so the server runs this after each request it answers, and
 /// long requests run it between their steps (see [`Rpc::run_background`]).
 pub type Background = Box<dyn FnMut(&mut Node)>;
+
+/// What [`Rpc::handle_with`] asks first about each method, with its
+/// parameters: an answer, or `None` to serve the method as usual.
+pub type Intercept<'a> =
+    &'a mut dyn FnMut(&mut Rpc, &str, &[Value]) -> Option<Result<Value, RpcError>>;
 
 /// Most storage keys one `eth_getProof` request may ask for (spec 20 §4.1):
 /// each costs a kernel query and a proof on the thread that drives
@@ -257,6 +262,14 @@ impl Rpc {
     /// Handles one JSON-RPC request object and returns the response object.
     /// Malformed requests get a JSON-RPC error response, never a panic.
     pub fn handle(&mut self, request: &Value) -> Value {
+        self.handle_with(request, &mut |_, _, _| None)
+    }
+
+    /// [`Rpc::handle`], with `intercept` given the first say on every
+    /// method: what it answers is the answer, and a method it answers
+    /// `None` to is served as usual. The WebSocket serves `eth_subscribe`
+    /// and `eth_unsubscribe` so (spec 20 §8.7.3).
+    pub fn handle_with(&mut self, request: &Value, intercept: Intercept<'_>) -> Value {
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let Some(method) = request.get("method").and_then(Value::as_str) else {
             return error_response(&id, &RpcError::with_code(-32600, "missing method".into()));
@@ -266,7 +279,11 @@ impl Rpc {
             .get("params")
             .and_then(Value::as_array)
             .unwrap_or(&empty);
-        match self.dispatch(method, params) {
+        let result = match intercept(self, method, params) {
+            Some(result) => result,
+            None => self.dispatch(method, params),
+        };
+        match result {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
             Err(e) => error_response(&id, &e),
         }
@@ -278,6 +295,12 @@ impl Rpc {
     /// [`Rpc::max_response_bytes`], the requests after are answered
     /// `response too large` without being run, as geth answers them.
     pub fn handle_body(&mut self, body: &str) -> Value {
+        self.handle_body_with(body, &mut |_, _, _| None)
+    }
+
+    /// [`Rpc::handle_body`], with every request of it handled as
+    /// [`Rpc::handle_with`] handles it.
+    pub fn handle_body_with(&mut self, body: &str, intercept: Intercept<'_>) -> Value {
         match serde_json::from_str::<Value>(body) {
             Ok(Value::Array(batch)) if batch.len() > self.max_batch => {
                 let id = batch.iter().find_map(|r| r.get("id")).cloned();
@@ -294,13 +317,13 @@ impl Rpc {
                         continue;
                     }
                     self.run_background();
-                    let answer = self.handle(request);
+                    let answer = self.handle_with(request, intercept);
                     spent += encoded_len(&answer);
                     out.push(answer);
                 }
                 Value::Array(out)
             }
-            Ok(single) => self.handle(&single),
+            Ok(single) => self.handle_with(&single, intercept),
             Err(_) => error_response(
                 &Value::Null,
                 &RpcError::with_code(-32700, "parse error".into()),
@@ -524,9 +547,9 @@ impl Rpc {
             "eth_getFilterChanges" => self.filter_changes(params)?,
             "eth_getFilterLogs" => self.filter_logs(params)?,
             "eth_uninstallFilter" => self.uninstall_filter(params)?,
-            // Subscriptions need a connection that stays open; this server
-            // answers one request per connection, so it answers as geth
-            // does over HTTP (§8.1).
+            // Subscriptions need a connection that stays open: the
+            // WebSocket serves them before they get here (§8.7.3), and over
+            // HTTP they are answered as geth answers them there (§8.3).
             "eth_subscribe" | "eth_unsubscribe" => {
                 return Err(RpcError::with_code(
                     -32601,
@@ -980,39 +1003,61 @@ impl Rpc {
                 return Ok((out, height - 1));
             }
             self.run_background();
-            let (header, block_hash) = self.header_at(height)?.unwrap_or_default();
-            let mut log_index = 0;
-            for tx_hash in &header.tx_hashes.0 {
-                let receipt = self.node.receipt(tx_hash)?.unwrap_or_default();
-                let position = Position {
-                    block_hash,
-                    height,
-                    index: receipt.index,
-                };
-                for log in &receipt.logs.0 {
-                    if filter.matches(log) {
-                        out.push(views::log(log, tx_hash, &position, log_index));
-                    }
-                    log_index += 1;
-                }
-            }
-            // What the end of the block logged comes after its transactions'
-            // logs, under the system receipt's hash (spec 20 §3.5).
-            if let Some((hash, receipt)) = self.system_receipt(&block_hash)? {
-                let position = Position {
-                    block_hash,
-                    height,
-                    index: receipt.index,
-                };
-                for log in &receipt.logs.0 {
-                    if filter.matches(log) {
-                        out.push(views::log(log, &hash, &position, log_index));
-                    }
-                    log_index += 1;
-                }
-            }
+            let logs = self.block_logs(height, &|log| filter.matches(log))?;
+            out.extend(logs.into_iter().map(|(_, view)| view));
         }
         Ok((out, to))
+    }
+
+    /// The logs of the block at `height`, which exists, that `keep` keeps,
+    /// each with its view, in the order `eth_getLogs` answers them: its
+    /// transactions' logs, then the system receipt's (spec 20 §3.5).
+    pub(crate) fn block_logs(
+        &mut self,
+        height: u64,
+        keep: &dyn Fn(&Log) -> bool,
+    ) -> Result<Vec<(Log, Value)>, RpcError> {
+        let mut out = Vec::new();
+        let (header, block_hash) = self.header_at(height)?.unwrap_or_default();
+        let mut log_index = 0;
+        for tx_hash in &header.tx_hashes.0 {
+            let receipt = self.node.receipt(tx_hash)?.unwrap_or_default();
+            let position = Position {
+                block_hash,
+                height,
+                index: receipt.index,
+            };
+            for log in &receipt.logs.0 {
+                if keep(log) {
+                    out.push((log.clone(), views::log(log, tx_hash, &position, log_index)));
+                }
+                log_index += 1;
+            }
+        }
+        // What the end of the block logged comes after its transactions'
+        // logs, under the system receipt's hash (spec 20 §3.5).
+        if let Some((hash, receipt)) = self.system_receipt(&block_hash)? {
+            let position = Position {
+                block_hash,
+                height,
+                index: receipt.index,
+            };
+            for log in &receipt.logs.0 {
+                if keep(log) {
+                    out.push((log.clone(), views::log(log, &hash, &position, log_index)));
+                }
+                log_index += 1;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The header `newHeads` announces for the block at `height`, if it
+    /// exists (spec 20 §8.7.3).
+    pub(crate) fn head_json(&mut self, height: u64) -> Result<Option<Value>, RpcError> {
+        Ok(self
+            .header_at(height)?
+            .map(|(header, hash)| views::head(&header, &hash)))
     }
 }
 
