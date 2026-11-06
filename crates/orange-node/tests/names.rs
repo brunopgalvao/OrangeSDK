@@ -134,9 +134,9 @@ fn a_configured_name_is_resolved_at_every_dial_and_every_address_is_tried() {
     drop(a);
     pump(&mut [&mut b, &mut c], |p| {
         p[0].1.connected() == [validator_id(&key(3))]
+            && p[1].1.connected() == [validator_id(&key(2))]
     });
     assert_eq!(b.1.outbound(), 1);
-    assert_eq!(c.1.connected(), [validator_id(&key(2))]);
 }
 
 #[test]
