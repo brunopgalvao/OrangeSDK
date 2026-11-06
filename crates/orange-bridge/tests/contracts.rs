@@ -36,11 +36,11 @@ const VERIFY_GAS: u64 = 126_708;
 /// Gas of a light client `submit` transaction with a 103-byte proposal.
 const SUBMIT_TX_GAS: u64 = 206_756;
 /// Gas of an inbox `prove` transaction with a 3-sibling proof and a 4-byte payload.
-const PROVE_TX_GAS: u64 = 86_179;
+const PROVE_TX_GAS: u64 = 86_316;
 /// Gas of a `prove` transaction in a state of 4 099 entries, whose proof has 14 siblings.
-const PROVE_DEEP_TX_GAS: u64 = 98_339;
+const PROVE_DEEP_TX_GAS: u64 = 98_476;
 /// Gas of the `execute` transaction that delivers it to `MessageRecipient`.
-const EXECUTE_TX_GAS: u64 = 206_725;
+const EXECUTE_TX_GAS: u64 = 209_327;
 
 /// Intrinsic gas of a call with `data` (EIP-2028), below the EIP-7623 floor
 /// only for calldata-heavy transactions, which these are not.
@@ -633,6 +633,73 @@ fn deliveries_are_rate_limited_per_window() {
     assert_eq!(word_u64(&b.get(b.inbox, "window()")), 10);
     assert_eq!(word_u64(&b.get(b.inbox, "maxMessagesPerWindow()")), 5);
     assert_eq!(word_u64(&b.get(b.inbox, "maxValuePerWindow()")), 7);
+}
+
+#[test]
+fn a_recipient_with_its_own_limit_is_not_crowded_out() {
+    // Two messages a window are shared by every recipient but the gateway,
+    // which the owner gives a limit of its own.
+    let mut b = Bridge::new(3, 1, 2, 1_000);
+    let gateway = b.eth.deploy(
+        DEPLOYER,
+        &init_code("MessageRecipient"),
+        &orange_bridge::abi::encode(&[Value::address(&b.inbox)]),
+    );
+    let to_gateway: Vec<Message> = (4..=7)
+        .map(|nonce| Message {
+            nonce,
+            recipient: gateway,
+            value: 0,
+            ..b.messages[0].clone()
+        })
+        .collect();
+    for m in &to_gateway {
+        b.trie.insert(&message_key(m.nonce), &message_hash(m));
+    }
+    b.anchor(12);
+    let set = |recipient: &[u8; 20], max: u64| {
+        abi::call(
+            "setRecipientLimit(address,uint64)",
+            &[Value::address(recipient), Value::uint(max.into())],
+        )
+    };
+    reverted_with(
+        &b.eth.call(GUARDIAN, b.inbox, &set(&gateway, 2)),
+        "NotOwner()",
+    );
+    assert!(b.eth.call(OWNER, b.inbox, &set(&gateway, 2)).success);
+    let lane = |b: &mut Bridge| {
+        let data = abi::call("recipientLimits(address)", &[Value::address(&gateway)]);
+        let out = b.eth.view(RELAYER, b.inbox, &data).output;
+        (word_u64(&out[..32]), word_u64(&out[64..96]))
+    };
+    assert_eq!(lane(&mut b), (2, 0));
+    let shared = b.messages.clone();
+    for m in shared.iter().chain(&to_gateway) {
+        let data = b.slot_proof(m, 12).prove_calldata(m);
+        assert!(b.eth.call(RELAYER, b.inbox, &data).success);
+    }
+    b.eth.advance(DELAY);
+    // Others fill the shared window; the gateway's messages still pass, up to
+    // its own limit.
+    assert!(b.execute(&shared[0]).success);
+    assert!(b.execute(&shared[1]).success);
+    reverted_with(&b.execute(&shared[2]), "RateLimited()");
+    assert!(b.execute(&to_gateway[0]).success);
+    assert!(b.execute(&to_gateway[1]).success);
+    assert_eq!(lane(&mut b), (2, 2));
+    reverted_with(&b.execute(&to_gateway[2]), "RateLimited()");
+    // Its window opens on its own: the next one takes it again.
+    b.eth.advance(WINDOW);
+    assert!(b.execute(&to_gateway[2]).success);
+    assert!(b.execute(&shared[2]).success);
+    // Without its own limit the gateway shares the window again.
+    assert!(b.eth.call(OWNER, b.inbox, &set(&gateway, 0)).success);
+    assert_eq!(word_u64(&b.get(b.inbox, "windowMessages()")), 1);
+    assert!(b.execute(&to_gateway[3]).success);
+    assert_eq!(word_u64(&b.get(b.inbox, "windowMessages()")), 2);
+    assert_eq!(lane(&mut b), (0, 1));
+    assert_eq!(word_u64(&b.get(gateway, "received()")), 4);
 }
 
 #[test]

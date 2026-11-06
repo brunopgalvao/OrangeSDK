@@ -6,7 +6,8 @@ import {IOrangeLightClient, IOrangeMessageRecipient} from "./IOrangeBridge.sol";
 /// @title Inbox of Orange messages on Ethereum
 /// @notice Follows spec 17 §6. Anyone proves a message of the Orange outbox against a state root the
 /// light client holds; after the delay anyone executes it, which delivers it to its recipient once.
-/// Deliveries are rate-limited per window in messages and in value. The guardian can pause the
+/// Deliveries are rate-limited per window in messages and in value; a recipient the owner gives a
+/// limit of its own, such as a token gateway, counts its messages against that limit alone. The guardian can pause the
 /// inbox, veto a proven message before it is executed and revoke a light-client root, after which
 /// nothing proven under it executes and its nonces can be proven again under another root; the
 /// owner sets the delay, the rate limits and the guardian, unpauses, and hands over ownership. Neither can deliver, alter or replay a
@@ -75,10 +76,19 @@ contract OrangeInbox {
     /// @notice Value executed in the current window.
     uint256 public windowValue;
 
+    /// @notice A recipient's own message limit and its current window.
+    struct RecipientLimit {
+        uint64 maxMessages;
+        uint64 windowStart;
+        uint64 messages;
+    }
+
     /// @notice Every proven nonce.
     mapping(uint64 nonce => Entry) public entries;
     /// @notice The heights whose light-client roots the guardian revoked.
     mapping(uint64 height => bool) public revoked;
+    /// @notice The recipients with a message limit of their own, apart from `maxMessagesPerWindow`.
+    mapping(address recipient => RecipientLimit) public recipientLimits;
 
     event MessageProven(uint64 indexed nonce, bytes32 messageHash, uint64 height, uint64 executableAt);
     event MessageDelivered(uint64 indexed nonce, bytes32 messageHash, address indexed recipient);
@@ -90,6 +100,7 @@ contract OrangeInbox {
     event GuardianChanged(address indexed guardian);
     event DelayChanged(uint64 delay);
     event RateLimitChanged(uint64 window, uint64 maxMessages, uint256 maxValue);
+    event RecipientLimitChanged(address indexed recipient, uint64 maxMessages);
 
     error NotOwner();
     error NotGuardian();
@@ -181,7 +192,7 @@ contract OrangeInbox {
         bytes32 messageHash = hashMessage(m);
         if (messageHash != e.messageHash) revert MessageMismatch();
         if (block.timestamp < e.executableAt) revert TooEarly();
-        consume(m.value);
+        consume(m.recipient, m.value);
         e.status = Status.Delivered;
         (bool ok, bytes memory ret) = m.recipient.call(
             abi.encodeCall(IOrangeMessageRecipient.onOrangeMessage, (sourceChainId, m.nonce, m.sender, m.value, m.payload))
@@ -246,15 +257,25 @@ contract OrangeInbox {
         emit RateLimitChanged(window_, maxMessages_, maxValue_);
     }
 
+    /// @notice Gives `recipient` a limit of its own of `maxMessages` per window, which its messages
+    /// count against instead of `maxMessagesPerWindow`; zero returns it to the shared limit.
+    function setRecipientLimit(address recipient, uint64 maxMessages) external onlyOwner {
+        recipientLimits[recipient].maxMessages = maxMessages;
+        emit RecipientLimitChanged(recipient, maxMessages);
+    }
+
     function transferOwnership(address owner_) external onlyOwner {
         if (owner_ == address(0)) revert ZeroAddress();
         owner = owner_;
         emit OwnerChanged(owner_);
     }
 
-    /// @dev Counts one message of `value` against the current window, starting a new one when it is over.
-    function consume(uint256 value) private {
-        if (block.timestamp >= uint256(windowStart) + window) {
+    /// @dev Counts one message of `value` to `recipient` against the current window, starting a new
+    /// one when it is over: the message against the recipient's own limit if it has one, else against
+    /// the shared one, and the value against the shared one.
+    function consume(address recipient, uint256 value) private {
+        uint64 length = window;
+        if (block.timestamp >= uint256(windowStart) + length) {
             windowStart = uint64(block.timestamp);
             windowMessages = 0;
             windowValue = 0;
@@ -262,9 +283,21 @@ contract OrangeInbox {
         uint256 delivered = windowValue;
         uint256 cap = maxValuePerWindow;
         // A limit lowered mid-window can sit below what the window already delivered.
-        if (windowMessages >= maxMessagesPerWindow || delivered > cap || value > cap - delivered) revert RateLimited();
-        windowMessages += 1;
-        windowValue = delivered + value;
+        if (delivered > cap || value > cap - delivered) revert RateLimited();
+        RecipientLimit storage own = recipientLimits[recipient];
+        uint64 ownMax = own.maxMessages;
+        if (ownMax == 0) {
+            if (windowMessages >= maxMessagesPerWindow) revert RateLimited();
+            windowMessages += 1;
+        } else {
+            if (block.timestamp >= uint256(own.windowStart) + length) {
+                own.windowStart = uint64(block.timestamp);
+                own.messages = 0;
+            }
+            if (own.messages >= ownMax) revert RateLimited();
+            own.messages += 1;
+        }
+        if (value != 0) windowValue = delivered + value;
     }
 
     /// @dev The root a proof of the outbox slot of `nonce` holding `messageHash` leads to (spec 10 §5.3).

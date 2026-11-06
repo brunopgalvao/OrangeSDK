@@ -38,6 +38,9 @@ interface IMessageVerifier {
     function unpause() external;
     /// Governance: sets the rate-limit window (seconds) and the deliveries it allows.
     function setRateLimit(uint64 window, uint64 maxMessages) external;
+    /// Governance: gives `recipient` a limit of its own of `maxMessages` deliveries per window,
+    /// which its messages count against instead of the shared one; zero returns it to the shared one.
+    function setRecipientLimit(address recipient, uint64 maxMessages) external;
 
     /// Whether message `nonce` was delivered.
     function delivered(uint64 nonce) external view returns (bool);
@@ -45,4 +48,6 @@ interface IMessageVerifier {
     function paused() external view returns (bool);
     /// The rate-limit window and the deliveries it allows.
     function rateLimit() external view returns (uint64 window, uint64 maxMessages);
+    /// The deliveries per window `recipient` has of its own, zero if it shares the rate limit.
+    function recipientLimit(address recipient) external view returns (uint64 maxMessages);
 }

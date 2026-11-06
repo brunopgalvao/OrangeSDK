@@ -163,6 +163,7 @@ Each native contract's state is its namespace (spec 16 §2.3): the stored key is
 | verifier | `delivered/` ‖ nonce (u64) | `[1]` |
 | verifier | `paused` | `[1]` while paused |
 | verifier | `window` | `{ start: u64, count: u64 }` |
+| verifier | `recipient/` ‖ recipient (20 bytes) | `{ max_messages: u64, start: u64, count: u64 }`, for a recipient with a limit of its own |
 
 Roots are kept for every finalized block the client stores, so a proof made against a root stays usable after newer updates. `epoch` is the checkpoint epoch (§3.4) of `finalized` and of the update that stored each root.
 
@@ -202,9 +203,11 @@ A governance function called by any other account, or with no governance account
 | `pause()` | `0x8456cb59` | governance | stops deliveries |
 | `unpause()` | `0x3f4ba83a` | governance | resumes them |
 | `setRateLimit(uint64 window, uint64 maxMessages)` | `0xe1e5cca4` | governance | sets the rate limit |
+| `setRecipientLimit(address recipient, uint64 maxMessages)` | `0xb43b5ebc` | governance | gives `recipient` a limit of its own (§6.4); zero returns it to the shared one |
 | `delivered(uint64 nonce)` | `0x2f2b0289` | view | whether the message was delivered |
 | `paused()` | `0x5c975abb` | view | whether deliveries are stopped |
 | `rateLimit()` | `0x61e08e72` | view | `(uint64 window, uint64 maxMessages)` |
+| `recipientLimit(address recipient)` | `0x86fa886d` | view | `(uint64 maxMessages)` of `recipient`'s own limit, 0 if it has none |
 
 ## 6. Messages
 
@@ -238,10 +241,12 @@ A state root may prove messages from `usable_at`, the timestamp (seconds) of the
 2. The calldata is the canonical encoding (§5). — empty revert data
 3. Deliveries are not paused. — `Paused()`
 4. `delivered/` ‖ nonce is absent. — `AlreadyDelivered(nonce)`
-5. The rate limit: with the window record `(start, count)` (zeros if absent), if `timestamp ≥ start + window` a new window opens at `timestamp` with count 0; then `count < maxMessages`. — `RateLimited()`
+5. The rate limit: with the window record `(start, count)` (zeros if absent) and the limit `maxMessages`, or, for a recipient with a limit of its own, its record `recipient/` ‖ recipient's `(start, count)` and its `max_messages`, if `timestamp ≥ start + window` a new window opens at `timestamp` with count 0; then `count < maxMessages`. — `RateLimited()`
 6. The proofs prove the message (§6.2) against `stateRoot`. — `BadProof()`
 
-It then increments the count, stores the window and marks the nonce delivered. These are native-call writes, so they stand only if every enclosing EVM frame succeeds (spec 16 §5.4).
+It then increments the count, stores the window it counted in and marks the nonce delivered.
+
+A recipient's limit of its own keeps others from crowding it out: anyone can send messages through `EthereumOutbox`, and messages to a recipient that accepts them, delivered as each window opens, would otherwise fill the shared limit and keep a token gateway's messages waiting. Governance gives such a recipient its own `max_messages` with `setRecipientLimit` (its window, of the same length, opens with its own deliveries); its messages then count against that alone, and a recipient that refuses messages it does not authenticate, as the gateways do (spec 21 §5.2), cannot have its limit filled by anyone else, since a refused delivery reverts its `consume`. Zero removes the record, and the recipient shares the limit again. `setRecipientLimit` calldata is two canonical words, an address and a `uint64`, or the call reverts with empty data. These are native-call writes, so they stand only if every enclosing EVM frame succeeds (spec 16 §5.4).
 
 ### 6.5 The inbox
 
@@ -276,7 +281,9 @@ Calls to the light client and the verifier are native calls, charged as spec 16 
 | `submitUpdate`, mainnet period 1888 update (512 members, carries the next committee) | 1 314 284 |
 | `submitFinalityUpdate`, mainnet, rotating into period 1889 | 332 454 |
 | `submitUpdate`, minimal preset (32 members, carries the next committee) | 161 803 |
-| `deliver` of a 12-byte message with a three-account state's proofs, to the test recipient `EthereumMessageRecipient` | 157 914 |
+| `deliver` of a 12-byte message with a three-account state's proofs, to the test recipient `EthereumMessageRecipient` | 158 029 |
+
+Recipients with a limit of their own (§6.4) added 115 gas to `deliver` on 2026-11-06, from 157 914: `consume` reads the recipient's record before the window.
 
 A mainnet `deliver` carries proofs of about 9 account-trie nodes and 7 storage-trie nodes (the WETH proof of §10 has 9 and 7), about 10 KiB of calldata.
 

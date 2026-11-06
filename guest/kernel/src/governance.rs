@@ -515,7 +515,11 @@ fn track_of(target: &Address, data: &[u8], switch: bool) -> Option<Track> {
             Some(Track::Normal)
         }
         VERIFIER_ADDRESS if selector == lcabi::PAUSE => Some(Track::Fast),
-        VERIFIER_ADDRESS if selector == lcabi::UNPAUSE || selector == lcabi::SET_RATE_LIMIT => {
+        VERIFIER_ADDRESS
+            if selector == lcabi::UNPAUSE
+                || selector == lcabi::SET_RATE_LIMIT
+                || selector == lcabi::SET_RECIPIENT_LIMIT =>
+        {
             Some(Track::Normal)
         }
         _ => None,

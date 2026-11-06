@@ -934,6 +934,24 @@ fn the_key_switches_the_chain_to_stake_governance_and_proposals_decide() {
     let r = sim_include(&mut sim, &alice.call(&Call::Execute { id: 9 }, 0));
     assert_eq!((r.status, r.logs.0.len()), (0, 0));
     assert_eq!(view(&mut sim.nodes[0], 9), None);
+    // Proposal 10 gives a recipient, a token gateway say, a message limit of
+    // its own in the verifier (spec 18 §6.4), on the normal track.
+    let gateway = [0x6A; 20];
+    let own = orange_ethlc::verifier::set_recipient_limit_call(&gateway, 5);
+    let r = sim_include(&mut sim, &val[0].call(&submit(VERIFIER_ADDRESS, &own), 0));
+    assert_eq!(r.status, 1);
+    let p10 = view(&mut sim.nodes[0], 10).unwrap().proposal;
+    assert!(!p10.fast_track);
+    assert_eq!(
+        sim_include(&mut sim, &val[0].call(&vote(10, true), 0)).status,
+        1
+    );
+    sim_reach(&mut sim, p10.executable_at - 1);
+    let r = sim_include(&mut sim, &alice.call(&Call::Execute { id: 10 }, 0));
+    assert_eq!((r.status, r.logs.0), (1, vec![gov::executed_log(10)]));
+    let limit = abi::encode(abi::RECIPIENT_LIMIT, &[abi::address_word(&gateway)]);
+    let r = call(&mut sim.nodes[0], alice.address(), VERIFIER_ADDRESS, &limit);
+    assert_eq!(r.output, abi::word(5));
     assert_agreement(&mut sim);
 }
 

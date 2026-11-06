@@ -257,7 +257,7 @@ An *action* is the pair `(target, data)` that `submit` carries: calldata to a sy
 | the module address (16 §4.2) | `install(address,bytes32,uint64,bytes)` | normal |
 | the light-client address (18 §5.1) | `setCheckpoint(bytes)`, `setDelay(uint64)` | normal |
 | the verifier address (18 §5.2) | `pause()` | **fast** |
-| the verifier address | `unpause()`, `setRateLimit(uint64,uint64)` | normal |
+| the verifier address | `unpause()`, `setRateLimit(uint64,uint64)`, `setRecipientLimit(address,uint64)` | normal |
 
 `data` to the governance or the module address must decode as the action (§2.1, 16 §4.2); to a bridge address, only its selector is checked and the module decodes the rest when the action executes. Anything else is no action, and a `submit` carrying it cannot run. `stage` and `signal` are not actions: they are sent directly (§2.2).
 

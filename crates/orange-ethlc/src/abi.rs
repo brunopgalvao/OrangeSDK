@@ -38,6 +38,10 @@ pub const DELIVERED: [u8; 4] = [0x2f, 0x2b, 0x02, 0x89];
 pub const PAUSED: [u8; 4] = [0x5c, 0x97, 0x5a, 0xbb];
 /// `rateLimit()`.
 pub const RATE_LIMIT: [u8; 4] = [0x61, 0xe0, 0x8e, 0x72];
+/// `setRecipientLimit(address,uint64)`.
+pub const SET_RECIPIENT_LIMIT: [u8; 4] = [0xb4, 0x3b, 0x5e, 0xbc];
+/// `recipientLimit(address)`.
+pub const RECIPIENT_LIMIT: [u8; 4] = [0x86, 0xfa, 0x88, 0x6d];
 
 /// The inbox's `deliver(uint64,uint64,address,address,uint64,bytes,bytes[],bytes[])`.
 pub const DELIVER: [u8; 4] = [0x9a, 0x28, 0x8f, 0x33];
@@ -139,6 +143,13 @@ fn read_u64(w: &[u8]) -> Option<u64> {
         .iter()
         .all(|b| *b == 0)
         .then(|| u64::from_be_bytes(w[24..32].try_into().expect("8 bytes")))
+}
+
+/// The `address` argument word at `index` after the selector, if its high
+/// bytes are zero.
+#[must_use]
+pub fn address_arg(data: &[u8], index: usize) -> Option<Address> {
+    read_address(data.get(4 + 32 * index..36 + 32 * index)?)
 }
 
 fn read_address(w: &[u8]) -> Option<Address> {

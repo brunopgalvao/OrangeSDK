@@ -392,7 +392,7 @@ fn messages_from_ethereum_reach_their_recipient_once() {
     let delivered = send(&mut sim, &relayer.tx(INBOX_ADDRESS, DELIVER_GAS, &d0));
     assert_eq!(
         (delivered.status, delivered.gas_used, applied.gas_used),
-        (1, 157_914, 161_803)
+        (1, 158_029, 161_803)
     );
     assert_eq!(count(&mut sim.nodes[0]), 1);
     // The recipient had the message's gas, less its own dispatch.

@@ -61,6 +61,11 @@ struct Outbox {
 }
 
 fn outbox() -> Outbox {
+    outbox_to(&[[0x7E; 20]; 3])
+}
+
+/// An outbox that sent one message to each of `recipients`, in order.
+fn outbox_to(recipients: &[[u8; 20]]) -> Outbox {
     let mut evm = Evm::new();
     let root = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -70,14 +75,12 @@ fn outbox() -> Outbox {
     init.extend_from_slice(&word(7));
     let address = evm.deploy([0xD0; 20], init).unwrap();
     let mut messages = Vec::new();
-    for (nonce, payload) in [b"one".to_vec(), vec![2; 50], b"three".to_vec()]
-        .into_iter()
-        .enumerate()
-    {
+    let payloads = [b"one".to_vec(), vec![2; 50], b"three".to_vec()];
+    for (nonce, (payload, recipient)) in payloads.into_iter().cycle().zip(recipients).enumerate() {
         let message = Message {
             nonce: nonce as u64,
             sender: [0x5E; 20],
-            recipient: [0x7E; 20],
+            recipient: *recipient,
             gas_limit: 60_000,
             payload,
         };
@@ -721,6 +724,98 @@ fn the_verifier_delivers_each_message_once() {
         verifier::call(&c, &mut Map::default(), &nobody, &abi::PAUSED),
         Err(vec![])
     );
+}
+
+#[test]
+fn a_recipient_with_its_own_limit_is_not_crowded_out() {
+    const OTHER: [u8; 20] = [0x7E; 20];
+    const GATEWAY: [u8; 20] = [0x6A; 20];
+    let c = Native;
+    let ob = outbox_to(&[OTHER, OTHER, OTHER, GATEWAY, GATEWAY, GATEWAY]);
+    let root = ob.state.root();
+    let mut store = Map::default();
+    let chain = Chain::minimal(32);
+    verifier::genesis(
+        &mut store,
+        &params(&chain, &chain.bootstrap(8, root), ob.address),
+        7,
+        GOVERNANCE,
+    );
+    let ctx = |caller: [u8; 20], timestamp: u64| Context { caller, timestamp };
+    let consume = |store: &mut Map, nonce: usize, timestamp: u64| {
+        let m = &ob.messages[nonce];
+        let (account_proof, storage_proof) = ob.state.proof(&ob.address, &inbox::slot(&c, m.nonce));
+        let d = Delivery {
+            anchor: root,
+            message: m.clone(),
+            account_proof,
+            storage_proof,
+        };
+        verifier::call(
+            &c,
+            store,
+            &ctx(INBOX_ADDRESS, timestamp),
+            &d.encode(abi::CONSUME),
+        )
+    };
+    let limit_of = |store: &Map, recipient: &[u8; 20]| {
+        verifier::query(
+            store,
+            &encode(abi::RECIPIENT_LIMIT, &[abi::address_word(recipient)]),
+        )
+    };
+    // Governance alone gives the gateway a limit of its own, of two words.
+    let set = verifier::set_recipient_limit_call(&GATEWAY, 2);
+    assert_eq!(
+        verifier::call(&c, &mut store, &ctx(OTHER, 0), &set),
+        Err(encode(abi::NOT_GOVERNANCE, &[]))
+    );
+    assert_eq!(
+        verifier::call(&c, &mut store, &ctx(GOVERNANCE, 0), &set[..67]),
+        Err(vec![])
+    );
+    let mut dirty = set.clone();
+    dirty[4] = 1;
+    assert_eq!(
+        verifier::call(&c, &mut store, &ctx(GOVERNANCE, 0), &dirty),
+        Err(vec![])
+    );
+    assert_eq!(
+        verifier::call(&c, &mut store, &ctx(GOVERNANCE, 0), &set),
+        Ok(vec![])
+    );
+    assert_eq!(limit_of(&store, &GATEWAY), Ok(word(2).to_vec()));
+    assert_eq!(limit_of(&store, &OTHER), Ok(word(0).to_vec()));
+    let mut short = encode(abi::RECIPIENT_LIMIT, &[abi::address_word(&GATEWAY)]);
+    short.pop();
+    assert_eq!(verifier::query(&store, &short), Err(vec![]));
+    // Others fill the shared window of two; the gateway's messages pass, up to
+    // its own two.
+    assert_eq!(consume(&mut store, 0, 500), Ok(vec![]));
+    assert_eq!(consume(&mut store, 1, 500), Ok(vec![]));
+    let limited = Err(encode(abi::RATE_LIMITED, &[]));
+    assert_eq!(consume(&mut store, 2, 500), limited);
+    assert_eq!(consume(&mut store, 3, 600), Ok(vec![]));
+    assert_eq!(consume(&mut store, 4, 600), Ok(vec![]));
+    assert_eq!(consume(&mut store, 5, 700), limited);
+    // Each window opens again with its first delivery a window after it opened.
+    assert_eq!(consume(&mut store, 5, 999), limited);
+    assert_eq!(consume(&mut store, 5, 1000), Ok(vec![]));
+    assert_eq!(consume(&mut store, 2, 1500), Ok(vec![]));
+    let shared: verifier::Window =
+        orange_abi::Decode::from_bytes(&store.get(verifier::keys::WINDOW).unwrap()).unwrap();
+    assert_eq!((shared.start, shared.count), (1500, 1));
+    let own: verifier::RecipientLimit =
+        orange_abi::Decode::from_bytes(&store.get(&verifier::keys::recipient(&GATEWAY)).unwrap())
+            .unwrap();
+    assert_eq!((own.max_messages, own.start, own.count), (2, 1000, 1));
+    // Zero returns it to the shared window.
+    let unset = verifier::set_recipient_limit_call(&GATEWAY, 0);
+    assert_eq!(
+        verifier::call(&c, &mut store, &ctx(GOVERNANCE, 0), &unset),
+        Ok(vec![])
+    );
+    assert_eq!(limit_of(&store, &GATEWAY), Ok(word(0).to_vec()));
 }
 
 #[test]
