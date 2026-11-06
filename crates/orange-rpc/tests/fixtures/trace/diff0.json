@@ -1,0 +1,17 @@
+{
+ "post": {
+  "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a": {
+   "balance": "0x56bc7236fc9799c00",
+   "nonce": 1
+  },
+  "0xae519fc2ba8e6ffe6473195c092bf1bae986ff90": {
+   "code": "0x60016000527faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa60206000a1602a60005260206000f3",
+   "nonce": 1
+  }
+ },
+ "pre": {
+  "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a": {
+   "balance": "0x56bc75e2d63100000"
+  }
+ }
+}

@@ -17,6 +17,7 @@ pub mod governance;
 pub mod modules;
 pub mod rotation;
 pub mod staking;
+pub mod trace;
 pub mod types;
 
 pub use codec::{Decode, DecodeError, Decoder, Encode, Encoder};

@@ -202,6 +202,10 @@ pub struct Rpc {
     /// that reaches the address could stop the node; a node whose operator
     /// stops it through its JSON-RPC turns it on (`--rpc-stop`).
     pub stop_allowed: bool,
+    /// Whether the `debug` namespace (spec 20 §9) is served: off unless
+    /// changed, since a trace holds the node's thread for up to the trace
+    /// budget; `--rpc-debug` turns it on, and `orange dev` serves it always.
+    pub debug_allowed: bool,
     /// The origins whose browser pages the HTTP server answers (spec 20
     /// §8.5), `*` for any; none unless changed. A request without an
     /// `Origin` header, which is what clients outside browsers send, is
@@ -227,6 +231,7 @@ impl Rpc {
             max_filters: crate::filters::MAX_FILTERS,
             stopped: false,
             stop_allowed: false,
+            debug_allowed: false,
             cors: Vec::new(),
         }
     }
@@ -353,7 +358,7 @@ impl Rpc {
     /// exist, and one whose state the node no longer keeps is refused as a
     /// pruned geth node refuses it, rather than answered from another
     /// block's state.
-    fn state_at(&mut self, param: Option<&Value>) -> Result<Option<u64>, RpcError> {
+    pub(crate) fn state_at(&mut self, param: Option<&Value>) -> Result<Option<u64>, RpcError> {
         let height = match param {
             None | Some(Value::Null) => return Ok(None),
             Some(Value::String(hash)) if hash.len() == 66 => self.hash_height(hash)?,
@@ -568,6 +573,21 @@ impl Rpc {
             "orange_getProposals" => crate::governance::proposals(&mut self.node)?,
             "orange_getProposal" => crate::governance::proposal(&mut self.node, params)?,
             "orange_upgradeStatus" => crate::upgrades::upgrade_status(&mut self.node)?,
+            // Tracing holds the node's thread for up to the trace budget, so
+            // the namespace is served only when asked for, as geth serves it
+            // only with `--http.api debug` (spec 20 §9).
+            debug if debug.starts_with("debug_") && !self.debug_allowed => {
+                return Err(RpcError::with_code(
+                    -32601,
+                    format!(
+                        "method not found: {debug} (this node serves the debug namespace only when started with --rpc-debug)"
+                    ),
+                ));
+            }
+            "debug_traceTransaction" => self.trace_transaction(params)?,
+            "debug_traceBlockByNumber" => self.trace_block_by(By::Number, params)?,
+            "debug_traceBlockByHash" => self.trace_block_by(By::Hash, params)?,
+            "debug_traceCall" => self.trace_call(params)?,
             other => {
                 return Err(RpcError::with_code(
                     -32601,
@@ -690,13 +710,23 @@ impl Rpc {
 
     /// The error for `height`, whose header carries `root`, once the node no
     /// longer keeps its state (spec 20 §5.3).
-    fn unavailable(&self, root: &[u8; 32], height: u64) -> RpcError {
+    pub(crate) fn unavailable(&self, root: &[u8; 32], height: u64) -> RpcError {
         RpcError::server(missing_state(root, height, self.node.oldest_state()))
     }
 
     /// Runs a message, first checking what the kernel would refuse it for so
     /// the error can say why.
     fn run(&mut self, request: &CallRequest, at: Option<u64>) -> Result<CallResult, RpcError> {
+        self.admit_call(request, at)?;
+        self.execute(request, at)
+    }
+
+    /// What the kernel would refuse a message for, as geth words it.
+    pub(crate) fn admit_call(
+        &mut self,
+        request: &CallRequest,
+        at: Option<u64>,
+    ) -> Result<(), RpcError> {
         let needed = min_gas(request);
         if request.gas != 0 && request.gas < needed {
             return Err(RpcError::server(format!(
@@ -720,7 +750,7 @@ impl Rpc {
                 )));
             }
         }
-        self.execute(request, at)
+        Ok(())
     }
 
     /// Runs a message in the kernel. One that computes past the node's query

@@ -709,7 +709,8 @@ fn free_ports(n: usize) -> Vec<String> {
 
 /// A validator finds an observer through the genesis file's bootnodes
 /// alone; the observer keeps the node key of its file, serves no
-/// `orange_stop` (`--no-rpc-stop` wins over `--rpc-stop`), and the node
+/// `orange_stop` (`--no-rpc-stop` wins over `--rpc-stop`) nor tracing
+/// (no `--rpc-debug`), and the node
 /// options around them name their mistakes.
 #[test]
 #[allow(clippy::too_many_lines)]
@@ -769,6 +770,7 @@ fn nodes_dial_the_genesis_bootnodes() {
             "--data-dir",
             &path(&dir, "val"),
             "--rpc-stop",
+            "--rpc-debug",
         ]
         .map(str::to_owned),
     );
@@ -792,6 +794,15 @@ fn nodes_dial_the_genesis_bootnodes() {
         refused.contains("only when started with --rpc-stop"),
         "{refused}"
     );
+    // The validator serves tracing, which it was told to; the observer
+    // does not (spec 20 §8.5).
+    let trace = json!(["0x0", {"tracer": "callTracer"}]);
+    assert_eq!(
+        client::call(&v_rpc, "debug_traceBlockByNumber", &trace).unwrap(),
+        json!([])
+    );
+    let refused = client::call(&o_rpc, "debug_traceBlockByNumber", &trace).unwrap_err();
+    assert!(refused.contains("--rpc-debug"), "{refused}");
     client::call(&v_rpc, "orange_stop", &json!([])).unwrap();
     done.store(true, Ordering::SeqCst);
     validator_thread.join().unwrap().unwrap();

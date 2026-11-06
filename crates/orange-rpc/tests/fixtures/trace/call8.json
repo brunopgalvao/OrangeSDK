@@ -1,0 +1,51 @@
+{
+ "from": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+ "gas": "0x441d8",
+ "gasUsed": "0x1734b",
+ "to": "0xa10a3b175f0f2641cf41912b887f77d8ef34fae8",
+ "input": "0x",
+ "calls": [
+  {
+   "from": "0xa10a3b175f0f2641cf41912b887f77d8ef34fae8",
+   "gas": "0x3b5ae",
+   "gasUsed": "0x138a",
+   "to": "0x7de8f3091b4ce498b3f6af7e04bfc0b3afc7985f",
+   "input": "0x33ff",
+   "calls": [
+    {
+     "from": "0x7de8f3091b4ce498b3f6af7e04bfc0b3afc7985f",
+     "gas": "0x0",
+     "gasUsed": "0x0",
+     "to": "0xa10a3b175f0f2641cf41912b887f77d8ef34fae8",
+     "input": "0x",
+     "value": "0x1",
+     "type": "SELFDESTRUCT"
+    }
+   ],
+   "value": "0x1",
+   "type": "CREATE"
+  },
+  {
+   "from": "0xa10a3b175f0f2641cf41912b887f77d8ef34fae8",
+   "gas": "0x32751",
+   "gasUsed": "0x138a",
+   "to": "0xe6995e833c4752b537dbbceb8e9f01b2c2b309f2",
+   "input": "0x33ff",
+   "calls": [
+    {
+     "from": "0xe6995e833c4752b537dbbceb8e9f01b2c2b309f2",
+     "gas": "0x0",
+     "gasUsed": "0x0",
+     "to": "0xa10a3b175f0f2641cf41912b887f77d8ef34fae8",
+     "input": "0x",
+     "value": "0x0",
+     "type": "SELFDESTRUCT"
+    }
+   ],
+   "value": "0x0",
+   "type": "CREATE2"
+  }
+ ],
+ "value": "0x1",
+ "type": "CALL"
+}

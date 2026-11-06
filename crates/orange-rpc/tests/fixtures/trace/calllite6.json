@@ -1,0 +1,62 @@
+{
+ "from": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+ "gas": "0x43d88",
+ "gasUsed": "0x855e",
+ "to": "0x08425d9df219f93d5763c3e85204cb5b4ce33aaa",
+ "input": "0x000000000000000000000000ae519fc2ba8e6ffe6473195c092bf1bae986ff9000000000000000000000000073b647cba2fe75ba05b8e12ef8f8d6327d6367bf0000000000000000000000007d73424a8256c0b2ba245e5d5a3de8820e45f390",
+ "calls": [
+  {
+   "from": "0x08425d9df219f93d5763c3e85204cb5b4ce33aaa",
+   "gas": "0x42102",
+   "gasUsed": "0x412",
+   "to": "0xae519fc2ba8e6ffe6473195c092bf1bae986ff90",
+   "input": "0x",
+   "output": "0x000000000000000000000000000000000000000000000000000000000000002a",
+   "value": "0x0",
+   "type": "CALL"
+  },
+  {
+   "from": "0x08425d9df219f93d5763c3e85204cb5b4ce33aaa",
+   "gas": "0x41172",
+   "gasUsed": "0x36",
+   "to": "0x73b647cba2fe75ba05b8e12ef8f8d6327d6367bf",
+   "input": "0x",
+   "output": "0x08c379a0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000046e6f706500000000000000000000000000000000000000000000000000000000",
+   "error": "execution reverted",
+   "revertReason": "nope",
+   "value": "0x0",
+   "type": "CALL"
+  },
+  {
+   "from": "0x08425d9df219f93d5763c3e85204cb5b4ce33aaa",
+   "gas": "0x410c7",
+   "gasUsed": "0x12",
+   "to": "0x0000000000000000000000000000000000000004",
+   "input": "0x00000000",
+   "output": "0x00000000",
+   "type": "STATICCALL"
+  },
+  {
+   "from": "0x08425d9df219f93d5763c3e85204cb5b4ce33aaa",
+   "gas": "0x4103d",
+   "gasUsed": "0x412",
+   "to": "0xae519fc2ba8e6ffe6473195c092bf1bae986ff90",
+   "input": "0x",
+   "output": "0x000000000000000000000000000000000000000000000000000000000000002a",
+   "value": "0x0",
+   "type": "DELEGATECALL"
+  },
+  {
+   "from": "0x08425d9df219f93d5763c3e85204cb5b4ce33aaa",
+   "gas": "0x3e8",
+   "gasUsed": "0x3e8",
+   "to": "0x7d73424a8256c0b2ba245e5d5a3de8820e45f390",
+   "input": "0x",
+   "error": "invalid opcode: INVALID",
+   "value": "0x0",
+   "type": "CALL"
+  }
+ ],
+ "value": "0x0",
+ "type": "CALL"
+}

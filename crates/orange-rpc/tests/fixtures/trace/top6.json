@@ -1,0 +1,25 @@
+{
+ "from": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+ "gas": "0x43d88",
+ "gasUsed": "0x855e",
+ "to": "0x08425d9df219f93d5763c3e85204cb5b4ce33aaa",
+ "input": "0x000000000000000000000000ae519fc2ba8e6ffe6473195c092bf1bae986ff9000000000000000000000000073b647cba2fe75ba05b8e12ef8f8d6327d6367bf0000000000000000000000007d73424a8256c0b2ba245e5d5a3de8820e45f390",
+ "logs": [
+  {
+   "address": "0x08425d9df219f93d5763c3e85204cb5b4ce33aaa",
+   "topics": [],
+   "data": "0x",
+   "position": "0x0",
+   "index": "0x0"
+  },
+  {
+   "address": "0x08425d9df219f93d5763c3e85204cb5b4ce33aaa",
+   "topics": [],
+   "data": "0x",
+   "position": "0x1",
+   "index": "0x2"
+  }
+ ],
+ "value": "0x0",
+ "type": "CALL"
+}

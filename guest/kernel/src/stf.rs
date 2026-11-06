@@ -9,6 +9,7 @@ use orange_abi::chain::{
     Receipt, SNAPSHOT_INTERVAL, SnapshotRecord, StorageQuery, call_status, keys, query, reason,
 };
 use orange_abi::codec::Seq;
+use orange_abi::trace::{self, TraceBlockRequest, TraceCallRequest, TraceConfig, TxTrace};
 use orange_abi::types::{
     Address, Ahead, Block, BuildArgs, ExecuteArgs, ExecuteResult, ExecuteSummary, FinalizeArgs,
     Hash, QueryArgs, QueryResult, ValidateArgs, ValidateResult,
@@ -17,6 +18,7 @@ use orange_abi::{Decode, Encode};
 use orange_eth::{MAX_TX_GAS, header, mpt};
 
 use crate::evm::{self, BlockFields, Message};
+use crate::trace::Tracing;
 use crate::tx::{self, Signed, decode_signed};
 use crate::{fees, state};
 
@@ -215,14 +217,16 @@ pub fn has_run(tx_hash: &Hash) -> bool {
 }
 
 /// Runs one transaction of `block` at `index`, after `cumulative` gas; `None`
-/// if it cannot run, in which case nothing changed.
+/// if it cannot run, in which case nothing changed. With `trace`, the
+/// transaction runs traced and its trace comes with the receipt.
 fn run_tx(
     raw: &[u8],
     chain_id: u64,
     block: BlockFields,
     index: u32,
     cumulative: u64,
-) -> Option<Receipt> {
+    trace: Option<Tracing>,
+) -> Option<(Receipt, Option<TxTrace>)> {
     let s = decode_signed(raw, chain_id).ok()?;
     if well_formed(&s, block.base_fee).is_err() || cumulative + s.tx.gas_limit > BLOCK_GAS_LIMIT {
         return None;
@@ -245,8 +249,9 @@ fn run_tx(
             .cloned()
             .zip(s.authorities.iter().copied())
             .collect(),
+        trace,
     };
-    let outcome = if crate::staking::is_staking(&s) {
+    let mut outcome = if crate::staking::is_staking(&s) {
         crate::staking::run(&s, block.number, message, block)
     } else {
         // Governance serves the governance and module addresses, and every
@@ -259,7 +264,11 @@ fn run_tx(
     // The EVM credited the beneficiary the priority fee and nobody the base
     // fee; a treasury, if the parameters name one, gets the base fee now.
     fees::route_base_fee(block, outcome.gas_used);
-    Some(Receipt {
+    let mut trace = outcome.trace.take();
+    if let Some(trace) = &mut trace {
+        crate::trace::settle(trace, s.tx.gas_limit, outcome.gas_used);
+    }
+    let receipt = Receipt {
         status: u8::from(outcome.status == call_status::SUCCESS),
         gas_used: outcome.gas_used,
         from: s.from,
@@ -275,7 +284,8 @@ fn run_tx(
             .tx
             .effective_gas_price(u128::from(block.base_fee))
             .unwrap_or(0),
-    })
+    };
+    Some((receipt, trace))
 }
 
 /// Blocks between snapshot records (spec 22 §6): the staking epoch, else the
@@ -340,6 +350,25 @@ fn snapshot(params: &[u8]) -> QueryResult {
 /// block leaves it out, neither listing it nor touching that receipt. So a
 /// transaction that ran keeps its receipt, in the one block that lists it.
 pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
+    execute_with(args, None).unwrap_or_else(|| orange_guest::trap())
+}
+
+/// What a traced execution of a block asks for and gathers (spec 20 §9).
+struct Traced {
+    /// The tracer.
+    config: TraceConfig,
+    /// The one transaction to trace, after which execution stops; every
+    /// transaction the block records when none.
+    only: Option<Hash>,
+    /// The traces, in block order.
+    traces: Vec<TxTrace>,
+}
+
+/// [`execute`], or with `traced` the block executed again to trace its
+/// transactions: the same steps in the same order, each transaction to trace
+/// run with a tracer, stopping after the last one to trace, so before the
+/// end of the block; `None` then.
+fn execute_with(args: &ExecuteArgs, mut traced: Option<&mut Traced>) -> Option<ExecuteResult> {
     let chain_id = state::chain_id();
     let template =
         BlockHeader::from_bytes(&args.block.header).unwrap_or_else(|_| orange_guest::trap());
@@ -367,15 +396,41 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let mut listed = Vec::new();
     let mut envelopes = Vec::new();
     let mut logs_bloom = [0u8; 256];
+    let mut log_offset = 0u32;
     for raw in &args.block.txs.0 {
         let index = receipts.len() as u32;
         let hash = state::keccak256(raw);
-        let receipt = match run_tx(raw, chain_id, block, index, cumulative) {
-            Some(receipt) => receipt,
+        let tracing = traced
+            .as_ref()
+            .filter(|t| t.only.is_none_or(|only| only == hash))
+            .map(|t| Tracing {
+                config: t.config.clone(),
+                query: false,
+                extra: [block.treasury]
+                    .into_iter()
+                    .filter(|a| *a != [0; 20])
+                    .collect(),
+                log_offset,
+            });
+        let traces = tracing.is_some();
+        let (receipt, trace) = match run_tx(raw, chain_id, block, index, cumulative, tracing) {
+            Some(ran) => ran,
             None if state::receipt(&hash).is_some() => continue,
-            None => failed(height, index, cumulative),
+            None => (failed(height, index, cumulative), None),
         };
+        if let Some(t) = traced.as_mut()
+            && traces
+        {
+            t.traces.push(TxTrace {
+                tx_hash: hash,
+                ..trace.unwrap_or_default()
+            });
+            if t.only.is_some() {
+                return None;
+            }
+        }
         cumulative = receipt.cumulative_gas_used;
+        log_offset += receipt.logs.0.len() as u32;
         state::put_receipt(&hash, &receipt, raw);
         let bloom = header::receipt_bloom(&receipt, state::keccak256);
         header::accrue(&mut logs_bloom, &bloom);
@@ -383,6 +438,9 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
         listed.push(raw.clone());
         receipts.push(receipt.to_bytes());
         tx_hashes.push(hash);
+    }
+    if traced.is_some() {
+        return None;
     }
     // Ethereum's tries over what the block records (spec 20 §3.2).
     let receipts_root = mpt::ordered_root(&envelopes, state::keccak256);
@@ -432,7 +490,7 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
         let hash = state::keccak256(&orange_abi::chain::system_receipt_preimage(&block_hash));
         state::set(&[keys::RECEIPT, &hash[..]].concat(), &receipt);
     }
-    ExecuteResult {
+    Some(ExecuteResult {
         state_root,
         summary: ExecuteSummary {
             gas_used: cumulative,
@@ -441,7 +499,30 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
             logs_bloom: logs_bloom.to_vec(),
         },
         receipts: Seq(receipts),
+    })
+}
+
+/// `query::TRACE_BLOCK`, over the state after the block before the one it
+/// names: that block executed again from the body this node finalized, as
+/// [`execute`] ran it (spec 20 §9). Nothing it writes outlives the query.
+fn trace_block(request: TraceBlockRequest) -> QueryResult {
+    if state::height().unwrap_or(0) + 1 != request.height {
+        return bad_params();
     }
+    let Some(block) = crate::driver::finalized_block(request.height) else {
+        return found::<Seq<TxTrace>>(None);
+    };
+    let args = ExecuteArgs {
+        block,
+        context: orange_abi::types::ExecContext::default(),
+    };
+    let mut traced = Traced {
+        config: request.config,
+        only: request.tx,
+        traces: Vec::new(),
+    };
+    let _ = execute_with(&args, Some(&mut traced));
+    found(Some(Seq(traced.traces)))
 }
 
 /// The end of `kernel_init`: the genesis block (spec 20 §3.1). Its header
@@ -504,6 +585,13 @@ fn bad_params() -> QueryResult {
 /// charges and warms one, and one with an authorization list as an EIP-7702
 /// transaction, each authority recovered as for a transaction.
 fn call(request: CallRequest) -> CallResult {
+    call_with(request, None).0
+}
+
+/// [`call`], traced with `config` when given (spec 20 §9). A traced call
+/// keeps its changes until the query ends, so that the prestate can read
+/// the state after it.
+fn call_with(request: CallRequest, config: Option<TraceConfig>) -> (CallResult, Option<TxTrace>) {
     let height = state::height().unwrap_or(0);
     let timestamp = state::block_by_number(height).map_or(0, |h| h.timestamp_ms / 1000);
     let block = BlockFields {
@@ -564,18 +652,33 @@ fn call(request: CallRequest) -> CallResult {
         nonce: None,
         access_list,
         authorization_list,
+        trace: config.map(|config| Tracing {
+            config,
+            query: true,
+            extra: Vec::new(),
+            log_offset: 0,
+        }),
     };
+    let traced = message.trace.is_some();
     // The host serves the gates active for the next block (spec 13 §7.1).
     crate::precompiles::begin(crate::governance::gate_active(
         orange_upgrade::gate::PRECOMPILES,
         height + 1,
     ));
-    let outcome = crate::native::run(message, block, false);
-    CallResult {
-        status: outcome.status,
-        gas_used: outcome.gas_used + surcharge,
-        output: outcome.output,
+    let mut outcome = crate::native::run(message, block, traced);
+    let gas_used = outcome.gas_used + surcharge;
+    let mut trace = outcome.trace.take();
+    if let Some(trace) = &mut trace {
+        crate::trace::settle(trace, gas, gas_used);
     }
+    (
+        CallResult {
+            status: outcome.status,
+            gas_used,
+            output: outcome.output,
+        },
+        trace,
+    )
 }
 
 /// `kernel_query`.
@@ -617,6 +720,20 @@ pub fn query(args: &QueryArgs) -> QueryResult {
         },
         query::CALL => match CallRequest::from_bytes(&args.params) {
             Ok(request) => found(Some(call(request))),
+            Err(_) => bad_params(),
+        },
+        trace::query::TRACE_BLOCK => match TraceBlockRequest::from_bytes(&args.params) {
+            Ok(request) => trace_block(request),
+            Err(_) => bad_params(),
+        },
+        trace::query::TRACE_CALL => match TraceCallRequest::from_bytes(&args.params) {
+            Ok(request) => {
+                let (result, trace) = call_with(request.call, Some(request.config));
+                found(Some(TxTrace {
+                    status: u8::from(result.status == call_status::SUCCESS),
+                    ..trace.unwrap_or_default()
+                }))
+            }
             Err(_) => bad_params(),
         },
         query::EVIDENCE => match u64::from_bytes(&args.params) {

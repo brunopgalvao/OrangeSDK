@@ -27,7 +27,7 @@ pub use mempool::{MAX_TX_BYTES, Mempool, PoolError, PoolLimits, PoolTx};
 pub use net::{Discovery, Transport};
 pub use node::{
     ARCHIVE, BLOCK_KERNEL_GAS, DRIVER_RETENTION, HISTORY_KEYS_PER_BLOCK, KEPT_RECORDS, Node,
-    NodeConfig, NodeError, PRUNE_EVERY, STATE_HISTORY, SubmitError, keep_latest,
+    NodeConfig, NodeError, PRUNE_EVERY, STATE_HISTORY, SubmitError, TRACE_GAS, keep_latest,
 };
 pub use resolve::PeerAddr;
 pub use sim::Sim;

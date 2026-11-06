@@ -7,8 +7,10 @@
 //! `eth_newFilter`), fee history and the `txpool` namespace, the
 //! bridge relayer's `orange_getFinalityProof`, `orange_getOutboxProof` and
 //! `orange_getRotation`, governance's `orange_getGovernance`,
-//! `orange_getProposals` and `orange_getProposal`, and the operator's
-//! `orange_upgradeStatus`.
+//! `orange_getProposals` and `orange_getProposal`, the operator's
+//! `orange_upgradeStatus`, and geth's tracing methods `debug_traceTransaction`,
+//! `debug_traceBlockByNumber`, `debug_traceBlockByHash` and `debug_traceCall`
+//! with `callTracer` and `prestateTracer`.
 //! Responses take geth's shapes and error codes. Quantities are `0x` hex
 //! without leading zeros, data is `0x` hex, addresses are lowercase.
 
@@ -34,3 +36,4 @@ pub mod ws;
 pub use methods::{Rpc, RpcError};
 
 pub mod telemetry;
+pub mod trace;

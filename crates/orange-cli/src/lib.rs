@@ -1,7 +1,7 @@
 //! The `orange` command.
 //!
 //! `orange dev --kernel <kernel.elf|kernel.orange> --genesis <genesis.json>
-//! [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>]
+//! [--rpc 127.0.0.1:8545] [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--trace-gas <n>]
 //! [--state-history <blocks> | --archive] [--data-dir <dir>]`
 //! runs a single-node development chain with Ethereum JSON-RPC. The node keeps
 //! the state of its latest 1 024 blocks for historical queries and proofs, or
@@ -33,6 +33,9 @@
 //! even beside `--rpc-stop`. The JSON-RPC answers browser pages, requests
 //! with an `Origin` header, only from the origins `--rpc-cors <origin>`
 //! names (repeatable; `*` for any), and refuses every other with `403`.
+//! `orange dev` serves geth's tracing methods (spec 20 §9); `orange node`
+//! serves them only with `--rpc-debug`, as a trace holds the node's thread
+//! for up to `--trace-gas`.
 //! The genesis file is
 //! JSON: `{"chainId": 1337, "slotMs": 400, "maxTxs": 64,
 //! "alloc": {"0x<address>": "<wei>"}, "validators": ["0x<32-byte id>"]}`.
@@ -128,8 +131,8 @@ pub const DEFAULT_RPC: &str = "127.0.0.1:8545";
 
 /// Usage line printed on a command-line mistake.
 pub const USAGE: &str = "usage:
-  orange dev  --kernel <kernel.elf|kernel.orange> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--rpc-stop] [--rpc-cors <origin>]... [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive] [--data-dir <dir>]
-  orange node --kernel <kernel.elf|kernel.orange> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--snapshot <file> | --sync-from-peers] [--trust-key <id>:<0x 96 bytes> | <0x 96 bytes>] [--serve-snapshots] [--listen 127.0.0.1:30333] [--peer <ip:port|host:port>]... [--bootstrap <ip:port|host:port>]... [--max-peers 32] [--outbound-peers 8] [--advertise <ip:port>] [--no-discovery] [--node-key-file <path>] [--rpc 127.0.0.1:8545] [--rpc-stop] [--rpc-cors <origin>]... [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
+  orange dev  --kernel <kernel.elf|kernel.orange> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--rpc-stop] [--rpc-cors <origin>]... [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--trace-gas <n>] [--state-history <blocks> | --archive] [--data-dir <dir>]
+  orange node --kernel <kernel.elf|kernel.orange> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--snapshot <file> | --sync-from-peers] [--trust-key <id>:<0x 96 bytes> | <0x 96 bytes>] [--serve-snapshots] [--listen 127.0.0.1:30333] [--peer <ip:port|host:port>]... [--bootstrap <ip:port|host:port>]... [--max-peers 32] [--outbound-peers 8] [--advertise <ip:port>] [--no-discovery] [--node-key-file <path>] [--rpc 127.0.0.1:8545] [--rpc-stop] [--rpc-debug] [--rpc-cors <origin>]... [--blocks <n>] [--query-gas <n>] [--trace-gas <n>] [--state-history <blocks> | --archive]
   orange key  <64 hex> | --key-file <path> | generate --out <path>
   orange genesis operator --key-file <key> --name <name> --chain-id <id> [--p2p <ip:port|host:port>] --out <card.json>
   orange genesis assemble --template <template.json> --kernel <kernel> --operator <card.json>... [--bootnode <ip:port|host:port>]... [--genesis-time <unix seconds>] [--operator-funding <wei>] --out <genesis.json>
@@ -1033,6 +1036,7 @@ pub(crate) fn run_inner(
             persisted,
             kernel_gas,
             query_gas,
+            trace_gas: parse_gas(args, "--trace-gas", orange_node::node::TRACE_GAS)?,
             state_history,
             store: chain_store,
             // Exports and DKG computations stay off the loop that answers
@@ -1058,6 +1062,9 @@ pub(crate) fn run_inner(
     report_driver_state(&node, resumed.as_deref(), opened_at);
     let chain_name = node.chain_name();
     let mut rpc = orange_rpc::Rpc::new(node);
+    // A development chain serves tracing to the tools that expect it; a
+    // node serves it only when told to (spec 20 §9).
+    rpc.debug_allowed = command == "dev" || args.iter().any(|a| a == "--rpc-debug");
     rpc.stop_allowed =
         args.iter().any(|a| a == "--rpc-stop") && !args.iter().any(|a| a == "--no-rpc-stop");
     rpc.cors = args_all(args, "--rpc-cors");

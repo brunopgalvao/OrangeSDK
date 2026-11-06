@@ -530,6 +530,12 @@ fn live_node_applies_geth_style_accounts() {
         r#"{"jsonrpc":"2.0","id":2,"method":"eth_getBalance","params":["0x3333333333333333333333333333333333333333","latest"]}"#,
     );
     assert!(reply.contains(r#""result":"0x10""#), "{reply}");
+    // A development chain serves tracing (spec 20 §8.5, §9).
+    let reply = post(
+        &live.addr,
+        r#"{"jsonrpc":"2.0","id":4,"method":"debug_traceBlockByNumber","params":["0x0",{"tracer":"callTracer"}]}"#,
+    );
+    assert!(reply.contains(r#""result":[]"#), "{reply}");
     let reply = post(
         &live.addr,
         r#"{"jsonrpc":"2.0","id":3,"method":"orange_stop"}"#,

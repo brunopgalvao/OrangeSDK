@@ -5,6 +5,7 @@ use core::convert::Infallible;
 
 use orange_abi::chain::{Account, BLOCK_GAS_LIMIT, Log, call_status};
 use orange_abi::codec::Seq;
+use orange_abi::trace::{TxTrace, tracer};
 use orange_abi::types::{Address, Hash};
 use orange_guest::host;
 use revm::bytecode::Bytecode;
@@ -23,9 +24,10 @@ use revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE;
 use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address as RAddress, B256, Bytes, KECCAK_EMPTY, TxKind, U256};
 use revm::state::{Account as RAccount, AccountInfo};
-use revm::{Database, ExecuteEvm, MainBuilder, MainContext};
+use revm::{Database, ExecuteEvm, InspectEvm, MainBuilder, MainContext};
 
 use crate::state;
+use crate::trace::{self, CallTracer, Tracing};
 
 /// Kernel state seen through revm's `Database`.
 pub struct StateDb;
@@ -226,6 +228,9 @@ pub struct Message {
     /// Authorizations of a set-code transaction, each with the authority its
     /// signature names (`tx::authority`); empty for every other type.
     pub authorization_list: Vec<(orange_eth::Authorization, Option<Address>)>,
+    /// The tracer of a traced message (spec 20 §9); none on the consensus
+    /// path and for every other query.
+    pub trace: Option<Tracing>,
 }
 
 /// What a message did.
@@ -240,6 +245,24 @@ pub struct Outcome {
     pub logs: Vec<Log>,
     /// Created contract.
     pub contract: Option<Address>,
+    /// What the tracer recorded, for a traced message that ran; the
+    /// prestate's accounts still without their state after it
+    /// (`trace::poststate` fills that in once the kernel is done with it).
+    pub trace: Option<TxTrace>,
+}
+
+impl Outcome {
+    /// The outcome of a message that could not run.
+    pub fn invalid() -> Outcome {
+        Outcome {
+            status: call_status::INVALID,
+            gas_used: 0,
+            output: Vec::new(),
+            logs: Vec::new(),
+            contract: None,
+            trace: None,
+        }
+    }
 }
 
 /// The block environment a message runs in, as the EVM sees it.
@@ -359,7 +382,7 @@ pub fn run_in<P: Precompiles>(message: Message, env: &Env, commit_state: bool) -
     };
     block_env
         .set_blob_excess_gas_and_price(env.excess_blob_gas, BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE);
-    let mut evm = Context::mainnet()
+    let context = Context::mainnet()
         .modify_cfg_chained(|cfg| {
             cfg.set_spec_and_mainnet_gas_params(SpecId::OSAKA);
             cfg.chain_id = chain_id;
@@ -372,26 +395,59 @@ pub fn run_in<P: Precompiles>(message: Message, env: &Env, commit_state: bool) -
             cfg.disable_base_fee = skip_nonce;
         })
         .with_block(block_env)
-        .with_db(StateDb)
-        .build_mainnet()
-        .with_precompiles(P::for_message(
-            BlockFields {
-                number: env.number,
-                timestamp: env.timestamp,
-                base_fee: env.basefee,
-                beneficiary: env.beneficiary,
-                treasury: [0; 20],
-            },
-            !commit_state,
-        ));
-    let Ok(result) = evm.transact(tx) else {
-        return Outcome {
-            status: call_status::INVALID,
-            gas_used: 0,
-            output: Vec::new(),
-            logs: Vec::new(),
-            contract: None,
-        };
+        .with_db(StateDb);
+    let fields = BlockFields {
+        number: env.number,
+        timestamp: env.timestamp,
+        base_fee: env.basefee,
+        beneficiary: env.beneficiary,
+        treasury: [0; 20],
+    };
+    let tracing = message.trace;
+    let query = !commit_state || tracing.as_ref().is_some_and(|t| t.query);
+    let (result, precompiles, mut trace) = match &tracing {
+        // The consensus path: no inspector.
+        None => {
+            let mut evm = context
+                .build_mainnet()
+                .with_precompiles(P::for_message(fields, query));
+            let result = evm.transact(tx);
+            (result, evm.precompiles, None)
+        }
+        Some(t) if t.config.tracer == tracer::CALL => {
+            let mut evm = context
+                .build_mainnet_with_inspector(CallTracer::new(t.config.clone(), t.log_offset))
+                .with_precompiles(P::for_message(fields, query));
+            let result = evm.inspect_tx(tx);
+            let (frames, truncated) = evm.inspector.finish();
+            let trace = TxTrace {
+                frames: Seq(frames),
+                truncated,
+                ..TxTrace::default()
+            };
+            (result, evm.precompiles, Some(trace))
+        }
+        Some(t) => {
+            let mut evm = context
+                .build_mainnet()
+                .with_precompiles(P::for_message(fields, query));
+            let result = evm.transact(tx);
+            let mut extra = t.extra.clone();
+            extra.extend([message.caller, env.beneficiary]);
+            extra.extend(message.to);
+            let accounts = result
+                .as_ref()
+                .map(|r| trace::prestate(&r.state, &extra))
+                .unwrap_or_default();
+            let trace = TxTrace {
+                accounts: Seq(accounts),
+                ..TxTrace::default()
+            };
+            (result, evm.precompiles, Some(trace))
+        }
+    };
+    let Ok(result) = result else {
+        return Outcome::invalid();
     };
     let (status, gas_used, output, logs, contract) = match result.result {
         ExecutionResult::Success {
@@ -421,7 +477,12 @@ pub fn run_in<P: Precompiles>(message: Message, env: &Env, commit_state: bool) -
         }
     };
     if commit_state {
-        commit(result.state, &evm.precompiles);
+        commit(result.state, &precompiles);
+    }
+    if let Some(trace) = &mut trace {
+        trace.ran = true;
+        trace.status = u8::from(status == call_status::SUCCESS);
+        trace.gas_used = gas_used;
     }
     let logs = logs
         .into_iter()
@@ -437,6 +498,7 @@ pub fn run_in<P: Precompiles>(message: Message, env: &Env, commit_state: bool) -
         output,
         logs,
         contract,
+        trace,
     }
 }
 

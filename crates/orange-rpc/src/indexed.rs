@@ -20,7 +20,11 @@ pub(crate) enum By {
 
 impl Rpc {
     /// The block the first parameter names, if it exists.
-    fn named_block(&mut self, by: By, params: &[Value]) -> Result<Option<BlockHeader>, RpcError> {
+    pub(crate) fn named_block(
+        &mut self,
+        by: By,
+        params: &[Value],
+    ) -> Result<Option<BlockHeader>, RpcError> {
         let param = param_str(params, 0)?;
         match by {
             By::Number => {

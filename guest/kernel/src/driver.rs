@@ -70,6 +70,33 @@ const GUARD_KEY: &[u8] = b"simplex/guard";
 const LIVE_CAP: usize = 256;
 const ZERO: Hash = [0; 32];
 
+/// The block the host executes for finalized proposal `p`.
+fn block_of(p: Proposal) -> Block {
+    let header = BlockHeader {
+        height: p.height,
+        parent_hash: p.parent,
+        timestamp_ms: p.timestamp_ms,
+        ..BlockHeader::default()
+    };
+    let participation = Participation {
+        evidence: p.evidence,
+        dkg: p.dkg,
+    }
+    .to_bytes();
+    Block {
+        header: header.to_bytes(),
+        txs: p.txs,
+        participation,
+    }
+}
+
+/// The block this node finalized at `height`, exactly as the host was
+/// asked to execute it, while the driver's tables keep its proposal (spec
+/// 22 §8.1): what `trace_block` executes again (spec 20 §9).
+pub fn finalized_block(height: u64) -> Option<Block> {
+    Ctx::finalized_proposal(height).map(block_of)
+}
+
 /// The anchor a leader puts in its proposal (spec 08 §5): its executed
 /// head and that block's state root, or none before the first block.
 fn anchor() -> (u64, Hash) {
@@ -1589,24 +1616,8 @@ impl Ctx {
 
     /// Asks the host to execute finalized proposal `p`.
     fn execute(&mut self, p: Proposal) {
-        let header = BlockHeader {
-            height: p.height,
-            parent_hash: p.parent,
-            timestamp_ms: p.timestamp_ms,
-            ..BlockHeader::default()
-        };
-        let participation = Participation {
-            evidence: p.evidence,
-            dkg: p.dkg,
-        }
-        .to_bytes();
-        self.effects.push(Effect::ExecuteBlock {
-            block: Block {
-                header: header.to_bytes(),
-                txs: p.txs,
-                participation,
-            },
-        });
+        self.effects
+            .push(Effect::ExecuteBlock { block: block_of(p) });
     }
 
     /// Begins re-executing, from the proposals and certificates this node

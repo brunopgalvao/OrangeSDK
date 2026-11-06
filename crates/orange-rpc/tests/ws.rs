@@ -888,3 +888,31 @@ fn a_socket_is_answered_before_the_node_stops_and_ends_with_it() {
     }
     stop.store(true, Ordering::SeqCst);
 }
+
+/// Tracing goes through the socket's dispatcher as through HTTP's: refused
+/// on a node that does not serve the `debug` namespace, served on one that
+/// does (spec 20 §8.5, §9).
+#[test]
+fn a_socket_traces_only_where_the_debug_namespace_is_served() {
+    let alice = Wallet::new(1);
+    let mut rpc = Rpc::new(node(&alice));
+    let hash = send_raw(&mut rpc, &alice.transfer(0, [9; 20], 1, 21_000));
+    mine(&mut rpc);
+    let listener = bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = Server::start(listener, Limits::default());
+    let mut client = Client::connect(addr, "");
+    opened(&server, &mut rpc, &mut client);
+    let trace = request(
+        1,
+        "debug_traceTransaction",
+        &json!([hash, {"tracer": "callTracer"}]),
+    );
+    let refused = ask(&server, &mut rpc, &mut client, &trace);
+    assert_eq!(refused["error"]["code"], -32601);
+    rpc.debug_allowed = true;
+    let traced = ask(&server, &mut rpc, &mut client, &trace);
+    assert_eq!(traced["result"]["gasUsed"], "0x5208");
+    assert_eq!(traced["result"]["to"], data(&[9; 20]));
+    assert_eq!(traced["result"]["type"], "CALL");
+}

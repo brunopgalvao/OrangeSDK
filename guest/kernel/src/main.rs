@@ -21,6 +21,7 @@ mod rotation;
 mod staking;
 mod state;
 mod stf;
+mod trace;
 mod tx;
 
 use alloc::vec::Vec;

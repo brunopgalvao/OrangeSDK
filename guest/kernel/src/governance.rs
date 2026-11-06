@@ -860,13 +860,7 @@ pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Out
         return crate::native::run(message, block, true);
     }
     let Some(request) = request_of(s, height) else {
-        return Outcome {
-            status: call_status::INVALID,
-            gas_used: 0,
-            output: Vec::new(),
-            logs: Vec::new(),
-            contract: None,
-        };
+        return Outcome::invalid();
     };
     let mut outcome = crate::native::run(message, block, true);
     if outcome.status == call_status::SUCCESS {
@@ -1075,6 +1069,7 @@ fn governed_call(
                 nonce: None,
                 access_list: Vec::new(),
                 authorization_list: Vec::new(),
+                trace: None,
             },
             block,
             true,

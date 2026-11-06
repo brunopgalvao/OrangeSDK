@@ -1,7 +1,7 @@
 //! The EVM conformance guest (spec 07 §4.2): runs one Ethereum state test
 //! case through the reference kernel's own EVM code.
 //!
-//! The kernel's `evm`, `native`, `outbox`, `modules`, `precompiles`, `state` and `tx` modules are
+//! The kernel's `evm`, `native`, `outbox`, `modules`, `precompiles`, `state`, `trace` and `tx` modules are
 //! compiled here from their source files, so there is one copy of the code
 //! under test: revm over the kernel's `StateDb` with the kernel's precompile
 //! provider (Ethereum's precompiles and native contracts), its commit of
@@ -37,6 +37,9 @@ mod precompiles;
 #[allow(dead_code)]
 #[path = "../../kernel/src/state.rs"]
 mod state;
+#[allow(dead_code)]
+#[path = "../../kernel/src/trace.rs"]
+mod trace;
 #[allow(dead_code)]
 #[path = "../../kernel/src/tx.rs"]
 mod tx;
@@ -89,6 +92,7 @@ fn run(case: Case, accelerated: bool) -> Outcome {
         nonce: Some(tx.nonce),
         access_list: tx.access_list,
         authorization_list,
+        trace: None,
     };
     let env = Env {
         chain_id: env.chain_id,

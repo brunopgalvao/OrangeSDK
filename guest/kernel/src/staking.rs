@@ -561,13 +561,7 @@ pub fn is_staking(s: &Signed) -> bool {
 /// then applies its action.
 pub fn run(s: &Signed, height: u64, message: Message, block: BlockFields) -> Outcome {
     let Some((action, id)) = action_of(s, height, true) else {
-        return Outcome {
-            status: call_status::INVALID,
-            gas_used: 0,
-            output: Vec::new(),
-            logs: Vec::new(),
-            contract: None,
-        };
+        return Outcome::invalid();
     };
     let report = matches!(action, StakingAction::Report { .. });
     let mut outcome = crate::native::run(message, block, true);

@@ -10,6 +10,7 @@ use orange_abi::chain::{
 };
 use orange_abi::codec::Seq;
 use orange_abi::fees::FeeStatus;
+use orange_abi::trace::{TraceBlockRequest, TraceCallRequest, TxTrace};
 use orange_abi::types::{
     self, Ahead, Block, Effect, ExecContext, ExecuteArgs, ExecuteResult, FinalizeArgs, Genesis,
     Input, QueryArgs, QueryResult, ValidateArgs, ValidateResult, exports,
@@ -39,6 +40,8 @@ pub struct NodeConfig {
     pub kernel_gas: i64,
     /// Gas budget per `kernel_query` call; see [`QUERY_GAS`].
     pub query_gas: i64,
+    /// Gas budget per tracing query; see [`TRACE_GAS`].
+    pub trace_gas: i64,
     /// How many of the latest executed blocks' states the node keeps to
     /// serve historical queries and proofs; see [`STATE_HISTORY`] and
     /// [`ARCHIVE`].
@@ -67,6 +70,7 @@ impl Default for NodeConfig {
             persisted: BTreeMap::new(),
             kernel_gas: KERNEL_GAS,
             query_gas: QUERY_GAS,
+            trace_gas: TRACE_GAS,
             state_history: STATE_HISTORY,
             history_keys_per_block: HISTORY_KEYS_PER_BLOCK,
             store: StoreConfig::Memory,
@@ -150,6 +154,26 @@ pub const HISTORY_KEYS_PER_BLOCK: usize = 512;
 /// (2026-10-20). Deploying the 2 KiB test contract takes about a million;
 /// ordinary calls take less.
 pub const QUERY_GAS: i64 = 1 << 26;
+
+/// Gas allowed to each tracing query (spec 20 §9), unless [`Node::kernel_gas`]
+/// is lower. Tracing a transaction executes again every transaction before it
+/// in its block, so it needs more than a call; 2^30 is sixteen query budgets,
+/// about fifty million EVM gas of plain opcodes, more than a full block of
+/// 30 million, and on the same measure 5 s to 50 s of the thread that drives
+/// consensus. A node that serves tracing to the public lowers it
+/// (`--trace-gas`).
+pub const TRACE_GAS: i64 = 1 << 30;
+
+/// A query's answer decoded: `None` when the kernel found nothing.
+fn decoded<T: Decode>(r: &QueryResult, what: &'static str) -> Result<Option<T>, NodeError> {
+    if r.status != 0 {
+        return Ok(None);
+    }
+    T::from_bytes(&r.body)
+        .ok()
+        .map(Some)
+        .ok_or(NodeError::Decode(what))
+}
 
 /// The kernel's storage namespace. Privileged instances use bare keys, so
 /// this value is only passed through.
@@ -245,6 +269,9 @@ pub struct Node {
     pub kernel_gas: i64,
     /// Gas budget for each kernel query, capped by `kernel_gas`; see [`QUERY_GAS`].
     pub query_gas: i64,
+    /// Gas budget for each tracing query, capped by `kernel_gas`; see
+    /// [`TRACE_GAS`].
+    pub trace_gas: i64,
     /// Raw transactions admitted since the last [`Node::take_tx_gossip`],
     /// for the transport to forward to peers.
     tx_gossip: Vec<Vec<u8>>,
@@ -351,6 +378,7 @@ impl Node {
             persisted_driver_state: None,
             kernel_gas: KERNEL_GAS,
             query_gas: config.query_gas,
+            trace_gas: config.trace_gas,
             tx_gossip: Vec::new(),
             state_history: config.state_history.max(1),
             history_keys_per_block: config.history_keys_per_block,
@@ -1375,6 +1403,17 @@ impl Node {
         params: &[u8],
         at: Option<u64>,
     ) -> Result<QueryResult, NodeError> {
+        self.query_within(method, params, at, self.query_gas)
+    }
+
+    /// [`Node::query_at`] within `budget`, capped by [`Node::kernel_gas`].
+    fn query_within(
+        &mut self,
+        method: &str,
+        params: &[u8],
+        at: Option<u64>,
+        budget: i64,
+    ) -> Result<QueryResult, NodeError> {
         let base = self.exec.state_mut().base_mut();
         let view = at.filter(|h| base.versions().is_none_or(|(_, latest)| *h != latest));
         base.set_view(view)
@@ -1387,7 +1426,7 @@ impl Node {
             params: params.to_vec(),
             at,
         };
-        let gas = self.query_gas.min(self.kernel_gas);
+        let gas = budget.min(self.kernel_gas);
         // A query changes nothing (spec 06 §6): whatever the kernel writes,
         // such as the precompile module of spec 19 §3.2, goes into a layer
         // dropped afterwards, so chain state and the kernel gas of the next
@@ -1461,13 +1500,7 @@ impl Node {
         at: Option<u64>,
     ) -> Result<Option<T>, NodeError> {
         let r = self.query_at(method, params, at)?;
-        if r.status != 0 {
-            return Ok(None);
-        }
-        T::from_bytes(&r.body)
-            .ok()
-            .map(Some)
-            .ok_or(NodeError::Decode("query"))
+        decoded(&r, "query")
     }
 
     /// Chain id from the kernel.
@@ -1628,6 +1661,52 @@ impl Node {
     ) -> Result<CallOutcome, NodeError> {
         self.query_decoded_at(orange_abi::chain::query::CALL, &request.to_bytes(), at)?
             .ok_or(NodeError::Decode(orange_abi::chain::query::CALL))
+    }
+
+    /// Traces the transactions of block `request.height`, or only
+    /// `request.tx` (spec 20 §9): the kernel executes the block again over
+    /// the state after the block before it, from the body the driver
+    /// finalized, within [`Node::trace_gas`]. `None` when the node has the
+    /// state but no longer the body; nothing for the genesis block.
+    ///
+    /// # Errors
+    /// As [`Node::query_at`], at the height before the block; a trace that
+    /// exhausts its budget is an out-of-gas [`NodeError::Kernel`].
+    pub fn trace_block(
+        &mut self,
+        request: &TraceBlockRequest,
+    ) -> Result<Option<Vec<TxTrace>>, NodeError> {
+        // The genesis block records no transactions.
+        let Some(at) = request.height.checked_sub(1) else {
+            return Ok(Some(Vec::new()));
+        };
+        let r = self.query_within(
+            orange_abi::trace::query::TRACE_BLOCK,
+            &request.to_bytes(),
+            Some(at),
+            self.trace_gas,
+        )?;
+        decoded::<Seq<TxTrace>>(&r, orange_abi::trace::query::TRACE_BLOCK).map(|t| t.map(|t| t.0))
+    }
+
+    /// Traces a call against the state after block `at`, as
+    /// [`Node::call_at`] runs it, within [`Node::trace_gas`].
+    ///
+    /// # Errors
+    /// As [`Node::query_at`].
+    pub fn trace_call(
+        &mut self,
+        request: &TraceCallRequest,
+        at: Option<u64>,
+    ) -> Result<TxTrace, NodeError> {
+        let r = self.query_within(
+            orange_abi::trace::query::TRACE_CALL,
+            &request.to_bytes(),
+            at,
+            self.trace_gas,
+        )?;
+        decoded(&r, orange_abi::trace::query::TRACE_CALL)?
+            .ok_or(NodeError::Decode(orange_abi::trace::query::TRACE_CALL))
     }
 
     /// Equivocation evidence recorded in chain state, from index `first`, at

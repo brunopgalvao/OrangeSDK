@@ -1,0 +1,10 @@
+{
+ "from": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+ "gas": "0x23a7c",
+ "gasUsed": "0xfc4a",
+ "to": "0xae519fc2ba8e6ffe6473195c092bf1bae986ff90",
+ "input": "0x603580600b6000396000f360016000527faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa60206000a1602a60005260206000f3",
+ "output": "0x60016000527faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa60206000a1602a60005260206000f3",
+ "value": "0x0",
+ "type": "CREATE"
+}
