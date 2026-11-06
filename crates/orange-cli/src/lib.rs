@@ -990,6 +990,19 @@ fn genesis_argument(
     Ok((genesis, bootnodes))
 }
 
+/// The JSON-RPC over `node` with what its options serve (spec 20 §8.5):
+/// `orange_stop` with `--rpc-stop` and without `--no-rpc-stop`, browser
+/// pages from `--rpc-cors` origins, and tracing on a development chain,
+/// which the tools that deploy to one expect, or with `--rpc-debug`.
+fn rpc_for(node: orange_node::Node, args: &[String], command: &str) -> orange_rpc::Rpc {
+    let mut rpc = orange_rpc::Rpc::new(node);
+    rpc.debug_allowed = command == "dev" || args.iter().any(|a| a == "--rpc-debug");
+    rpc.stop_allowed =
+        args.iter().any(|a| a == "--rpc-stop") && !args.iter().any(|a| a == "--no-rpc-stop");
+    rpc.cors = args_all(args, "--rpc-cors");
+    rpc
+}
+
 pub(crate) fn run_inner(
     args: &[String],
     keep_going: &mut dyn FnMut(&orange_rpc::Rpc) -> bool,
@@ -1061,13 +1074,7 @@ pub(crate) fn run_inner(
     node.start(resumed.clone())?;
     report_driver_state(&node, resumed.as_deref(), opened_at);
     let chain_name = node.chain_name();
-    let mut rpc = orange_rpc::Rpc::new(node);
-    // A development chain serves tracing to the tools that expect it; a
-    // node serves it only when told to (spec 20 §9).
-    rpc.debug_allowed = command == "dev" || args.iter().any(|a| a == "--rpc-debug");
-    rpc.stop_allowed =
-        args.iter().any(|a| a == "--rpc-stop") && !args.iter().any(|a| a == "--no-rpc-stop");
-    rpc.cors = args_all(args, "--rpc-cors");
+    let mut rpc = rpc_for(node, args, command);
     let listener = bind_rpc(rpc_addr, command, (chain_id, &chain_name), key.as_ref())?;
     let mut last_tick = Instant::now();
     let mut switches_seen = 0usize;
