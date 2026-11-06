@@ -389,6 +389,24 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     let transactions_root = mpt::ordered_root(&listed, state::keccak256);
     crate::modules::end_block(height, template.timestamp_ms);
     let system_logs = crate::governance::end_block(height, block);
+    // What the end of the block logged, in a receipt of no transaction after
+    // the block's own, whose logs the header's bloom covers too (spec 20
+    // §3.5, codex ADR 0058).
+    let system = (!system_logs.is_empty()).then(|| Receipt {
+        status: 1,
+        to: orange_abi::governance::GOVERNANCE_ADDRESS,
+        height,
+        index: receipts.len() as u32,
+        cumulative_gas_used: cumulative,
+        logs: Seq(system_logs),
+        ..Receipt::default()
+    });
+    if let Some(receipt) = &system {
+        header::accrue(
+            &mut logs_bloom,
+            &header::receipt_bloom(receipt, state::keccak256),
+        );
+    }
     // What the vault collected joins the reward pool before an epoch end
     // distributes it (spec 15 §10.2).
     fees::sweep();
@@ -410,19 +428,8 @@ pub fn execute(args: &ExecuteArgs) -> ExecuteResult {
     };
     let block_hash = header::block_hash(&header, state::keccak256);
     state::put_block(&header, &block_hash);
-    if !system_logs.is_empty() {
-        // What the end of the block logged, in a receipt of no transaction
-        // after the block's own (spec 20 §3.5).
+    if let Some(receipt) = system {
         let hash = state::keccak256(&orange_abi::chain::system_receipt_preimage(&block_hash));
-        let receipt = Receipt {
-            status: 1,
-            to: orange_abi::governance::GOVERNANCE_ADDRESS,
-            height,
-            index: receipts.len() as u32,
-            cumulative_gas_used: cumulative,
-            logs: Seq(system_logs),
-            ..Receipt::default()
-        };
         state::set(&[keys::RECEIPT, &hash[..]].concat(), &receipt);
     }
     ExecuteResult {

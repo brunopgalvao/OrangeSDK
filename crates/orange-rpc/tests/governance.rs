@@ -445,6 +445,40 @@ fn a_fast_track_execution_logs_in_the_system_receipt() {
     );
     let receipts = ok(&mut rpc, "eth_getBlockReceipts", json!([block]));
     assert_eq!(receipts.as_array().unwrap().len(), 1);
+    // The header's bloom covers the system log (spec 20 §3.5): it is the OR
+    // of the vote's receipt's bloom and the system receipt's, and a client
+    // that skips blocks by their bloom, filtering on the one topic only the
+    // system log has, keeps this block, where `eth_getLogs` finds that log.
+    let bloom = |v: &Value| -> [u8; 256] {
+        orange_rpc::methods::parse_hex(v.as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap()
+    };
+    let header = bloom(&ok(&mut rpc, "eth_getBlockByNumber", json!([block, false]))["logsBloom"]);
+    let ours = bloom(&receipts[0]["logsBloom"]);
+    let theirs = bloom(&system["logsBloom"]);
+    let or: Vec<u8> = ours.iter().zip(&theirs).map(|(a, b)| a | b).collect();
+    assert_eq!(header.to_vec(), or);
+    let wanted =
+        orange_eth::logs_bloom(&[(&GOVERNANCE_ADDRESS, &executed.topics.0[..1])], keccak256);
+    let admits = |b: &[u8; 256]| {
+        b.iter()
+            .zip(&wanted)
+            .all(|(have, want)| have & want == *want)
+    };
+    assert!(admits(&header));
+    assert!(admits(&theirs));
+    assert!(
+        !admits(&ours),
+        "the vote's bloom alone would skip the block"
+    );
+    let only = ok(
+        &mut rpc,
+        "eth_getLogs",
+        json!([{"fromBlock": block, "toBlock": block, "topics": [data(&executed.topics.0[0])]}]),
+    );
+    assert_eq!(only, json!([logs[1]]));
     // The proposal names it; the proposal it rejected is gone.
     assert_eq!(
         ok(&mut rpc, "orange_getProposal", json!(["0x2"])),

@@ -414,7 +414,7 @@ A `vote(id, true)` transaction with no other calldata uses 71 860 gas: its intri
 ### 9.10 Limits of this version
 
 - Votes weigh stake at the tally, not at the vote: a validator that leaves the set loses its vote, one that joins can vote, and stake bonded or unbonded during the voting period counts as it stands at the tally. Delegators vote with their bonded stake, any amount of it, in any number. Balances that are not bonded do not vote (ADR 0042): stake is what slashing and the unbonding period hold to account.
-- A fast-track proposal executes at the end of a block; its logs are in the block's system receipt (20 §3.5), which the header's roots and bloom do not cover and `eth_getBlockReceipts` does not list.
+- A fast-track proposal executes at the end of a block; its logs are in the block's system receipt (20 §3.5), which the header's roots do not cover and `eth_getBlockReceipts` does not list, and whose logs the header's logs bloom includes.
 - An executed proposal's `Execution` record stays in state for good, a few bytes per proposal.
 - A governed call is one call. A sequence that must be atomic is a contract the call invokes; several independent calls take several proposals.
 - A proposal carries one action. Several actions take several proposals, which may run at the same time within the bound.
