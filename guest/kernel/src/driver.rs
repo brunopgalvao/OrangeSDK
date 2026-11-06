@@ -133,6 +133,11 @@ fn key(prefix: &[u8], parts: &[&[u8]]) -> Vec<u8> {
 /// Most proposals one sync response carries, give or take one batch.
 const SYNC_BATCH: u64 = 16;
 
+/// Most bytes of encoded proposals one sync response carries, unless the
+/// shortest batch it can carry is longer (spec 08 §7a): half a frame of
+/// spec 09 §2, which leaves the rest for the certificates.
+const SYNC_BYTES: usize = 8 << 20;
+
 /// A validator set as ids and weights, in leader-rotation order.
 type Set = Vec<(Hash, u64)>;
 
@@ -1683,7 +1688,10 @@ impl Ctx {
     /// Serves finalized proposals from the requested height, never past the
     /// last block of that height's epoch, so the requester knows the set
     /// that certified them; a batch ends at the head of its certificate,
-    /// which can be a suffix proposal.
+    /// which can be a suffix proposal. A batch whose proposals pass
+    /// `SYNC_BYTES` is cut back to the longest that ends at a lower
+    /// height's certificate head and fits, or to the shortest there is, so
+    /// that every answer carries blocks and fits a frame (spec 08 §7a).
     fn on_request(&mut self, request_id: u64, payload: &[u8]) {
         let Ok(request) = SyncRequest::from_bytes(payload) else {
             return;
@@ -1702,37 +1710,73 @@ impl Ctx {
             if blocks != 0 {
                 top = top.min(epoch_end(epoch_of(from, blocks), blocks));
             }
-            if let Some(certificate) =
-                persist::get::<Certificate>(&key(b"cert/", &[&top.to_le_bytes()]))
-                && let Some(head) = Self::proposal(&certificate.hash)
-            {
-                let mut proposals = Vec::new();
-                let mut cursor = Some(head);
-                while let Some(p) = cursor {
-                    let height = p.height;
-                    cursor = if height > from {
-                        Self::proposal(&p.parent)
-                    } else {
-                        None
-                    };
-                    proposals.push(p);
-                    if height == from {
-                        break;
-                    }
-                }
-                if proposals.last().is_some_and(|p| p.height == from) {
-                    proposals.reverse();
-                    response.proposals = Seq(proposals);
-                    response.certificate = Some(certificate);
-                    response.threshold = persist::get_raw(&key(b"bcert/", &[&top.to_le_bytes()]))
-                        .unwrap_or_default();
-                }
+            if let Some((top, certificate, proposals)) = Self::batch(from, top) {
+                response.proposals = Seq(proposals);
+                response.certificate = Some(certificate);
+                response.threshold =
+                    persist::get_raw(&key(b"bcert/", &[&top.to_le_bytes()])).unwrap_or_default();
             }
         }
         self.effects.push(Effect::Respond {
             request_id,
             payload: response.to_bytes(),
         });
+    }
+
+    /// The batch from `from` that the certificate stored for `top`
+    /// finalizes, cut back within `SYNC_BYTES`: the height whose
+    /// certificate ends it, that certificate and the proposals, lowest
+    /// first; none when they do not link down to `from`.
+    fn batch(from: u64, top: u64) -> Option<(u64, Certificate, Vec<Proposal>)> {
+        let cert =
+            |height: u64| persist::get::<Certificate>(&key(b"cert/", &[&height.to_le_bytes()]));
+        let certificate = cert(top)?;
+        let mut proposals = Vec::new();
+        let mut cursor = Self::proposal(&certificate.hash);
+        while let Some(p) = cursor {
+            let height = p.height;
+            cursor = if height > from {
+                Self::proposal(&p.parent)
+            } else {
+                None
+            };
+            proposals.push(p);
+            if height == from {
+                break;
+            }
+        }
+        if proposals.last().is_none_or(|p| p.height != from) {
+            return None;
+        }
+        proposals.reverse();
+        // How many proposals from `from` on fit; at least the first counts.
+        let mut fits = 0u64;
+        let mut bytes = 0;
+        for p in &proposals {
+            bytes += encoded_len(p);
+            if bytes > SYNC_BYTES {
+                break;
+            }
+            fits += 1;
+        }
+        if fits == proposals.len() as u64 {
+            return Some((top, certificate, proposals));
+        }
+        // A batch must end at a certificate's head: the proposal whose
+        // successor's parent the certificate names. The highest height whose
+        // certificate ends a batch that fits gives the batch; failing that,
+        // `from`'s gives the shortest there is.
+        for height in (from..from + fits.max(1)).rev() {
+            let Some(lower) = cert(height) else { continue };
+            let Some(end) = proposals.iter().position(|p| p.parent == lower.hash) else {
+                continue;
+            };
+            if end as u64 <= fits || height == from {
+                proposals.truncate(end);
+                return Some((height, lower, proposals));
+            }
+        }
+        Some((top, certificate, proposals))
     }
 
     /// Verifies and adopts a sync response; asks for more if the peer is

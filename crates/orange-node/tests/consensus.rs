@@ -1992,3 +1992,121 @@ fn tip_fetching_messages_are_checked_and_bounded() {
         &keccak256(&lacking(v, unknown, st1.tip_height + 2).to_bytes())
     ));
 }
+
+/// Most bytes of proposals one sync answer carries (spec 08 §7a).
+const SYNC_BYTES: usize = 8 << 20;
+
+/// An observer that the test hands, signed by its validators, the
+/// proposals of `heights` with about `bytes` of junk transactions each, in
+/// the views after its current one, and the votes that notarize each;
+/// with `together`, the finalize votes for the last alone, which finalize
+/// them all under one certificate, and otherwise each its own.
+fn finalize_big(
+    node: &mut Node,
+    keys: &[SigningKey],
+    heights: std::ops::RangeInclusive<u64>,
+    bytes: usize,
+    together: bool,
+) {
+    let last = *heights.end();
+    for height in heights {
+        let state = node.simplex_state().unwrap();
+        let view = state.view;
+        let proposal = Proposal {
+            view,
+            height,
+            parent: state.tip_hash,
+            timestamp_ms: state.tip_timestamp_ms.max(node.now_ms()) + 1,
+            txs: Seq(vec![vec![0xAB; bytes / 8]; 8]),
+            ..Proposal::default()
+        };
+        let hash = keccak256(&proposal.to_bytes());
+        let leader = &keys[leader(view, keys.len())];
+        node.deliver(validator_id(leader), TOPIC, propose(leader, proposal))
+            .unwrap();
+        for key in &keys[..3] {
+            node.deliver(validator_id(key), TOPIC, vote(key, view, hash))
+                .unwrap();
+        }
+        if !together || height == last {
+            for key in &keys[..3] {
+                node.deliver(validator_id(key), TOPIC, finalize(key, view, hash))
+                    .unwrap();
+            }
+        }
+    }
+    assert_eq!(node.finalized_height().unwrap(), last);
+}
+
+/// What `node` answers a peer's sync request from `from`.
+fn sync_answer(node: &mut Node, from: u64) -> SyncResponse {
+    use orange_abi::chain::SyncRequest;
+    use orange_abi::types::Input;
+    node.take_outbound();
+    node.step(Input::Request {
+        peer: [7; 32],
+        request_id: 1,
+        payload: SyncRequest { from_height: from }.to_bytes(),
+    })
+    .unwrap();
+    node.take_outbound()
+        .into_iter()
+        .find_map(|m| match m {
+            Outbound::Respond { payload, .. } => Some(SyncResponse::from_bytes(&payload).unwrap()),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// The heights of an answer's proposals, its bytes of proposals, and
+/// whether its certificate names its last proposal.
+fn shape(answer: &SyncResponse) -> (Vec<u64>, usize, bool) {
+    let proposals = &answer.proposals.0;
+    let bytes = proposals.iter().map(|p| p.to_bytes().len()).sum();
+    let certified = answer.certificate.as_ref().map(|c| c.hash)
+        == proposals.last().map(|p| keccak256(&p.to_bytes()));
+    (
+        proposals.iter().map(|p| p.height).collect(),
+        bytes,
+        certified,
+    )
+}
+
+/// A sync answer carries at most `SYNC_BYTES` of proposals, cut back to
+/// end at the head of a lower height's certificate, unless the shortest
+/// batch there is is longer, so that it always carries blocks (spec 08
+/// §7a). Before, sixteen proposals near the 2 MiB cap made an answer longer
+/// than a frame of spec 09 §2, which the asker closed the connection on,
+/// and on the same answer every time it asked again.
+#[test]
+fn sync_answers_are_cut_back_to_fit_a_frame() {
+    let keys = keys(4);
+    let genesis = genesis(&keys, address(&keys[0]));
+    let mut node = Node::open(kernel_module(), &genesis, at(10_000)).unwrap();
+    node.start(None).unwrap();
+    let mib = 1 << 20;
+    // Six blocks of nearly 2 MiB, each finalized alone: four fit.
+    finalize_big(&mut node, &keys, 1..=6, 2 * mib - 4_096, false);
+    let (heights, bytes, certified) = shape(&sync_answer(&mut node, 1));
+    assert_eq!(heights, vec![1, 2, 3, 4]);
+    assert!(bytes <= SYNC_BYTES && certified, "{bytes}");
+    // Three more under one certificate: from 5, only 5 and 6 end at a
+    // certificate's head and fit; from 7, all three fit.
+    finalize_big(&mut node, &keys, 7..=9, 2 * mib - 4_096, true);
+    let (heights, _, certified) = shape(&sync_answer(&mut node, 5));
+    assert_eq!(heights, vec![5, 6]);
+    assert!(certified);
+    let (heights, _, certified) = shape(&sync_answer(&mut node, 7));
+    assert_eq!(heights, vec![7, 8, 9]);
+    assert!(certified);
+    // Five under one certificate are the shortest batch from 10, however long.
+    finalize_big(&mut node, &keys, 10..=14, 2 * mib - 4_096, true);
+    let (heights, bytes, certified) = shape(&sync_answer(&mut node, 10));
+    assert_eq!(heights, vec![10, 11, 12, 13, 14]);
+    assert!(bytes > SYNC_BYTES && certified, "{bytes}");
+    // Small blocks are served sixteen at a time, as before.
+    finalize_big(&mut node, &keys, 15..=40, 1_000, false);
+    let (heights, _, certified) = shape(&sync_answer(&mut node, 15));
+    assert_eq!(heights, (15..=30).collect::<Vec<_>>());
+    assert!(certified);
+}

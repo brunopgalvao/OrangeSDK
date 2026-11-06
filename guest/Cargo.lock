@@ -580,12 +580,12 @@ name = "evm-conformance"
 version = "0.0.1"
 dependencies = [
  "alloy-primitives",
- "revm",
  "orange-abi",
  "orange-eth",
  "orange-guest",
  "orange-rlp",
  "orange-upgrade",
+ "revm",
 ]
 
 [[package]]
@@ -731,13 +731,13 @@ name = "kernel"
 version = "0.0.1"
 dependencies = [
  "alloy-primitives",
- "revm",
  "orange-abi",
  "orange-eth",
  "orange-ethlc",
  "orange-guest",
  "orange-rlp",
  "orange-upgrade",
+ "revm",
 ]
 
 [[package]]
@@ -836,6 +836,49 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "orange-abi"
+version = "0.0.1"
+
+[[package]]
+name = "orange-eth"
+version = "0.0.1"
+dependencies = [
+ "orange-abi",
+ "orange-rlp",
+]
+
+[[package]]
+name = "orange-ethlc"
+version = "0.0.1"
+dependencies = [
+ "orange-abi",
+ "orange-rlp",
+]
+
+[[package]]
+name = "orange-guest"
+version = "0.0.1"
+
+[[package]]
+name = "orange-module"
+version = "0.0.1"
+dependencies = [
+ "orange-abi",
+ "orange-guest",
+]
+
+[[package]]
+name = "orange-rlp"
+version = "0.0.1"
+
+[[package]]
+name = "orange-upgrade"
+version = "0.0.1"
+dependencies = [
+ "orange-abi",
+]
 
 [[package]]
 name = "p256"
@@ -1291,49 +1334,6 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest 0.10.7",
  "rand_core 0.6.4",
-]
-
-[[package]]
-name = "orange-abi"
-version = "0.0.1"
-
-[[package]]
-name = "orange-eth"
-version = "0.0.1"
-dependencies = [
- "orange-abi",
- "orange-rlp",
-]
-
-[[package]]
-name = "orange-ethlc"
-version = "0.0.1"
-dependencies = [
- "orange-abi",
- "orange-rlp",
-]
-
-[[package]]
-name = "orange-guest"
-version = "0.0.1"
-
-[[package]]
-name = "orange-module"
-version = "0.0.1"
-dependencies = [
- "orange-abi",
- "orange-guest",
-]
-
-[[package]]
-name = "orange-rlp"
-version = "0.0.1"
-
-[[package]]
-name = "orange-upgrade"
-version = "0.0.1"
-dependencies = [
- "orange-abi",
 ]
 
 [[package]]

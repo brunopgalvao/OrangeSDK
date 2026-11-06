@@ -135,12 +135,16 @@ impl Session {
     /// follows), the encrypted frame and its tag, with the length as the
     /// associated data. `None` once this direction's counter is spent.
     pub fn seal(&mut self, frame: &Frame) -> Option<Vec<u8>> {
-        let body = frame.to_bytes();
+        self.seal_encoded(&frame.to_bytes())
+    }
+
+    /// [`Session::seal`] of a frame already encoded as `body`.
+    pub fn seal_encoded(&mut self, body: &[u8]) -> Option<Vec<u8>> {
         let header = u32::try_from(body.len() + TAG).ok()?.to_le_bytes();
         let nonce = self.send.next()?;
         let mut out = Vec::with_capacity(4 + body.len() + TAG);
         out.extend_from_slice(&header);
-        out.extend_from_slice(&body);
+        out.extend_from_slice(body);
         let cipher = &self.send.cipher;
         let tag = cipher.encrypt_in_place_detached(&nonce, &header, &mut out[4..]);
         out.extend_from_slice(&tag.ok()?);

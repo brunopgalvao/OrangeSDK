@@ -545,10 +545,22 @@ impl Conn {
 
     /// Queues `frame` sealed under the session; a connection without one,
     /// whose counter is spent, or whose queue it would put past its cap, is
-    /// closed instead (spec 09 §5b).
+    /// closed instead (spec 09 §5b). A frame longer than [`MAX_FRAME`],
+    /// which the peer would close the connection on (spec 09 §2), is never
+    /// sealed: it is dropped and said on standard error, and the connection
+    /// goes on.
     fn send(&mut self, frame: &Frame) {
+        let body = frame.to_bytes();
+        if body.len() > MAX_FRAME {
+            eprintln!(
+                "p2p: dropped a {} frame of {} bytes, past the {MAX_FRAME} a peer accepts",
+                frame.kind(),
+                body.len()
+            );
+            return;
+        }
         let room = self.max_output.saturating_sub(self.outbuf.len());
-        let sealed = self.session.as_mut().and_then(|s| s.seal(frame));
+        let sealed = self.session.as_mut().and_then(|s| s.seal_encoded(&body));
         let sealed = sealed.filter(|b| b.len() <= room);
         self.dead |= sealed.is_none();
         self.outbuf.bytes.extend(sealed.unwrap_or_default());
@@ -1731,6 +1743,37 @@ mod tests {
         );
         let mut script = Script(vec![]);
         assert!(Write::flush(&mut script).is_ok());
+    }
+
+    /// A frame longer than a peer accepts is dropped before it is sealed,
+    /// and the connection goes on: sent, the peer would close it, and an
+    /// answer it asks again for would close it every time (spec 09 §2).
+    #[test]
+    fn a_frame_past_the_limit_is_dropped_not_sent() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let ours = Ephemeral::from_seed(&[1; 32]);
+        let theirs = Ephemeral::from_seed(&[2; 32]);
+        let side = |nonce, e: &Ephemeral| Side {
+            nonce,
+            ephemeral: e.public(),
+        };
+        let (mine, other) = (side([3; 32], &ours), side([4; 32], &theirs));
+        let hello = Frame::GetPeers;
+        let mut conn = Conn::new(stream, (mine, ours), &hello, MAX_OUTPUT, 0);
+        let ephemeral = conn.ephemeral.take().unwrap();
+        conn.session = Session::new(ephemeral, 7, &[9; 32], &mine, &other);
+        conn.outbuf = Buffer::default();
+        // A `Tx` frame is its tag, a length of four bytes and the bytes.
+        let at = |n: usize| Frame::Tx {
+            raw: vec![0; n - 5],
+        };
+        assert_eq!(at(MAX_FRAME + 1).to_bytes().len(), MAX_FRAME + 1);
+        conn.send(&at(MAX_FRAME + 1));
+        assert!(!conn.dead && conn.outbuf.is_empty());
+        conn.send(&at(MAX_FRAME));
+        assert!(!conn.dead);
+        assert_eq!(conn.outbuf.len(), 4 + MAX_FRAME + TAG);
     }
 
     #[test]
