@@ -43,7 +43,8 @@
 #   ORANGE_ROLE=validator|rpc|bootnode  ORANGE_NAME=<name>
 #   ORANGE_LISTEN=<ip:port to bind for peers>   ORANGE_ADVERTISE=<ip:port peers dial>
 #   ORANGE_RPC=<private ip:port of JSON-RPC, /metrics, /status>
-#   ORANGE_BOOTSTRAP="<ip:port> ..."    beyond the genesis bootnodes
+#   ORANGE_BOOTSTRAP="<ip:port|host:port> ..."  beyond the genesis bootnodes;
+#                                     a name is resolved at every dial
 #   ORANGE_GENESIS_HASH=0x...           the published hash check-config checks
 #   ORANGE_PUBLIC_RPC=1                 the RPC faces the public: no orange_stop
 #                                       (without it the node gets --rpc-stop)

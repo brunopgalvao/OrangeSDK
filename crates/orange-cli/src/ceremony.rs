@@ -3,9 +3,9 @@
 //!
 //! ```text
 //! orange key generate --out <key file>                      # each operator, on their own machine
-//! orange genesis operator --key-file <key> --name <name> --chain-id <id> [--p2p <ip:port>] --out <card.json>
+//! orange genesis operator --key-file <key> --name <name> --chain-id <id> [--p2p <ip:port|host:port>] --out <card.json>
 //! orange genesis assemble --template <template.json> --kernel <kernel> --operator <card.json>...
-//!                       [--bootnode <ip:port>]... [--genesis-time <unix seconds>]
+//!                       [--bootnode <ip:port|host:port>]... [--genesis-time <unix seconds>]
 //!                       [--operator-funding <wei>] --out <genesis.json>   # the coordinator
 //! orange genesis hash --genesis <genesis.json> --kernel <kernel>
 //! orange genesis verify --genesis <genesis.json> --kernel <kernel> --hash <0x genesis hash>
@@ -30,7 +30,8 @@
 //! signed with the consensus key over [`card_digest`], so the coordinator
 //! knows each card comes from the holder of its key and is meant for this
 //! chain. `p2p`, optional, is the address the operator's node listens on for
-//! peers, listed in the genesis as a bootnode.
+//! peers, listed in the genesis as a bootnode: an `ip:port`, or a
+//! `host:port` that nodes resolve at every dial (spec 09 §5a.5).
 //!
 //! `assemble` reads a *template*, a genesis file without validators (its
 //! chain id, genesis time, slot, fee market, staking epochs, governance and
@@ -62,11 +63,11 @@
 //! (spec 09 §3).
 
 use std::fmt::Write as _;
-use std::net::SocketAddr;
 use std::path::Path;
 
 use k256::ecdsa::SigningKey;
 use orange_host::hash::keccak256;
+use orange_node::PeerAddr;
 use orange_rpc::methods::{data, parse_hex};
 use serde_json::{Map, Value, json};
 
@@ -91,13 +92,13 @@ pub struct Operator {
     /// DKG encryption key (spec 15 §2), 48 bytes.
     pub dkg_key: Vec<u8>,
     /// The address its node listens on for peers, if it serves as a bootnode.
-    pub p2p: Option<SocketAddr>,
+    pub p2p: Option<PeerAddr>,
 }
 
 impl Operator {
     /// The operator holding `key`.
     #[must_use]
-    pub fn of_key(key: &SigningKey, name: &str, p2p: Option<SocketAddr>) -> Operator {
+    pub fn of_key(key: &SigningKey, name: &str, p2p: Option<PeerAddr>) -> Operator {
         Operator {
             name: name.to_owned(),
             id: orange_node::validator_id(key),
@@ -122,7 +123,11 @@ impl Operator {
 /// address empty when the card names none.
 #[must_use]
 pub fn card_digest(chain_id: u64, operator: &Operator) -> [u8; 32] {
-    let p2p = operator.p2p.map(|a| a.to_string()).unwrap_or_default();
+    let p2p = operator
+        .p2p
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
     let len = |b: &[u8]| u32::try_from(b.len()).unwrap_or(u32::MAX).to_be_bytes();
     keccak256(
         &[
@@ -146,10 +151,10 @@ pub fn card(
     key: &SigningKey,
     name: &str,
     chain_id: u64,
-    p2p: Option<SocketAddr>,
+    p2p: Option<PeerAddr>,
 ) -> Result<Value, String> {
     check_name(name)?;
-    let operator = Operator::of_key(key, name, p2p);
+    let operator = Operator::of_key(key, name, p2p.clone());
     let signature = orange_node::sign_recoverable(key, &card_digest(chain_id, &operator))
         .ok_or("card: the key cannot sign")?;
     let mut card = json!({
@@ -213,9 +218,8 @@ pub fn read_card(card: &Value, chain_id: u64) -> Result<Operator, String> {
         None => None,
         Some(addr) => Some(
             addr.as_str()
-                .and_then(|a| a.parse().ok())
-                .filter(orange_node::peers::dialable)
-                .ok_or("p2p must be an ip:port peers can dial")?,
+                .and_then(PeerAddr::dialable)
+                .ok_or("p2p must be an ip:port peers can dial or a host:port")?,
         ),
     };
     let operator = Operator {
@@ -253,7 +257,7 @@ pub fn assemble(
     template: &Value,
     operators: &[Operator],
     funding: &str,
-    extra_bootnodes: &[SocketAddr],
+    extra_bootnodes: &[PeerAddr],
 ) -> Result<Value, String> {
     let mut genesis = template.clone();
     let Some(fields) = genesis.as_object_mut() else {
@@ -294,11 +298,11 @@ pub fn assemble(
     }
     let mut bootnodes: Vec<String> = Vec::new();
     let listed = bootnodes_of(template)?;
-    let addresses = operators.iter().filter_map(|o| o.p2p);
+    let addresses = operators.iter().filter_map(|o| o.p2p.clone());
     for addr in listed
         .into_iter()
         .chain(addresses)
-        .chain(extra_bootnodes.iter().copied())
+        .chain(extra_bootnodes.iter().cloned())
     {
         let addr = addr.to_string();
         if !bootnodes.contains(&addr) {
@@ -315,25 +319,21 @@ pub fn assemble(
 /// for peer exchange beside its `--bootstrap` ones; none without the field.
 ///
 /// # Errors
-/// If it is not a list of `ip:port` addresses peers can dial.
-pub fn bootnodes(v: &Value) -> Result<Vec<SocketAddr>, String> {
+/// If it is not a list of `ip:port` addresses peers can dial or
+/// `host:port` names.
+pub fn bootnodes(v: &Value) -> Result<Vec<PeerAddr>, String> {
     bootnodes_of(v)
 }
 
-fn bootnodes_of(v: &Value) -> Result<Vec<SocketAddr>, String> {
+fn bootnodes_of(v: &Value) -> Result<Vec<PeerAddr>, String> {
     let Some(list) = v.get("bootnodes") else {
         return Ok(Vec::new());
     };
-    let wrong = || "genesis: bootnodes must be a list of ip:port addresses peers can dial";
+    let wrong = || "genesis: bootnodes must be a list of ip:port addresses peers can dial or host:port names";
     list.as_array()
         .ok_or_else(wrong)?
         .iter()
-        .map(|a| {
-            a.as_str()
-                .and_then(|a| a.parse().ok())
-                .filter(orange_node::peers::dialable)
-                .ok_or_else(wrong)
-        })
+        .map(|a| a.as_str().and_then(PeerAddr::dialable).ok_or_else(wrong))
         .collect::<Result<_, _>>()
         .map_err(str::to_owned)
 }
@@ -366,14 +366,13 @@ fn kernel_argument(args: &[String]) -> Result<Vec<u8>, String> {
     load_kernel(&required(args, "--kernel")?)
 }
 
-fn p2p_argument(args: &[String], flag: &str) -> Result<Vec<SocketAddr>, String> {
+fn p2p_argument(args: &[String], flag: &str) -> Result<Vec<PeerAddr>, String> {
     args_all(args, flag)
         .iter()
         .map(|a| {
-            a.parse()
-                .ok()
-                .filter(orange_node::peers::dialable)
-                .ok_or_else(|| format!("{flag} {a}: expected an ip:port peers can dial"))
+            PeerAddr::dialable(a).ok_or_else(|| {
+                format!("{flag} {a}: expected an ip:port peers can dial or a host:port")
+            })
         })
         .collect()
 }
@@ -384,9 +383,9 @@ fn operator_command(args: &[String]) -> Result<String, String> {
     let name = required(args, "--name")?;
     check_name(&name)?;
     let chain_id = crate::parse_number(args, "--chain-id")?.ok_or("--chain-id is required")?;
-    let p2p = p2p_argument(args, "--p2p")?.first().copied();
+    let p2p = p2p_argument(args, "--p2p")?.first().cloned();
     let out = required(args, "--out")?;
-    let card = card(&key, &name, chain_id, p2p)?;
+    let card = card(&key, &name, chain_id, p2p.clone())?;
     let text = serde_json::to_string_pretty(&card).expect("json") + "\n";
     std::fs::write(&out, text).map_err(|e| format!("{out}: {e}"))?;
     Ok(format!(

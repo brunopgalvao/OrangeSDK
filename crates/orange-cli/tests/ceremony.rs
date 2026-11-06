@@ -305,7 +305,7 @@ fn every_ceremony_mistake_is_named() {
             "--p2p",
             "0.0.0.0:1"
         ]),
-        "--p2p 0.0.0.0:1: expected an ip:port peers can dial"
+        "--p2p 0.0.0.0:1: expected an ip:port peers can dial or a host:port"
     );
     assert_eq!(
         op(&["--key-file", &key, "--name", "a", "--chain-id", "1"]),
@@ -371,7 +371,7 @@ fn every_ceremony_mistake_is_named() {
     assert!(bad(&|c| c["name"] = json!("")).contains("1 to 64"));
     assert_eq!(
         bad(&|c| c["p2p"] = json!("nowhere")),
-        "p2p must be an ip:port peers can dial"
+        "p2p must be an ip:port peers can dial or a host:port"
     );
     assert_eq!(
         bad(&|c| c["validator"] = json!("0x00")),
@@ -469,7 +469,7 @@ fn every_ceremony_mistake_is_named() {
     );
     assert_eq!(
         with(&["--out", &out, "--operator", &card, "--bootnode", "x"]),
-        "--bootnode x: expected an ip:port peers can dial"
+        "--bootnode x: expected an ip:port peers can dial or a host:port"
     );
     assert_eq!(
         with(&["--out", &out, "--operator", &card, "--operator", &card]),
@@ -509,7 +509,7 @@ fn every_ceremony_mistake_is_named() {
     write_json(&template_path, &t);
     assert_eq!(
         with(&["--out", &out, "--operator", &card]),
-        "genesis: bootnodes must be a list of ip:port addresses peers can dial"
+        "genesis: bootnodes must be a list of ip:port addresses peers can dial or host:port names"
     );
     // A template without staking gets no DKG keys; one that funds an
     // operator keeps its amount, whatever the case of its address.
@@ -561,9 +561,22 @@ fn every_ceremony_mistake_is_named() {
             .unwrap_err()
             .starts_with("the kernel refuses this genesis: "),
     );
+    // A bootnode may be a name, which nodes resolve at every dial (spec 09
+    // §5a.5), and so may a card's p2p address, which its signature covers.
+    let named =
+        ceremony::bootnodes(&json!({"bootnodes": ["seed.example.org:30333", "10.0.0.1:1"]}));
+    let named: Vec<String> = named.unwrap().iter().map(ToString::to_string).collect();
+    assert_eq!(named, ["seed.example.org:30333", "10.0.0.1:1"]);
+    {
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x42; 32]).unwrap();
+        let p2p = "orange-0.example.org:30333".parse().ok();
+        let card = ceremony::card(&key, "a", 1, p2p.clone()).unwrap();
+        assert_eq!(card["p2p"], json!("orange-0.example.org:30333"));
+        assert_eq!(ceremony::read_card(&card, 1).unwrap().p2p, p2p);
+    }
     assert_eq!(
         ceremony::bootnodes(&json!({"bootnodes": ["0.0.0.0:1"]})),
-        Err("genesis: bootnodes must be a list of ip:port addresses peers can dial".to_owned())
+        Err("genesis: bootnodes must be a list of ip:port addresses peers can dial or host:port names".to_owned())
     );
     // A name is a chain name, and the kernel refuses any other one that
     // reaches it.

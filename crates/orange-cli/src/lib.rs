@@ -18,7 +18,8 @@
 //! `orange node --sync-from-peers` fetches one from its `--peer`s instead
 //! (spec 22 §7.4), and `--serve-snapshots` serves them to such nodes.
 //! `orange node` runs peer exchange (spec 09 §5a) unless `--no-discovery`: it
-//! learns the network from its `--peer`s and `--bootstrap` addresses, keeps
+//! learns the network from its `--peer`s and `--bootstrap` addresses (each
+//! an `ip:port` or a `host:port`, whose name is resolved at every dial), keeps
 //! up to `--outbound-peers` connections it dials itself, accepts up to
 //! `--max-peers` (with or without peer exchange), and advertises
 //! `--advertise` (by default its listen address) in a record signed with
@@ -128,10 +129,10 @@ pub const DEFAULT_RPC: &str = "127.0.0.1:8545";
 /// Usage line printed on a command-line mistake.
 pub const USAGE: &str = "usage:
   orange dev  --kernel <kernel.elf|kernel.orange> --genesis <genesis.json> [--rpc 127.0.0.1:8545] [--rpc-stop] [--rpc-cors <origin>]... [--blocks <n>] [--kernel-gas <n>] [--query-gas <n>] [--state-history <blocks> | --archive] [--data-dir <dir>]
-  orange node --kernel <kernel.elf|kernel.orange> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--snapshot <file> | --sync-from-peers] [--trust-key <id>:<0x 96 bytes> | <0x 96 bytes>] [--serve-snapshots] [--listen 127.0.0.1:30333] [--peer <addr>]... [--bootstrap <addr>]... [--max-peers 32] [--outbound-peers 8] [--advertise <addr>] [--no-discovery] [--node-key-file <path>] [--rpc 127.0.0.1:8545] [--rpc-stop] [--rpc-cors <origin>]... [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
+  orange node --kernel <kernel.elf|kernel.orange> --genesis <genesis.json> [--key <64 hex> | --key-file <path>] [--data-dir <dir>] [--snapshot <file> | --sync-from-peers] [--trust-key <id>:<0x 96 bytes> | <0x 96 bytes>] [--serve-snapshots] [--listen 127.0.0.1:30333] [--peer <ip:port|host:port>]... [--bootstrap <ip:port|host:port>]... [--max-peers 32] [--outbound-peers 8] [--advertise <ip:port>] [--no-discovery] [--node-key-file <path>] [--rpc 127.0.0.1:8545] [--rpc-stop] [--rpc-cors <origin>]... [--blocks <n>] [--query-gas <n>] [--state-history <blocks> | --archive]
   orange key  <64 hex> | --key-file <path> | generate --out <path>
-  orange genesis operator --key-file <key> --name <name> --chain-id <id> [--p2p <ip:port>] --out <card.json>
-  orange genesis assemble --template <template.json> --kernel <kernel> --operator <card.json>... [--bootnode <ip:port>]... [--genesis-time <unix seconds>] [--operator-funding <wei>] --out <genesis.json>
+  orange genesis operator --key-file <key> --name <name> --chain-id <id> [--p2p <ip:port|host:port>] --out <card.json>
+  orange genesis assemble --template <template.json> --kernel <kernel> --operator <card.json>... [--bootnode <ip:port|host:port>]... [--genesis-time <unix seconds>] [--operator-funding <wei>] --out <genesis.json>
   orange genesis hash --genesis <genesis.json> --kernel <kernel>
   orange genesis verify --genesis <genesis.json> --kernel <kernel> --hash <0x genesis hash> [--key-file <key>] [--operator <card.json>]...
   orange snapshot export --data-dir <dir> --out <file> [--epoch <n>] | verify --snapshot <file> --genesis <genesis.json> [--trust-key <id>:<0x 96 bytes> | <0x 96 bytes>] | import --snapshot <file> --data-dir <dir> --kernel <kernel> --genesis <genesis.json> [--trust-key <id>:<0x 96 bytes> | <0x 96 bytes>] | trust-key --rpc <addr,...>
@@ -540,18 +541,19 @@ fn report(result: Result<(), orange_node::NodeError>) {
     }
 }
 
-fn parse_peers(args: &[String]) -> Result<Vec<std::net::SocketAddr>, String> {
+fn parse_peers(args: &[String]) -> Result<Vec<orange_node::PeerAddr>, String> {
     parse_addresses(args, "--peer")
 }
 
-/// Every address given with `flag`, each `ip:port`.
-fn parse_addresses(args: &[String], flag: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+/// Every address given with `flag`, each an `ip:port` or a `host:port`
+/// whose name is resolved at every dial (spec 09 §5).
+fn parse_addresses(args: &[String], flag: &str) -> Result<Vec<orange_node::PeerAddr>, String> {
     args_all(args, flag)
         .into_iter()
         .map(|peer| {
             peer.parse()
                 .ok()
-                .ok_or_else(|| format!("{flag} {peer}: expected ip:port"))
+                .ok_or_else(|| format!("{flag} {peer}: expected ip:port or host:port"))
         })
         .collect()
 }
@@ -563,7 +565,7 @@ fn parse_addresses(args: &[String], flag: &str) -> Result<Vec<std::net::SocketAd
 fn discovery(
     args: &[String],
     key: Option<k256::ecdsa::SigningKey>,
-    genesis_bootnodes: &[std::net::SocketAddr],
+    genesis_bootnodes: &[orange_node::PeerAddr],
 ) -> Result<(Option<orange_node::Discovery>, usize), String> {
     let defaults = orange_node::Discovery::default();
     let limit = |flag: &str, default: usize| -> Result<usize, String> {
@@ -589,7 +591,7 @@ fn discovery(
     for addr in genesis_bootnodes {
         let me = own.iter().flatten().any(|a| *a == addr.to_string());
         if !me && !bootstrap.contains(addr) {
-            bootstrap.push(*addr);
+            bootstrap.push(addr.clone());
         }
     }
     let max_peers = limit("--max-peers", defaults.max_peers)?;
@@ -651,8 +653,8 @@ fn key_command(args: &[String]) -> Result<String, String> {
 fn bind_transport(
     args: &[String],
     node: &orange_node::Node,
-    (chain_id, genesis_bootnodes): (u64, &[std::net::SocketAddr]),
-    peers: Vec<std::net::SocketAddr>,
+    (chain_id, genesis_bootnodes): (u64, &[orange_node::PeerAddr]),
+    peers: Vec<orange_node::PeerAddr>,
 ) -> Result<orange_node::Transport, CliError> {
     let listen_arg = arg(args, "--listen");
     let listen = listen_arg.as_deref().unwrap_or(DEFAULT_LISTEN);
@@ -668,7 +670,7 @@ fn bind_transport(
     };
     let (discovery, max_peers) = discovery(args, lasting, genesis_bootnodes)?;
     let genesis = node.genesis_hash();
-    let mut t = match orange_node::Transport::bind(listen, key, chain_id, genesis, peers) {
+    let mut t = match orange_node::Transport::bind_named(listen, key, chain_id, genesis, peers) {
         Ok(t) => t,
         Err(e) => return Err(format!("{listen}: {e}").into()),
     };
@@ -969,7 +971,7 @@ fn check_options(args: &[String], command: &str) -> Result<(), CliError> {
 fn genesis_argument(
     args: &[String],
     command: &str,
-) -> Result<(Genesis, Vec<std::net::SocketAddr>), CliError> {
+) -> Result<(Genesis, Vec<orange_node::PeerAddr>), CliError> {
     let genesis_path = arg(args, "--genesis").ok_or("--genesis is required")?;
     let genesis_text = match std::fs::read_to_string(&genesis_path) {
         Ok(text) => text,

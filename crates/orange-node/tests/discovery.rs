@@ -181,7 +181,7 @@ fn one_bootstrap_address_finds_the_network_and_outlives_it() {
             Some(key),
             key,
             Some(Discovery {
-                bootstrap: vec![boot],
+                bootstrap: vec![boot.into()],
                 ..Discovery::default()
             }),
         );
@@ -276,7 +276,7 @@ fn forged_records_are_refused_and_a_flood_displaces_no_good_peer() {
         Some(&keys[0]),
         &keys[0],
         Some(Discovery {
-            bootstrap: vec![net.addr(0)],
+            bootstrap: vec![net.addr(0).into()],
             ..Discovery::default()
         }),
     );
@@ -396,7 +396,7 @@ fn dials_are_judged_by_their_handshakes() {
     let own = net.addr(me);
     net.transports[me].enable_discovery(Discovery {
         key: Some(keys[0].clone()),
-        bootstrap: vec![closed, own],
+        bootstrap: vec![closed.into(), own.into()],
         ..Discovery::default()
     });
     // A listener the test answers for, advertised by key X.
@@ -630,13 +630,13 @@ fn a_restarted_node_keeps_the_peers_that_answered() {
         None,
         &stranger(2),
         Some(Discovery {
-            bootstrap: boot.clone(),
+            bootstrap: boot.iter().map(|&a| a.into()).collect(),
             ..Discovery::default()
         }),
     );
     let me = stranger(3);
     let keeping = Discovery {
-        bootstrap: boot,
+        bootstrap: boot.into_iter().map(Into::into).collect(),
         peer_file: Some(file.clone()),
         ..Discovery::default()
     };
@@ -752,7 +752,7 @@ fn a_table_that_takes_every_dial_leaves_one_slot_to_the_bootstrap_addresses() {
     let mut t = Transport::bind("127.0.0.1:0", me.clone(), CHAIN_ID, genesis, vec![]).unwrap();
     t.enable_discovery(Discovery {
         key: Some(me.clone()),
-        bootstrap: vec![boot.local_addr().unwrap()],
+        bootstrap: vec![boot.local_addr().unwrap().into()],
         outbound: 2,
         peer_file: Some(file),
         ..Discovery::default()

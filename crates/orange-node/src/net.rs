@@ -23,11 +23,18 @@
 //! them in a bounded [`PeerTable`], and dials from it, on threads of their
 //! own, up to its outbound target, and, given a file, keeps the peers that
 //! answered across restarts.
+//!
+//! A configured peer or a bootstrap address may be a DNS name
+//! ([`PeerAddr`]): it is resolved at every dial, on a thread of its own,
+//! and a dial of a name that has not come back within [`RESOLVE_MS`] is
+//! abandoned (spec 09 §5), so a slow resolver never holds the node.
 
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
@@ -39,6 +46,7 @@ use orange_metrics::{Direction, Traffic};
 use crate::extension::Outbound;
 use crate::node::{Node, NodeError};
 use crate::peers::{self, PeerRecord, PeerTable};
+pub use crate::resolve::{MAX_RESOLVING, PeerAddr, RESOLVE_MS, Resolve, SystemResolver};
 use crate::session::{Ephemeral, Session, Side, TAG, VERSION};
 use crate::statesync::StateSync;
 
@@ -485,6 +493,8 @@ struct Conn {
     peer: Option<[u8; 32]>,
     /// The address this connection was dialled at, if we dialled it.
     dialled: Option<SocketAddr>,
+    /// The configured name it was dialled for, by index, if it was.
+    named: Option<usize>,
     dead: bool,
     /// The peer closed, or reading failed: the connection dies once the
     /// frames it sent before are taken.
@@ -531,6 +541,7 @@ impl Conn {
             claimed: None,
             peer: None,
             dialled: None,
+            named: None,
             dead: false,
             closed: false,
             target: None,
@@ -628,8 +639,9 @@ pub struct Discovery {
     /// The address to advertise; by default the listen address, unless
     /// that is unspecified.
     pub advertise: Option<SocketAddr>,
-    /// Addresses dialled to learn the network, with no id expected.
-    pub bootstrap: Vec<SocketAddr>,
+    /// Addresses dialled to learn the network, with no id expected: IP
+    /// addresses or DNS names, resolved at every dial.
+    pub bootstrap: Vec<PeerAddr>,
     /// Most connections in all, configured peers aside.
     pub max_peers: usize,
     /// Connections this node dials itself, configured peers included.
@@ -656,20 +668,41 @@ impl Default for Discovery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
     Entry([u8; 32]),
-    Boot(SocketAddr),
+    /// A bootstrap address, by its key.
+    Boot(usize),
 }
 
 /// A bootstrap address and how its dials went.
 struct Boot {
-    addr: SocketAddr,
+    /// What tells it from the others: its place in the list it was given.
+    key: usize,
+    addr: PeerAddr,
     /// The id its last handshake named.
     id: Option<[u8; 32]>,
     failures: u32,
     next_dial_ms: u64,
 }
 
-/// A finished dial: what it was for, and the stream or the error.
-type Dialled = (Target, std::io::Result<TcpStream>);
+/// A finished dial: its token, and the stream or the error.
+type Dialled = (u64, std::io::Result<TcpStream>);
+
+/// A finished dial of a configured name: its index, and the dial.
+type NamedDialled = (usize, Dialled);
+
+/// A dial in flight: what it is for, its token, and, for a name, when it is
+/// abandoned (spec 09 §5).
+struct Dialing {
+    target: Target,
+    token: u64,
+    by_ms: Option<u64>,
+}
+
+/// A configured peer named by DNS name, and its dial in flight: its token
+/// and when it is abandoned.
+struct Named {
+    addr: PeerAddr,
+    dial: Option<(u64, u64)>,
+}
 
 /// The state of peer exchange.
 struct Exchange {
@@ -682,7 +715,7 @@ struct Exchange {
     max_peers: usize,
     outbound: usize,
     /// Dials in flight.
-    dialing: Vec<Target>,
+    dialing: Vec<Dialing>,
     done: (Sender<Dialled>, Receiver<Dialled>),
     next_validators_ms: u64,
     /// Where the table is kept, whether it was read yet, what was last
@@ -694,16 +727,16 @@ struct Exchange {
 }
 
 impl Exchange {
-    fn boot(&mut self, addr: SocketAddr) -> Option<&mut Boot> {
-        self.boot.iter_mut().find(|b| b.addr == addr)
+    fn boot(&mut self, key: usize) -> Option<&mut Boot> {
+        self.boot.iter_mut().find(|b| b.key == key)
     }
 
     /// A dial of `target` failed, or its connection closed before its handshake.
     fn failed(&mut self, target: Target, now_ms: u64) {
         match target {
             Target::Entry(id) => self.table.dial_failed(&id, now_ms),
-            Target::Boot(addr) => {
-                if let Some(b) = self.boot(addr) {
+            Target::Boot(key) => {
+                if let Some(b) = self.boot(key) {
                     b.failures += 1;
                     b.next_dial_ms = now_ms + peers::backoff_ms(b.failures);
                 }
@@ -748,6 +781,16 @@ pub struct Transport {
     /// replaced by its hash at every draw.
     seed: [u8; 32],
     peers: Vec<SocketAddr>,
+    /// The configured peers named by DNS name.
+    named: Vec<Named>,
+    /// Finished dials of named peers: the index, the token and the result.
+    named_done: (Sender<NamedDialled>, Receiver<NamedDialled>),
+    /// What turns names into addresses.
+    resolver: Arc<dyn Resolve>,
+    /// Dials of names whose threads still run, at most [`MAX_RESOLVING`].
+    resolving: Arc<AtomicUsize>,
+    /// The token of the last dial started on a thread.
+    next_token: u64,
     last_dial_ms: Option<u64>,
     /// Requests this node is serving, by local id.
     serving: BTreeMap<u64, Serving>,
@@ -782,6 +825,32 @@ impl Transport {
         genesis: [u8; 32],
         peers: Vec<SocketAddr>,
     ) -> std::io::Result<Transport> {
+        let peers = peers.into_iter().map(PeerAddr::Ip).collect();
+        Transport::bind_named(listen, key, chain_id, genesis, peers)
+    }
+
+    /// [`Transport::bind`] with peers that may be DNS names, each resolved
+    /// at every dial (spec 09 §5).
+    ///
+    /// # Errors
+    /// As [`Transport::bind`].
+    pub fn bind_named(
+        listen: &str,
+        key: k256::ecdsa::SigningKey,
+        chain_id: u64,
+        genesis: [u8; 32],
+        configured: Vec<PeerAddr>,
+    ) -> std::io::Result<Transport> {
+        let (mut peers, mut named) = (Vec::new(), Vec::new());
+        for addr in configured {
+            match addr {
+                PeerAddr::Ip(ip) => peers.push(ip),
+                name @ PeerAddr::Name { .. } => named.push(Named {
+                    addr: name,
+                    dial: None,
+                }),
+            }
+        }
         let listener = TcpListener::bind(listen)?;
         listener.set_nonblocking(true)?;
         let mut seed = [0u8; 32];
@@ -797,6 +866,11 @@ impl Transport {
             genesis,
             seed,
             peers,
+            named,
+            named_done: channel(),
+            resolver: Arc::new(SystemResolver),
+            resolving: Arc::new(AtomicUsize::new(0)),
+            next_token: 0,
             last_dial_ms: None,
             serving: BTreeMap::new(),
             limits: Limits::default(),
@@ -807,6 +881,24 @@ impl Transport {
             foreign_heard: false,
             alone_since_ms: None,
         })
+    }
+
+    /// Resolves DNS names with `resolver` from now on, instead of the
+    /// operating system's.
+    pub fn set_resolver(&mut self, resolver: Arc<dyn Resolve>) {
+        self.resolver = resolver;
+    }
+
+    /// Dials of names whose threads still run, abandoned ones included.
+    #[must_use]
+    pub fn resolving(&self) -> usize {
+        self.resolving.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A token no dial has had.
+    fn token(&mut self) -> u64 {
+        self.next_token += 1;
+        self.next_token
     }
 
     /// What one connection may cost (spec 09 §5b).
@@ -851,7 +943,9 @@ impl Transport {
             boot: discovery
                 .bootstrap
                 .into_iter()
-                .map(|addr| Boot {
+                .enumerate()
+                .map(|(key, addr)| Boot {
+                    key,
                     addr,
                     id: None,
                     failures: 0,
@@ -1001,12 +1095,25 @@ impl Transport {
             x.own = PeerRecord::sign(key, self.chain_id, addr, now_ms);
         }
         let mut finished = Vec::new();
-        while let Ok((target, result)) = x.done.1.try_recv() {
-            x.dialing.retain(|t| *t != target);
+        while let Ok((token, result)) = x.done.1.try_recv() {
+            // An abandoned dial's late result is dropped, its stream closed.
+            let Some(at) = x.dialing.iter().position(|d| d.token == token) else {
+                continue;
+            };
+            let target = x.dialing.remove(at).target;
             match result {
                 Ok(stream) => finished.push((target, stream)),
                 Err(_) => x.failed(target, now_ms),
             }
+        }
+        // A dial of a name not back in time is abandoned as failed (spec
+        // 09 §5); its thread may run on, counted until it ends.
+        let (late, kept): (Vec<_>, _) = std::mem::take(&mut x.dialing)
+            .into_iter()
+            .partition(|d| d.by_ms.is_some_and(|by| now_ms >= by));
+        x.dialing = kept;
+        for d in late {
+            x.failed(d.target, now_ms);
         }
         for (target, stream) in finished {
             let mut conn = self.open(stream, now_ms);
@@ -1034,7 +1141,7 @@ impl Transport {
                 .iter()
                 .filter_map(|c| c.target.as_ref().and_then(entry)),
         );
-        busy.extend(x.dialing.iter().filter_map(entry));
+        busy.extend(x.dialing.iter().map(|d| &d.target).filter_map(entry));
         // While it has bootstrap addresses, one outbound slot is theirs
         // alone (spec 09 §5a.5): a table that answers on every slot, as one
         // an attacker filled before a restart does, would otherwise keep
@@ -1046,36 +1153,42 @@ impl Transport {
             .iter()
             .filter(|c| c.dialled.is_some() || c.target.is_some_and(|t| !boot(&t)))
             .count()
-            + x.dialing.iter().filter(|t| !boot(t)).count();
+            + x.dialing.iter().filter(|d| !boot(&d.target)).count();
         let for_table = x
             .outbound
             .saturating_sub(reserved)
             .saturating_sub(others)
             .min(room);
-        let mut targets: Vec<(Target, SocketAddr)> = x
+        let mut targets: Vec<(Target, PeerAddr)> = x
             .table
             .candidates(now_ms, &busy, for_table)
             .into_iter()
-            .map(|(id, addr)| (Target::Entry(id), addr))
+            .map(|(id, addr)| (Target::Entry(id), PeerAddr::Ip(addr)))
             .collect();
         for boot in &x.boot {
-            let target = Target::Boot(boot.addr);
+            let target = Target::Boot(boot.key);
             let open = self.conns.iter().any(|c| c.target == Some(target))
-                || x.dialing.contains(&target)
+                || x.dialing.iter().any(|d| d.target == target)
                 || boot.id.is_some_and(|id| busy.contains(&id));
             if targets.len() < room && boot.next_dial_ms <= now_ms && !open {
-                targets.push((target, boot.addr));
+                targets.push((target, boot.addr.clone()));
             }
         }
         for (target, addr) in targets {
-            x.dialing.push(target);
+            let token = self.token();
+            let by_ms = matches!(addr, PeerAddr::Name { .. }).then_some(now_ms + RESOLVE_MS);
             let done = x.done.0.clone();
-            std::thread::spawn(move || {
-                let stream =
-                    TcpStream::connect_timeout(&addr, Duration::from_millis(DIAL_TIMEOUT_MS));
-                // A transport dropped meanwhile no longer listens.
-                let _ = done.send((target, stream));
-            });
+            let timeout = Duration::from_millis(DIAL_TIMEOUT_MS);
+            // A transport dropped meanwhile no longer listens.
+            let send = move |stream| drop(done.send((token, stream)));
+            // Past the cap on running dials of names, it waits for the next turn.
+            if crate::resolve::spawn_dial(addr, &self.resolver, &self.resolving, timeout, send) {
+                x.dialing.push(Dialing {
+                    target,
+                    token,
+                    by_ms,
+                });
+            }
         }
     }
 
@@ -1169,10 +1282,10 @@ impl Transport {
         let conn = &mut self.conns[index];
         if id == self.id {
             conn.dead = true;
-            if let Some(Target::Boot(addr)) = conn.target
+            if let Some(Target::Boot(key)) = conn.target
                 && let Some(x) = self.exchange.as_mut()
             {
-                x.boot.retain(|b| b.addr != addr);
+                x.boot.retain(|b| b.key != key);
             }
             return;
         }
@@ -1185,8 +1298,8 @@ impl Transport {
             Some(Target::Entry(expected)) => {
                 conn.dead |= !x.table.handshake(&expected, &id, now_ms);
             }
-            Some(Target::Boot(addr)) => {
-                if let Some(b) = x.boot(addr) {
+            Some(Target::Boot(key)) => {
+                if let Some(b) = x.boot(key) {
                     b.failures = 0;
                     b.id = Some(id);
                 }
@@ -1273,8 +1386,8 @@ impl Transport {
                     (Some(Target::Entry(id)), Some(peer)) if peer == id => {
                         x.table.lost(&id, now_ms);
                     }
-                    (Some(Target::Boot(addr)), Some(_)) => {
-                        if let Some(b) = x.boot(addr) {
+                    (Some(Target::Boot(key)), Some(_)) => {
+                        if let Some(b) = x.boot(key) {
                             b.next_dial_ms = now_ms + peers::BACKOFF_MS;
                         }
                     }
@@ -1322,7 +1435,30 @@ impl Transport {
         x.table.set_validators(ids);
     }
 
+    /// Keeps a connection open to every configured peer, redialling at most
+    /// every [`REDIAL_MS`]: an IP address on this thread, within 200 ms; a
+    /// name on a thread of its own, resolved anew at every dial and
+    /// abandoned when not back within [`RESOLVE_MS`] (spec 09 §5).
     fn redial(&mut self, now_ms: u64) {
+        while let Ok((i, (token, result))) = self.named_done.1.try_recv() {
+            // A result that comes after its dial was abandoned is dropped.
+            if self.named[i].dial.is_none_or(|(t, _)| t != token) {
+                continue;
+            }
+            self.named[i].dial = None;
+            if let Ok(stream) = result {
+                let remote = stream.peer_addr().ok();
+                let mut conn = self.open(stream, now_ms);
+                conn.dialled = Some(remote.unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))));
+                conn.named = Some(i);
+                self.conns.push(conn);
+            }
+        }
+        for named in &mut self.named {
+            if named.dial.is_some_and(|(_, by)| now_ms >= by) {
+                named.dial = None;
+            }
+        }
         if self.last_dial_ms.is_some_and(|t| now_ms < t + REDIAL_MS) {
             return;
         }
@@ -1335,6 +1471,21 @@ impl Transport {
                 let mut conn = self.open(stream, now_ms);
                 conn.dialled = Some(addr);
                 self.conns.push(conn);
+            }
+        }
+        for i in 0..self.named.len() {
+            let open = self.conns.iter().any(|c| c.named == Some(i));
+            if open || self.named[i].dial.is_some() {
+                continue;
+            }
+            let token = self.token();
+            let done = self.named_done.0.clone();
+            let send = move |stream| drop(done.send((i, (token, stream))));
+            let addr = self.named[i].addr.clone();
+            let timeout = Duration::from_millis(DIAL_TIMEOUT_MS);
+            // Past the cap on running dials of names, it waits for the next turn.
+            if crate::resolve::spawn_dial(addr, &self.resolver, &self.resolving, timeout, send) {
+                self.named[i].dial = Some((token, now_ms + RESOLVE_MS));
             }
         }
     }

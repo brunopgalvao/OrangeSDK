@@ -12,6 +12,7 @@ pub mod mempool;
 pub mod net;
 pub mod node;
 pub mod peers;
+pub mod resolve;
 pub mod session;
 pub mod sim;
 pub mod state;
@@ -28,6 +29,7 @@ pub use node::{
     ARCHIVE, BLOCK_KERNEL_GAS, DRIVER_RETENTION, HISTORY_KEYS_PER_BLOCK, KEPT_RECORDS, Node,
     NodeConfig, NodeError, PRUNE_EVERY, STATE_HISTORY, SubmitError, keep_latest,
 };
+pub use resolve::PeerAddr;
 pub use sim::Sim;
 pub use state::{ChainState, StoreConfig};
 pub use store::DriverStore;

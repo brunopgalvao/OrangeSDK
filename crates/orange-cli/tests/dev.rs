@@ -682,6 +682,8 @@ fn node_command_runs_a_multi_validator_chain() {
             .map(|_| std::sync::atomic::AtomicUsize::new(0))
             .collect(),
     );
+    // `127.0.0.1:<port>` as `localhost:<port>`, which the system resolves.
+    let by_name = |addr: &str| addr.replace("127.0.0.1", "localhost");
     let mut threads = Vec::new();
     for i in 0..5 {
         let mut list: Vec<String> = vec![
@@ -699,9 +701,15 @@ fn node_command_runs_a_multi_validator_chain() {
             let data = scratch(&format!("multi-data-{i}"));
             let _ = std::fs::remove_dir_all(&data);
             list.extend(["--key".into(), seeds[i].clone(), "--data-dir".into(), data]);
-            // Validators find each other by peer exchange from the first one's address.
+            // Validators find each other by peer exchange from the first one's
+            // address, which the last one has by name (spec 09 §5a.5).
             if i > 0 {
-                list.extend(["--bootstrap".into(), ports[0].clone()]);
+                let boot = if i == 3 {
+                    by_name(&ports[0])
+                } else {
+                    ports[0].clone()
+                };
+                list.extend(["--bootstrap".into(), boot]);
             }
             if i == 1 {
                 list.extend(["--max-peers".into(), "16".into()]);
@@ -709,7 +717,7 @@ fn node_command_runs_a_multi_validator_chain() {
                 list.extend(["--advertise".into(), ports[1].clone()]);
             }
         } else {
-            list.extend(["--peer".into(), ports[0].clone()]);
+            list.extend(["--peer".into(), by_name(&ports[0])]);
         }
         let argv = args(&list.iter().map(String::as_str).collect::<Vec<_>>());
         let counts = std::sync::Arc::clone(&counts);
@@ -810,7 +818,7 @@ fn node_command_errors() {
     // Peer exchange's options are checked, and refused beside --no-discovery.
     assert_eq!(
         with(&["--bootstrap", "nowhere"]).unwrap_err(),
-        "--bootstrap nowhere: expected ip:port"
+        "--bootstrap nowhere: expected ip:port or host:port"
     );
     assert_eq!(
         with(&["--max-peers", "0"]).unwrap_err(),
