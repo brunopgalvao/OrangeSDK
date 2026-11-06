@@ -528,7 +528,7 @@ fn stop_node(devnet: &Devnet, index: usize) -> Result<String, String> {
         // The RPC goes first; the process holds its stores a little longer,
         // and whoever opens the directory next needs it gone.
         let pid = recorded_pid(&pid_file, index);
-        poll_until(NODE_TIMEOUT, &what, &mut || pid.is_none_or(|p| !alive(p)))?;
+        poll_until(NODE_TIMEOUT, &what, &mut || !pid.is_some_and(alive))?;
         let _ = fs::remove_file(&pid_file);
         return Ok(format!("node {index} stopped"));
     }
