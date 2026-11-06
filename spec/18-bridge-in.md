@@ -160,7 +160,7 @@ Each native contract's state is its namespace (spec 16 §2.3): the stored key is
 | light client | `committee/` ‖ period (u64) | the committee's keys, `48 · N` bytes |
 | light client | `root/` ‖ execution block number (u64) | `{ state_root: [32], block_hash: [32], slot: u64, usable_at: u64, epoch: u64 }` |
 | verifier | `config` | `{ outbox: [20], chain_id: u64, governance: [20], window: u64, max_messages: u64 }` |
-| verifier | `delivered/` ‖ nonce (u64) | `[1]` |
+| verifier | `delivered/` ‖ nonce (u64) | the delivered message's hash (§6.1), 32 bytes |
 | verifier | `paused` | `[1]` while paused |
 | verifier | `window` | `{ start: u64, count: u64 }` |
 | verifier | `recipient/` ‖ recipient (20 bytes) | `{ max_messages: u64, start: u64, count: u64 }`, for a recipient with a limit of its own |
@@ -205,6 +205,7 @@ A governance function called by any other account, or with no governance account
 | `setRateLimit(uint64 window, uint64 maxMessages)` | `0xe1e5cca4` | governance | sets the rate limit |
 | `setRecipientLimit(address recipient, uint64 maxMessages)` | `0xb43b5ebc` | governance | gives `recipient` a limit of its own (§6.4); zero returns it to the shared one |
 | `delivered(uint64 nonce)` | `0x2f2b0289` | view | whether the message was delivered |
+| `deliveredHash(uint64 nonce)` | `0x8d2f7dd3` | view | the hash of the message delivered with `nonce` (§6.1), zero if none was |
 | `paused()` | `0x5c975abb` | view | whether deliveries are stopped |
 | `rateLimit()` | `0x61e08e72` | view | `(uint64 window, uint64 maxMessages)` |
 | `recipientLimit(address recipient)` | `0x86fa886d` | view | `(uint64 maxMessages)` of `recipient`'s own limit, 0 if it has none |
@@ -244,7 +245,7 @@ A state root may prove messages from `usable_at`, the timestamp (seconds) of the
 5. The rate limit: with the window record `(start, count)` (zeros if absent) and the limit `maxMessages`, or, for a recipient with a limit of its own, its record `recipient/` ‖ recipient's `(start, count)` and its `max_messages`, if `timestamp ≥ start + window` a new window opens at `timestamp` with count 0; then `count < maxMessages`. — `RateLimited()`
 6. The proofs prove the message (§6.2) against `stateRoot`. — `BadProof()`
 
-It then increments the count, stores the window it counted in and marks the nonce delivered.
+It then increments the count, stores the window it counted in and records the nonce delivered: `delivered/` ‖ nonce holds the message's hash, which step 6 computed, so that what was delivered with a nonce can be told exactly, as `OrangeInbox`'s entries tell it on Ethereum (spec 17 §6.3); the token gateway reads it to report a nonce a forgery took (spec 21 §5.2, §5.5c). A record shorter than 32 bytes, which no verifier of this version writes, reads right-aligned in the word `deliveredHash` returns.
 
 A recipient's limit of its own keeps others from crowding it out: anyone can send messages through `EthereumOutbox`, and messages to a recipient that accepts them, delivered as each window opens, would otherwise fill the shared limit and keep a token gateway's messages waiting. Governance gives such a recipient its own `max_messages` with `setRecipientLimit` (its window, of the same length, opens with its own deliveries); its messages then count against that alone, and a recipient that refuses messages it does not authenticate, as the gateways do (spec 21 §5.2), cannot have its limit filled by anyone else, since a refused delivery reverts its `consume`. Zero removes the record, and the recipient shares the limit again. `setRecipientLimit` calldata is two canonical words, an address and a `uint64`, or the call reverts with empty data. These are native-call writes, so they stand only if every enclosing EVM frame succeeds (spec 16 §5.4).
 
@@ -256,6 +257,8 @@ A recipient's limit of its own keeps others from crowding it out: anyone can sen
 2. calls the verifier's `consume` with that state root and its own arguments, bubbling up any revert;
 3. calls `recipient.onEthereumMessage(nonce, sender, payload)` (`IEthereumMessageReceiver`, `0x64f7ddb0`) with exactly `gasLimit` gas: if the recipient has no code, `deliver` reverts with empty data; if less than `⌊(gasLimit + 5 000) · 64 / 63⌋` gas is left just before the call, it reverts `InsufficientGas(gasLimit)` (`0xc0a1813d`), so the EVM's 1/64 rule cannot cut the call short; if the recipient reverts, it reverts `DeliveryFailed(reason)`; each undoes step 2;
 4. emits `MessageDelivered(nonce, sender, recipient, blockNumber)`.
+
+Two views read the record: `deliveredHash(uint64 nonce)` (`0x8d2f7dd3`) returns the verifier's `deliveredHash(nonce)`, and `hashMessage((uint64 nonce, address sender, address recipient, uint64 gasLimit, bytes payload))` (`0x61defa74`) the hash of §6.1 of that message with `block.chainid` as the OrangeSDK chain's id. A contract on the OrangeSDK chain with both tells exactly what the inbox delivered with a nonce, or that it delivered nothing. Contracts and `eth_call` reach the views; a transaction to the inbox may carry only `deliver` (§7).
 
 A message is therefore delivered *exactly once*: never twice, because the verifier refuses a delivered nonce, and never half, because a recipient that fails undoes the whole delivery, which anyone may retry. Because the gas is the sender's choice, proven with the message, a relayer cannot starve the recipient: a recipient that catches a failing inner call still had the gas the sender asked for. A recipient authenticates a message by checking `msg.sender` is the inbox address and trusting `sender` as the Ethereum account that sent it.
 
@@ -281,9 +284,9 @@ Calls to the light client and the verifier are native calls, charged as spec 16 
 | `submitUpdate`, mainnet period 1888 update (512 members, carries the next committee) | 1 314 284 |
 | `submitFinalityUpdate`, mainnet, rotating into period 1889 | 332 454 |
 | `submitUpdate`, minimal preset (32 members, carries the next committee) | 161 803 |
-| `deliver` of a 12-byte message with a three-account state's proofs, to the test recipient `EthereumMessageRecipient` | 158 029 |
+| `deliver` of a 12-byte message with a three-account state's proofs, to the test recipient `EthereumMessageRecipient` | 158 705 |
 
-Recipients with a limit of their own (§6.4) added 115 gas to `deliver` on 2026-11-06, from 157 914: `consume` reads the recipient's record before the window.
+Recipients with a limit of their own (§6.4) added 115 gas to `deliver` on 2026-11-06, from 157 914: `consume` reads the recipient's record before the window. Later that day the record of the delivered message's hash (§6.4) added 676, from 158 029: 600 for the second 32-byte word the `delivered/` entry now writes (spec 16 §6.1), the rest the verifier's and the inbox's code around it.
 
 A mainnet `deliver` carries proofs of about 9 account-trie nodes and 7 storage-trie nodes (the WETH proof of §10 has 9 and 7), about 10 KiB of calldata.
 

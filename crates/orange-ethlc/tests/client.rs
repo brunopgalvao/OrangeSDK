@@ -650,6 +650,26 @@ fn the_verifier_delivers_each_message_once() {
     let mut high = client::u64_call(abi::DELIVERED, 1);
     high[5] = 1;
     assert_eq!(verifier::query(&store, &high), Err(vec![]));
+    // The record is the delivered message's hash, so what was delivered with
+    // a nonce can be told exactly (spec 21 §5.2); zero for none.
+    assert_eq!(
+        verifier::query(&store, &client::u64_call(abi::DELIVERED_HASH, 0)),
+        Ok(ob.messages[0].hash(&c, 7).to_vec())
+    );
+    assert_eq!(
+        verifier::query(&store, &client::u64_call(abi::DELIVERED_HASH, 1)),
+        Ok(word(0).to_vec())
+    );
+    let mut high = client::u64_call(abi::DELIVERED_HASH, 1);
+    high[5] = 1;
+    assert_eq!(verifier::query(&store, &high), Err(vec![]));
+    // A shorter record, as an earlier verifier wrote, reads right-aligned.
+    let mut earlier = store.clone();
+    earlier.set(&verifier::keys::delivered(0), Some(&[1]));
+    assert_eq!(
+        verifier::query(&earlier, &client::u64_call(abi::DELIVERED_HASH, 0)),
+        Ok(word(1).to_vec())
+    );
 
     // Two per window of 1000 s (the first window opened at 0): the third
     // waits for the next one, which opens with the first delivery after.

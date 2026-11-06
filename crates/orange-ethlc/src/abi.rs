@@ -34,6 +34,8 @@ pub const UNPAUSE: [u8; 4] = [0x3f, 0x4b, 0xa8, 0x3a];
 pub const SET_RATE_LIMIT: [u8; 4] = [0xe1, 0xe5, 0xcc, 0xa4];
 /// `delivered(uint64)`.
 pub const DELIVERED: [u8; 4] = [0x2f, 0x2b, 0x02, 0x89];
+/// `deliveredHash(uint64)`.
+pub const DELIVERED_HASH: [u8; 4] = [0x8d, 0x2f, 0x7d, 0xd3];
 /// `paused()`.
 pub const PAUSED: [u8; 4] = [0x5c, 0x97, 0x5a, 0xbb];
 /// `rateLimit()`.

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity 0.8.28;
 
-import {IEthereumMessageReceiver} from "../EthereumInbox.sol";
+import {EthereumInbox, IEthereumMessageReceiver} from "../EthereumInbox.sol";
 import {IOrangeOutbox} from "../IOrangeOutbox.sol";
 import {TokenGateway} from "./TokenGateway.sol";
 
@@ -44,6 +44,17 @@ contract TokenGatewayOnOrange is TokenGateway, IEthereumMessageReceiver {
         if (msg.sender != inbox) revert NotInbox();
         if (sender != remoteGateway) revert NotRemoteGateway();
         _receive(nonce, payload);
+    }
+
+    /// @notice Tells the paired gateway what the inbox delivered as its message `m.nonce`: a `SPENT`
+    /// with the identity of `m` if it came here, else `VOID`. What the gateway on Ethereum sent with
+    /// that nonce, if it differs (a forgery took its nonce and was paid out here), never arrives, and
+    /// it refunds or sends it again. Anyone may call it, once per nonce.
+    function reportDelivered(EthereumInbox.Message calldata m) external returns (uint64) {
+        EthereumInbox source = EthereumInbox(inbox);
+        bytes32 messageHash = source.deliveredHash(m.nonce);
+        if (messageHash != source.hashMessage(m)) revert NotDelivered();
+        return _report(m.nonce, m.recipient == address(this) ? _identity(m.payload) : VOID);
     }
 
     function _send(bytes memory payload) internal override returns (uint64) {

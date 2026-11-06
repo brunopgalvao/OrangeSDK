@@ -39,7 +39,9 @@ use orange_abi::bridge::{
     FinalityProof, Message, OUTBOX_ADDRESS, anchor, message_key, message_slot, query,
 };
 use orange_abi::chain::Log;
-use orange_abi::rotation::{Handoff, query as rotation_query, threshold_certificate};
+use orange_abi::rotation::{
+    Handoff, keys as rotation_keys, query as rotation_query, threshold_certificate,
+};
 use orange_abi::staking::{KeySetRecord, keys as staking_keys};
 use orange_abi::types::{Address, Hash};
 use orange_abi::{Decode, Encode};
@@ -66,6 +68,10 @@ pub enum Error {
     /// The node's handoff out of this key set is not from it, or not to a
     /// newer key set.
     BadHandoff(u64),
+    /// A light client holding this key set is stranded: the chain never
+    /// activated it and adopted a newer one, so it never hands off from it
+    /// (spec 17 §5.4). Its owner recovers it with [`recovery`].
+    Stranded(u64),
     /// The node failed.
     Node(NodeError),
 }
@@ -83,6 +89,11 @@ impl fmt::Display for Error {
             Error::BadHandoff(id) => write!(
                 f,
                 "the handoff recorded out of key set {id} does not move to a newer one"
+            ),
+            Error::Stranded(id) => write!(
+                f,
+                "key set {id} was superseded and never hands off: the light client is stranded \
+                 and its owner must recover it"
             ),
             Error::Node(e) => write!(f, "node: {e}"),
         }
@@ -211,9 +222,10 @@ pub fn verifier_v2_args(chain_id: u64) -> Vec<u8> {
 }
 
 /// Constructor arguments of `OrangeLightClientV2(address verifier, uint64
-/// keyId, bytes key, uint64 epochBlocks, uint64 maxKeyAge)`: the trusted key
-/// set to start from, in EIP-2537 encoding, and the chain's epoch length and
-/// key age.
+/// keyId, bytes key, uint64 epochBlocks, uint64 maxKeyAge, address owner)`:
+/// the trusted key set to start from, in EIP-2537 encoding, the chain's
+/// epoch length and key age, and the owner who recovers a stranded client
+/// (spec 17 §5.4).
 #[must_use]
 pub fn light_client_v2_args(
     verifier: &Address,
@@ -221,6 +233,7 @@ pub fn light_client_v2_args(
     key: &[u8; 256],
     epoch_blocks: u64,
     max_key_age: u64,
+    owner: &Address,
 ) -> Vec<u8> {
     abi::encode(&[
         Value::address(verifier),
@@ -228,6 +241,7 @@ pub fn light_client_v2_args(
         Value::Bytes(key.to_vec()),
         Value::uint(u128::from(epoch_blocks)),
         Value::uint(u128::from(max_key_age)),
+        Value::address(owner),
     ])
 }
 
@@ -308,10 +322,86 @@ pub const MAX_ROTATIONS: usize = 256;
 /// asks again from where the last one ends.
 ///
 /// # Errors
-/// As [`rotation`], and [`Error::BadHandoff`] for a record out of a key
-/// set that is not from it or not to a newer one, which no chain records.
+/// As [`rotation`], [`Error::BadHandoff`] for a record out of a key set
+/// that is not from it or not to a newer one, which no chain records, and
+/// [`Error::Stranded`] when no handoff out of `from` is recorded and none
+/// ever will be ([`stranded`]).
 pub fn rotations_from(node: &mut Node, from: u64) -> Result<Vec<Rotation>, Error> {
-    chain_of(from, &mut |at| rotation(node, at))
+    let chain = chain_of(from, &mut |at| rotation(node, at))?;
+    if chain.is_empty() && stranded(node, from) {
+        return Err(Error::Stranded(from));
+    }
+    Ok(chain)
+}
+
+/// Whether a light client holding key set `key_id` is stranded (spec 17
+/// §5.4): `node`'s chain never activated that key set and has adopted a
+/// newer one, so the active key never hands off to it, and no handoff out
+/// of it is ever recorded. A key set the chain will still hand off to, the
+/// current target, is not stranded: a client that took its rotation early
+/// waits for the chain to catch up.
+#[must_use]
+pub fn stranded(node: &Node, key_id: u64) -> bool {
+    let activated = node
+        .state_get(&[rotation_keys::ACTIVATED, &key_id.to_be_bytes()].concat())
+        .is_some();
+    let adopted = node
+        .state_get(rotation_keys::ADOPTED)
+        .and_then(|bytes| u64::from_bytes(&bytes).ok());
+    !activated && adopted.is_some_and(|newest| newest > key_id)
+}
+
+/// The group key of key set `key_id` as `node`'s chain adopted it.
+fn adopted_key(node: &Node, key_id: u64) -> Option<orange_bls::PublicKey> {
+    let bytes = node.state_get(&[staking_keys::KEY_SET, &key_id.to_be_bytes()].concat())?;
+    let record = KeySetRecord::from_bytes(&bytes).ok()?;
+    let key: [u8; 96] = record.group_key()?.try_into().ok()?;
+    orange_bls::PublicKey::from_bytes(&key).ok()
+}
+
+/// What the owner of a stranded light client submits to recover it (spec
+/// 17 §5.4): the handoff the chain recorded out of the client's previous
+/// key set, with that key set's group key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recovery {
+    /// The client's previous key set, which signed the handoff.
+    pub from_key: [u8; 256],
+    /// The handoff out of it.
+    pub rotation: Rotation,
+}
+
+impl Recovery {
+    /// The light client's `recover(uint64,bytes,uint64,bytes,bytes)` calldata.
+    #[must_use]
+    pub fn calldata(&self) -> Vec<u8> {
+        abi::call(
+            "recover(uint64,bytes,uint64,bytes,bytes)",
+            &[
+                Value::uint(u128::from(self.rotation.from)),
+                Value::Bytes(self.from_key.to_vec()),
+                Value::uint(u128::from(self.rotation.to)),
+                Value::Bytes(self.rotation.key_eip2537.to_vec()),
+                Value::Bytes(self.rotation.signature.to_vec()),
+            ],
+        )
+    }
+}
+
+/// The recovery of a light client stranded on key set `held` whose
+/// previous key set (`previousKeyId()`) is `previous`: the handoff `node`'s
+/// chain recorded out of `previous`, which moves the client past `held`.
+/// `None` while the chain has recorded none, or one that does not move
+/// past `held`, which the client would refuse.
+///
+/// # Errors
+/// [`Error::UnknownKeySet`] if the chain holds no key set `previous`, and
+/// as [`rotation`].
+pub fn recovery(node: &mut Node, previous: u64, held: u64) -> Result<Option<Recovery>, Error> {
+    let key = adopted_key(node, previous).ok_or(Error::UnknownKeySet(previous))?;
+    let from_key = group_key(&key.to_bytes())?;
+    Ok(rotation(node, previous)?
+        .filter(|r| r.to > held)
+        .map(|rotation| Recovery { from_key, rotation }))
 }
 
 /// The chain of handoffs from `from` that `fetch` reads one at a time:
@@ -586,14 +676,7 @@ pub fn submission_covering_key(
     height: u64,
     key_id: u64,
 ) -> Result<Covering, Error> {
-    let key = node
-        .state_get(&[staking_keys::KEY_SET, &key_id.to_be_bytes()].concat())
-        .and_then(|bytes| KeySetRecord::from_bytes(&bytes).ok())
-        .and_then(|record| {
-            let key: [u8; 96] = record.group_key()?.try_into().ok()?;
-            orange_bls::PublicKey::from_bytes(&key).ok()
-        })
-        .ok_or(Error::UnknownKeySet(key_id))?;
+    let key = adopted_key(node, key_id).ok_or(Error::UnknownKeySet(key_id))?;
     let held = HeldKey {
         id: key_id,
         chain_id: node.chain_id().map_err(Error::Node)?,
@@ -670,6 +753,11 @@ mod tests {
             (
                 Error::BadHandoff(3),
                 "the handoff recorded out of key set 3 does not move to a newer one",
+            ),
+            (
+                Error::Stranded(4),
+                "key set 4 was superseded and never hands off: the light client is stranded \
+                 and its owner must recover it",
             ),
             (
                 Error::Node(NodeError::Decode("x")),
@@ -903,8 +991,8 @@ mod tests {
         assert!(matches!(Rotation::new(&bad_key), Err(Error::Bls(_))));
         assert_eq!(verifier_v2_args(7), abi::encode(&[Value::uint(7)]));
         assert_eq!(
-            light_client_v2_args(&[1; 20], 2, &[3; 256], 16, 2).len(),
-            32 * 5 + 32 + 256
+            light_client_v2_args(&[1; 20], 2, &[3; 256], 16, 2, &[4; 20]).len(),
+            32 * 6 + 32 + 256
         );
     }
 

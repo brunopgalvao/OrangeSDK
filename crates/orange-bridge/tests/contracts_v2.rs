@@ -4,9 +4,10 @@
 //! given; the light client moves from key set to key set by rotation
 //! certificates of the key it holds, refuses certificates of any other key
 //! and certificates anchored past its key's age, and an unchanged
-//! `OrangeInbox` delivers against its roots. Gas of `verify`,
-//! `verifyRotation`, `submit` and `rotate` is pinned here, and spec 17 §8
-//! states these numbers.
+//! `OrangeInbox` delivers against its roots; a client stranded on a
+//! superseded key set is recovered by its owner from its previous key set
+//! (spec 17 §5.4). Gas of `verify`, `verifyRotation`, `submit`, `rotate` and
+//! `recover` is pinned here, and spec 17 §8 states these numbers.
 
 mod support;
 
@@ -26,15 +27,19 @@ const DEPLOYER: [u8; 20] = [0xD0; 20];
 const RELAYER: [u8; 20] = [0xEE; 20];
 const EPOCH_BLOCKS: u64 = 16;
 const MAX_KEY_AGE: u64 = 2;
+/// The owner of the version-2 light client (spec 17 §5.4).
+const LIGHT_CLIENT_OWNER: [u8; 20] = [0x0C; 20];
 
 /// Execution gas of `OrangeFinalityVerifierV2.verify` called with the key.
 const VERIFY_GAS: u64 = 127_279;
 /// Execution gas of `OrangeFinalityVerifierV2.verifyRotation`.
 const VERIFY_ROTATION_GAS: u64 = 129_050;
 /// Gas of an `OrangeLightClientV2.submit` transaction with a 103-byte proposal.
-const SUBMIT_TX_GAS: u64 = 228_155;
+const SUBMIT_TX_GAS: u64 = 228_248;
 /// Gas of an `OrangeLightClientV2.rotate` transaction.
-const ROTATE_TX_GAS: u64 = 236_883;
+const ROTATE_TX_GAS: u64 = 239_729;
+/// Gas of an `OrangeLightClientV2.recover` transaction (spec 17 §5.4).
+const RECOVER_TX_GAS: u64 = 245_148;
 
 #[allow(clippy::naive_bytecount)]
 fn intrinsic(data: &[u8]) -> u64 {
@@ -324,7 +329,14 @@ impl Deployed {
         let client = eth.deploy(
             DEPLOYER,
             &init_code("OrangeLightClientV2"),
-            &light_client_v2_args(&verifier, key_id, &key_of(sk), EPOCH_BLOCKS, MAX_KEY_AGE),
+            &light_client_v2_args(
+                &verifier,
+                key_id,
+                &key_of(sk),
+                EPOCH_BLOCKS,
+                MAX_KEY_AGE,
+                &LIGHT_CLIENT_OWNER,
+            ),
         );
         Deployed {
             eth,
@@ -489,30 +501,247 @@ fn the_light_client_follows_rotations_and_expires_old_keys() {
     );
     assert!(c.call(&certified(&keys[3], 3, 80, [0x56; 32])).success);
     assert_eq!(c.root(80), [0x56; 32].to_vec());
-    // Deployment refuses a zero epoch length or key age and an invalid key.
+    // Deployment refuses a zero epoch length or key age, a zero owner and an invalid key.
     let init = init_code("OrangeLightClientV2");
-    for (epoch_blocks, age, key) in [
-        (0u64, 2u64, key_of(&keys[0])),
-        (16, 0, key_of(&keys[0])),
-        (16, 2, [0; 256]),
+    for (epoch_blocks, age, key, owner, error) in [
+        (
+            0u64,
+            2u64,
+            key_of(&keys[0]),
+            LIGHT_CLIENT_OWNER,
+            "InvalidParameters()",
+        ),
+        (
+            16,
+            0,
+            key_of(&keys[0]),
+            LIGHT_CLIENT_OWNER,
+            "InvalidParameters()",
+        ),
+        (16, 2, key_of(&keys[0]), [0; 20], "ZeroAddress()"),
+        (16, 2, [0; 256], LIGHT_CLIENT_OWNER, "InvalidKey()"),
     ] {
-        let args = abi::encode(&[
-            Value::address(&c.verifier),
-            Value::uint(0),
-            Value::Bytes(key.to_vec()),
-            Value::uint(u128::from(epoch_blocks)),
-            Value::uint(u128::from(age)),
-        ]);
+        let args = light_client_v2_args(&c.verifier, 0, &key, epoch_blocks, age, &owner);
         let (outcome, _) = c.eth.try_deploy(DEPLOYER, &init, &args);
-        reverted_with(
-            &outcome,
-            if epoch_blocks == 0 || age == 0 {
-                "InvalidParameters()"
-            } else {
-                "InvalidKey()"
-            },
-        );
+        reverted_with(&outcome, error);
     }
+}
+
+fn recover_call(
+    from: u64,
+    from_key: &orange_bls::SecretKey,
+    to: u64,
+    next: &[u8; 256],
+    signature: &[u8],
+) -> Vec<u8> {
+    abi::call(
+        "recover(uint64,bytes,uint64,bytes,bytes)",
+        &[
+            Value::uint(u128::from(from)),
+            Value::Bytes(key_of(from_key).to_vec()),
+            Value::uint(u128::from(to)),
+            Value::Bytes(next.to_vec()),
+            Value::Bytes(signature.to_vec()),
+        ],
+    )
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_stranded_client_is_recovered_from_its_previous_key() {
+    let keys: Vec<orange_bls::SecretKey> = (1..=4u8)
+        .map(|i| orange_bls::SecretKey::generate(&[0x70 + i; 32], b"").unwrap())
+        .collect();
+    let mut c = Deployed::new(0, &keys[0]);
+    let owner = |c: &mut Deployed, data: &[u8]| c.eth.call(LIGHT_CLIENT_OWNER, c.client, data);
+    // Before any rotation the previous key set is the one the client started from.
+    assert_eq!(word_u64(&c.get("previousKeyId()", &[])), 0);
+    assert_eq!(c.get("owner()", &[]), word_address(&LIGHT_CLIENT_OWNER));
+    // Key set 0's shareholders signed a handoff to key set 1, which key set 2 superseded
+    // before the chain recorded it; the chain then recorded 0 → 2 (spec 15 §6.6). Someone
+    // relays the stale certificate, and the client holds key set 1, which never hands off.
+    assert!(
+        c.call(&rotate_call(
+            1,
+            &keys[1],
+            &sign_rotation(&keys[0], 1, &keys[1])
+        ))
+        .success
+    );
+    assert_eq!(word_u64(&c.get("previousKeyId()", &[])), 0);
+    let handoff = sign_rotation(&keys[0], 2, &keys[2]);
+    // The chain's handoff does not verify under the key the client holds, and nothing
+    // else will: the client is stranded.
+    reverted_with(
+        &c.call(&rotate_call(2, &keys[2], &handoff)),
+        "InvalidCertificate()",
+    );
+    reverted_with(
+        &c.call(&certified(&keys[2], 2, 40, [0x71; 32])),
+        "InvalidCertificate()",
+    );
+    let recover = recover_call(0, &keys[0], 2, &key_of(&keys[2]), &handoff);
+    // Only the owner recovers, and only while paused.
+    reverted_with(&c.call(&recover), "NotOwner()");
+    reverted_with(&owner(&mut c, &recover), "NotPaused()");
+    reverted_with(&c.call(&abi::call("pause()", &[])), "NotOwner()");
+    let paused = owner(&mut c, &abi::call("pause()", &[]));
+    assert!(paused.success, "{paused:?}");
+    assert_eq!(paused.logs[0].data.topics()[0].0, keccak256(b"Paused()"));
+    assert_eq!(c.get("paused()", &[]), word(1));
+    // Paused, the client takes neither roots nor rotations.
+    reverted_with(
+        &c.call(&certified(&keys[1], 1, 20, [0x72; 32])),
+        "IsPaused()",
+    );
+    reverted_with(
+        &c.call(&rotate_call(
+            3,
+            &keys[3],
+            &sign_rotation(&keys[1], 3, &keys[3]),
+        )),
+        "IsPaused()",
+    );
+    // The recovery must start from the previous key set, by id and key.
+    reverted_with(
+        &owner(
+            &mut c,
+            &recover_call(
+                1,
+                &keys[1],
+                2,
+                &key_of(&keys[2]),
+                &sign_rotation(&keys[1], 2, &keys[2]),
+            ),
+        ),
+        "NotPreviousKey()",
+    );
+    reverted_with(
+        &owner(
+            &mut c,
+            &recover_call(5, &keys[0], 2, &key_of(&keys[2]), &handoff),
+        ),
+        "NotPreviousKey()",
+    );
+    // It moves past the stranded key set, within the previous key's age.
+    reverted_with(
+        &owner(
+            &mut c,
+            &recover_call(
+                0,
+                &keys[0],
+                1,
+                &key_of(&keys[1]),
+                &sign_rotation(&keys[0], 1, &keys[1]),
+            ),
+        ),
+        "NotNewer()",
+    );
+    reverted_with(
+        &owner(
+            &mut c,
+            &recover_call(
+                0,
+                &keys[0],
+                3,
+                &key_of(&keys[3]),
+                &sign_rotation(&keys[0], 3, &keys[3]),
+            ),
+        ),
+        "KeyExpired()",
+    );
+    reverted_with(
+        &owner(&mut c, &recover_call(0, &keys[0], 2, &[0; 256], &handoff)),
+        "InvalidKey()",
+    );
+    // The owner cannot choose a key the previous key set did not sign over.
+    reverted_with(
+        &owner(
+            &mut c,
+            &recover_call(0, &keys[0], 2, &key_of(&keys[3]), &handoff),
+        ),
+        "InvalidCertificate()",
+    );
+    reverted_with(
+        &owner(
+            &mut c,
+            &recover_call(
+                0,
+                &keys[0],
+                2,
+                &key_of(&keys[2]),
+                &sign_rotation(&keys[1], 2, &keys[2]),
+            ),
+        ),
+        "InvalidCertificate()",
+    );
+    // The recorded handoff out of key set 0 recovers the client.
+    let recovered = owner(&mut c, &recover);
+    assert!(recovered.success, "{recovered:?}");
+    assert_eq!(recovered.gas, RECOVER_TX_GAS, "{}", recovered.gas);
+    let topics = recovered.logs[0].data.topics();
+    assert_eq!(
+        topics[0].0,
+        keccak256(b"KeyRecovered(uint64,uint64,uint64)")
+    );
+    assert_eq!(
+        [&topics[1].0[..], &topics[2].0[..], &topics[3].0[..]],
+        [&word(1)[..], &word(0)[..], &word(2)[..]]
+    );
+    assert_eq!(word_u64(&c.get("keyId()", &[])), 2);
+    assert_eq!(word_u64(&c.get("previousKeyId()", &[])), 0);
+    assert_eq!(
+        returned_bytes(&c.get("currentKey()", &[])),
+        key_of(&keys[2]).to_vec()
+    );
+    reverted_with(&c.call(&abi::call("unpause()", &[])), "NotOwner()");
+    let unpaused = owner(&mut c, &abi::call("unpause()", &[]));
+    assert!(unpaused.success, "{unpaused:?}");
+    assert_eq!(
+        unpaused.logs[0].data.topics()[0].0,
+        keccak256(b"Unpaused()")
+    );
+    assert_eq!(c.get("paused()", &[]), word(0));
+    // The client follows the chain again: key set 2 certifies and hands off to 3.
+    assert!(c.call(&certified(&keys[2], 2, 40, [0x73; 32])).success);
+    assert_eq!(c.root(40), [0x73; 32].to_vec());
+    assert!(
+        c.call(&rotate_call(
+            3,
+            &keys[3],
+            &sign_rotation(&keys[2], 3, &keys[3])
+        ))
+        .success
+    );
+    assert_eq!(word_u64(&c.get("previousKeyId()", &[])), 2);
+    // The rotation retired key set 0 as the previous one: it recovers nothing any more.
+    assert!(owner(&mut c, &abi::call("pause()", &[])).success);
+    reverted_with(
+        &owner(
+            &mut c,
+            &recover_call(
+                0,
+                &keys[0],
+                4,
+                &key_of(&keys[1]),
+                &sign_rotation(&keys[0], 4, &keys[1]),
+            ),
+        ),
+        "NotPreviousKey()",
+    );
+    // Ownership moves, never to zero, and only by the owner.
+    let transfer = |to: &[u8; 20]| abi::call("transferOwnership(address)", &[Value::address(to)]);
+    reverted_with(&c.call(&transfer(&RELAYER)), "NotOwner()");
+    reverted_with(&owner(&mut c, &transfer(&[0; 20])), "ZeroAddress()");
+    let moved = owner(&mut c, &transfer(&RELAYER));
+    assert!(moved.success, "{moved:?}");
+    assert_eq!(
+        moved.logs[0].data.topics()[0].0,
+        keccak256(b"OwnerChanged(address)")
+    );
+    assert_eq!(c.get("owner()", &[]), word_address(&RELAYER));
+    reverted_with(&owner(&mut c, &abi::call("unpause()", &[])), "NotOwner()");
+    assert!(c.call(&abi::call("unpause()", &[])).success);
 }
 
 fn word_address(a: &[u8; 20]) -> Vec<u8> {

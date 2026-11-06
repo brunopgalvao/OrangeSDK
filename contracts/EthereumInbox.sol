@@ -36,6 +36,15 @@ contract EthereumInbox {
     /// between the check in `_call` and the call itself.
     uint256 internal constant CALL_RESERVE = 5000;
 
+    /// A message of the `EthereumOutbox` (spec 18 §6.1), as `deliver` takes it.
+    struct Message {
+        uint64 nonce;
+        address sender;
+        address recipient;
+        uint64 gasLimit;
+        bytes payload;
+    }
+
     /// Delivers message `nonce` once the verifier accepts its proofs against
     /// the light client's state root of execution block `blockNumber`.
     /// Anyone may relay it.
@@ -54,6 +63,18 @@ contract EthereumInbox {
         );
         _call(recipient, gasLimit, abi.encodeCall(IEthereumMessageReceiver.onEthereumMessage, (nonce, sender, payload)));
         emit MessageDelivered(nonce, sender, recipient, blockNumber);
+    }
+
+    /// The hash of the message delivered with `nonce` (spec 18 §6.1), as the
+    /// verifier recorded it; zero if none was. With `hashMessage` a contract
+    /// tells exactly what was delivered with a nonce.
+    function deliveredHash(uint64 nonce) external view returns (bytes32) {
+        return VERIFIER.deliveredHash(nonce);
+    }
+
+    /// The hash the outbox stores for `m` sent to this chain (spec 18 §6.1).
+    function hashMessage(Message calldata m) external view returns (bytes32) {
+        return keccak256(abi.encode(uint64(block.chainid), m.nonce, m.sender, m.recipient, m.gasLimit, m.payload));
     }
 
     /// The light client's state root of execution block `blockNumber`, once

@@ -14,6 +14,9 @@
 //! several epochs the group key rotates, and a version-2 light client
 //! follows the handoffs the chain records and keeps verifying, while it
 //! refuses what the shareholders of an old key sign and a key past its age.
+//! A client that a valid rotation to a superseded key set strands is seen
+//! by the relayer, which says so, and its owner recovers it from the
+//! handoff out of its previous key set (spec 17 §5.4).
 
 mod support;
 
@@ -22,19 +25,20 @@ use orange_abi::bridge::{Message, anchor};
 use orange_abi::chain::consensus::{KIND_PROPOSE, TOPIC, leader, signing_preimage};
 use orange_abi::chain::{ConsensusMessage, Proposal, Receipt, Signature};
 use orange_abi::codec::Seq;
+use orange_abi::rotation::keys as rotation_keys;
 use orange_abi::rotation::{certificate_message, rotation_message};
 use orange_abi::staking::{
-    DkgRequest, DkgRun, KeySetRecord, KeystoreRequest, PartialShare, StakingParams, StakingStatus,
-    keys as skeys, query as staking_query,
+    DkgRequest, DkgRun, GWEI, KeySetRecord, KeystoreRequest, PartialShare, STAKING_ADDRESS,
+    StakingAction, StakingParams, StakingStatus, keys as skeys, query as staking_query,
 };
 use orange_abi::{Decode, Encode};
 use orange_bridge::abi::{self, Value};
 use orange_bridge::{
     Error, InboxConfig, Skip, Submission, execute_calldata, finality_proof, group_key,
-    light_client_v2_args, message_hash, rotations_from, sent_messages, slot_proof,
-    submission_covering, submission_covering_key, verifier_v2_args,
+    light_client_v2_args, message_hash, recovery, rotation, rotations_from, sent_messages,
+    slot_proof, stranded, submission_covering, submission_covering_key, verifier_v2_args,
 };
-use orange_node::keystore::Keystore;
+use orange_node::keystore::{Keystore, encryption_key};
 use orange_node::{HISTORY_KEYS_PER_BLOCK, Node, NodeConfig, Sim, validator_id};
 use orange_trie::keccak256;
 use support::eth::{ETH_CHAIN_ID, Eth, init_code, word_u64};
@@ -48,6 +52,8 @@ const GUARDIAN: [u8; 20] = [0x0B; 20];
 const DELAY: u64 = 3_600;
 const WINDOW: u64 = 86_400;
 const MAX_KEY_AGE: u64 = 2;
+/// The owner of the version-2 light client (spec 17 §5.4).
+const LIGHT_CLIENT_OWNER: [u8; 20] = [0x0C; 20];
 
 fn status(sim: &mut Sim, node: usize) -> StakingStatus {
     let r = sim.nodes[node].query(staking_query::STAKING, &[]).unwrap();
@@ -220,7 +226,7 @@ fn messages_cross_from_orange_to_ethereum() {
     let client = eth.deploy(
         DEPLOYER,
         &init_code("OrangeLightClientV2"),
-        &light_client_v2_args(&verifier, 0, &key, 200, MAX_KEY_AGE),
+        &light_client_v2_args(&verifier, 0, &key, 200, MAX_KEY_AGE, &LIGHT_CLIENT_OWNER),
     );
     let config = InboxConfig {
         light_client: client,
@@ -258,7 +264,14 @@ fn messages_cross_from_orange_to_ethereum() {
     let other_client = eth.deploy(
         DEPLOYER,
         &init_code("OrangeLightClientV2"),
-        &light_client_v2_args(&other_verifier, 0, &key, 200, MAX_KEY_AGE),
+        &light_client_v2_args(
+            &other_verifier,
+            0,
+            &key,
+            200,
+            MAX_KEY_AGE,
+            &LIGHT_CLIENT_OWNER,
+        ),
     );
     assert!(
         !eth.call(RELAYER, other_client, &submission.calldata())
@@ -664,6 +677,7 @@ fn a_light_client_follows_the_group_key_across_epochs() {
                 &group_key(&s.group_key).unwrap(),
                 16,
                 MAX_KEY_AGE,
+                &LIGHT_CLIENT_OWNER,
             ),
         )
     };
@@ -843,4 +857,200 @@ fn a_light_client_follows_the_group_key_across_epochs() {
     );
     assert!(eth.call(RELAYER, stale, &data).success);
     assert_eq!(word_u64(&get_from(&mut eth, stale, "keyId()")), MAX_KEY_AGE);
+}
+
+/// The `u64` at `key` in `node`'s chain state.
+fn state_u64(node: &Node, key: &[u8]) -> Option<u64> {
+    node.state_get(key).map(|v| u64::from_bytes(&v).unwrap())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_light_client_stranded_by_a_superseded_rotation_is_detected_and_recovered() {
+    // Four genesis validators hold key 0. Two of them unbond and two newcomers take their
+    // seats in epoch 1, then the two leavers stop their nodes: key sets 1 and 2 are adopted
+    // among the new set while key 0, short of shareholders, cannot hand off (spec 15 §6.6).
+    let validators: Vec<SigningKey> = (1..=6).map(|i| key(0x30 + i)).collect();
+    let staking = StakingParams {
+        epoch_blocks: 24,
+        unbonding_epochs: MAX_KEY_AGE + 2,
+        min_stake: 0,
+        max_validators: 0,
+        dkg_phase_blocks: 4,
+        max_key_age: MAX_KEY_AGE,
+        ..StakingParams::default()
+    };
+    let genesis = genesis(
+        &validators[..4],
+        &validators.iter().map(address).collect::<Vec<_>>(),
+        SLOT_MS,
+        Some(staking),
+    );
+    let config = NodeConfig {
+        now_ms: 10_000,
+        ..NodeConfig::default()
+    };
+    let kernel = kernel_module();
+    let mut sim = Sim::new(kernel, &genesis, &validators, 0, &config, 20).unwrap();
+    assert!(
+        sim.run_until(80 * SLOT_MS, |s| (0..6)
+            .all(|i| status(s, i).active.is_some()))
+            .unwrap()
+    );
+    let stake = 1_000 * GWEI;
+    for i in [4, 5] {
+        let register = StakingAction::Register {
+            dkg_key: encryption_key(&validators[i]).to_vec(),
+        };
+        let raw = tx(
+            &validators[i],
+            0,
+            Some(STAKING_ADDRESS),
+            stake,
+            &register.encode(),
+            200_000,
+        );
+        sim.submit(i, &raw).unwrap();
+    }
+    for i in [2, 3] {
+        let unbond = StakingAction::Unbond { amount: stake };
+        let raw = tx(
+            &validators[i],
+            0,
+            Some(STAKING_ADDRESS),
+            0,
+            &unbond.encode(),
+            200_000,
+        );
+        sim.submit(i, &raw).unwrap();
+    }
+    assert!(
+        sim.run_until(160 * SLOT_MS, |s| s.nodes[0].finalized_height().unwrap()
+            >= 25)
+            .unwrap()
+    );
+    sim.crash(2);
+    sim.crash(3);
+    let key_set_at = |node: &Node, id: u64| {
+        node.state_get(&[skeys::KEY_SET, &id.to_be_bytes()].concat())
+            .is_some()
+    };
+    assert!(
+        sim.run_until(400 * SLOT_MS, |s| key_set_at(&s.nodes[0], 2))
+            .unwrap()
+    );
+    assert_eq!(status(&mut sim, 0).active.unwrap().id, 0);
+    // A light client that holds key set 0, as the chain does.
+    let mut eth = Eth::new();
+    let verifier = eth.deploy(
+        DEPLOYER,
+        &init_code("OrangeFinalityVerifierV2"),
+        &verifier_v2_args(CHAIN_ID),
+    );
+    let client = eth.deploy(
+        DEPLOYER,
+        &init_code("OrangeLightClientV2"),
+        &light_client_v2_args(
+            &verifier,
+            0,
+            &group_key(&key_set_record(&sim.nodes[0], 0).key_set[..96]).unwrap(),
+            24,
+            MAX_KEY_AGE,
+            &LIGHT_CLIENT_OWNER,
+        ),
+    );
+    // Three of key 0's shareholders signed the handoff to key set 1 while it was the
+    // target; combined from their gossiped shares, the certificate is valid, and the
+    // client takes it. The chain never records it: key set 1 was superseded.
+    let older = key_set_record(&sim.nodes[0], 1);
+    let message = rotation_message(CHAIN_ID, 1, &older.key_set[..96]);
+    let signature = forged_signature(&sim.nodes[0], &validators[..3], 0, &message);
+    let superseded = abi::call(
+        "rotate(uint64,bytes,bytes)",
+        &[
+            Value::uint(1),
+            Value::Bytes(group_key(&older.key_set[..96]).unwrap().to_vec()),
+            Value::Bytes(signature),
+        ],
+    );
+    assert!(eth.call(RELAYER, client, &superseded).success);
+    let view = |eth: &mut Eth, signature: &str| {
+        word_u64(&eth.view(RELAYER, client, &abi::call(signature, &[])).output)
+    };
+    assert_eq!(
+        (view(&mut eth, "keyId()"), view(&mut eth, "previousKeyId()")),
+        (1, 0)
+    );
+    // The leavers come back and sign: key 0 hands off to the newest adopted key set.
+    sim.revive(2, kernel, &genesis).unwrap();
+    sim.revive(3, kernel, &genesis).unwrap();
+    assert!(
+        sim.run_until(400 * SLOT_MS, |s| rotation(&mut s.nodes[0], 0)
+            .unwrap()
+            .is_some())
+            .unwrap()
+    );
+    let handoff = rotation(&mut sim.nodes[0], 0).unwrap().unwrap();
+    assert!(handoff.to >= 2, "{handoff:?}");
+    let node = &mut sim.nodes[0];
+    assert!(
+        state_u64(
+            node,
+            &[rotation_keys::ACTIVATED, &1u64.to_be_bytes()].concat()
+        )
+        .is_none()
+    );
+    // The relayer sees that the client is stranded, and says so, instead of waiting for a
+    // handoff out of key set 1 that never comes.
+    assert!(stranded(node, 1));
+    assert!(!stranded(node, 0));
+    assert!(!stranded(node, handoff.to));
+    let newest = state_u64(node, rotation_keys::ADOPTED).unwrap();
+    assert!(!stranded(node, newest + 1));
+    let error = rotations_from(node, 1).unwrap_err();
+    assert!(matches!(error, Error::Stranded(1)), "{error}");
+    assert!(!rotations_from(node, 0).unwrap().is_empty());
+    // The recovery: the handoff out of the client's previous key set, which moves it past
+    // the stranded one. None moves a client past the key set the handoff reaches, and a
+    // key set the chain never adopted has no key to recover from.
+    let recovery_call = recovery(node, 0, 1).unwrap().expect("the handoff out of 0");
+    assert_eq!(recovery_call.rotation, handoff);
+    assert_eq!(
+        recovery_call.from_key,
+        group_key(&key_set_record(node, 0).key_set[..96]).unwrap()
+    );
+    assert_eq!(recovery(node, 0, handoff.to).unwrap(), None);
+    assert!(matches!(
+        recovery(node, 1_000, 1),
+        Err(Error::UnknownKeySet(1_000))
+    ));
+    // The owner pauses, recovers and unpauses; the client follows the chain again.
+    let owner = |eth: &mut Eth, data: &[u8]| eth.call(LIGHT_CLIENT_OWNER, client, data);
+    assert!(owner(&mut eth, &abi::call("pause()", &[])).success);
+    let recovered = owner(&mut eth, &recovery_call.calldata());
+    assert!(recovered.success, "{recovered:?}");
+    assert!(owner(&mut eth, &abi::call("unpause()", &[])).success);
+    assert_eq!(
+        (view(&mut eth, "keyId()"), view(&mut eth, "previousKeyId()")),
+        (handoff.to, 0)
+    );
+    let height = sim.nodes[0].finalized_height().unwrap();
+    assert!(
+        sim.run_until(80 * SLOT_MS, |s| {
+            submission_covering_key(&mut s.nodes[0], height, handoff.to)
+                .unwrap()
+                .submission
+                .is_some()
+        })
+        .unwrap()
+    );
+    let submission = submission_covering_key(&mut sim.nodes[0], height, handoff.to)
+        .unwrap()
+        .submission
+        .unwrap();
+    let outcome = eth.call(RELAYER, client, &submission.calldata());
+    assert!(outcome.success, "{outcome:?}");
+    for r in rotations_from(&mut sim.nodes[0], handoff.to).unwrap() {
+        assert!(eth.call(RELAYER, client, &r.calldata()).success);
+    }
 }

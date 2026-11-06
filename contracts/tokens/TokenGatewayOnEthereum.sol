@@ -22,21 +22,15 @@ contract TokenGatewayOnEthereum is TokenGateway, IOrangeMessageRecipient {
     /// @notice The least `messageGas`: enough to create a wrapped token, and far more than a
     /// release needs, so that no setting strands the messages sent under it.
     uint64 public constant MIN_MESSAGE_GAS = 1_000_000;
-    /// @notice The nonces of the paired gateway's messages reported spent (`reportVetoed`,
-    /// `reportDelivered`), each once.
-    mapping(uint64 nonce => bool) public reported;
 
     event InboxChanged(address indexed inbox);
     event MessageGasChanged(uint64 gas);
-    event Reported(uint64 indexed nonce, bytes32 effect, uint64 reportNonce);
 
     error NotInbox();
     error WrongChain();
     error NotRemoteGateway();
     error MessageGasTooLow();
     error NotVetoed();
-    error NotDelivered();
-    error AlreadyReported();
 
     constructor(
         EthereumOutbox outbox_,
@@ -102,13 +96,6 @@ contract TokenGatewayOnEthereum is TokenGateway, IOrangeMessageRecipient {
         if (gas < MIN_MESSAGE_GAS) revert MessageGasTooLow();
         messageGas = gas;
         emit MessageGasChanged(gas);
-    }
-
-    function _report(uint64 nonce, bytes32 effect) private returns (uint64 reportNonce) {
-        if (reported[nonce]) revert AlreadyReported();
-        reported[nonce] = true;
-        reportNonce = _sendRecorded(abi.encode(SPENT, nonce, effect));
-        emit Reported(nonce, effect, reportNonce);
     }
 
     function _send(bytes memory payload) internal override returns (uint64) {

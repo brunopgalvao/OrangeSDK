@@ -3,7 +3,7 @@ pragma solidity 0.8.28;
 
 /// The message verifier of an Orange chain (spec 18 §5.2): a native contract at
 /// 0x000000000000000000000000000000000000454D running the verifier module.
-/// It proves messages of the `EthereumOutbox`, records each delivered once,
+/// It proves messages of the `EthereumOutbox`, records the hash of each delivered once,
 /// and paces and pauses deliveries.
 interface IMessageVerifier {
     /// Only the inbox may consume messages.
@@ -44,6 +44,8 @@ interface IMessageVerifier {
 
     /// Whether message `nonce` was delivered.
     function delivered(uint64 nonce) external view returns (bool);
+    /// The hash of the message delivered with `nonce`, zero if none was.
+    function deliveredHash(uint64 nonce) external view returns (bytes32);
     /// Whether deliveries are stopped.
     function paused() external view returns (bool);
     /// The rate-limit window and the deliveries it allows.

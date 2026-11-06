@@ -26,7 +26,8 @@ pub mod keys {
     /// `window` → [`super::Window`].
     pub const WINDOW: &[u8] = b"window";
 
-    /// `delivered/` ‖ nonce (big-endian u64) → `[1]` once the message is delivered.
+    /// `delivered/` ‖ nonce (big-endian u64) → the delivered message's hash
+    /// (spec 18 §6.1), once it is delivered.
     #[must_use]
     pub fn delivered(nonce: u64) -> Vec<u8> {
         crate::client::keys::keyed(b"delivered/", nonce)
@@ -136,7 +137,7 @@ fn consume(
     if count >= max {
         return Err(encode(abi::RATE_LIMITED, &[]));
     }
-    if inbox::verify(
+    let hash = inbox::verify(
         c,
         &d.anchor,
         &cfg.outbox,
@@ -145,16 +146,14 @@ fn consume(
         &d.account_proof,
         &d.storage_proof,
     )
-    .is_err()
-    {
-        return Err(encode(abi::BAD_PROOF, &[]));
-    }
+    .ok()
+    .ok_or_else(|| encode(abi::BAD_PROOF, &[]))?;
     let count = count + 1;
     match own {
         Some(r) => put(store, &own_key, &RecipientLimit { start, count, ..r }),
         None => put(store, keys::WINDOW, &Window { start, count }),
     }
-    store.set(&keys::delivered(nonce), Some(&[1]));
+    store.set(&keys::delivered(nonce), Some(&hash));
     Ok(Vec::new())
 }
 
@@ -228,7 +227,8 @@ pub fn call(
     Ok(Vec::new())
 }
 
-/// Answers a view (`delivered`, `paused`, `rateLimit`, `recipientLimit`), as
+/// Answers a view (`delivered`, `deliveredHash`, `paused`, `rateLimit`,
+/// `recipientLimit`), as
 /// `module_query` does.
 ///
 /// # Errors
@@ -244,6 +244,15 @@ pub fn query(store: &dyn Storage, data: &[u8]) -> Result<Vec<u8>, Vec<u8>> {
                 .get(&keys::delivered(arg(data, 0).ok_or_else(Vec::new)?))
                 .is_some(),
         )
+    } else if selector == abi::DELIVERED_HASH && data.len() == 36 {
+        // The record right-aligned in a word: the hash, or zero if none.
+        let record = store
+            .get(&keys::delivered(arg(data, 0).ok_or_else(Vec::new)?))
+            .unwrap_or_default();
+        let mut hash = [0u8; 32];
+        let n = record.len().min(32);
+        hash[32 - n..].copy_from_slice(&record[record.len() - n..]);
+        Ok(words(&[hash]))
     } else if selector == abi::PAUSED && data.len() == 4 {
         flag(store.get(keys::PAUSED).is_some())
     } else if selector == abi::RATE_LIMIT && data.len() == 4 {

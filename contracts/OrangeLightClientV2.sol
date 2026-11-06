@@ -9,8 +9,10 @@ import {IOrangeFinalityVerifierV2} from "./IOrangeBridgeV2.sol";
 /// EIP-2537 encoding. A relayer moves it along the chain's handoffs with `rotate`, each signed by the key
 /// it replaces, and submits certified proposals with `submit`, whose anchored state roots it stores. A key
 /// is trusted for anchors up to `maxKeyAge` epochs past its own; past that the client refuses its
-/// certificates, so that every shareholder of a key it still trusts is still bonded on Orange. It has no
-/// owner: the verifier, the chain, the epoch length and the key age are fixed at deployment.
+/// certificates, so that every shareholder of a key it still trusts is still bonded on Orange. The
+/// verifier, the chain, the epoch length and the key age are fixed at deployment. Its owner can pause it
+/// and, while it is paused, recover it from a rotation that strands it (spec 17 §5.4): `recover` moves it
+/// along a handoff out of the key set it held before the current one, signed by that key set.
 contract OrangeLightClientV2 is IOrangeLightClient {
     /// @notice The verifier of the certificates this client accepts.
     IOrangeFinalityVerifierV2 public immutable verifier;
@@ -30,6 +32,19 @@ contract OrangeLightClientV2 is IOrangeLightClient {
     /// @notice The highest anchored height stored, zero before the first submission.
     uint64 public latestHeight;
 
+    /// @notice The id of the key set held before the current one: the one the last rotation left, or
+    /// the starting key set before any rotation.
+    uint64 public previousKeyId;
+
+    /// @notice Whether `submit` and `rotate` are stopped.
+    bool public paused;
+
+    /// @notice Pauses, unpauses, recovers a stranded client and transfers ownership.
+    address public owner;
+
+    /// @dev keccak256 of the previous key set's id (8 bytes) and group key (EIP-2537 encoding).
+    bytes32 private previousKeyHash;
+
     /// @dev The current group key in EIP-2537 encoding.
     bytes private key;
 
@@ -40,6 +55,15 @@ contract OrangeLightClientV2 is IOrangeLightClient {
     event StateRootStored(uint64 indexed height, bytes32 stateRoot, uint64 proposalHeight, bytes32 proposalHash);
     /// @notice The current key set moved from `from` to `to`.
     event KeyRotated(uint64 indexed from, uint64 indexed to);
+    /// @notice The owner moved the current key set from `stranded` to `to` along the handoff out of
+    /// `from`, the key set held before `stranded`.
+    event KeyRecovered(uint64 indexed stranded, uint64 indexed from, uint64 indexed to);
+    /// @notice The owner paused the client.
+    event Paused();
+    /// @notice The owner unpaused the client.
+    event Unpaused();
+    /// @notice Ownership moved to `owner`.
+    event OwnerChanged(address indexed owner);
 
     /// @notice The epoch length or the key age is zero.
     error InvalidParameters();
@@ -59,21 +83,48 @@ contract OrangeLightClientV2 is IOrangeLightClient {
     error NotNewer();
     /// @notice The certificate does not verify under the current key.
     error InvalidCertificate();
+    /// @notice The client is paused.
+    error IsPaused();
+    /// @notice The client is not paused.
+    error NotPaused();
+    /// @notice Only the owner may do this.
+    error NotOwner();
+    /// @notice A zero owner.
+    error ZeroAddress();
+    /// @notice The key set named is not the one held before the current one.
+    error NotPreviousKey();
 
     /// @param verifier_ The version-2 verifier.
     /// @param keyId_ The id of the trusted key set to start from.
     /// @param key_ Its group key in EIP-2537 encoding (256 bytes).
     /// @param epochBlocks_ Blocks per epoch on the chain.
     /// @param maxKeyAge_ The chain's `max_key_age`.
-    constructor(IOrangeFinalityVerifierV2 verifier_, uint64 keyId_, bytes memory key_, uint64 epochBlocks_, uint64 maxKeyAge_) {
+    /// @param owner_ The owner: a timelock or multisig, as `OrangeInbox`'s.
+    constructor(
+        IOrangeFinalityVerifierV2 verifier_,
+        uint64 keyId_,
+        bytes memory key_,
+        uint64 epochBlocks_,
+        uint64 maxKeyAge_,
+        address owner_
+    ) {
         if (epochBlocks_ == 0 || maxKeyAge_ == 0) revert InvalidParameters();
+        if (owner_ == address(0)) revert ZeroAddress();
         if (!verifier_.isValidKey(key_)) revert InvalidKey();
         verifier = verifier_;
         chainId = verifier_.chainId();
         epochBlocks = epochBlocks_;
         maxKeyAge = maxKeyAge_;
         keyId = keyId_;
+        previousKeyId = keyId_;
+        owner = owner_;
+        previousKeyHash = keccak256(abi.encodePacked(keyId_, key_));
         key = key_;
+    }
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert NotOwner();
+        _;
     }
 
     /// @notice The current group key in EIP-2537 encoding.
@@ -89,20 +140,68 @@ contract OrangeLightClientV2 is IOrangeLightClient {
     /// @notice Moves the current key set to `newKeyId` with group key `newKey` (EIP-2537 encoding), given
     /// the current key's group signature over the rotation message (spec 12 §7) in EIP-2537 encoding.
     function rotate(uint64 newKeyId, bytes calldata newKey, bytes calldata signature) external {
+        if (paused) revert IsPaused();
         uint64 current = keyId;
         if (newKeyId <= current) revert NotNewer();
         if (newKeyId > current + maxKeyAge) revert KeyExpired();
         if (!verifier.isValidKey(newKey)) revert InvalidKey();
-        if (!verifier.verifyRotation(key, newKeyId, newKey, signature)) revert InvalidCertificate();
+        bytes memory currentKey_ = key;
+        if (!verifier.verifyRotation(currentKey_, newKeyId, newKey, signature)) revert InvalidCertificate();
         keyId = newKeyId;
+        previousKeyId = current;
+        previousKeyHash = keccak256(abi.encodePacked(current, currentKey_));
         key = newKey;
         emit KeyRotated(current, newKeyId);
+    }
+
+    /// @notice Recovers a client that a rotation stranded on a key set the chain never hands off from
+    /// (spec 17 §5.4): moves the current key set to `newKeyId` with group key `newKey`, given the group
+    /// signature of the key set held before the current one, `fromKeyId` with group key `fromKey`, over
+    /// the rotation message to them, as `rotate` would have taken it from that key set. The owner,
+    /// while paused. The previous key set stays the one named, as the new key set is its successor.
+    function recover(
+        uint64 fromKeyId,
+        bytes calldata fromKey,
+        uint64 newKeyId,
+        bytes calldata newKey,
+        bytes calldata signature
+    ) external onlyOwner {
+        if (!paused) revert NotPaused();
+        if (keccak256(abi.encodePacked(fromKeyId, fromKey)) != previousKeyHash) revert NotPreviousKey();
+        uint64 stranded = keyId;
+        if (newKeyId <= stranded) revert NotNewer();
+        if (newKeyId > fromKeyId + maxKeyAge) revert KeyExpired();
+        if (!verifier.isValidKey(newKey)) revert InvalidKey();
+        if (!verifier.verifyRotation(fromKey, newKeyId, newKey, signature)) revert InvalidCertificate();
+        keyId = newKeyId;
+        key = newKey;
+        emit KeyRecovered(stranded, fromKeyId, newKeyId);
+    }
+
+    /// @notice Stops `submit` and `rotate`. The owner.
+    function pause() external onlyOwner {
+        paused = true;
+        emit Paused();
+    }
+
+    /// @notice Resumes `submit` and `rotate`. The owner.
+    function unpause() external onlyOwner {
+        paused = false;
+        emit Unpaused();
+    }
+
+    /// @notice Moves ownership to `owner_`, never zero. The owner.
+    function transferOwnership(address owner_) external onlyOwner {
+        if (owner_ == address(0)) revert ZeroAddress();
+        owner = owner_;
+        emit OwnerChanged(owner_);
     }
 
     /// @notice Stores the anchor of `proposal`, the canonical encoding of an Orange proposal (spec 08 §4),
     /// whose hash `signature` (the version-2 certificate's group signature in EIP-2537 encoding) certifies
     /// under the current key.
     function submit(bytes calldata proposal, bytes calldata signature) external {
+        if (paused) revert IsPaused();
         if (proposal.length < 96) revert ProposalTooShort();
         uint64 height = le64(proposal[8:16]);
         uint64 anchor = le64(proposal[56:64]);

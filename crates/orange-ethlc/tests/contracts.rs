@@ -94,7 +94,7 @@ fn the_outbox_stores_the_hash_the_inbox_proves() {
                 &account_proof,
                 &storage_proof
             ),
-            Ok(())
+            Ok(message.hash(&c, 7))
         );
         // Another chain id, payload, sender or recipient is not what was stored.
         assert!(

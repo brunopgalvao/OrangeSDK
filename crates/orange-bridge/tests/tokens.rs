@@ -79,6 +79,8 @@ const MALLORY: [u8; 20] = [0x66; 20];
 
 const DELAY: u64 = 600;
 const MAX_KEY_AGE: u64 = 2;
+/// The owner of the version-2 light client (spec 17 §5.4).
+const LIGHT_CLIENT_OWNER: [u8; 20] = [0x0C; 20];
 /// The gas each message from Ethereum gives the gateway on the OrangeSDK chain.
 const MESSAGE_GAS: u64 = 1_500_000;
 const UPDATE_GAS: u64 = 3_000_000;
@@ -91,29 +93,29 @@ const DEPOSIT_ETH_GAS: u64 = 123_972;
 /// Of the first `deposit` of an ERC-20 there.
 const DEPOSIT_TOKEN_GAS: u64 = 181_961;
 /// Of the delivery on the OrangeSDK chain whose mint creates wrapped ETH (the inbox's proofs included).
-const FIRST_MINT_GAS: u64 = 833_182;
+const FIRST_MINT_GAS: u64 = 833_869;
 /// Of a delivery on the OrangeSDK chain whose wrapped token exists.
-const MINT_GAS: u64 = 110_104;
+const MINT_GAS: u64 = 110_791;
 /// Of a withdrawal on the OrangeSDK chain: the burn and the send through the outbox.
-const BURN_GAS: u64 = 120_033;
+const BURN_GAS: u64 = 120_011;
 /// Of a deposit of the OrangeSDK chain's currency on the OrangeSDK chain.
-const LOCK_NATIVE_GAS: u64 = 140_161;
+const LOCK_NATIVE_GAS: u64 = 140_139;
 /// Of `OrangeInbox.execute` releasing ETH through the gateway on Ethereum.
 const RELEASE_GAS: u64 = 85_303;
 /// Of a withdrawal on Ethereum: the burn and the send through `EthereumOutbox`.
 const ETH_BURN_GAS: u64 = 108_860;
 /// Of the delivery on the OrangeSDK chain that releases the OrangeSDK chain's currency.
-const NATIVE_RELEASE_GAS: u64 = 100_327;
+const NATIVE_RELEASE_GAS: u64 = 101_002;
 /// Of `OrangeInbox.execute` of a `REFUND` that releases ETH back to its depositor.
 const REFUND_GAS: u64 = 88_289;
 /// Of the delivery on the OrangeSDK chain of a `MINT` of a token the gateway does not list, which sends it back.
-const BOUNCE_GAS: u64 = 165_186;
+const BOUNCE_GAS: u64 = 165_861;
 /// Of `refundSpent` on Ethereum releasing ETH whose message never arrives.
 const REFUND_SPENT_GAS: u64 = 47_282;
 /// Of `reportVetoed` on Ethereum, through `EthereumOutbox`.
 const REPORT_GAS: u64 = 114_844;
 /// Of the delivery on the OrangeSDK chain of the `SPENT` it sends.
-const SPENT_GAS: u64 = 106_564;
+const SPENT_GAS: u64 = 107_239;
 
 /// The OrangeSDK side: the simulated chain and its wallets' nonces.
 struct Orange {
@@ -441,6 +443,7 @@ fn tokens_cross_both_ways_over_the_verified_channels() {
             &group_key(&compressed).unwrap(),
             200,
             MAX_KEY_AGE,
+            &LIGHT_CLIENT_OWNER,
         ),
     );
     let orange_inbox = eth.deploy(

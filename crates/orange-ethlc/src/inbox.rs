@@ -95,7 +95,8 @@ pub fn storage_root(
 }
 
 /// Whether the proofs show `message` stored by the outbox at `outbox` in
-/// the state under `state_root`, for the OrangeSDK chain `chain_id`.
+/// the state under `state_root`, for the OrangeSDK chain `chain_id`: its
+/// hash (spec 18 §6.1) when they do.
 ///
 /// # Errors
 /// [`BadProof`] when they do not.
@@ -107,7 +108,7 @@ pub fn verify(
     message: &Message,
     account_proof: &[Vec<u8>],
     storage_proof: &[Vec<u8>],
-) -> Result<(), BadProof> {
+) -> Result<Hash, BadProof> {
     let root = storage_root(c, state_root, outbox, account_proof)?;
     let raw = mpt::verify(
         c,
@@ -117,8 +118,9 @@ pub fn verify(
     )?
     .ok_or(BadProof)?;
     let stored = decode(&raw).and_then(|v| v.u256()).ok().ok_or(BadProof)?;
-    if stored == message.hash(c, chain_id) {
-        Ok(())
+    let hash = message.hash(c, chain_id);
+    if stored == hash {
+        Ok(hash)
     } else {
         Err(BadProof)
     }

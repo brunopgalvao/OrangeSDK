@@ -33,6 +33,8 @@ const DEPLOYER: [u8; 20] = [0xD0; 20];
 const RELAYER: [u8; 20] = [0xEE; 20];
 const EPOCH_BLOCKS: u64 = 16;
 const MAX_KEY_AGE: u64 = 2;
+/// The owner of the version-2 light client (spec 17 §5.4).
+const LIGHT_CLIENT_OWNER: [u8; 20] = [0x0C; 20];
 /// The key set the light client starts from, and the one it hands off to.
 const ACTIVE: u64 = 3;
 const NEXT: u64 = 4;
@@ -244,7 +246,14 @@ impl Client {
         let client = eth.deploy(
             DEPLOYER,
             &init_code("OrangeLightClientV2"),
-            &light_client_v2_args(&verifier, ACTIVE, &eip(key), EPOCH_BLOCKS, MAX_KEY_AGE),
+            &light_client_v2_args(
+                &verifier,
+                ACTIVE,
+                &eip(key),
+                EPOCH_BLOCKS,
+                MAX_KEY_AGE,
+                &LIGHT_CLIENT_OWNER,
+            ),
         );
         Client { eth, client }
     }

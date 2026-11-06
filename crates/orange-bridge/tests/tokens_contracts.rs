@@ -28,9 +28,9 @@ use orange_bridge::tokens::{
     EthereumGatewayConfig, NATIVE, OrangeGatewayConfig, TokenMessage, VOID, address_view,
     cancel_queued_calldata, claim_calldata, claim_to_calldata, deposit_calldata,
     execute_queued_calldata, freeze_queued_calldata, identity, refund_queued_calldata,
-    refund_spent_calldata, report_delivered_calldata, report_vetoed_calldata,
-    resend_spent_calldata, set_lock_cap_calldata, set_mint_cap_calldata, set_mint_limit_calldata,
-    set_release_limit_calldata, unfreeze_queued_calldata, wrapped_token,
+    refund_spent_calldata, report_delivered_calldata, report_delivered_on_orange_calldata,
+    report_vetoed_calldata, resend_spent_calldata, set_lock_cap_calldata, set_mint_cap_calldata,
+    set_mint_limit_calldata, set_release_limit_calldata, unfreeze_queued_calldata, wrapped_token,
 };
 use orange_trie::keccak256;
 use revm::primitives::Log;
@@ -54,9 +54,9 @@ const BIG: u128 = 1 << 100;
 
 /// Gas of a `deposit` of ETH on `TokenGatewayOnEthereum`, the first one, as a transaction. The
 /// stand-in's nonce is no longer zero: the gateways' `HELLO`s came first.
-const DEPOSIT_ETH_GAS: u64 = 100_631;
+const DEPOSIT_ETH_GAS: u64 = 100_653;
 /// Gas of the first `deposit` of an ERC-20 there.
-const DEPOSIT_TOKEN_GAS: u64 = 158_620;
+const DEPOSIT_TOKEN_GAS: u64 = 158_642;
 /// Gas of a `deposit` that burns a wrapped token on the other side.
 const WITHDRAW_GAS: u64 = 78_611;
 /// Gas of the guardian's `freezeQueued` of a queued transfer (spec 21 §8).
@@ -69,7 +69,7 @@ const CANCEL_RELEASE_GAS: u64 = 53_095;
 /// cancellation, and the `REFUND` sent through the stand-in and recorded.
 const REFUND_MINT_GAS: u64 = 79_786;
 /// Gas of the owner's `refundQueued` of a queued release under a release limit.
-const REFUND_RELEASE_GAS: u64 = 85_770;
+const REFUND_RELEASE_GAS: u64 = 85_788;
 
 fn ok(outcome: &Outcome) {
     assert!(outcome.success, "{outcome:?}");
@@ -401,19 +401,34 @@ impl World {
     }
 
     /// Anyone reports to the gateway on the OrangeSDK chain that its message `nonce` was
-    /// vetoed, or, with `delivered`, what the inbox delivered with it.
+    /// vetoed in `OrangeInbox`, or, with `delivered`, what that inbox delivered with it; or,
+    /// for a message delivered on the OrangeSDK chain, to the gateway on Ethereum what the
+    /// inbox there delivered (spec 21 §5.2).
     fn report(&mut self, nonce: u64, delivered: Option<&Pending>) -> Outcome {
-        let data = match delivered {
-            None => report_vetoed_calldata(nonce),
-            Some(p) => report_delivered_calldata(&OrangeMessage {
-                nonce: p.nonce,
-                sender: p.sender,
-                recipient: p.recipient,
-                payload: p.payload.clone(),
-                ..OrangeMessage::default()
-            }),
+        let (at, data) = match delivered {
+            None => (self.on_eth, report_vetoed_calldata(nonce)),
+            Some(p) if p.recipient == self.on_orange => (
+                self.on_orange,
+                report_delivered_on_orange_calldata(
+                    p.nonce,
+                    &p.sender,
+                    &p.recipient,
+                    0,
+                    &p.payload,
+                ),
+            ),
+            Some(p) => (
+                self.on_eth,
+                report_delivered_calldata(&OrangeMessage {
+                    nonce: p.nonce,
+                    sender: p.sender,
+                    recipient: p.recipient,
+                    payload: p.payload.clone(),
+                    ..OrangeMessage::default()
+                }),
+            ),
         };
-        let o = self.eth.call(STRANGER, self.on_eth, &data);
+        let o = self.eth.call(STRANGER, at, &data);
         self.record(o)
     }
 
@@ -2001,6 +2016,69 @@ fn messages_that_never_arrive_are_refunded_or_sent_again() {
     assert_eq!(w.eth.balance(CAROL), carol);
     checks(&mut w);
 
+    // From Ethereum: a forgery that pays out at once on the OrangeSDK chain (a HELLO,
+    // which moves nothing) takes the nonce of Alice's deposit. The OrangeSDK chain's
+    // inbox recorded the hash of what it delivered, so anyone reports it there, and
+    // Alice is refunded on Ethereum.
+    let alice = w.eth.balance(ALICE);
+    ok(&w.deposit(ALICE, on_eth, NATIVE, BOB, ETHER / 4));
+    let honest = w.strand(0);
+    let forged = Pending {
+        payload: hello(true),
+        ..honest.clone()
+    };
+    ok(&w.forge(&forged));
+    checks(&mut w);
+    reverted_with(&w.unstrand(0), "NotSpent()");
+    // Only exactly what the inbox delivered is reported, and only once.
+    reverted_with(&w.report(honest.nonce, Some(&honest)), "NotDelivered()");
+    let starved = report_delivered_on_orange_calldata(
+        forged.nonce,
+        &forged.sender,
+        &forged.recipient,
+        1,
+        &forged.payload,
+    );
+    reverted_with(&w.eth.call(STRANGER, on_orange, &starved), "NotDelivered()");
+    let never = Pending {
+        nonce: 7_000,
+        ..forged.clone()
+    };
+    reverted_with(&w.report(never.nonce, Some(&never)), "NotDelivered()");
+    let reported = w.report(honest.nonce, Some(&forged));
+    ok(&reported);
+    assert!(logged(&reported, "Reported(uint64,bytes32,uint64)"));
+    reverted_with(&w.report(honest.nonce, Some(&forged)), "AlreadyReported()");
+    assert_eq!(
+        TokenMessage::decode(&w.pending[0].payload),
+        Some(TokenMessage::Spent {
+            nonce: honest.nonce,
+            effect: identity(&hello(true)),
+        })
+    );
+    w.deliver_all();
+    assert_eq!(w.spent(on_eth, honest.nonce), identity(&hello(true)));
+    let paid = w.unstrand(0);
+    ok(&paid);
+    assert!(logged(&paid, "SpentRefunded(uint64)"));
+    w.execute_all();
+    assert_eq!(w.eth.balance(ALICE), alice);
+    checks(&mut w);
+    // An honest message delivered there is reported as itself, and not refunded.
+    ok(&w.deposit(ALICE, on_eth, NATIVE, BOB, ETHER / 4));
+    let delivered = w.pending[0].clone();
+    w.deliver_all();
+    ok(&w.report(delivered.nonce, Some(&delivered)));
+    w.deliver_all();
+    assert_eq!(
+        w.spent(on_eth, delivered.nonce),
+        identity(&delivered.payload)
+    );
+    w.stranded.push(delivered);
+    reverted_with(&w.unstrand(0), "NotSpent()");
+    w.stranded.clear();
+    checks(&mut w);
+
     // A vetoed message is reported in the same way, with nothing delivered.
     ok(&w.deposit(CAROL, on_orange, NATIVE, DAVE, ETHER));
     let nonce = w.pending[0].nonce;
@@ -2391,11 +2469,12 @@ fn locked_always_covers_what_is_minted() {
             // A forgery takes the nonce of an honest message in flight, which
             // never arrives: a mint or release over its limit (or of a token
             // the receiving gateway does not list, which goes back at once),
-            // or, from the OrangeSDK chain, a HELLO that moves nothing.
+            // or a HELLO that moves nothing, paid out at once on either chain.
+            // Either inbox's record tells the sender what took the nonce.
             18..=19 if !w.pending.is_empty() => {
                 let i = usize::try_from(rng.below(w.pending.len() as u64)).unwrap();
                 let p = w.pending[i].clone();
-                let payload = if op == 19 && p.recipient == on_eth {
+                let payload = if op == 19 {
                     hello(true)
                 } else {
                     let (home, origin) = rng.pick(&homes);
@@ -2415,9 +2494,7 @@ fn locked_always_covers_what_is_minted() {
                     if let Some(&(gateway, id, _)) = w.queued.get(before) {
                         ok(&w.eth.call(GUARDIAN, gateway, &freeze_queued_calldata(id)));
                     }
-                    if forged.recipient == on_eth {
-                        reportable.push((forged.nonce, Some(forged)));
-                    }
+                    reportable.push((forged.nonce, Some(forged)));
                 }
             }
             // `OrangeInbox`'s guardian vetoes a message from the OrangeSDK chain.
@@ -2434,7 +2511,7 @@ fn locked_always_covers_what_is_minted() {
             // stranded message refunded or sent again, which works once the
             // nonce is known spent there by something else.
             21 if !reportable.is_empty() || !w.stranded.is_empty() => {
-                if !reportable.is_empty() && rng.below(2) == 0 {
+                if !reportable.is_empty() && rng.below(3) == 0 {
                     let i = usize::try_from(rng.below(reportable.len() as u64)).unwrap();
                     let (nonce, delivered) = reportable.remove(i);
                     ok(&w.report(nonce, delivered.as_ref()));

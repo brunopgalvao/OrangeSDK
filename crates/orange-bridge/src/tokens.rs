@@ -446,6 +446,30 @@ pub fn report_delivered_calldata(message: &Message) -> Vec<u8> {
     )
 }
 
+/// `reportDelivered(message)` on `TokenGatewayOnOrange`: tells the gateway
+/// on Ethereum what the OrangeSDK chain's inbox delivered as its message
+/// `nonce`, the `EthereumOutbox` message `(nonce, sender, recipient,
+/// gasLimit, payload)` (spec 18 §6.1, spec 21 §5.2); anyone may send it.
+#[must_use]
+pub fn report_delivered_on_orange_calldata(
+    nonce: u64,
+    sender: &Address,
+    recipient: &Address,
+    gas_limit: u64,
+    payload: &[u8],
+) -> Vec<u8> {
+    abi::call(
+        "reportDelivered((uint64,address,address,uint64,bytes))",
+        &[Value::Tuple(vec![
+            Value::uint(u128::from(nonce)),
+            Value::address(sender),
+            Value::address(recipient),
+            Value::uint(u128::from(gas_limit)),
+            Value::Bytes(payload.to_vec()),
+        ])],
+    )
+}
+
 /// The calldata of a gateway view that takes one address, such as
 /// `locked(address)`, `lockCap(address)`, `wrappedToken(address)` or a
 /// token's `balanceOf(address)`.
@@ -800,6 +824,21 @@ mod tests {
                     ..Message::default()
                 }),
                 [0x00, 0x09, 0xc8, 0xba],
+                &[
+                    word(&[0x20]),
+                    word(&[9]),
+                    word(&[1; 20]),
+                    word(&[2; 20]),
+                    word(&[3]),
+                    word(&[0xa0]),
+                    word(&[1]),
+                    padded(&[0xAB]),
+                ]
+                .concat(),
+            ),
+            (
+                report_delivered_on_orange_calldata(9, &[1; 20], &[2; 20], 3, &[0xAB]),
+                [0xb0, 0xa4, 0x25, 0xb4],
                 &[
                     word(&[0x20]),
                     word(&[9]),

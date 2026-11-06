@@ -129,6 +129,9 @@ abstract contract TokenGateway {
     /// message whose record differs never arrives, and is refunded (`refundSpent`) or sent again
     /// (`resendSpent`).
     mapping(uint64 nonce => bytes32) public spent;
+    /// @notice The nonces of the paired gateway's messages this gateway reported spent in its own
+    /// inbox (`reportDelivered`, and on Ethereum `reportVetoed`), each once.
+    mapping(uint64 nonce => bool) public reported;
 
     uint256 private transient entered;
 
@@ -160,6 +163,7 @@ abstract contract TokenGateway {
     event NonceSpent(uint64 indexed nonce, bytes32 effect);
     event SpentRefunded(uint64 indexed nonce);
     event Resent(uint64 indexed nonce, uint64 indexed resentNonce);
+    event Reported(uint64 indexed nonce, bytes32 effect, uint64 reportNonce);
     event PeerConfirmed();
     event Paused(address indexed by);
     event Unpaused();
@@ -189,6 +193,8 @@ abstract contract TokenGateway {
     error NotRecorded();
     error NotSpent();
     error NotResendable();
+    error NotDelivered();
+    error AlreadyReported();
     /// @notice A transfer's time to wait does not fit 64 bits; its delivery reverts and stays in its channel.
     error QueueTooLong();
 
@@ -449,6 +455,15 @@ abstract contract TokenGateway {
     function _identity(bytes calldata payload) internal pure returns (bytes32) {
         if (uint256(bytes32(payload[:32])) == MINT) return keccak256(payload[:160]);
         return keccak256(payload);
+    }
+
+    /// @dev Tells the paired gateway that this gateway's inbox spent nonce `nonce` of its messages with
+    /// `effect`: a `SPENT`, recorded as every `SPENT` is, once per nonce.
+    function _report(uint64 nonce, bytes32 effect) internal returns (uint64 reportNonce) {
+        if (reported[nonce]) revert AlreadyReported();
+        reported[nonce] = true;
+        reportNonce = _sendRecorded(abi.encode(SPENT, nonce, effect));
+        emit Reported(nonce, effect, reportNonce);
     }
 
     /// @dev Records that the paired gateway's inbox spent nonce `nonce` of this gateway's messages

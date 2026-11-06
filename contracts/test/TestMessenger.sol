@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity 0.8.28;
 
-import {IEthereumMessageReceiver} from "../EthereumInbox.sol";
+import {EthereumInbox, IEthereumMessageReceiver} from "../EthereumInbox.sol";
 import {IOrangeMessageRecipient} from "../IOrangeBridge.sol";
 
 /// @notice Test stand-in for both message channels at once, so that both token gateways run in one
@@ -30,11 +30,19 @@ contract TestMessenger {
     /// @notice What `toEthereum` delivered and `veto` vetoed, as `OrangeInbox.entries` reports it.
     mapping(uint64 nonce => Entry) public entries;
 
+    /// @notice What `toOrange` delivered, as `EthereumInbox.deliveredHash` reports it.
+    mapping(uint64 nonce => bytes32) public deliveredHash;
+
     event Sent(uint64 indexed nonce, address indexed sender, address indexed recipient, bytes payload);
 
     /// @notice Stands in for `OrangeInbox.hashMessage`.
     function hashMessage(Message memory m) public pure returns (bytes32) {
         return keccak256(abi.encode(m.nonce, m.sender, m.recipient, m.value, m.payload));
+    }
+
+    /// @notice Stands in for `EthereumInbox.hashMessage`.
+    function hashMessage(EthereumInbox.Message memory m) public view returns (bytes32) {
+        return keccak256(abi.encode(uint64(block.chainid), m.nonce, m.sender, m.recipient, m.gasLimit, m.payload));
     }
 
     /// @notice Vetoes message `nonce` as `OrangeInbox.veto` does.
@@ -62,8 +70,10 @@ contract TestMessenger {
         entries[nonce] = Entry(hashMessage(Message(nonce, sender, gateway, 0, payload)), 0, 0, 2);
     }
 
-    /// @notice Delivers as the Orange inbox does.
+    /// @notice Delivers as the Orange inbox does, with a gas limit of 0 in the message, and records
+    /// the delivery.
     function toOrange(address gateway, uint64 nonce, address sender, bytes calldata payload) external {
         IEthereumMessageReceiver(gateway).onEthereumMessage(nonce, sender, payload);
+        deliveredHash[nonce] = hashMessage(EthereumInbox.Message(nonce, sender, gateway, 0, payload));
     }
 }
