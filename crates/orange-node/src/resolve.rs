@@ -174,7 +174,7 @@ pub fn spawn_dial(
     resolver: &Arc<dyn Resolve>,
     running: &Arc<AtomicUsize>,
     timeout: Duration,
-    done: impl FnOnce(io::Result<TcpStream>) + Send + 'static,
+    done: Box<dyn FnOnce(io::Result<TcpStream>) + Send>,
 ) -> bool {
     let guard = match addr {
         PeerAddr::Ip(_) => None,
@@ -266,6 +266,26 @@ mod tests {
         assert!(connect(&addr, &here, second, second).is_ok());
         let late = connect(&addr, &here, second, Duration::ZERO).unwrap_err();
         assert_eq!(late.kind(), io::ErrorKind::TimedOut);
+        // An address that refuses is passed over for the next; an address
+        // that is an ip is dialled without the resolver.
+        let open = listener.local_addr().unwrap();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let both = Exact(vec![closed, open]);
+        assert!(connect(&addr, &both, second, second).is_ok());
+        let refused = connect(&addr, &Exact(vec![closed]), second, second).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(connect(&PeerAddr::Ip(open), &Exact(vec![]), second, second).is_ok());
+    }
+
+    struct Exact(Vec<SocketAddr>);
+
+    impl Resolve for Exact {
+        fn resolve(&self, _: &str, _: u16) -> io::Result<Vec<SocketAddr>> {
+            Ok(self.0.clone())
+        }
     }
 
     #[test]

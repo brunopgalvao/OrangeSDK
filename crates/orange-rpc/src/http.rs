@@ -204,6 +204,23 @@ fn read_line(
     String::from_utf8(line).map_err(|_| bad("stream did not contain valid UTF-8"))
 }
 
+/// Takes the header `name: value` if it is one of a WebSocket upgrade's:
+/// `Upgrade` sets `upgrade`, the others fill `handshake`.
+fn websocket_header(name: &str, value: &str, upgrade: &mut bool, handshake: &mut Handshake) {
+    let value = value.trim();
+    if name.eq_ignore_ascii_case("upgrade") {
+        *upgrade = value.eq_ignore_ascii_case("websocket");
+    } else if name.eq_ignore_ascii_case("connection") {
+        handshake.connection_upgrade = value
+            .split(',')
+            .any(|t| t.trim().eq_ignore_ascii_case("upgrade"));
+    } else if name.eq_ignore_ascii_case("sec-websocket-key") {
+        handshake.key = Some(value.to_owned());
+    } else if name.eq_ignore_ascii_case("sec-websocket-version") {
+        handshake.version = Some(value.to_owned());
+    }
+}
+
 /// Reads one HTTP request from a stream, within `limits`.
 ///
 /// # Errors
@@ -249,16 +266,8 @@ pub fn read_request(
                 .map_err(|_| bad("bad content-length"))?;
         } else if name.eq_ignore_ascii_case("origin") {
             origin = Some(value.trim().to_owned());
-        } else if name.eq_ignore_ascii_case("upgrade") {
-            upgrade = value.trim().eq_ignore_ascii_case("websocket");
-        } else if name.eq_ignore_ascii_case("connection") {
-            handshake.connection_upgrade = value
-                .split(',')
-                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"));
-        } else if name.eq_ignore_ascii_case("sec-websocket-key") {
-            handshake.key = Some(value.trim().to_owned());
-        } else if name.eq_ignore_ascii_case("sec-websocket-version") {
-            handshake.version = Some(value.trim().to_owned());
+        } else {
+            websocket_header(name, value, &mut upgrade, &mut handshake);
         }
     }
     if content_length > limits.max_body {

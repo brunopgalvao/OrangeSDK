@@ -1180,7 +1180,7 @@ impl Transport {
             let done = x.done.0.clone();
             let timeout = Duration::from_millis(DIAL_TIMEOUT_MS);
             // A transport dropped meanwhile no longer listens.
-            let send = move |stream| drop(done.send((token, stream)));
+            let send = Box::new(move |stream| drop(done.send((token, stream))));
             // Past the cap on running dials of names, it waits for the next turn.
             if crate::resolve::spawn_dial(addr, &self.resolver, &self.resolving, timeout, send) {
                 x.dialing.push(Dialing {
@@ -1480,7 +1480,7 @@ impl Transport {
             }
             let token = self.token();
             let done = self.named_done.0.clone();
-            let send = move |stream| drop(done.send((i, (token, stream))));
+            let send = Box::new(move |stream| drop(done.send((i, (token, stream)))));
             let addr = self.named[i].addr.clone();
             let timeout = Duration::from_millis(DIAL_TIMEOUT_MS);
             // Past the cap on running dials of names, it waits for the next turn.
