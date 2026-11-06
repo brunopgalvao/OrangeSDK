@@ -8,7 +8,7 @@ Codex ADR 0003 makes every OrangeSDK chain a Type 2 Ethereum chain: standard EVM
 - the block header: every block, the genesis block included, has an Ethereum header whose `keccak256` of the RLP is the block hash, with Merkle-Patricia transactions and receipts roots and a logs bloom, while the state root stays OrangeSDK's binary trie (§3); the genesis block's hash and the chain id identify the chain (§3.4);
 - `eth_getProof`, which answers with spec 10 proofs in EIP-1186's response shape (§4);
 - historical state: the state methods answer at any block within a retention window, or at every block on an archive node (§5);
-- the polled filters and the smaller methods standard clients call, the differences from geth that remain, and the suite of standard clients that checks them (§8).
+- the polled filters and the smaller methods standard clients call, the WebSocket server and its subscriptions, the differences from geth that remain, and the suite of standard clients that checks them (§8).
 
 It extends codex ADR 0020, which specified the RPC with state at the head only and OrangeSDK's own block commitments; §3 and §5 replace its points 2 and 5. What this document does not change: proposals, anchors and threshold certificates (spec 08, 12, 17) keep their formats, since none of them carries the block hash or the receipts root; the state commitment is spec 10's.
 
@@ -251,11 +251,11 @@ The execution-spec state tests run set-code transactions through the kernel's ow
 - A node without a data directory keeps its history in memory and has none from before it started; while blocks write heavily a window is shorter than `state_history` (§5.1). A node started from a snapshot has no state from before the snapshot (22 §7).
 - The pool's rules for delegation are geth's, plus the take's rule for authorities ahead (§2.4); a pool of another host may differ without affecting consensus (14 §1).
 - Proposals are not run before they are made: a delegated account's code can spend the account's balance, or move its nonce by creating a contract, during another sender's transaction, and a later transaction of that account in the same block is then recorded as failed (06 §5.1) where a geth builder would have left it out; so is a transaction priced below the base fee of the block it lands in (23 §10).
-- The RPC serves no subscriptions, no tracing and no access-list generation (§8.3).
+- The RPC serves no tracing and no access-list generation (§8.3).
 
 ## 8. Filters and the client surface
 
-What standard clients call beyond the methods above, as they call it over HTTP. `tools/ecosystem` runs ethers 6, viem 2 and Foundry (`cast`, `forge create`, `forge script`, `cast run`) against `orange dev`, and CI runs it on every change (§8.4).
+What standard clients call beyond the methods above, as they call it over HTTP and over a WebSocket (§8.7). `tools/ecosystem` runs ethers 6, viem 2 and Foundry (`cast`, `forge create`, `forge script`, `cast run`) against `orange dev`, and CI runs it on every change (§8.4).
 
 ### 8.1 Filters
 
@@ -276,14 +276,15 @@ As the execution API specifies them: `eth_getBlockTransactionCountByNumber` and 
 
 Deliberate differences from geth, each found by the suite of §8.4:
 
-- **No subscriptions.** The server answers one request per connection (`Connection: close`), so it has no WebSocket and no `eth_subscribe`: it answers `eth_subscribe` and `eth_unsubscribe` with geth's answer over HTTP, -32601 `notifications not supported`. Clients poll: ethers' `JsonRpcProvider` and viem's `http` transport do so by default, through the filters of §8.1 or `eth_getLogs` and `eth_blockNumber`.
+- **Subscriptions over WebSocket only.** An HTTP request is answered and its connection closed (`Connection: close`); `eth_subscribe` and `eth_unsubscribe` sent over HTTP get geth's answer, -32601 `notifications not supported`. Over a WebSocket on the same port (§8.7) they are served. Clients on HTTP poll: ethers' `JsonRpcProvider` and viem's `http` transport do so by default, through the filters of §8.1 or `eth_getLogs` and `eth_blockNumber`; ethers' `WebSocketProvider`, viem's `webSocket` transport and `cast subscribe` subscribe.
+- **Subscription kinds.** `newHeads`, `logs` and `newPendingTransactions` (hashes only, as geth sends them without `true`) are served; `syncing` and the full-transaction form of `newPendingTransactions` get -32602 (§8.7.3).
 - **No tracing, no access-list generation, no simulation.** `debug_*`, `trace_*`, `eth_createAccessList` and `eth_simulateV1` would need an inspector in the kernel's EVM; they get -32601. `cast run` works without them: it replays a transaction in Foundry's own EVM over historical state (§5), and the suite checks it charges the gas the kernel charged. `cast access-list` does not work.
 - **Methods geth removed** (`eth_coinbase`, `eth_mining`, `eth_hashrate`, `eth_protocolVersion`) and the node-held-key methods (`eth_sign`, `eth_sendTransaction`, `eth_signTransaction`; `eth_accounts` is empty) are not served.
 - **Client caches and short slots.** A block every 400 ms is shorter than some client caches: ethers 6 answers a request identical to one made in the last 250 ms from its cache (`cacheTimeout`), so a script that sends, waits for the receipt and sends again within that can sign with a stale pending nonce, which the node refuses as `nonce too low`, as it does against anvil or hardhat with automine. A client on an OrangeSDK chain sets `cacheTimeout: -1` (or manages nonces, as ethers' `NonceManager` does); viem has no such cache for nonces.
 
 ### 8.4 The ecosystem suite
 
-`tools/ecosystem` (its README says how to run it) starts nothing itself: CI builds `orange`, starts `orange dev` with the suite's genesis (chain id 1337, a 1 gwei base-fee floor) and runs `npm test` (ethers 6.17.0 and viem 2.57.7, pinned, with solc-js 0.8.28) and `foundry.sh` (cast and forge) against it. Together they cover the chain id and blocks by number, hash and tag; balances and nonces, `pending` included; signed EIP-1559, EIP-155 legacy, EIP-2930 and EIP-7702 transactions and their receipts; an ERC-20 deployed with `forge create`, `forge script` (several transactions of one sender before any is mined) and both clients' factories, its calls, gas estimates and events through `eth_getLogs`, the filters of §8.1 and both clients' watchers; `eth_feeHistory`, `eth_maxPriorityFeePerGas` and the clients' fee estimates (spec 23 §7); `eth_getProof`; and revert reasons, a custom error and a revert string decoded by each client from `eth_call` and `eth_estimateGas`, and a reverted transaction reported as failed.
+`tools/ecosystem` (its README says how to run it) starts nothing itself: CI builds `orange`, starts `orange dev` with the suite's genesis (chain id 1337, a 1 gwei base-fee floor) and runs `npm test` (ethers 6.17.0 and viem 2.57.7, pinned, with solc-js 0.8.28) and `foundry.sh` (cast and forge) against it. Together they cover the chain id and blocks by number, hash and tag; balances and nonces, `pending` included; signed EIP-1559, EIP-155 legacy, EIP-2930 and EIP-7702 transactions and their receipts; an ERC-20 deployed with `forge create`, `forge script` (several transactions of one sender before any is mined) and both clients' factories, its calls, gas estimates and events through `eth_getLogs`, the filters of §8.1 and both clients' watchers; `eth_feeHistory`, `eth_maxPriorityFeePerGas` and the clients' fee estimates (spec 23 §7); `eth_getProof`; revert reasons, a custom error and a revert string decoded by each client from `eth_call` and `eth_estimateGas`, and a reverted transaction reported as failed; and, over the WebSocket of §8.7, ordinary calls, `newHeads`, the token's events through a `logs` subscription and `newPendingTransactions`, through ethers' `WebSocketProvider` and viem's `webSocket` transport.
 
 ### 8.5 Browsers and `orange_stop`
 
@@ -314,3 +315,49 @@ What one request makes the node build is bounded as well (`crates/orange-rpc/src
 - **`txpool_content`** answers at most `MAX_RESPONSE_BYTES` of JSON: a pool whose content is larger (a full pool holds 64 MiB of raw transactions, over twice that as JSON, 14 §4) is refused with -32003 `response too large`; `txpool_status` still counts it (14 §7).
 
 Before 2026-11-06 the server read, answered and wrote each connection on the node's own thread, one at a time, with only a 5 s timeout on each read: a client that sent a byte every 4 s, or never read a large answer, stopped the node from voting, ticking and talking to its peers for as long as it liked; and a 5 MB request of reward percentiles, or a batch of 1 000 `txpool_content` over a full pool, made the node build tens of gigabytes of answer.
+
+### 8.7 WebSocket and subscriptions
+
+Clients that subscribe (ethers' `WebSocketProvider`, viem's `webSocket` transport, `cast subscribe`, wallets and indexers that watch heads and events) need a connection that stays open and a server that sends without being asked. The reference host serves a WebSocket (RFC 6455) on the JSON-RPC port, beside HTTP: `crates/orange-rpc/src/ws.rs` has the frame codec, the handshake and the socket's threads, `crates/orange-rpc/src/subscriptions.rs` what the node's thread keeps and sends. The codec and the SHA-1 the handshake needs are the host's own, about 400 lines with their tests: no crate in the workspace frames WebSocket messages, and the crates that do (`tungstenite` and its kin) bring an HTTP parser, TLS and randomness features of their own beside the server of §8.6, whose bounds the socket must share.
+
+#### 8.7.1 The upgrade
+
+A `GET` request, on any path, whose `Upgrade` header is `websocket` asks for a WebSocket. It is read under the bounds of §8.6 (its deadline, its header limits), decided on the node's thread like any request, and answered, in this order:
+
+1. `400 Bad Request` when its `Connection` header does not list `upgrade`, or its `Sec-WebSocket-Key` is missing or is not the base64 of 16 bytes;
+2. `426 Upgrade Required`, with `Sec-WebSocket-Version: 13`, when its `Sec-WebSocket-Version` is not `13`;
+3. `403 Forbidden` when it carries an `Origin` that `--rpc-cors` does not allow, under the rule of §8.5. Browsers send `Origin` with every WebSocket upgrade and never preflight one, so this check is all that keeps a page the operator opened off the socket; CORS headers mean nothing to a WebSocket and none are sent. A client outside a browser sends no `Origin` and is answered whatever `--rpc-cors` says, as over HTTP;
+4. `503 Service Unavailable` when `MAX_WS_CONNECTIONS` (32) sockets are open;
+5. otherwise `101 Switching Protocols` with `Sec-WebSocket-Accept`, the base64 of the SHA-1 of the key followed by RFC 6455's GUID. No extension and no subprotocol is agreed.
+
+An open socket counts against `MAX_WS_CONNECTIONS` and no longer against the `MAX_CONNECTIONS` of HTTP, so open sockets never keep HTTP clients out.
+
+#### 8.7.2 Messages
+
+Each text or binary message the client sends is one JSON-RPC body, a request or a batch, answered with one text message exactly as the same body sent over HTTP would be, the batch limits of §8.6 included, except that `eth_subscribe` and `eth_unsubscribe` are served (§8.7.3). A notification is a text message `{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":id,"result":…}}`.
+
+Frames follow RFC 6455. A client's frame that is not masked, has a reserved bit set or an unknown opcode closes the connection with status 1002, and so does a control frame longer than 125 bytes or fragmented, or a continuation that continues nothing or a new message before the last one ended; a text message that is not UTF-8 closes it with 1007. Fragmented messages are assembled. A `Ping` is answered with a `Pong` of the same payload, a `Pong` is taken as a sign of life, and a `Close` is answered with a `Close`, after which the connection ends. The server's frames are unmasked and never fragmented.
+
+A socket's reader hands the node one message at a time and reads the next only once the node has answered it, so one socket has at most one request waiting for the node's thread, as one HTTP connection does (§8.6); a client that sends many requests without waiting has them answered in order.
+
+#### 8.7.3 Subscriptions
+
+`eth_subscribe([kind, options])` answers a subscription id, 16 bytes as `0x` hex drawn as filter ids are (§8.1); `eth_unsubscribe([id])` answers whether this socket held such a subscription, and a socket can remove only its own. A subscription lives until it is removed or its socket closes, and starts with the first block after the head when it was made. The kinds:
+
+- **`newHeads`** announces every block once the node has executed it, in order, as its header: the fields of `eth_getBlockByNumber`'s block without `transactions`, `uncles`, `withdrawals` and `size`. A node executes a block only once it is finalized (spec 08 §5), so the head announced is the executed head, the `latest` of every method and of `eth_blockNumber`; it is never replaced by another block at its height, and no subscription ever reports a reorganization. A block finalized and not yet executed is announced once it is executed.
+- **`logs`**, with an optional filter object, announces, one notification per log, every log of every newly executed block that the object's `address` and `topics` match, with `eth_getLogs`' matching and its limits (at most `MAX_FILTER_ADDRESSES` addresses, and `MAX_SUB_TOPICS` alternatives in each of 4 positions, §8.6), system receipts' logs included (§3.5), in the order `eth_getLogs` answers them. The object's `fromBlock`, `toBlock` and `blockHash` are checked as `eth_getLogs` checks them and otherwise ignored, as geth ignores them: a subscription reports new blocks only. No log carries `removed: true`, for the reason above.
+- **`newPendingTransactions`** announces the hash of every transaction the pool holds that it did not hold when it was last looked at for the socket's subscriptions. The pool is looked at at most every `PENDING_MS` (200 ms), so a transaction that enters and leaves it between two looks is not announced. With a second parameter `true` (geth's full transactions) it is refused with -32602 `full pending transactions are not served`.
+
+Any other kind, `syncing` included, gets -32602 `unsupported subscription kind: <kind>`. A socket holds at most `MAX_SUBSCRIPTIONS` (128) subscriptions; one more is refused with -32000 `too many subscriptions on this connection, the limit is 128`.
+
+The node's thread sends notifications after the requests of its turn (§8.6), for at most `BLOCKS_PER_TURN` (16) blocks a turn, so a node that executed many blocks at once announces them over several turns and is never held by them. A block is read only for the subscriptions that want it: its header for `newHeads`, its receipts for `logs`.
+
+#### 8.7.4 What one socket can cost the node
+
+- **Messages.** A frame, and a message once its fragments are assembled, is at most `MAX_MESSAGE` (5 MiB, the HTTP body limit); a longer one closes the connection with 1009, from its length alone.
+- **Queue.** What the node sends a socket, answers and notifications, is queued for the socket's writer thread, which writes each frame within `WRITE_MS` (§8.6) or closes the socket. At most `WS_QUEUE_BYTES` (32 MiB) is queued for one socket, room for an answer of `MAX_RESPONSE_BYTES` and more: a frame that would take the queue past it closes the socket instead, and ends its subscriptions. A client that subscribes and never reads costs at most that much memory before it is cut off, and the node's thread never waits for a socket.
+- **Idle sockets.** A socket from which nothing has been read for `PING_MS` (30 000 ms) is sent a `Ping`; one from which nothing is read for another `PING_MS` after it is closed. A client that answers pings is kept, as geth keeps it.
+- **Stopping.** When the server stops it waits, at most `WRITE_MS`, for what is queued on its sockets to be written, then closes them, so the answer to an `orange_stop` sent over a socket reaches its caller.
+- **Threads.** An open socket costs two threads, its reader and its writer: at most `MAX_CONNECTIONS` HTTP threads and twice `MAX_WS_CONNECTIONS` socket threads run at once.
+
+Before 2026-11-06 the server had no WebSocket: `eth_subscribe` was refused, and a client that subscribes could not be used against an OrangeSDK node.
