@@ -596,6 +596,17 @@ fn a_socket_serves_every_method_and_the_three_subscriptions() {
         &json!([{ "fromBlock": "0x2", "toBlock": "0x2" }]),
     ));
     assert_eq!(got["result"][0], log);
+    // A transaction pooled and mined between two looks at the pool is
+    // announced from its block.
+    let quick = send_raw(&mut rpc, &increment(2));
+    mine(&mut rpc);
+    let announced = loop {
+        let n = message(s, &mut rpc, &mut client);
+        if n["params"]["subscription"] == pending.as_str() {
+            break n;
+        }
+    };
+    assert_eq!(announced["params"]["result"], quick.as_str());
     // Unsubscribed, nothing more under that id; an unknown id is false.
     let gone = ask(
         s,
@@ -645,7 +656,7 @@ fn a_socket_serves_every_method_and_the_three_subscriptions() {
     );
     assert_eq!(error(&mut rpc, &mut client, json!([])).0, json!(-32602));
     // Blocks executed at once are announced over several turns, in order.
-    for nonce in 2..2 + BLOCKS_PER_TURN + 2 {
+    for nonce in 3..3 + BLOCKS_PER_TURN + 2 {
         send_raw(&mut rpc, &increment(nonce));
         mine(&mut rpc);
     }
@@ -656,7 +667,7 @@ fn a_socket_serves_every_method_and_the_three_subscriptions() {
             numbers.push(n["params"]["result"]["number"].as_str().unwrap().to_owned());
         }
     }
-    let expected: Vec<String> = (3..3 + BLOCKS_PER_TURN + 2)
+    let expected: Vec<String> = (4..4 + BLOCKS_PER_TURN + 2)
         .map(|h| format!("{h:#x}"))
         .collect();
     assert_eq!(numbers, expected);

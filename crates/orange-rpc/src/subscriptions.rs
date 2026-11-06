@@ -53,9 +53,17 @@ pub(crate) struct Subscriptions {
     /// Random per server, so that ids cannot be guessed.
     seed: u64,
     count: u64,
-    /// The pool's hashes when it was last looked at, and when, while any
+    /// What `newPendingTransactions` last looked at, while any socket
     /// socket subscribes to `newPendingTransactions`.
-    pool: Option<(BTreeSet<[u8; 32]>, Instant)>,
+    pool: Option<Look>,
+}
+
+/// The last look at the pool for `newPendingTransactions`: the hashes it
+/// held then, when it was, and the first block not yet looked at.
+struct Look {
+    seen: BTreeSet<[u8; 32]>,
+    at: Instant,
+    next: u64,
 }
 
 /// The pool's transaction hashes.
@@ -145,7 +153,11 @@ impl Subscriptions {
         }
         let next = rpc.block_number()? + 1;
         if matches!(kind, Kind::Pending) && self.pool.is_none() {
-            self.pool = Some((pool_hashes(rpc), Instant::now()));
+            self.pool = Some(Look {
+                seen: pool_hashes(rpc),
+                at: Instant::now(),
+                next,
+            });
         }
         self.count += 1;
         let mut preimage = self.seed.to_be_bytes().to_vec();
@@ -258,15 +270,33 @@ impl Subscriptions {
         }
     }
 
-    /// Announces the transactions the pool holds that it did not when it
-    /// was last looked at, once [`PENDING_MS`] has passed since.
-    fn pending(&mut self, rpc: &Rpc) {
-        let Some((seen, at)) = &self.pool else { return };
-        if at.elapsed() < Duration::from_millis(PENDING_MS) {
+    /// Announces, once [`PENDING_MS`] has passed since the last look, the
+    /// transactions the pool holds, or the blocks executed since hold (at
+    /// most [`BLOCKS_PER_TURN`] of them a look), that the pool did not hold
+    /// at the last look: a transaction pooled and mined between two looks
+    /// is announced all the same.
+    fn pending(&mut self, rpc: &mut Rpc) {
+        let Some(look) = &self.pool else { return };
+        if look.at.elapsed() < Duration::from_millis(PENDING_MS) {
             return;
         }
+        let head = rpc.block_number().unwrap_or_default();
+        let last = head.min(look.next.saturating_add(BLOCKS_PER_TURN - 1));
+        let mut candidates = Vec::new();
+        for height in look.next..=last {
+            let (header, _) = rpc.header_at(height).ok().flatten().unwrap_or_default();
+            candidates.extend(header.tx_hashes.0);
+        }
         let now = pool_hashes(rpc);
-        let new: Vec<Value> = now.difference(seen).map(|h| json!(data(h))).collect();
+        candidates.extend(now.iter().copied());
+        let mut new = Vec::new();
+        let mut told = BTreeSet::new();
+        for hash in candidates {
+            if !look.seen.contains(&hash) && told.insert(hash) {
+                new.push(json!(data(&hash)));
+            }
+        }
+        let next = look.next.max(last + 1);
         for open in self.sockets.values() {
             let pending = open
                 .subscriptions
@@ -278,6 +308,10 @@ impl Subscriptions {
                 }
             }
         }
-        self.pool = Some((now, Instant::now()));
+        self.pool = Some(Look {
+            seen: now,
+            at: Instant::now(),
+            next,
+        });
     }
 }
