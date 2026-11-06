@@ -214,13 +214,9 @@ pub fn duties(chain_id: u64, me: &Hash, executed: u64) -> Option<Vec<u8>> {
     let next = executed + 1;
     let epoch = epoch_of(next, p.epoch_blocks);
     let run = staking::dkg_run(epoch)?;
-    let phase = staking::phase(epoch, next);
-    if phase < 3 && staking::phase_complete(&run, phase) {
-        // What the next phase sends depends only on what this one recorded,
-        // which is all in: the keystore can start on it now.
-        let _ = duty(chain_id, me, &run, phase + 1);
-    }
-    duty(chain_id, me, &run, phase)
+    // A complete phase has already ended (spec 15 §6.1), so the duty of the
+    // phase `next` is in is the first whose inputs are all recorded.
+    duty(chain_id, me, &run, staking::phase(epoch, next))
 }
 
 /// This node's message or confirmation for `phase` of `run`, as long as

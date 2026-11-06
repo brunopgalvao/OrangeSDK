@@ -232,14 +232,10 @@ pub fn phase(epoch: u64, height: u64) -> u8 {
     ((height - epoch_start(epoch, p.epoch_blocks)) / p.dkg_phase_blocks).min(3) as u8
 }
 
-/// Whether every message phase `phase` of the run of `epoch` waits for is
-/// recorded, so that its outcome can no longer change (spec 15 §6.1): every
+/// Whether every message phase `phase` of `run` waits for is recorded in
+/// `p`, so that its outcome can no longer change (spec 15 §6.1): every
 /// dealing, every recipient's complaints, or a justification from every
-/// accused dealer. Never for a run an earlier kernel scheduled.
-pub fn phase_complete(run: &DkgRun, phase: u8) -> bool {
-    progress(run.epoch).is_some_and(|p| complete(run, &p, phase))
-}
-
+/// accused dealer.
 fn complete(run: &DkgRun, p: &DkgProgress, phase: u8) -> bool {
     match phase {
         0 => p.dealings as usize == run.dealers.0.len(),
@@ -249,25 +245,27 @@ fn complete(run: &DkgRun, p: &DkgProgress, phase: u8) -> bool {
 }
 
 /// Ends the phase of the current epoch's run after the block at `height`
-/// when it has lasted its `P` blocks and either everything it waits for is
-/// recorded or it reaches its deadline (spec 15 §6.1): phase `i` ends at the
-/// latest after the block at `start + (i + 1)·⌊L/4⌋ − 1`. The confirmation
-/// lasts to the end of the epoch.
+/// when everything it waits for is recorded or it reaches its deadline
+/// (spec 15 §6.1, codex ADR 0058), and so on for the phase that follows, so
+/// that a justification phase with nobody accused takes no block: phase `i`
+/// ends at the latest after the block at `start + (i + 1)·⌊L/4⌋ − 1`. The
+/// confirmation lasts to the end of the epoch.
 fn advance_phase(height: u64, p: &StakingParams) {
     let epoch = epoch_of(height, p.epoch_blocks);
     let (Some(mut progress), Some(run)) = (progress(epoch), dkg_run(epoch)) else {
         return;
     };
-    if progress.phase >= 3 {
-        return;
-    }
     let next = height + 1;
+    let start = epoch_start(epoch, p.epoch_blocks);
     let span = p.epoch_blocks / 4;
-    let lasted = next >= progress.since + p.dkg_phase_blocks;
-    let deadline =
-        next >= epoch_start(epoch, p.epoch_blocks) + (u64::from(progress.phase) + 1) * span;
-    if lasted && (deadline || complete(&run, &progress, progress.phase)) {
+    let before = progress.phase;
+    while progress.phase < 3
+        && (next >= start + (u64::from(progress.phase) + 1) * span
+            || complete(&run, &progress, progress.phase))
+    {
         progress.phase += 1;
+    }
+    if progress.phase != before {
         progress.since = next;
         state::set(&progress_key(epoch), &progress);
     }

@@ -11,7 +11,10 @@
 //! earlier key in force, its defined fallback; the staking address holds
 //! exactly the stake, the unbonding stake, the delegations and the reward
 //! pool; and every threshold certificate any node recorded verifies under
-//! the key set it names, which was in force for its block. See `orange-fuzz`
+//! the key set it names, which was in force for its block. Every block any
+//! node executes in turn ends the DKG phases chain state says it ends: a
+//! complete phase after the block that completed it, an incomplete one at
+//! its deadline and not before (codex ADR 0058), and some phases end early. See `orange-fuzz`
 //! for the long mode.
 
 use std::collections::BTreeMap;
@@ -24,8 +27,8 @@ use orange_abi::chain::{
 use orange_abi::codec::Seq;
 use orange_abi::rotation::keys as rkeys;
 use orange_abi::staking::{
-    DelegationEntry, GWEI, KeySetRecord, STAKING_ADDRESS, StakingAction, StakingParams,
-    StakingStatus, ValidatorKey, keys as skeys, query,
+    DelegationEntry, DkgProgress, DkgRun, GWEI, KeySetRecord, STAKING_ADDRESS, StakingAction,
+    StakingParams, StakingStatus, ValidatorKey, epoch_of, epoch_start, keys as skeys, query,
 };
 use orange_abi::types::Genesis;
 use orange_abi::{Decode, Encode};
@@ -404,6 +407,109 @@ fn check_keys(node: &Node, epoch_blocks: u64, last: u64, newest: u64) {
     }
 }
 
+/// A node's last executed block, its hash, and the progress, after it, of
+/// the run the next block is in.
+type Seen = (u64, [u8; 32], Option<DkgProgress>);
+
+/// Watches every node execute block after block and checks, for each block
+/// whose parent's state it saw on the same node, that the DKG phases ended
+/// after it exactly as spec 15 §6.1 says, from the run's progress before and
+/// after the block: a phase ends when every message it waits for is recorded
+/// or at its deadline, the next one at once when it is complete too, and
+/// otherwise the phase stays.
+struct Phases {
+    epoch_blocks: u64,
+    /// Per node: the last height it executed, that block's hash, and the
+    /// progress, after it, of the run the next block is in.
+    last: Vec<Option<Seen>>,
+    /// Phases that ended before their deadlines, complete.
+    early: u64,
+    /// Transitions checked.
+    checked: u64,
+}
+
+impl Phases {
+    fn new(epoch_blocks: u64) -> Phases {
+        Phases {
+            epoch_blocks,
+            last: vec![None; NODES],
+            early: 0,
+            checked: 0,
+        }
+    }
+
+    fn progress(node: &Node, epoch: u64) -> Option<DkgProgress> {
+        node.state_get(&[skeys::PROGRESS, &epoch.to_be_bytes()].concat())
+            .map(|b| DkgProgress::from_bytes(&b).unwrap())
+    }
+
+    fn observe(&mut self, sim: &Sim) {
+        for (i, node) in sim.nodes.iter().enumerate() {
+            let n = node.executed.len();
+            let Some(&(height, hash)) = node.executed.last() else {
+                continue;
+            };
+            let epoch = epoch_of(height, self.epoch_blocks);
+            let parent = n.checked_sub(2).map(|k| node.executed[k]);
+            if let Some((h, ph, Some(before))) = self.last[i].clone()
+                && h + 1 == height
+                && parent == Some((h, ph))
+                && let Some(after) = Self::progress(node, epoch)
+                && let Some(run) = node.state_get(&[skeys::RUN, &epoch.to_be_bytes()].concat())
+            {
+                let run = DkgRun::from_bytes(&run).unwrap();
+                self.check(&run, height, &before, &after);
+            }
+            // The run the next block is in, as this block left it.
+            let ahead = Self::progress(node, epoch_of(height + 1, self.epoch_blocks));
+            self.last[i] = Some((height, hash, ahead));
+        }
+    }
+
+    fn check(&mut self, run: &DkgRun, height: u64, before: &DkgProgress, after: &DkgProgress) {
+        let start = epoch_start(run.epoch, self.epoch_blocks);
+        let span = self.epoch_blocks / 4;
+        let next = height + 1;
+        let complete = |phase: u8| match phase {
+            0 => after.dealings as usize == run.dealers.0.len(),
+            1 => after.complaints as usize == run.recipients.0.len(),
+            _ => after.justified as usize == after.accused.0.len(),
+        };
+        let deadline = |phase: u8| next >= start + (u64::from(phase) + 1) * span;
+        let mut phase = before.phase;
+        while phase < 3 && (deadline(phase) || complete(phase)) {
+            if !deadline(phase) {
+                self.early += 1;
+            }
+            phase += 1;
+        }
+        let since = if phase == before.phase {
+            before.since
+        } else {
+            next
+        };
+        assert_eq!(
+            (after.phase, after.since),
+            (phase, since),
+            "epoch {}, block {height}: {before:?} then {after:?}",
+            run.epoch
+        );
+        // The deadlines hold: by `start + 3S` the run is confirming.
+        assert!(next < start + 3 * span || after.phase == 3);
+        self.checked += 1;
+    }
+}
+
+/// Advances `sim` by `ms`, slot by slot, watching the DKG phases.
+fn advance(sim: &mut Sim, ms: u64, phases: &mut Phases) {
+    let end = sim.now_ms + ms;
+    while sim.now_ms < end {
+        let step = SLOT_MS.min(end - sim.now_ms);
+        sim.advance(step).unwrap();
+        phases.observe(sim);
+    }
+}
+
 /// Runs every node's kernel on the native backend, which gives the same
 /// results and gas as the interpreter (spec 07 §4.1), faster.
 fn native(sim: &mut Sim) {
@@ -447,6 +553,7 @@ fn schedule(r: &mut Rng) {
         byzantine,
     };
     let mut seen = Finalized::default();
+    let mut phases = Phases::new(epoch_blocks);
     let mut down = [false; NODES];
     // At most one node, never the one that equivocates, comes back with its
     // data wiped in a case: it counts as faulty until its signing guard ends,
@@ -476,7 +583,7 @@ fn schedule(r: &mut Rng) {
         for _ in 0..=r.below(3) {
             act(&mut sim, &live, r, &mut accounts);
         }
-        sim.advance(SLOT_MS * (4 + r.below(epoch_blocks))).unwrap();
+        advance(&mut sim, SLOT_MS * (4 + r.below(epoch_blocks)), &mut phases);
         seen.check(&sim);
     }
     // Heal: every node back, every link clean.
@@ -490,6 +597,7 @@ fn schedule(r: &mut Rng) {
     let target = seen.top() + 3;
     let live = sim
         .run_until(HEAL_SLOTS * SLOT_MS, |s| {
+            phases.observe(s);
             s.nodes
                 .iter()
                 .all(|n| n.finalized.last().is_some_and(|h| *h >= target))
@@ -505,6 +613,7 @@ fn schedule(r: &mut Rng) {
     let healed_epoch = status(&mut sim.nodes[0]).epoch;
     let rotated = sim
         .run_until(4 * epoch_blocks * 4 * SLOT_MS, |s| {
+            phases.observe(s);
             (0..NODES).all(|i| {
                 status(&mut s.nodes[i])
                     .active
@@ -517,6 +626,14 @@ fn schedule(r: &mut Rng) {
         rotated,
         "no key after epoch {healed_epoch}: {:?}",
         sim.finalized_heights().unwrap()
+    );
+    // Whatever the faults, the network healed made a key set: its phases
+    // were watched, and once every member was in time some ended early.
+    assert!(
+        phases.checked > 0 && phases.early > 0,
+        "{} transitions checked, {} early ends",
+        phases.checked,
+        phases.early
     );
     if let Some(w) = wiped {
         let id = validator_id(&keys[w]);

@@ -1217,8 +1217,8 @@ fn dkg_message(node: &Node, epoch: u64, phase: u8, index: u32) -> Option<Vec<u8>
     )
 }
 
-/// A validator whose keystore is still computing when the dealing phase
-/// would have ended at a fixed height lands its dealing all the same, and
+/// A validator whose keystore is still computing when its peers have all
+/// dealt lands its dealing all the same, and
 /// then its confirmation (spec 15 §6.1, codex ADR 0048): the phase waits
 /// for it, up to its deadline. Here the slow validator holds half the
 /// stake, so without its dealing the dealers would weigh 6 shares against a
@@ -1228,8 +1228,8 @@ fn dkg_message(node: &Node, epoch: u64, phase: u8, index: u32) -> Option<Vec<u8>
 fn a_slow_validator_still_lands_its_dealing_and_confirmation() {
     let keys = keys(4);
     let kernel = kernel_module();
-    // Epochs of 40 blocks, phases of at least 4: span 10, so dealing may run
-    // to block 10, complaints to 20, justifications to 30.
+    // Epochs of 40 blocks: span 10, so dealing may run to block 10,
+    // complaints to 20, justifications to 30.
     let weights = [1_000, 1_000, 1_000, 3_000];
     let genesis = genesis(&keys, &[0, 1, 2, 3], &weights, &staking(40, 4));
     let template = NodeConfig {
@@ -1244,9 +1244,9 @@ fn a_slow_validator_still_lands_its_dealing_and_confirmation() {
     // Epoch 1's run starts at block 41; the fourth validator's keystore is
     // held before it is asked for its dealing.
     sim.nodes[3].hold_keystore(true);
-    // Past the dealing phase's fourth block, the end of a fixed schedule:
-    // three dealings are in, the fourth validator's keystore still computes,
-    // and the run is still dealing.
+    // Past the dealing phase's fourth block: three dealings are in, the
+    // fourth validator's keystore still computes, and the run is still
+    // dealing.
     let waited = run_patiently(&mut sim, &[3], 40 * SLOT_MS, |s| {
         s.nodes[0].finalized_height().unwrap() >= 47
     });
@@ -1265,9 +1265,10 @@ fn a_slow_validator_still_lands_its_dealing_and_confirmation() {
     let p = progress(&sim.nodes[0], 1);
     assert_eq!((p.phase, p.dealings, p.complaints), (3, 4, 4));
     assert!(p.accused.0.is_empty());
-    // Every recipient spoke, so complaints ended after their 4 blocks;
-    // nobody was accused, so justifications ended after theirs too.
-    assert!(p.since <= 50 + 4 + 4 + 1, "{p:?}");
+    // Every recipient spoke, so complaints ended after the block that
+    // completed them; nobody was accused, so justifications took no block,
+    // and confirmations began within the complaints' deadline.
+    assert!(p.since <= 61, "{p:?}");
     let vote = [
         skeys::VOTE,
         &1u64.to_be_bytes(),
@@ -1296,9 +1297,10 @@ fn a_slow_validator_still_lands_its_dealing_and_confirmation() {
     assert_eq!(record.shareholders.0.len(), 2 + 2 + 2 + 8);
 }
 
-/// Phases keep their fixed length of `P` blocks when every participant is in
-/// time, and wait for an absent one only up to their deadlines, after which
-/// the run goes on without it and still makes a key (spec 15 §6.1).
+/// Phases end after the block that completes them when every participant is
+/// in time, whatever `P` (codex ADR 0058), and wait for an absent one only
+/// up to their deadlines, after which the run goes on without it and still
+/// makes a key (spec 15 §6.1).
 #[test]
 fn dkg_phases_wait_for_an_absent_validator_only_up_to_their_deadlines() {
     let keys = keys(4);
@@ -1309,9 +1311,10 @@ fn dkg_phases_wait_for_an_absent_validator_only_up_to_their_deadlines() {
         .run_until(80 * SLOT_MS, |s| adopted(s, &[0, 1, 2, 3], 0))
         .unwrap();
     assert!(done, "{:?}", sim.finalized_heights().unwrap());
-    // Everyone in time: dealing 1–4, complaints 5–8, justifications 9–12.
+    // Everyone in time: dealing in block 1, complaints in 2 and 3, and no
+    // block of justifications, since nobody is accused.
     let p = progress(&sim.nodes[0], 0);
-    assert_eq!((p.phase, p.since, p.dealings, p.complaints), (3, 13, 4, 4));
+    assert_eq!((p.phase, p.since, p.dealings, p.complaints), (3, 4, 4, 4));
     // The fourth validator is down for all of epoch 1's run.
     let ready = sim
         .run_until(80 * SLOT_MS, |s| {
@@ -1325,9 +1328,9 @@ fn dkg_phases_wait_for_an_absent_validator_only_up_to_their_deadlines() {
         .unwrap();
     assert!(made, "{:?}", sim.finalized_heights().unwrap());
     // Dealing waits to its deadline (block 50), complaints to theirs (60);
-    // nobody is accused, so justifications last their 4 blocks.
+    // nobody is accused, so justifications take no block.
     let p = progress(&sim.nodes[0], 1);
-    assert_eq!((p.phase, p.since, p.dealings, p.complaints), (3, 65, 3, 3));
+    assert_eq!((p.phase, p.since, p.dealings, p.complaints), (3, 61, 3, 3));
     assert_eq!(key_set(&sim.nodes[0], 1).unwrap().shareholders.0.len(), 16);
 }
 
