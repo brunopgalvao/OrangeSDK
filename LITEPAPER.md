@@ -327,7 +327,7 @@ OrangeSDK treats its specification as the source of truth and tests every claim 
 
 ## Status and what comes next
 
-As of 2026-11-07, OrangeSDK implements everything its specification describes, at version 0.1 (draft). The code is open source under Apache-2.0 at [github.com/brunopgalvao/orange](https://github.com/brunopgalvao/orange). It passes 1 001 tests with 100% line coverage.
+As of 2026-11-07, OrangeSDK implements everything its specification describes, at version 0.1 (draft). The code is open source under Apache-2.0 at [github.com/brunopgalvao/OrangeSDK](https://github.com/brunopgalvao/OrangeSDK). It passes 1 001 tests with 100% line coverage.
 
 What runs today:
 
