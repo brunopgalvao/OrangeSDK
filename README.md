@@ -10,6 +10,8 @@ OrangeSDK is a framework for EVM-compatible solochains. The first chain built wi
 
 The specification is normative: code that disagrees with it is a bug. Every change keeps 100% line coverage, and the native backend is differentially tested against the interpreter.
 
+The [litepaper](LITEPAPER.md) explains the whole design in about 20 minutes of reading.
+
 ## What a chain gets
 
 | Area | What it does | Spec |
